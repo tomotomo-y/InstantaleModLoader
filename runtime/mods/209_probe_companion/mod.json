@@ -1,0 +1,14 @@
+{
+  "entry": "probe_companion.py",
+  "api": 1,
+  "name": {
+    "en": "Area move probe",
+    "ja": "土地移動の計測"
+  },
+  "description": {
+    "en": "Records the buttons and classes involved in travelling between areas",
+    "ja": "土地移動のボタンの spec とクラスの発火順を写し取り、同行 MOD の足場を測る"
+  },
+  "version": "1",
+  "author": "R01/Flossian"
+}

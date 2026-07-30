@@ -1,0 +1,17 @@
+{
+  "entry": "probe_crime_attribution.py",
+  "api": 1,
+  "name": {
+    "en": "Crime attribution probe",
+    "ja": "犯罪主体の計測"
+  },
+  "description": {
+    "en": "Records the prompts, manager results, and final display involved in player crime attribution",
+    "ja": "主人公の犯罪判定に関わるプロンプト、マネージャ結果、最終表示を記録する"
+  },
+  "version": "1",
+  "author": "R01/Flossian",
+  "after": [
+    "111_fix_crime_attribution"
+  ]
+}

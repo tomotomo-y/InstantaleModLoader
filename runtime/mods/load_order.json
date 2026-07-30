@@ -22,12 +22,16 @@
     "206_probe_quest_flow",
     "207_probe_battle_bgm",
     "208_probe_item_detail",
+    "209_probe_companion",
     "300_event_facility_arrival",
     "301_quest_from_conversation",
     "302_leave_party_in_conversation",
     "303_quest_end_party_to_guild",
     "304_quest_end_keep_party",
-    "305_mini_quest"
+    "305_mini_quest",
+    "111_fix_crime_attribution",
+    "210_probe_crime_attribution",
+    "306_companion_travel"
   ],
   "disabled": []
 }

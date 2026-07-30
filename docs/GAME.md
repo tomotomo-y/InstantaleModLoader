@@ -236,6 +236,24 @@ app.process_choice(ConversationStartManager(app, npc_id), npc_name)
 `llm_manager:conversation_starter` に渡す **messages のコピーだけ**を差し替える
 （ゲームが持つ会話履歴には触らない）。
 
+**関係と感情はプロンプトに文章で載る**（`output_data/*/conversation_starter/` の実ログ）:
+
+```
+- プレイヤーとの関係: ['初対面', '同行中']
+- プレイヤーに対する感情: '['警戒心がある', '耐え難いほど魅力的に見えている']'
+```
+
+- どちらも**語句のリスト**。`affinity` の生値を探して自前の閾値を作る必要は無く、
+  この文面をそのまま自前のプロンプトに載せれば LLM 側で解釈される
+- **`'同行中'` はパーティ在籍の印。** パーティ以外の「連れ歩き」の意味では使われて
+  いないので、この語彙で同行状態を判定してはいけない
+
+**会話の記録はパーティ外の NPC にも溜まる**（同ログ直近 200 件を数えた結果、NPC 側の
+`current_log` が非空だったのは 54 件で、うち 47 件がパーティ外）。中身は
+`['<会話>…']` の要約。`Character.current_log` / `life_log` は会話画面の外からでも
+読めるので、**会話履歴が手元に無い場面（移動中など）で「その NPC と何があったか」を
+参照する材料になる**。
+
 ### 2.6 割り込みのタイミング
 
 移動・クエスト終了・会話終了の後始末（テキストの流し込み・ボタンの張り替え・要約）の
@@ -653,6 +671,75 @@ cipher[i]  = plaintext[i] ^ b"Instantale_Save_Key_2026"[i % 24]
 
 `savedata.json` も同じ方式。セーブを書き換えるツールは、**書き込み前に毎回
 復号→再暗号化のラウンドトリップを検査し、一致しなければ拒否する**こと。
+
+### 2.17 土地移動（エリア間）
+
+施設間の移動（`MovePhaseManager.move_phase`）とは別系統で、**4つのクラスが順に出る**。
+
+```
+__main__:DisplayAreaMoveChoice.__init__(self, app)
+__main__:AreaMoveCofirmation.__init__(self, app, target_area_id)
+__main__:AreaMoveRestriction.__init__(self, app, target_area_id)
+__main__:AreaMoveManager.__init__(self, app, target_area_id, mode)
+                        .execute(choice_text) / .method_1() / .show_loading_text()
+```
+
+**押下の流れ（`209_` の実測・2026-07-30。ボタンの spec をそのまま写したもの）**:
+
+```
+'他の土地へ行く'  DisplayAreaMoveChoice []
+   ↓            → DisplayAreaMoveChoice()
+'灰屑の街'        AreaMoveCofirmation ['0']       ← 行き先の一覧。**文言が行き先名**
+'東京'            AreaMoveCofirmation ['2']
+'やめる'          JustSetButtonToNormalPhase []
+   ↓            → AreaMoveCofirmation('2')
+'徒歩(3ヵ月)'     AreaMoveManager ['2', 'on_foot']  ← mode はこの2語
+'馬車(1000G)'     AreaMoveManager ['2', 'coach']
+'やめる'          JustSetButtonToNormalPhase []
+   ↓            → AreaMoveManager('2', 'coach') → execute('馬車(1000G)')
+                   method_1() の中で show_loading_text()「・」「・・」「・・・」
+到着              MovePhaseManager が並ぶ（その土地の移動先候補）
+```
+
+- **`mode` は `'on_foot'` / `'coach'`**、`target_area_id` はエリアの id の文字列。
+  ただし**横取りする側は spec を読むだけでよい**（`ui.spec_cls_name` / `ui.spec_args`）。
+  押されたボタンの `cls_name` と `args` をそのまま組み直せば、語彙を知らなくても
+  本来の押下と同じ移動が起こせる
+- **行き先の名前は `AreaMoveCofirmation` のボタンの文言から取る。** 土地の名前は外部の
+  データ改変ツールで書き換えられることがある（上の記録の `'東京'` は `'鉄鎖の町'` を
+  改名したもの。施設名 `'鉄鎖の町 - 入口'` は旧名のまま残っていた）。**名前で世界の物を
+  引き当てない。** プレイヤーが押したボタンの文言なら、何に改名されていても画面に出て
+  いたものと必ず一致する
+- 徒歩は 3 ヵ月、馬車は 1000G。**移動の重さが手段で桁違いに変わる**
+- **到着が確定するのは `AreaMoveManager.method_1` の中**:
+
+  ```
+  before method_1: location='嘆きの村 - 出口'(38) node='4' area='1'
+  after  method_1: location='鉄鎖の町 - 入口'(52) node='9' area='2'
+  after  execute : （同じ。execute は method_1 を呼んで戻るだけ）
+  ```
+
+  `player.location` / `current_node` / `current_area` は `method_1` の復帰時点で
+  揃っている。**移動先で NPC を動かすならここより後**
+- `AreaMoveManager` の属性は `app` / `mode` / `target_area` / `target_area_dict` /
+  `target_area_id` / `show_loading_finished`
+- 到着地点は `entrance` / `exit` 系の施設（主の居ない通路）。`300_` の到着イベントは
+  この施設種別では発火しない
+- **`AreaMoveRestriction` は今回の経路では一度も作られなかった**（パーティ NPC 無しで
+  土地移動を1回。同じ移動で `area_move_rejector` も呼ばれていない）。**何のゲートなのかは
+  未確定** ― 雇用 NPC を連れているときに現れる可能性が高いが、実測はまだ無い
+
+**`area_move_rejector` はゲーム自身の同行拒否機構**（`scripts.llm.llm_manager`。
+`output_data/*/area_move_rejector/` の実ログで確認）:
+
+```
+area_move_rejector(character_life_log, player, character_instance, worldview)
+プロンプト: 「システム的には彼らの関係性が深くないために拒否されるべきです」
+```
+
+- 対象は**雇用したパーティ NPC**。関係が浅いと土地移動に付いて来ない
+- **拒否されると移動そのものが止まる。** 選択肢は徒歩／馬車のまま残り、一方的な
+  セリフだけが流れる（実ログではプレイヤーがパーティを解散してから旅立っている）
 
 ---
 
