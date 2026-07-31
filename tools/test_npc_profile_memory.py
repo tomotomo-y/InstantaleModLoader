@@ -22,6 +22,7 @@
 """
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -33,8 +34,25 @@ import types
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "runtime"))
 
-MOD_PATH = os.path.join(_ROOT, "runtime", "mods", "307_npc_profile_memory",
-                        "npc_profile_memory.py")
+MODS_DIR = os.path.join(_ROOT, "runtime", "mods")
+
+
+def find_mod(suffix):
+    """mod を **番号を除いた名前** で探す（番号は振り直されることがある）。"""
+    matches = sorted(name for name in os.listdir(MODS_DIR)
+                     if name.endswith(suffix)
+                     and os.path.isfile(os.path.join(MODS_DIR, name, "mod.json")))
+    if not matches:
+        raise SystemExit("cannot find *{} in {}".format(suffix, MODS_DIR))
+    if len(matches) > 1:
+        raise SystemExit("ambiguous: {} in {}".format(matches, MODS_DIR))
+    folder = os.path.join(MODS_DIR, matches[0])
+    with io.open(os.path.join(folder, "mod.json"), encoding="utf-8") as fh:
+        entry = json.load(fh)["entry"]
+    return os.path.join(folder, entry)
+
+
+MOD_PATH = find_mod("_npc_profile_memory")
 
 FOUND = "北方の村で育った無口な傭兵。古い剣の話を好み、冒険者とギルドの件を調べる約束をしている。"
 GIBBERISH = "……（彼について新しく分かった事は特に無いように思われた）"

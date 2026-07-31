@@ -1,22 +1,36 @@
 # -*- coding: utf-8 -*-
-"""`111_fix_crime_attribution` の純粋関数テスト。ゲーム不要。
+"""`113_fix_crime_attribution` の純粋関数テスト。ゲーム不要。
 
     python tools/test_crime_attribution.py
 """
 
 import importlib.util
+import io
+import json
 import os
 import types
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MOD_PATH = os.path.join(
-    ROOT,
-    "runtime",
-    "mods",
-    "111_fix_crime_attribution",
-    "fix_crime_attribution.py",
-)
+MODS_DIR = os.path.join(ROOT, "runtime", "mods")
+
+
+def find_mod(suffix):
+    """mod を **番号を除いた名前** で探す（番号は振り直されることがある）。"""
+    matches = sorted(name for name in os.listdir(MODS_DIR)
+                     if name.endswith(suffix)
+                     and os.path.isfile(os.path.join(MODS_DIR, name, "mod.json")))
+    if not matches:
+        raise SystemExit("cannot find *{} in {}".format(suffix, MODS_DIR))
+    if len(matches) > 1:
+        raise SystemExit("ambiguous: {} in {}".format(matches, MODS_DIR))
+    folder = os.path.join(MODS_DIR, matches[0])
+    with io.open(os.path.join(folder, "mod.json"), encoding="utf-8") as fh:
+        entry = json.load(fh)["entry"]
+    return os.path.join(folder, entry)
+
+
+MOD_PATH = find_mod("_fix_crime_attribution")
 
 
 def load_mod():

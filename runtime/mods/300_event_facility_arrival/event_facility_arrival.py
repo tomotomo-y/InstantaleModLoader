@@ -199,12 +199,22 @@ def apply(ctx):
         return chance_table.get(facility_type, 0.0)
 
     def is_at(character, facility):
-        """NPC の現在地が対象施設なら True を返す。"""
+        """NPC の現在地が対象施設なら True を返す。
+
+        現在地を読めない相手は施設の名簿を信じて True に倒す。名簿にしか
+        居場所が無い NPC を弾くと、話者が一人も選ばれずイベント自体が
+        出なくなる。
+        """
         here = getattr(character, "location", None)
+        if here is None:
+            return True
         if here is facility:
             return True
         here_id = getattr(here, "id", None)
-        return here_id is not None and here_id == getattr(facility, "id", None)
+        facility_id = getattr(facility, "id", None)
+        if here_id is None or facility_id is None:
+            return True
+        return here_id == facility_id
 
     def pick_speaker(app, facility):
         """施設に現在居る話者を (id, インスタンス) で返す。主がいれば主。"""

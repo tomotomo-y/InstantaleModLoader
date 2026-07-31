@@ -1,5 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
-"""`306_companion_travel` の検証。ゲーム不要。
+"""`308_companion_travel` の検証。ゲーム不要。
 
     python tools/test_companion_travel.py
 
@@ -22,6 +22,7 @@
 """
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -32,8 +33,25 @@ import types
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "runtime"))
 
-MOD_PATH = os.path.join(_ROOT, "runtime", "mods", "306_companion_travel",
-                        "companion_travel.py")
+MODS_DIR = os.path.join(_ROOT, "runtime", "mods")
+
+
+def find_mod(suffix):
+    """mod を **番号を除いた名前** で探す（番号は振り直されることがある）。"""
+    matches = sorted(name for name in os.listdir(MODS_DIR)
+                     if name.endswith(suffix)
+                     and os.path.isfile(os.path.join(MODS_DIR, name, "mod.json")))
+    if not matches:
+        raise SystemExit("cannot find *{} in {}".format(suffix, MODS_DIR))
+    if len(matches) > 1:
+        raise SystemExit("ambiguous: {} in {}".format(matches, MODS_DIR))
+    folder = os.path.join(MODS_DIR, matches[0])
+    with io.open(os.path.join(folder, "mod.json"), encoding="utf-8") as fh:
+        entry = json.load(fh)["entry"]
+    return os.path.join(folder, entry)
+
+
+MOD_PATH = find_mod("_companion_travel")
 
 ACCEPT = "承諾\n「ああ、付いて行こう」"
 REFUSE = "拒否\n「悪いが、ここを離れられない」"

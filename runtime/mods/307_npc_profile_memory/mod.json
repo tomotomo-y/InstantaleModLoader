@@ -2,8 +2,8 @@
   "entry": "npc_profile_memory.py",
   "api": 1,
   "name": {
-    "en": "NPCs remember what you told them",
-    "ja": "NPCが会話で知った事を覚える"
+    "en": "NPC conversation memory",
+    "ja": "NPCが会話を覚える"
   },
   "description": {
     "en": "After each turn, a background LLM call updates a persistent profile formed from what conversations reveal about that NPC. The extra profile is appended to the NPC profile in every later conversation",
