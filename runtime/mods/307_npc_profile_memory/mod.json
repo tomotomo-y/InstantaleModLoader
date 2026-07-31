@@ -1,0 +1,44 @@
+{
+  "entry": "npc_profile_memory.py",
+  "api": 1,
+  "name": {
+    "en": "NPCs remember what you told them",
+    "ja": "NPCが会話で知った事を覚える"
+  },
+  "description": {
+    "en": "After each turn, a background LLM call updates a persistent profile formed from what conversations reveal about that NPC. The extra profile is appended to the NPC profile in every later conversation",
+    "ja": "会話1ターンごとに、バックグラウンドの LLM が会話から形成された人物プロフィールを更新する。追加プロフィールは以降の会話でゲーム本体のプロフィール欄に毎回載る"
+  },
+  "version": "1",
+  "author": "R01/Flossian",
+  "settings": {
+    "CONVERSATION_TURNS": {
+      "type": "int",
+      "default": 8,
+      "min": 2,
+      "max": 30,
+      "label": {
+        "ja": "抜き出しに載せる直近のやり取りの数",
+        "en": "Recent exchanges fed to the extractor"
+      },
+      "note": {
+        "ja": "増やすと取りこぼしが減るが、抜き出しの待ち時間が伸びる",
+        "en": "More context misses less, but each extraction takes longer"
+      }
+    },
+    "INJECT_CHARS": {
+      "type": "int",
+      "default": 1200,
+      "min": 200,
+      "max": 4000,
+      "label": {
+        "ja": "追加プロフィールの最大長",
+        "en": "Maximum extra profile length"
+      },
+      "note": {
+        "ja": "保存と会話への注入はこの文字数まで。上げるほど会話が遅く高くつく",
+        "en": "Storage and prompt injection use this cap. Raising it makes every reply slower"
+      }
+    }
+  }
+}

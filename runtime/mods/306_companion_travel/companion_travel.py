@@ -422,22 +422,41 @@ def apply(ctx):
                  player_profile=_text(getattr(player, "profile", ""), 400))
 
     # ------------------------------------------------------------ LLM 呼び出し
+    # ゲームはスロットによって推論モジュールが違う。ローカルは llama_cpp、
+    # 外部 API は any_server。片方しか sys.modules に載らない（実機 2026-07-30:
+    # any_server 運用中に llama_cpp だけ見ると常にフォールバック拒否になった）。
+    REQUEST_MODULES = (
+        "scripts.llm.request_llm_inference_llama_cpp_completion",
+        "scripts.llm.request_llm_inference_any_server",
+    )
+
+    def resolve_send():
+        """いま載っている推論モジュールから `send_request_with_no_structure` を拾う。"""
+        for name in REQUEST_MODULES:
+            module = sys.modules.get(name)
+            send = (getattr(module, "send_request_with_no_structure", None)
+                    if module else None)
+            if send is not None:
+                return send, name
+        return None, None
+
     def ask(manager_name, messages):
         """`send_request_with_no_structure` を1回。`str` が返る（GAME.md §2.12）。"""
-        module = sys.modules.get(
-            "scripts.llm.request_llm_inference_llama_cpp_completion")
-        send = getattr(module, "send_request_with_no_structure", None) if module else None
+        send, module_name = resolve_send()
         if send is None:
-            write("{}: send_request_with_no_structure unavailable".format(manager_name))
+            write("{}: send_request_with_no_structure unavailable "
+                  "(checked {})".format(manager_name, ", ".join(REQUEST_MODULES)))
             return None
         started = time.monotonic()
         try:
             result = send(manager_name, messages, max_tokens=MAX_TOKENS)
         except Exception:
-            ctx.log_exc("companion: {} failed".format(manager_name))
+            ctx.log_exc("companion: {} failed via {}".format(
+                manager_name, module_name))
             return None
-        write("{}: {:.1f}s -> {!r}".format(
-            manager_name, time.monotonic() - started, _text(result, 300)))
+        write("{}: {:.1f}s via {} -> {!r}".format(
+            manager_name, time.monotonic() - started, module_name,
+            _text(result, 300)))
         return result
 
     def read_verdict(result, default):
@@ -539,10 +558,17 @@ def apply(ctx):
                  current_log=current_log_text(npc) or "（記録なし）",
                  life_log=life_log_text(app, npc) or "（記録なし）")
 
-        accepted, reply = read_verdict(
-            ask(MANAGER_JOIN, [{"role": "user", "content": instruction + "\n\n" + context},
-                               {"role": "user", "content": "<行動: 同行を持ちかける>"}]),
-            default=False)
+        result = ask(
+            MANAGER_JOIN,
+            [{"role": "user", "content": instruction + "\n\n" + context},
+             {"role": "user", "content": "<行動: 同行を持ちかける>"}])
+        # LLM 経路が取れないときは偽の拒否セリフを出さない。会話内容と無関係な
+        # 「ここを離れるわけにはいかない」が何度も出て、判定が固まったように見える。
+        if result is None:
+            write("join: {!r} ({}) aborted (LLM unavailable) transcript={} chars".format(
+                npc_name, npc_id, len(transcript)))
+            return FAILED_TEXT
+        accepted, reply = read_verdict(result, default=False)
         write("join: {!r} ({}) accepted={} transcript={} chars".format(
             npc_name, npc_id, accepted, len(transcript)))
 

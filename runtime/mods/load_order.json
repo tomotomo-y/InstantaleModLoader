@@ -31,7 +31,8 @@
     "305_mini_quest",
     "111_fix_crime_attribution",
     "210_probe_crime_attribution",
-    "306_companion_travel"
+    "306_companion_travel",
+    "307_npc_profile_memory"
   ],
   "disabled": []
 }

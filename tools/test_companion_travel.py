@@ -539,6 +539,64 @@ def test_party_member_gets_no_button():
     return run
 
 
+LLAMA_CPP = "scripts.llm.request_llm_inference_llama_cpp_completion"
+ANY_SERVER = "scripts.llm.request_llm_inference_any_server"
+
+
+def with_llm_backend(backend):
+    """推論モジュールを一時的に差し替える。実機では片方しか載らない。"""
+    saved = {name: sys.modules.get(name) for name in (LLAMA_CPP, ANY_SERVER)}
+    for name in (LLAMA_CPP, ANY_SERVER):
+        sys.modules.pop(name, None)
+    if backend is not None:
+        module = types.ModuleType(backend)
+        module.send_request_with_no_structure = Llm.send
+        sys.modules[backend] = module
+    return saved
+
+
+def restore_llm_backend(saved):
+    for name in (LLAMA_CPP, ANY_SERVER):
+        sys.modules.pop(name, None)
+    for name, module in saved.items():
+        if module is not None:
+            sys.modules[name] = module
+
+
+def test_offer_via_any_server():
+    """外部 API スロット（any_server のみ）でも承諾できる"""
+    saved = with_llm_backend(ANY_SERVER)
+    try:
+        run = Run(answers={"mod_companion_join": [ACCEPT]})
+        run.conversation("77")
+        run.press("同行を持ちかける")
+        check("77" in run.companions().get("灰都", {}),
+              "any_server 経路で同行できない: {}".format(run.companions()))
+        check(any("付いて行こう" in text for text in run.app.texts),
+              "any_server 経路のセリフが出ない: {}".format(run.app.texts))
+        return run
+    finally:
+        restore_llm_backend(saved)
+
+
+def test_offer_llm_unavailable():
+    """推論モジュールが無いとき、偽の拒否セリフではなく失敗文言を出す"""
+    saved = with_llm_backend(None)
+    try:
+        run = Run(answers={"mod_companion_join": [ACCEPT]})
+        run.conversation("77")
+        run.press("同行を持ちかける")
+        check(run.companions().get("灰都", {}) == {},
+              "LLM 無しなのに同行した: {}".format(run.companions()))
+        check(any("切り出せない" in text for text in run.app.texts),
+              "失敗文言が出ていない: {}".format(run.app.texts))
+        check(not any("離れるわけにはいかない" in text for text in run.app.texts),
+              "偽の拒否セリフが出た: {}".format(run.app.texts))
+        return run
+    finally:
+        restore_llm_backend(saved)
+
+
 def test_offer_accepted():
     """承諾で同行リストに入り、そのときの会話が控えられる"""
     run = Run(answers={"mod_companion_join": [ACCEPT]})
@@ -755,6 +813,8 @@ def test_orphan_label_is_not_duplicated():
 def main():
     for test in (test_party_member_gets_no_button,
                  test_offer_accepted,
+                 test_offer_via_any_server,
+                 test_offer_llm_unavailable,
                  test_offer_refused,
                  test_companion_opening_is_not_a_reunion,
                  test_release,

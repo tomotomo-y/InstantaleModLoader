@@ -1,6 +1,6 @@
 # VERIFICATION — 検証記録と現在地
 
-最終更新: 2026-07-30
+最終更新: 2026-07-31
 
 **何がどこまで確かめられているか**の記録。
 
@@ -38,6 +38,7 @@
 | `303_quest_end_party_to_guild` | クエスト解散で町のギルドに残す | **実機未確認**（§3.3） | 45件全通 |
 | `304_quest_end_keep_party` | クエストクリアで解散しない（`303_` より外側） | **実機未確認**（§3.3） | 50件全通 |
 | `306_companion_travel` | パーティを使わずに NPC を連れて歩く | **実機2回目**。同行・施設間の追従・土地跨ぎ（横取り→判定→原形で再発行）・解除まで通った。**別れのセリフだけ外した**（材料に道中が無く事務的になった。直して再確認待ち）。§2.24 / §3.12 | 52件全通 |
+| `307_npc_profile_memory` | 会話から NPC の追加プロフィールを形成し、ゲーム本体のプロフィール欄へ載せる | 旧分類版は抽出・永続化・人生ログへの注入まで**実機確認済**。2026-07-31 に、分類を廃止して1本の人物像を更新し、NPC の `profile` へ直接足す仕様へ変更。抽出は専用ワーカーへ移した。新仕様は実機再確認待ち（§3.14） | 75件全通 |
 | `305_mini_quest` | 戦闘を伴わないミニクエスト（採集・救助・偵察） | **実機4回**。依頼の中身・非戦闘の進行・イベント主体の道中まで成立。残るのは**達成としての帰還**だけ（4回とも `return_after_completion` が選ばれず、文面では2回外した。戻り値を差し替える形に切り替えて投入済み・再確認待ち。§2.19〜§2.22 / §3.10） | 107件全通。うち4件は `output_data/` の実プロンプト 612件との突き合わせ |
 
 ### ローダ
@@ -1554,6 +1555,146 @@ boot complete: 27/27 mod(s) applied
 
 加えて、誤判定3件で `TrialStartManager` / `ImprisonmentStartManager` が起動しないこと、
 実犯罪2件を誤って除去しないこと、マーカーがゲーム内の記憶に残らないことを確認する。
+
+### 3.14 `307_` NPC プロフィールの追記 — 実機確認の手順
+
+抽出の記録は `out/npc_profile.log`、プロンプトと応答は
+`output_data/<世界>/<PC>/mod_npc_profile_extract/` に残る。控えの本体は
+`out/npc_profiles.json`。
+
+##### 抽出は通った・**注入は通っていない**（2026-07-31）
+
+| 見たこと | 結果 |
+|---|---|
+| 抽出 | **動いている。** `npc_profile.log` に38回の `mod_npc_profile_extract`（1.2〜6.5秒・`any_server`）と `learned:` が並び、`npc_profiles.json` の `ペルディション/3`（ラト・イリディス）に5枠が埋まった。上限4件のトリムも効いている |
+| パッチ | **7つ全部当たっている**（`status.json` の `by_mod`）。`conversation_facilitator` を含む |
+| 注入 | **一度も入っていない。** `output_data/ペルディション/カナ/conversation_facilitator/` の68件を検索し、対照語（`全体の指示` / `人生ログ`）は 68/68 一致、**注入の見出し `これまでの会話で分かっている事` は 0 件**、控えの本文（`絶頂の直前で寸止め`）も 0 件 |
+
+**同じ手口が効くことは確認済み。** `306_` の `conversation_starter` フックは実機で2回
+発火している（`out/companion.log` の `opening:`）。つまり
+`scripts.llm.llm_manager` のモジュール属性差し替えそのものは届く。原因は注入側の条件。
+
+**この MOD は注入経路に一切ログを出していなかった** ― 素通りしても何も残らないので、
+どこで降りたのか分からない。まずそこを直した（`note_inject`。同じ結末が続く間は
+書かない）。併せて相手の id を **`world.characters` の鍵から引く**ように変えた
+（`character_instance.id` が実在するかは recon で確かめられず、無ければ `getattr` が
+黙って None を返して素通りする）。
+
+##### 原因確定 — `character_life_log` は**辞書**だった（2026-07-31・実測）
+
+ログを入れて1セッション回したら1行で出た:
+
+```
+[08:26:01] starter: nothing recorded for 'イスラ・マグダレーナ' (4)
+[08:27:06] starter: character_life_log is dict, not a string
+[08:30:40] facilitator: character_life_log is dict, not a string
+```
+
+- **相手の特定は成功していた**（名前と id が出ている）。`world.characters` 経由の
+  引き方で足りる
+- 降りていたのは**足す先の型**。`character_life_log` は文字列ではなく
+  **`{'450日前': "[...]", '270日前': "[...]", '180日前': "[...]"}`** という
+  「N日前」をキーにした辞書で、ゲームはこれをそのまま
+  `【<名前>の人生ログ】` の欄へ流し込んでいる
+  （`output_data/ペルディション/カナ/conversation_facilitator/75.json` の system 本文）
+- `context_manager.get_life_log_text(app, character_instance)` は文字列を返す名前だが、
+  **`conversation_*` に渡っているのはその手前の辞書**。GAME.md の推定（文字列）は誤り
+
+**対応:** 辞書には `LIFE_LOG_KEY = "会話から分かっている事"` を1項目足す（元の辞書は
+複製して書き換えない）。文字列で来た場合は従来どおり末尾に見出し付きで足す。
+`conversation_facilitator` の指示文は「人生ログと現在ログを参照」と書いているので、
+同じ欄に入れれば参照の対象に自然に入る。
+
+##### 注入も通った（2026-07-31・実機）
+
+辞書に足す形に直した直後のセッションで確定。
+
+```
+[08:59:13] starter:     'ラト・イリディス' (3) +702 chars into dict
+[08:59:59] facilitator: 'ラト・イリディス' (3) +702 chars into dict
+```
+
+**実プロンプトでも裏が取れた。** 08:55 以降に書かれた記録4件のうち、会話の2件が
+どちらも注入済み:
+
+| 時刻 | ファイル | 注入 |
+|---|---|---|
+| 08:59:15 | `unknown/unknown/conversation_starter/708.json` | **あり** |
+| 09:00:03 | `unknown/unknown/conversation_facilitator/8606.json` | **あり** |
+
+`【ラト・イリディスの人生ログ】` の辞書の末尾に、こう並んだ（`【…の今日の現在ログ】`
+の直前）:
+
+```
+ '会話から分かっている事': '- 好み: …／…\n- 嫌悪: …\n- 経歴: …／…\n- 人間関係: …／…\n- 目標: …／…\n- 秘密: …'}
+```
+
+**ここまでは旧・分類別プロフィールを人生ログに足す仕様の実測。**
+
+##### 1本の追加プロフィールへ変更（2026-07-31・実機再確認待ち）
+
+分類別の `slots` は、会話上の人物像として弱かった。ゲーム本体の短い
+`プロフィール` / `性格` / `感情` が優先され、人生ログ末尾の分類項目は参照されても
+ロールプレイへ反映されにくい。そのため次の仕様へ変更した:
+
+- `slots` を廃止し、毎ターン「更新後の追加プロフィール全文」をLLMに書かせる
+- 旧 `slots` は初回読込時に情報を落とさず `profile` へ自動移行する。旧データ自体は残す
+- ゲーム世界の NPC を浅く複製し、複製の `profile` だけを次の形にする
+
+```
+<ゲーム本体のプロフィール>
+
+【会話から形成された追加プロフィール】
+<MOD の profile>
+```
+
+- ゲームの NPC 本体、人生ログ、会話 `messages` は変更しない
+- `starter` / `facilitator` / retrieval / quest の5経路へ同じ形で渡す
+- LLM 不在・例外・`変更なし` は既存プロフィールを維持する
+- 次フレームでは会話と NPC の文字列をコピーしてキューへ積むだけにし、LLM は
+  専用ワーカーで直列実行する。ゲームオブジェクトをワーカーから触らず、保存用の
+  キャッシュとJSON書込はロックする
+- 続いた抽出は順番を保ち、後の抽出は前の更新済みプロフィールを読んでから始める
+
+##### 外れたときに見ること
+
+会話を1ターンして `out/npc_profile.log` の `facilitator:` で始まる行を読む。
+
+| 出た行 | 意味 | 次の手 |
+|---|---|---|
+| `facilitator: 'ラト・イリディス' (3) +N chars into profile` | **注入処理は正常** | `conversation_facilitator/` の最新ファイルで `【会話から形成された追加プロフィール】` を確認 |
+| `migrated: ... slots -> profile` | 旧JSONを新形式へ移した | 正常。`npc_profiles.json` の `profile` を確認 |
+| `facilitator: nothing recorded for ... ` | 相手は引けたが控えが無い | 世界名と `profile` の有無を確認 |
+| `facilitator: cannot copy Character (...)` | NPC の浅い複製ができない | 実機の型に合わせてプロキシ方式を検討 |
+| `facilitator: profile is <型>` | ゲーム本体のプロフィールが文字列でない | その型に合わせる |
+| `facilitator: no character_instance (...)` | 引数の並びが recon と違う | 引数の数とキーワード名から位置を決め直す |
+
+##### GM 経由では確認できない
+
+GM の経路は `gm_conversation_facilitator(conversation_history)` /
+`master_ai_facilitator_from_conversation(player, player_life_log, worldview,
+facility_list, npc_list, npc_list_text, conversation_log, master_process_log)` で、
+**`character_life_log` も `character_instance` も受け取らない**（`targets.txt`
+L1375 / L1388）。注入が直っても GM は NPC の控えを見ない。確認は NPC 本人との
+会話で行うこと。
+
+| 見ること | 期待 | 外れたときに見る場所 |
+|---|---|---|
+| NPC と1ターン話す | 返答が**先に出て**、抽出中も画面操作できる | `npc_profile.log` の `mod_npc_profile_extract: N.Ns via ...` と、その後の `extract: finished` |
+| 素性が読み取れる話をする | `profile` が更新後の人物像へ置き換わる | `npc_profile.log` の `updated:` と `mod_npc_profile_extract/` の全文 |
+| 新情報の無い話をする | 応答が `変更なし` となり、`profile` は変わらない | JSONの更新時刻と本文 |
+| 会話を開き直す | 第一声から前の話を踏まえて喋る | `conversation_starter/` のNPC `プロフィール:` 内に追加見出しがあるか |
+| 別の NPC と話す | その人物の控えだけが載る | `conversation_facilitator/` の本文に他人の名前が混ざっていないこと |
+| 旧JSONで起動する | `profile` が追加され、旧 `slots` も残る | `migrated:` と `npc_profiles.json` |
+
+**測っておきたいこと**（オフラインでは出せない）:
+
+- **抽出中の操作性。** 実測の抽出は1.2〜6.5秒。この間も画面操作と次の会話が
+  止まらないこと、続けて話した場合に `extract: finished` がターン数だけ順番に出ること
+- **プロンプトの膨らみ。** `204_probe_prompt_bloat` を有効にしたまま数十ターン話し、
+  追加プロフィールが `INJECT_CHARS` の上限で頭打ちになることを確認する
+- **抽出の質。** `mod_npc_profile_extract/` の応答を読み、会話に無い事を書いていないか。
+  全文更新で古い情報が消えていないか。外すなら `build_messages` の指示を調整する
 
 ### 3.11 アイテム説明欄が閉じた後も残る（新種・2026-07-28、計測を仕掛けた）
 
