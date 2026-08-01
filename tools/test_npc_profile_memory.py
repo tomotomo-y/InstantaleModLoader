@@ -562,6 +562,17 @@ def test_profile_is_capped():
     return run
 
 
+def test_extraction_prompt_leaves_a_margin():
+    """抽出LLMには保存上限の8割を指示する"""
+    run = Run(answers=FOUND)
+    run.turn()
+    prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
+    expected = MOD.INJECT_CHARS * 4 // 5
+    check("{}文字以内に収める".format(expected) in prompt,
+          "抽出上限が8割でない: {}".format(prompt[:300]))
+    return run
+
+
 def test_profile_reaches_the_next_reply():
     """控えは複製NPCのprofileに足され、元NPCは変わらない"""
     run = Run(answers=MOD.NO_CHANGE, seed="北方の村で育った無口な傭兵。")
@@ -748,6 +759,7 @@ def main():
                  test_empty_explanation_keeps_profile,
                  test_legacy_slots_migrate_to_profile,
                  test_profile_is_capped,
+                 test_extraction_prompt_leaves_a_margin,
                  test_profile_reaches_the_next_reply,
                  test_profile_reaches_keyword_calls,
                  test_profile_reaches_the_opening_line,

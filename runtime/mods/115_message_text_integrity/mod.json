@@ -1,0 +1,17 @@
+{
+  "entry": "message_text_integrity.py",
+  "api": 1,
+  "name": {
+    "en": "Limit displayed message text",
+    "ja": "本文の表示量を制限する"
+  },
+  "description": {
+    "en": "Keeps only the latest part of oversized game text in the display label",
+    "ja": "巨大なゲーム本文は保持したまま、表示ラベルだけを末尾へ制限する"
+  },
+  "version": "1",
+  "author": "yoshinari/tomotomo-y",
+  "before": [
+    "112_ui_text_spacing"
+  ]
+}

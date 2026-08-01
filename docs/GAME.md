@@ -345,6 +345,41 @@ hud={'buttons': ['テスト討伐依頼A', 'クエストを探す', 'やめる',
 ラベルの `line_height` や `text` を触ったら、`texture_update()` の後にこれを
 呼べば本文の高さがゲーム側の計算で揃う（`112_` が実機でこの経路を通している）。
 
+本文は `InstantaleApp.add_text_display(self, dt, context, index=-1)` が **1文字に
+1回**呼ばれて流し込まれ、そのたびにこのラベル全体のテクスチャが作り直される。
+726文字の応答で 727 回・100.06秒 ＝ **0.138秒/文字**（`out/text_viewport.log`、
+2026-08-01。そのときのラベルは 2021文字・`[915.84, 4104]`）。公称のタイプ速度は
+`scripts.functions:TEXT_SPEED_DEFAULT_BY_LANGUAGE` の `ja: 0.07` なので、
+**残りの約0.068秒/文字は描画そのもの**。本文の重さを触る MOD は、速度ではなく
+「1文字ごとに塗り直していること」を止めにいくこと（`116_`）。
+全文を一度に入れる入口として `InstantaleApp.add_text_immediately(self, content)`
+がある。
+
+**流し込みの前後には待ち行列がある。ここを壊すと本文が二度と出なくなる。**
+`out/text_viewport.log`（2026-08-01）の実測:
+
+```
+add_text:           to_add_text_list[0] -> to_add_text_list[1]   ← 積む
+process_text_queue: is_adding_text=False -> True                  ← 鎖を始める
+stream: index=-1    to_add_text_list[1]
+stream: index=69    to_add_text_list[1] -> [0], is_adding_text -> False   ← 取り除く
+```
+
+読み取れること:
+
+- 行列は `InstantaleApp.to_add_text_list`。`add_text` が積み、
+  `process_text_queue` が `is_adding_text` を立てて `add_text_display(dt, ctx, -1)`
+  の鎖を始める
+- **行列から取り除くのは鎖の「最後の」呼び出しであって、開始の呼び出しではない。**
+  流し込みの間ずっと行列は 1 のままで、`is_adding_text` が下りるのと同時に 0 になる
+- 終端の呼び出しは `index == len(context)`（`len=36/726/69` の3件で一致）
+
+したがって `add_text_display` を横取りする MOD は、**必ず終端の呼び出しを
+`orig` へ通して完了処理を走らせること**。自分で `is_adding_text = False` を
+書いて済ませると行列の先頭が永久に残り、`process_text_queue` が毎回同じ本文を
+読み直して、後から積まれた本文が一切表示されなくなる（`116_` が実機で踏んだ。
+VERIFICATION.md §2.26）。
+
 ### 2.4 待機表示（「…」のアニメーション）
 
 ゲームは長い処理の間、こうやって操作を止めている:

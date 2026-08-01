@@ -10,7 +10,7 @@
     "ja": "会話1ターンごとに、バックグラウンドの LLM が会話から形成された人物プロフィールを更新する。追加プロフィールは以降の会話でゲーム本体のプロフィール欄に毎回載る"
   },
   "version": "1",
-  "author": "R01/Flossian",
+  "author": "yoshinari/tomotomo-y",
   "settings": {
     "CONVERSATION_TURNS": {
       "type": "int",

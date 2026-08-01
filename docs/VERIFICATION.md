@@ -1,6 +1,6 @@
 # VERIFICATION: 検証記録と現在地
 
-最終更新: 2026-07-31
+最終更新: 2026-08-01
 
 何がどこまで確かめられているかの記録。
 
@@ -28,7 +28,9 @@
 | `110_fix_character_name_path` | 名前の `"` でキャラクタ画像が生成できない（`OSError: [WinError 123]`） | 決着（`id='101'` の改名・画像8点の生成・`WinError 123` が増えないことまで実機確認。2026-07-28） | §2.14 / §2.15 |
 | `111_llm_prompt_replace` | プロンプトの置換ルール（プロキシの REPLACE をプロセス内へ） | オフライン検証済（63件全通。同梱ルール29行を実プロンプト51,897件に当てて 26/27 グループが発火）・実機未確認 | §2.24 |
 | `112_ui_text_spacing` | 本文の行間が広く、段落の間に空行が入って読みづらい | 実機で発火（`hud.text_display` を実行時に特定、`line_height` 1.8 → 1.44、画面でも変化を確認。2026-07-31）。詰め具合が適当かは未評価 | §2.25 |
-| `113_fix_crime_attribution` | NPC・第三者の犯罪を主人公へ帰属する | 原因確定・修正投入済、実機再確認待ち。`210_` が外側から観測する | 4件全通 |
+| `113_fix_crime_attribution` | NPC・第三者の犯罪を主人公へ帰属する | 原因確定・修正投入済、実機再確認待ち | 4件全通 |
+| `115_message_text_integrity` | 巨大化したゲーム本文の表示を末尾1,000文字へ制限する | オフライン検証済・実機未確認。ゲーム本文は保持し、表示ラベルだけを制限する | `test_message_text_integrity` 全通 |
+| `116_batch_message_render` | 本文を一括描画し、新着部分を先頭行から順に表示する | 一括描画は実機で決着（2026-08-01、543文字が呼び出し1回・16ミリ秒、2往復とも待ち行列が空）。行リビールはオフライン検証済み・実機確認待ち | §2.26 / `test_batch_message_render` 全通 |
 
 ### 機能追加（300番台）
 
@@ -1008,6 +1010,123 @@ label Label at hud.text_display (match=2) line_height=1.44 design=1.8
 残る未確認は、詰め具合が適当かどうか（`LINE_SCALE=0.8` / `BLANK_LINES=0` は
 こちらが決めた既定で、読みやすさの評価はしていない）。
 `0.7`〜`0.9` の範囲は GUI から変えられる。
+
+### 2.26 `116_` 本文の1文字ずつの流し込み（2026-08-01、実測と誤診の訂正）
+
+#### 何が重いのか（`out/text_viewport.log` L2428–2541）
+
+726文字の応答1本を通したときの `out/text_viewport.log` の記録:
+
+```
+[06:45:46.048] stream: context=str(len=726, ...) index=-1  calls=39  is_adding_text True -> True
+[06:46:24.626] stream: context=str(len=726, ...) index=260 calls=300 is_adding_text True -> True
+[06:47:26.109] stream: context=str(len=726, ...) index=726 calls=766 is_adding_text True -> False
+```
+
+| | 値 |
+|---|---|
+| `add_text_display` の呼び出し | 727回（1文字に1回）|
+| 出そろうまで | 100.06秒 ＝ **0.138秒/文字** |
+| ゲームの公称タイプ速度 | `TEXT_SPEED_DEFAULT_BY_LANGUAGE['ja'] = 0.07` |
+| 差 ＝ 純粋な描画コスト | **約0.068秒/文字** |
+
+正体は本文ラベルの再テクスチャ化。同じログの同時刻の標本で
+`label=str(len=2021)` / `Label size=[915.84, 4104]` ＝ 1文字足すたびに約375万
+ピクセルを再レイアウトして貼り直している。`115_` が入っていてこの値なので、
+入っていなければ `display_text` の実測 89,800 文字ぶんが毎回テクスチャになる。
+
+#### 強制終了の原因は設計ではなかった（`out/live_crashes.log`）
+
+```
+AttributeError: module 'instantale_modloader.ui' has no attribute 'hud_of'
+  File "...\116_batch_message_render\batch_message_render.py", line 31, in run
+    hud = ui.hud_of(app)
+```
+
+`ui` にあるのは `find_hud` だけで `hud_of` は存在しない。ここから2つ:
+
+- **オフラインテストが存在しない API をモックしていた**（`module.ui.hud_of =
+  lambda app: app.hud`）。偽物で埋めた名前は本物の有無を検査しない。以後は
+  `115_` と同じく偽の `scripts.hud.new_hud` を置いて**本物の `find_hud` を通す**
+- **`ctx.wrap(safe=True)` はラッパ本体しか守らない。** フェードは
+  `Clock.schedule_once` で後のフレームへ渡しており、`_guard` の外側だった。
+  Clock コールバックは自前で `try` を持つこと（`patch.py` の `_guard` を参照）
+
+「ゲーム本体の完了処理と競合して強制終了する」と書いていたのは、**強制終了の原因
+としては誤診**だった。ただし「本体の完了処理を保て」という指摘そのものは正しく、
+次項の不具合はまさにそれを守らなかったために起きた。
+
+#### 2通目以降が出なくなる（2026-08-01、実機で発見・原因確定）
+
+上記を直して実機に入れたところ、**LLM の長文が一度も出ず、最初のフレーバー
+テキストだけが何度も再表示される**状態になった。原因は `out/text_viewport.log`
+で確定した。`211_` に待ち行列の観測を足して会話を1往復した記録:
+
+```
+[07:28:56.495] add_text:           to_add_text_list[0] -> to_add_text_list[1]
+[07:28:56.504] stream: index=-1    is_adding_text True -> True   to_add_text_list[1]
+[07:28:56.505] process_text_queue: is_adding_text=False -> True  to_add_text_list[1]
+[07:29:01.591] stream: index=69    is_adding_text True -> False  to_add_text_list[0]
+```
+
+読み方:
+
+- 待ち行列の名前は **`to_add_text_list`**。`add_text` が積む（0→1）
+- `process_text_queue` が `is_adding_text` を立てて `add_text_display(dt, context, -1)`
+  の鎖を始める
+- **行列は流し込みの間ずっと 1 のままで、0 に減るのは最後の呼び出しと同時。**
+  つまり**行列から取り除いているのは `add_text_display` の完了処理**であって、
+  開始処理ではない
+
+旧 `116_` は `index=-1` の呼び出しを丸ごと横取りして完了処理を走らせなかった。
+行列の先頭が永久に減らず、`process_text_queue` が毎回同じ先頭を読み直す。観測
+された「同じ本文が `calls=1,2,3,4` と sha256 同一で繰り返し出る」「後から積まれた
+長文が一度も出ない」が両方ともこれで説明できる。`add_text_immediately` 自体は
+無実で、`display_text` は正しく伸びていた。
+
+直し方は、完了処理をゲーム自身に走らせること:
+
+```python
+immediate(context)                             # 全文を一括で出す
+return orig(self, dt, context, len(context))   # 終わらせるのはゲーム
+```
+
+終端の呼び出しが `index == len(context)` であることは実測3件で一致
+（`len=36 → index=36`、`len=726 → index=726`、`len=69 → index=69`）。ただし
+**「終端 index では何も足さない」は推定であって断定ではない**ので、`display_text`
+が伸びたら一度だけ WARN を残すようにしてある。
+
+`tools/test_batch_message_render.py` の `FakeApp` はこの行列の挙動を写した。旧実装
+を戻すと `a second message still reaches the screen -- ['一つ目', '一つ目']` で落ちる
+ことを確認済み ＝ 実機で踏んだ不具合をオフラインで捕まえられる。
+
+#### 実機で決着（2026-08-01 07:39–07:41、会話2往復）
+
+同じ `out/text_viewport.log` に旧実装と新実装が並んでいる:
+
+```
+旧 [07:29:50.311] stream: len=766 index=766 calls=839 -> to_add_text_list[0]
+   [07:29:50.362] wait_for_add_text: 39.76s
+新 [07:40:51.175] add_text:            len=543  to_add_text_list[0] -> [1]
+   [07:40:51.190] add_text_immediately: len=543
+   [07:40:51.191] stream: len=543 index=-1 calls=2 is_adding_text True -> False  to_add_text_list[0]
+   [07:40:51.191] process_text_queue:  to_add_text_list[1] -> [0]
+   [07:40:51.677] wait_for_add_text: 0.50s
+```
+
+| 見たもの | 結果 |
+|---|---|
+| 長文が一括で出るか | 543文字が呼び出し1回・**16ミリ秒**で完了（旧: 766文字で 40.11秒）|
+| `to_add_text_list` | 2往復とも `[0]` へ戻る ＝ 行列放置は解消 |
+| 2往復目の本文 | 表示された（20文字 → 543文字の2本とも）|
+| `the finishing call appended text` の WARN | 出ず ＝ 終端 index で余分な文字は足さない（推定は正しかった）|
+| `out/live_crashes.log` | 6866バイトのまま増えず |
+
+`wait_for_add_text` が 0 にならず 0.50秒 残るのは、ゲーム側が固定間隔で待ち直して
+いるため。表示そのものは既に終わっている。
+
+残る未確認は見た目だけ ― フェードの開始値 `FADE_FROM=0.4` が読んでいる最中の本文を
+不自然に暗くしないか。ログには出ないので実プレイでの主観評価が要る。
 
 ---
 

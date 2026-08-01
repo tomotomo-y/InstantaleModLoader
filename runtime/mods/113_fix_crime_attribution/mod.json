@@ -10,7 +10,7 @@
     "ja": "NPCや第三者の犯罪を主人公の犯罪として扱う誤判定を防ぐ"
   },
   "version": "1",
-  "author": "R01/Flossian",
+  "author": "yoshinari/tomotomo-y",
   "after": [
     "105_fix_schema_compact",
     "305_mini_quest"

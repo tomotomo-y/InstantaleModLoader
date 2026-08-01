@@ -461,6 +461,7 @@ def apply(ctx):
         }
 
     def build_messages(snapshot, known):
+        extract_chars = INJECT_CHARS * 4 // 5
         instruction = (
             "あなたは人物プロフィールの記録係だ。現在の追加プロフィールと"
             "新しい会話を統合し、更新後の追加プロフィール全文を作れ。\n\n"
@@ -472,7 +473,7 @@ def apply(ctx):
             "- 重複はまとめ、既存内容と新しい会話が矛盾するときは新しい会話を優先する\n"
             "- {chars}文字以内に収める\n"
             "- 人物像に加える内容が無ければ「{no_change}」だけを出力する"
-        ).format(chars=INJECT_CHARS, no_change=NO_CHANGE)
+        ).format(chars=extract_chars, no_change=NO_CHANGE)
         context = (
             "【{npc_name}の素性（ゲームの記録）】\n"
             "- プロフィール: {profile}\n- 人格: {personality}\n- 役割: {job}\n\n"
