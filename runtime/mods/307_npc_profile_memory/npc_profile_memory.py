@@ -13,14 +13,14 @@
         │        └─ NPC の返答
         │
         └─ 返答が描画された次のフレーム
-                 └─ 自前 LLM ── 人物像を更新 ── out/npc_profiles.json
+                 └─ 自前 LLM ── 人物像を更新 ── out/npc_profiles/<世界名>.json
 ```
 
 ## この mod が守っている決め事
 
 **ゲームのセーブ構造に独自キーを足さない**（TECH.md §6）。控えは
-`out/npc_profiles.json` に置き、**世界名をキーに含める** ― `out/` は世界を跨いで
-残るので、含めないと別の世界の人物像が湧く（`306_` と同じ）。
+`out/npc_profiles/<世界名>.json` に置く ― `out/` は世界を跨いで残るので、
+世界ごとにファイルを分けないと別の世界の人物像が湧く（`306_` と同じ）。
 
 **注入は NPC の複製の `profile` にだけ足す。** `conversation_starter` /
 `conversation_facilitator` / `..._after_retrieval` / `..._in_quest` /
@@ -41,7 +41,9 @@ NPC を浅く複製し、複製の `profile` を拡張すれば全経路を賄�
 import copy
 import datetime
 import json
+import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -54,14 +56,15 @@ CONVERSATION_TURNS = 8     # 抽出に載せる直近のやり取りの数
 INJECT_CHARS = 1200        # MOD プロフィールの保存・注入上限
 
 LOG_BASENAME = "npc_profile.log"
-STATE_BASENAME = "npc_profiles.json"
+STATE_DIRNAME = "npc_profiles"
+
+# ファイル名に使えない文字（Windows 禁則＋制御文字）。世界名そのものは鍵に残す。
+_UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 # 自前の `manager_name`。これを付けると自分のプロンプトも
 # `output_data/<世界>/<PC>/<manager_name>/N.json` に残り、抽出の検証が
 # オフラインでできる（GAME.md §2.12）。
 MANAGER_EXTRACT = "mod_npc_profile_extract"
-
-MAX_TOKENS = 400
 
 # 旧版 `slots` の読み取り順。移行にだけ使い、新しいプロフィールは分類しない。
 LEGACY_SLOTS = ("好み", "嫌悪", "経歴", "人間関係", "目標", "秘密", "約束")
@@ -85,16 +88,27 @@ def _text(value, limit=200):
     return value if len(value) <= limit else value[:limit] + "…"
 
 
+def safe_world_filename(world_key):
+    """世界名を `out/npc_profiles/` 配下のファイル名にする。拡張子 `.json` 付き。"""
+    name = world_key if isinstance(world_key, str) else ""
+    name = _UNSAFE_FILENAME.sub("_", name.strip()).rstrip(". ")
+    if not name or name in (".", ".."):
+        name = "_"
+    if len(name) > 120:
+        name = name[:120]
+    return name + ".json"
+
+
 def apply(ctx):
     log_path = ctx.out_path(LOG_BASENAME)
-    state_path = ctx.out_path(STATE_BASENAME)
+    state_dir = os.path.join(ctx.out_dir, STATE_DIRNAME)
     state = {
         "warned_world": False,  # 世界名で控えが引けなかったことを1度だけ残す
         "last_inject": None,    # 直前に書いた注入の結末（同じ理由を繰り返さない）
         "last_extract_skip": None,  # 抽出を始められない理由の連続重複を抑える
         "worker": None,         # 抽出専用ワーカー（仕事が無ければ終了する）
     }
-    cache = {"data": None}      # 控えのメモリ写し（書くのはこの mod だけ）
+    cache = {"buckets": {}}     # 世界名 -> 控え（書くのはこの mod だけ）
     jobs = queue.Queue()
     data_lock = threading.RLock()
     worker_lock = threading.Lock()
@@ -171,32 +185,51 @@ def apply(ctx):
         write("extract skipped: " + message)
 
     # ------------------------------------------------------------ 控えの読み書き
-    def load_all():
-        """ファイル全体（世界名 -> 人物 -> 控え）。**一度読んだら覚えておく。**
+    def state_path_for(key):
+        return ctx.out_path(STATE_DIRNAME, safe_world_filename(key))
+
+    def known_world_files():
+        """診断用。ディレクトリにある世界ファイル名（拡張子なし）の一覧。"""
+        try:
+            names = sorted(
+                name[:-5] for name in os.listdir(state_dir)
+                if name.endswith(".json") and os.path.isfile(
+                    os.path.join(state_dir, name)))
+        except Exception:
+            return []
+        return names
+
+    def load_bucket(key):
+        """1世界分の控え `{npc_id: レコード}`。**一度読んだら覚えておく。**
 
         注入のフックは LLM を呼ぶたびに走るので、そのたびに JSON を読み直すと
         会話1ターンで何度もディスクを叩くことになる。書くのはこの mod だけ
         なので、書いた内容をそのまま控えれば足りる（`306_` と同じ）。
         """
         with data_lock:
-            if cache["data"] is None:
-                try:
-                    with open(state_path, "r", encoding="utf-8") as fh:
-                        data = json.load(fh)
-                except Exception:
-                    data = {}
-                cache["data"] = data if isinstance(data, dict) else {}
-            return cache["data"]
-
-    def save_all(data):
-        with data_lock:
-            cache["data"] = data
+            bucket = cache["buckets"].get(key)
+            if bucket is not None:
+                return bucket
+            path = state_path_for(key)
             try:
-                with open(state_path, "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, ensure_ascii=False, indent=1)
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                data = {}
+            bucket = data if isinstance(data, dict) else {}
+            cache["buckets"][key] = bucket
+            return bucket
+
+    def save_bucket(key, bucket):
+        with data_lock:
+            cache["buckets"][key] = bucket
+            path = state_path_for(key)
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(bucket, fh, ensure_ascii=False, indent=1)
                 return True
             except Exception:
-                ctx.log_exc("npc profile: cannot write {}".format(state_path))
+                ctx.log_exc("npc profile: cannot write {}".format(path))
                 return False
 
     def bucket_of(app):
@@ -207,15 +240,14 @@ def apply(ctx):
         行方不明になる。安定した id は実測できていないため名前のままにして
         あるが、そうなったことが分かるように1度だけ残す。
         """
-        data = load_all()
         key = world_key(app)
-        bucket = data.get(key)
-        if not isinstance(bucket, dict):
-            if data and not state["warned_world"]:
+        bucket = load_bucket(key)
+        if not bucket and not state["warned_world"]:
+            others = known_world_files()
+            if others:
                 state["warned_world"] = True
-                write("no profiles for world {!r}; the file has {}".format(
-                    key, sorted(data)))
-            return {}
+                write("no profiles for world {!r}; directory has {}".format(
+                    key, others))
         return bucket
 
     def flatten_slots(slots):
@@ -236,10 +268,7 @@ def apply(ctx):
     def profile_for(key, npc_id, npc_name):
         """世界名と人物 id だけで引く。ワーカーからゲームオブジェクトを触らない。"""
         with data_lock:
-            data = load_all()
-            bucket = data.get(key)
-            if not isinstance(bucket, dict):
-                return ""
+            bucket = load_bucket(key)
             record = bucket.get(str(npc_id))
             if not isinstance(record, dict):
                 return ""
@@ -250,7 +279,7 @@ def apply(ctx):
             if not profile:
                 return ""
             record["profile"] = profile
-            if save_all(data):
+            if save_bucket(key, bucket):
                 write("migrated: {!r} ({}) slots -> profile ({} chars)".format(
                     npc_name, npc_id, len(profile)))
             return profile
@@ -258,7 +287,7 @@ def apply(ctx):
     def profile_of(app, npc_id):
         """MOD 固有プロフィール。旧 `slots` は初回に自動移行する。"""
         key = world_key(app)
-        if not isinstance(load_all().get(key), dict):
+        if not load_bucket(key):
             bucket_of(app)  # 世界名不一致の診断だけ残す
             return ""
         return profile_for(key, npc_id, name_of(app, npc_id))
@@ -268,8 +297,7 @@ def apply(ctx):
         if not profile:
             return
         with data_lock:
-            data = load_all()
-            bucket = data.setdefault(key, {})
+            bucket = load_bucket(key)
             record = bucket.get(str(npc_id))
             if not isinstance(record, dict):
                 record = {}
@@ -280,7 +308,7 @@ def apply(ctx):
             record["name"] = npc_name
             record["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
             record["profile"] = profile
-            if save_all(data):
+            if save_bucket(key, bucket):
                 write("updated: {!r} ({}) {} -> {} chars".format(
                     npc_name, npc_id,
                     len(old) if isinstance(old, str) else 0, len(profile)))
@@ -373,7 +401,8 @@ def apply(ctx):
             return None
         started = time.monotonic()
         try:
-            result = send(manager_name, messages, max_tokens=MAX_TOKENS)
+            # 出力上限は INJECT_CHARS に比例。日本語は1字≒1〜2tok なので ×3。
+            result = send(manager_name, messages, max_tokens=INJECT_CHARS * 3)
         except Exception:
             ctx.log_exc("npc profile: {} failed via {}".format(
                 manager_name, module_name))
@@ -602,4 +631,4 @@ def apply(ctx):
     def conversation_starter_in_quest(orig, *args, **kwargs):
         return inject(orig, "starter[quest]", args, kwargs)
 
-    ctx.log("npc profile memory: state={}".format(state_path))
+    ctx.log("npc profile memory: state={}/".format(state_dir))

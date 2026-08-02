@@ -423,6 +423,50 @@ def run():
           app.hud.text_display.markup is False
           and app.hud.text_display.text == "一つ目二つ目",
           app.hud.text_display.text)
+
+    # 長文保護の末尾表示では、追跡済みの主人公文の後ろにNPC応答だけが
+    # 対応付け不能な末尾として残ることがある。その末尾も追加直後は白くする。
+    recent_app = app
+    app = InstantaleApp()
+
+    def with_untracked_response(content):
+        app.immediate_calls.append(content)
+        app.display_text += content
+        app.hud.text_display.set_text(content + "\nNPCの返答")
+
+    app.add_text_immediately = with_untracked_response
+    app.add_text("主人公の発言")
+    app.process_text_queue(0)
+    CLOCK.drain()
+    check("an untracked trailing response stays white",
+          app.hud.text_display.markup is False
+          and app.hud.text_display.text == "主人公の発言\nNPCの返答",
+          app.hud.text_display.text)
+
+    # 主人公の入力は、表示上はNPC応答より前でも、内部では後から本文ラベルへ
+    # 差し込まれることがある。追加順で照合するとNPC応答を既存本文と誤認し、
+    # 直後なのに灰色化してしまう。
+    app = InstantaleApp()
+
+    def reordered_immediate(content):
+        app.immediate_calls.append(content)
+        app.display_text += content
+        shown = content if len(app.immediate_calls) == 1 else "主人公の発言\nNPCの返答"
+        app.hud.text_display.set_text(shown)
+
+    app.add_text_immediately = reordered_immediate
+    app.add_text("NPCの返答")
+    app.process_text_queue(0)
+    CLOCK.drain()
+    app.add_text("主人公の発言")
+    app.process_text_queue(0)
+    CLOCK.drain()
+    check("display-order insertion keeps both new messages white",
+          app.hud.text_display.text
+          == "主人公の発言[color=#808080]\n[/color]NPCの返答",
+          app.hud.text_display.text)
+
+    app = recent_app
     CLOCK.advance(mod.FRESH_SECONDS)
     check("idle time does not change message colors",
           app.hud.text_display.markup is False

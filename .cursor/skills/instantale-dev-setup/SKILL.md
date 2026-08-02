@@ -85,6 +85,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .cursor/skills/instantale-de
 | `settings/gui.json` | ゲームの場所・ウィンドウ位置 |
 | `settings/mod_settings.json` | GUI から変えた MOD 設定。**MOD のフォルダ名がキー**なので、番号を振り直す前に見ておく |
 | `out/*.log` | 注入ごとに世代交代する |
-| `out/companions.json` / `out/npc_profiles.json` など | MOD が持つ永続データ。ログではないので世代交代しない |
+| `out/companions.json` / `out/npc_profiles/<世界名>.json` など | MOD が持つ永続データ。ログではないので世代交代しない |
 
 いずれも `.gitignore` 済み。commit しない。

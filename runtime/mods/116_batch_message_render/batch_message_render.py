@@ -175,19 +175,25 @@ def apply(ctx):
         return estimate_height(label, shown[start:], line_height)
 
     def apply_text_colors(state, hud, label, shown):
-        cursor = len(shown)
         visible_segments = []
+        claimed = []
         for text, added_at in reversed(state["segments"]):
             if not text:
                 continue
-            start = shown.rfind(text, 0, cursor)
+            start = shown.rfind(text)
+            end = start + len(text)
+            while start >= 0 and any(
+                    start < claimed_end and end > claimed_start
+                    for claimed_start, claimed_end in claimed):
+                start = shown.rfind(text, 0, start)
+                end = start + len(text)
             if start < 0:
                 continue
-            end = start + len(text)
             visible_segments.append((start, end, added_at))
-            cursor = start
+            claimed.append((start, end))
         if not visible_segments:
             return False
+        visible_segments.sort()
 
         try:
             from kivy.utils import escape_markup
@@ -196,7 +202,7 @@ def apply(ctx):
             has_old_text = False
             fresh_start = None
             position = 0
-            for start, end, added_at in reversed(visible_segments):
+            for start, end, added_at in visible_segments:
                 if position < start:
                     parts.append("[color={}]{}[/color]".format(
                         OLD_TEXT_COLOR, escape_markup(shown[position:start])))
@@ -213,9 +219,9 @@ def apply(ctx):
                         fresh_start = start
                 position = end
             if position < len(shown):
-                parts.append("[color={}]{}[/color]".format(
-                    OLD_TEXT_COLOR, escape_markup(shown[position:])))
-                has_old_text = True
+                parts.append(escape_markup(shown[position:]))
+                if fresh_start is None:
+                    fresh_start = position
             if has_old_text:
                 label.markup = True
                 label.text = "".join(parts)

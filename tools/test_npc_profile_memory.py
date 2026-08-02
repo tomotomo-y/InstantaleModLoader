@@ -11,7 +11,7 @@
 
 見ているのは振る舞いだけ:
 
-- 1ターン終わると抽出が走り、更新後のプロフィール全文が `out/npc_profiles.json` に残る
+- 1ターン終わると抽出が走り、更新後のプロフィール全文が `out/npc_profiles/<世界名>.json` に残る
 - **変更なし・空・読めない返答では既存プロフィールを維持する**
 - 旧版の分類別 `slots` は情報を落とさず `profile` へ自動移行する
 - 控えは次の会話で、浅く複製した NPC の `profile` に足される
@@ -265,8 +265,12 @@ class Ctx(object):
         self.hooks = {}
         self.errors = []
 
-    def out_path(self, basename):
-        return os.path.join(self.out_dir, basename)
+    def out_path(self, *parts):
+        path = os.path.join(self.out_dir, *parts)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return path
 
     def log(self, message, level="INFO"):
         pass
@@ -375,10 +379,11 @@ class Run(object):
         """既に何か覚えている状態から始める。"""
         record = {"name": "傭兵ガロ", "updated": "2026-07-30T00:00:00"}
         record["slots" if legacy else "profile"] = profile
-        data = {world_name: {npc_id: record}}
-        with open(os.path.join(self.tmp, "npc_profiles.json"), "w",
-                  encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
+        path = os.path.join(self.tmp, "npc_profiles",
+                            MOD.safe_world_filename(world_name))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({npc_id: record}, fh, ensure_ascii=False)
 
     # -- 操作 -------------------------------------------------------------
     def turn(self, text="お前の故郷はどこだ"):
@@ -398,12 +403,23 @@ class Run(object):
             time.sleep(0.005)
 
     def profiles(self):
-        path = os.path.join(self.tmp, "npc_profiles.json")
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception:
-            return {}
+        """全世界分。キーはファイル名の幹（通常は世界名そのもの）。"""
+        root = os.path.join(self.tmp, "npc_profiles")
+        result = {}
+        if not os.path.isdir(root):
+            return result
+        for name in os.listdir(root):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                result[name[:-5]] = data
+        return result
 
     def log(self):
         path = os.path.join(self.tmp, "npc_profile.log")
@@ -421,9 +437,9 @@ class Run(object):
             "", "", "", "", [], [], "", None)
 
     def profile(self, npc_id="77", world_name=None):
-        bucket = self.profiles().get(world_name or self.app.world.name, {})
+        stem = MOD.safe_world_filename(world_name or self.app.world.name)[:-5]
+        bucket = self.profiles().get(stem, {})
         return (bucket.get(npc_id) or {}).get("profile", "")
-
     def cleanup(self):
         APP_HOLDER.running = None
         if self.saved_llm is not None:
@@ -458,9 +474,13 @@ def test_turn_updates_profile():
     run = Run(answers=FOUND)
     run.turn()
     check(run.profile() == FOUND, "プロフィールが残らない: {!r}".format(run.profile()))
-    record = run.profiles()[run.app.world.name]["77"]
+    stem = MOD.safe_world_filename(run.app.world.name)[:-5]
+    record = run.profiles()[stem]["77"]
     check(record.get("name") == "傭兵ガロ", "名前が控えられていない: {}".format(record))
     check(bool(record.get("updated")), "更新時刻が無い: {}".format(record))
+    path = os.path.join(run.tmp, "npc_profiles",
+                        MOD.safe_world_filename(run.app.world.name))
+    check(os.path.isfile(path), "世界ファイルが無い: {}".format(path))
     return run
 
 
@@ -547,7 +567,8 @@ def test_legacy_slots_migrate_to_profile():
     check("好み: 古い剣の話" in profile, "好みが落ちた: {!r}".format(profile))
     check("経歴: 北方の村の生まれ" in profile, "経歴が落ちた: {!r}".format(profile))
     check("約束: ギルドの件を調べる" in profile, "約束が落ちた: {!r}".format(profile))
-    check(run.profiles()[run.app.world.name]["77"].get("slots") == slots,
+    stem = MOD.safe_world_filename(run.app.world.name)[:-5]
+    check(run.profiles()[stem]["77"].get("slots") == slots,
           "移行で旧slotsを消した: {}".format(run.profiles()))
     return run
 
