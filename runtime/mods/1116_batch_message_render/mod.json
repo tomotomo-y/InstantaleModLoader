@@ -11,9 +11,6 @@
   },
   "version": "1",
   "author": "yoshinari/tomotomo-y",
-  "after": [
-    "1114_message_viewport_height"
-  ],
   "settings": {
     "FRESH_SECONDS": {
       "type": "float",

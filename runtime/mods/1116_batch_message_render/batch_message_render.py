@@ -346,7 +346,7 @@ def apply(ctx):
 
         schedule(begin)
 
-    @ctx.wrap("__main__:InstantaleApp.add_text_display", safe=True)
+    @ctx.wrap("__main__:InstantaleApp.add_text_display", required=False, safe=True)
     def add_text_display(orig, self, dt, context, index=-1):
         if index != -1 or not isinstance(context, str):
             # 1文字ぶんの続きの呼び出し。注入し直した時にだけ飛んでくる

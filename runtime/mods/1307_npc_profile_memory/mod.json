@@ -32,12 +32,12 @@
       "min": 200,
       "max": 4000,
       "label": {
-        "ja": "追加プロフィールの最大長",
-        "en": "Maximum extra profile length"
+        "ja": "追加プロフィールの目標長",
+        "en": "Target extra profile length"
       },
       "note": {
-        "ja": "保存と会話への注入はこの文字数まで。上げるほど会話が遅く高くつく",
-        "en": "Storage and prompt injection use this cap. Raising it makes every reply slower"
+        "ja": "抜き出しLLMへの要約の目安。保存や注入では切らない。上げるほど会話が遅く高くつく",
+        "en": "Soft target for the extractor summary. Not hard-truncated on save or inject"
       }
     }
   }

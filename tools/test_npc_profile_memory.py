@@ -573,24 +573,27 @@ def test_legacy_slots_migrate_to_profile():
     return run
 
 
-def test_profile_is_capped():
-    """保存するプロフィールは設定上限を超えない"""
+def test_profile_keeps_full_llm_response():
+    """保存でも注入でもLLMの返却を切らない"""
     answer = "新" * (MOD.INJECT_CHARS + 200)
     run = Run(answers=answer)
     run.turn()
-    check(len(run.profile()) == MOD.INJECT_CHARS,
-          "上限を超えた: {}".format(len(run.profile())))
+    check(run.profile() == answer,
+          "保存で切った: {} chars".format(len(run.profile())))
+    run.facilitate()
+    passed = Facilitator.calls[-1]["npc"]
+    check(answer in passed.profile,
+          "注入で切った: {} chars".format(len(passed.profile)))
     return run
 
 
-def test_extraction_prompt_leaves_a_margin():
-    """抽出LLMには保存上限の8割を指示する"""
+def test_extraction_prompt_asks_for_summary_budget():
+    """抽出LLMには目標長までの要約を指示する"""
     run = Run(answers=FOUND)
     run.turn()
     prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
-    expected = MOD.INJECT_CHARS * 4 // 5
-    check("{}文字以内に収める".format(expected) in prompt,
-          "抽出上限が8割でない: {}".format(prompt[:300]))
+    check("要約して統合し、全体を{}文字以内に収める".format(MOD.INJECT_CHARS) in prompt,
+          "要約の目標長指示が無い: {}".format(prompt[:300]))
     return run
 
 
@@ -779,8 +782,8 @@ def main():
                  test_no_change_keeps_profile,
                  test_empty_explanation_keeps_profile,
                  test_legacy_slots_migrate_to_profile,
-                 test_profile_is_capped,
-                 test_extraction_prompt_leaves_a_margin,
+                 test_profile_keeps_full_llm_response,
+                 test_extraction_prompt_asks_for_summary_budget,
                  test_profile_reaches_the_next_reply,
                  test_profile_reaches_keyword_calls,
                  test_profile_reaches_the_opening_line,

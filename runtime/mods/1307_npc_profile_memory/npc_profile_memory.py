@@ -53,7 +53,7 @@ from instantale_modloader import ui
 # ---- 設定（既定値は mod.json の "settings" と一致させること。
 #      `tools/check_mods.py` が AST で突き合わせる）------------------------
 CONVERSATION_TURNS = 8     # 抽出に載せる直近のやり取りの数
-INJECT_CHARS = 1200        # MOD プロフィールの保存・注入上限
+INJECT_CHARS = 1200        # 抽出LLMへの目標長（要約で収める。保存・注入では切らない）
 
 LOG_BASENAME = "npc_profile.log"
 STATE_DIRNAME = "npc_profiles"
@@ -263,7 +263,7 @@ def apply(ctx):
                       if isinstance(fact, str) and fact.strip()]
             if values:
                 lines.append("{}: {}".format(label, "／".join(values)))
-        return "\n".join(lines)[:INJECT_CHARS]
+        return "\n".join(lines)
 
     def profile_for(key, npc_id, npc_name):
         """世界名と人物 id だけで引く。ワーカーからゲームオブジェクトを触らない。"""
@@ -274,7 +274,7 @@ def apply(ctx):
                 return ""
             profile = record.get("profile")
             if isinstance(profile, str) and profile.strip():
-                return profile.strip()[:INJECT_CHARS]
+                return profile.strip()
             profile = flatten_slots(record.get("slots"))
             if not profile:
                 return ""
@@ -430,7 +430,8 @@ def apply(ctx):
             body = body[3:-3].strip()
             if body.startswith(("text\n", "markdown\n")):
                 body = body.split("\n", 1)[1].strip()
-        return body[:INJECT_CHARS]
+        # 長さは抽出LLMの要約に任せる。ここで切ると文の途中で壊れる。
+        return body
 
     # ------------------------------------------------------------ 抽出の材料
     def transcribe(app, npc_id):
@@ -490,7 +491,6 @@ def apply(ctx):
         }
 
     def build_messages(snapshot, known):
-        extract_chars = INJECT_CHARS * 4 // 5
         instruction = (
             "あなたは人物プロフィールの記録係だ。現在の追加プロフィールと"
             "新しい会話を統合し、更新後の追加プロフィール全文を作れ。\n\n"
@@ -500,9 +500,9 @@ def apply(ctx):
             "目標、秘密、約束を自然な人物像として簡潔に統合する\n"
             "- 会話に出ていない事を推測で補ってはならない\n"
             "- 重複はまとめ、既存内容と新しい会話が矛盾するときは新しい会話を優先する\n"
-            "- {chars}文字以内に収める\n"
+            "- 書き足すのではなく要約して統合し、全体を{chars}文字以内に収める\n"
             "- 人物像に加える内容が無ければ「{no_change}」だけを出力する"
-        ).format(chars=extract_chars, no_change=NO_CHANGE)
+        ).format(chars=INJECT_CHARS, no_change=NO_CHANGE)
         context = (
             "【{npc_name}の素性（ゲームの記録）】\n"
             "- プロフィール: {profile}\n- 人格: {personality}\n- 役割: {job}\n\n"
