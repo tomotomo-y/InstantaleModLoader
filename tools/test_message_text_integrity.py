@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""115_message_text_integrity をゲーム抜きで通す。
+"""1115_message_text_integrity をゲーム抜きで通す。
 
     python tools/test_message_text_integrity.py
 """
@@ -12,7 +12,7 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.normpath(os.path.join(HERE, os.pardir, "runtime"))
 MOD_PATH = os.path.join(
-    RUNTIME_DIR, "mods", "115_message_text_integrity", "message_text_integrity.py")
+    RUNTIME_DIR, "mods", "1115_message_text_integrity", "message_text_integrity.py")
 if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 

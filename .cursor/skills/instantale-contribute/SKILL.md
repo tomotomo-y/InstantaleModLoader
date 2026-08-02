@@ -47,14 +47,15 @@ git switch -c feat/<mod-name> upstream/main
 `personal/*` から特定のファイルだけ持ってくる:
 
 ```powershell
-git checkout personal/v1.1 -- runtime/mods/308_companion_travel tools/test_companion_travel.py
+git checkout personal/v1.1 -- runtime/mods/1308_companion_travel tools/test_companion_travel.py
 ```
 
 ### 番号を確認する
 
 本家は番号を先に使うことがある。PR に出す前に `upstream/main` の
 `runtime/mods/` と自分の番号が重なっていないか見る。重なっていたら自分側を
-空き番号へ動かす（手順は `instantale-upstream-sync` を参照）。
++1000 帯へ動かす（手順は `instantale-upstream-sync` を参照）。
+fork 固有は最初から +1000（`1113_` / `1307_` など）で採番する。
 
 テストは番号なしで MOD を引く形（`find_mod("_suffix")`）にしておく。
 

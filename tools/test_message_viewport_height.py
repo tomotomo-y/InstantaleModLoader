@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""114_message_viewport_height をゲーム抜きで通す。
+"""1114_message_viewport_height をゲーム抜きで通す。
 
     python tools/test_message_viewport_height.py
 
@@ -22,7 +22,7 @@ if RUNTIME_DIR not in sys.path:
 
 
 def mod_path():
-    folder = os.path.join(MODS_DIR, "114_message_viewport_height")
+    folder = os.path.join(MODS_DIR, "1114_message_viewport_height")
     with io.open(os.path.join(folder, "mod.json"), encoding="utf-8") as fh:
         return os.path.join(folder, json.load(fh)["entry"])
 

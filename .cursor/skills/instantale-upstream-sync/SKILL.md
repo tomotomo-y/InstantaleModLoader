@@ -49,10 +49,11 @@ git merge upstream/main
 git diff --name-only --diff-filter=A HEAD@{1} upstream/main -- runtime/mods | Select-String "mod.json"
 ```
 
-自分の MOD と番号が重なっていたら、**自分側を空き番号へ動かす**（本家の番号を残す）。
+自分の MOD と番号が重なっていたら、**自分側を +1000 帯へ動かす**（本家の番号を残す）。
+この fork の固有 MOD は最初から +1000（`1113_` / `1307_` など）で採番する。
 
 ```powershell
-git mv runtime/mods/111_fix_crime_attribution runtime/mods/113_fix_crime_attribution
+git mv runtime/mods/113_fix_crime_attribution runtime/mods/1113_fix_crime_attribution
 ```
 
 移した後に追う場所:

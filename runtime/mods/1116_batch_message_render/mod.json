@@ -12,7 +12,7 @@
   "version": "1",
   "author": "yoshinari/tomotomo-y",
   "after": [
-    "114_message_viewport_height"
+    "1114_message_viewport_height"
   ],
   "settings": {
     "FRESH_SECONDS": {

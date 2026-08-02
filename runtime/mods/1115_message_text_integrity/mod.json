@@ -3,7 +3,7 @@
   "api": 1,
   "name": {
     "en": "Show more of long messages",
-    "ja": "長い本文をより多く表示する"
+    "ja": "長い本文をより多く見せる"
   },
   "description": {
     "en": "The game truncates long replies before they fill the label; this keeps the latest 1,000 characters visible while leaving stored text unchanged",

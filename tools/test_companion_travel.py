@@ -1,5 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
-"""`308_companion_travel` の検証。ゲーム不要。
+"""`1308_companion_travel` の検証。ゲーム不要。
 
     python tools/test_companion_travel.py
 
