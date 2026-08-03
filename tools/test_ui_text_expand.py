@@ -72,7 +72,7 @@ def check(name, cond, detail=""):
 
 # ---------------------------------------------------------------- 実測値
 WIN_WIDTH, WIN_HEIGHT = 2560.0, 1440.0
-FRAME_SIZE = (1400.0, 400.0)          # 本文の枠（スクロールする入れ物）
+FRAME_SIZE = (1400.0, 300.0)          # 本文の枠（スクロールする入れ物）
 FRAME_POS = (580.0, 120.0)           # 画面の下寄り（実機と同じく下端が近い）
 WRAP_WIDTH = 1340.8                   # out/text_spacing.log の text_size[0]
 GAME_FONT = "fonts/NotoSansJP.ttf"    # 本文のフォント（豆腐にしないために写す）
@@ -640,7 +640,7 @@ def run():
 
     # -- 窓より大きくは広げない ----------------------------------------------
     install(mod, ctx)
-    mod.WIDTH_SCALE, mod.HEIGHT_SCALE = 4.0, 4.0
+    mod.WIDTH_SCALE, mod.HEIGHT_SCALE = 8.0, 8.0    # 窓より大きい倍率
     install(mod, ctx)
     hud = FakeHUD()
     hud.show()
@@ -777,6 +777,43 @@ def run():
            [type(c).__name__ for c in hud.root.children]))
     check("moving it does not leave a second button behind",
           sum(1 for c in hud.root.children if isinstance(c, FakeButton)) == 1,
+          [type(c).__name__ for c in hud.root.children])
+
+    # -- 他の MOD が HUD 直下に置いたウィジェット ------------------------------
+    # 初版は `children` の**先頭**（＝いちばん新しい子）を置き場所に採っていて、
+    # 除外していたのは自分のボタンだけだった。HUD へウィジェットを足す MOD が
+    # 2本になった時点（`116_`）で、相手のボタンの中へ入り込みうる状態になる。
+    # VERIFICATION.md §2.31 の「残った懸念」。
+    install(mod, ctx)
+    hud = FakeHUD()
+    other = FakeButton(text="パーティ", size=(30.0, 30.0))
+    setattr(other, "_instantale_party_icon", object())   # 116_ の印
+    hud.add_widget(other)
+    hud.show()
+    button = hud.toggle_button()
+    check("another mod's widget on the HUD is not used as the host",
+          button is not None and button.parent is hud.root,
+          (type(button.parent).__name__ if button is not None else None,
+           [type(c).__name__ for c in hud.children]))
+    check("and nothing is nested inside it",
+          other.children == [], [type(c).__name__ for c in other.children])
+
+    # -- ゲームが一時的に出している窓 ------------------------------------------
+    # 消えるときにこちらのボタンも道連れになる。ゲームの `FloatLayout` は画面が
+    # 組まれた時点で居る ＝ `children` の最後尾なので、そこから探せば避けられる。
+    install(mod, ctx)
+    hud = FakeHUD()
+    popup = FakeWidget()
+    hud.add_widget(popup)                       # Kivy の既定は先頭挿入
+    hud.show()
+    button = hud.toggle_button()
+    check("a transient window on the HUD is not used as the host",
+          button is not None and button.parent is hud.root,
+          (type(button.parent).__name__ if button is not None else None,
+           [type(c).__name__ for c in hud.children]))
+    check("the button survives that window going away",
+          (hud.remove_widget(popup) or True) and button.parent is hud.root
+          and button in hud.root.children,
           [type(c).__name__ for c in hud.root.children])
 
     # -- 窓の大きさが変わったとき --------------------------------------------

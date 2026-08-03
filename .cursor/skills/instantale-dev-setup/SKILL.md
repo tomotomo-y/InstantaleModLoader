@@ -72,8 +72,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .cursor/skills/instantale-de
 読み込まれない。番号帯は分類のためだけ（`0xx` 調査 / `1xx` 修正 / `2xx` 計測 /
 `3xx` 追加）で、適用順は `load_order.json` と `mod.json` の `after` / `before` が決める。
 
-**この fork の固有 MOD は番号を +1000 する**（例: 修正なら `1113_`、追加なら `1307_`）。
-本家の 3 桁帯と衝突させないための規則。本家同梱を直すときは番号を動かさない。
+**未マージの fork 専用 MOD だけ番号を +1000 する**（例: `1114_` / `1308_`）。
+本家にマージされたら本家の番号に従う。本家同梱を直すときは番号を動かさない。
 
 コピー直後は `load_order.json` に載っていないので、GUI の一覧から並べるか
 `"order"` に自分で足す。`check_mods.py` が「記載の無い MOD」として報告する。

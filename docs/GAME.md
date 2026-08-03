@@ -307,9 +307,18 @@ spec が `JustSetButtonToNormalPhase` なので押しても無反応 ―
 **見た目は同じなのに片方だけ効かない**という、最も分かりにくい壊れ方になる。
 
 差し込む前に `ui.Screen.prune_stale(buttons, ラベル一覧)` を通すこと。
-「自分のラベル（前方一致）」かつ「印が無い」かつ「無害 spec」の3つが揃ったものだけを
-落とすので、ゲーム側の同名ボタンは巻き込まない。落としてから差し直すため、残骸は
-消えるのではなく生き返る。
+「自分のラベル（前方一致）」かつ「**どの MOD の印も無い**」かつ「無害 spec」の3つが
+揃ったものだけを落とすので、ゲーム側の同名ボタンは巻き込まない。落としてから差し直す
+ため、残骸は消えるのではなく生き返る。
+
+**「自分の印が無い」では足りない**（2026-08-03）。`refresh_choice_buttons` を包む
+MOD の掃除は**画面が何であれ**走るので、他の MOD が今その場に出しているボタンも
+「自分の印が無い」に見える。`302_`（`やめておく`）と `309_`（同じ文字列）が衝突し、
+役場の罰金の確認画面から**キャンセルが最初から消えていた**。復元された残骸は印を
+1つも持たないので、判定は「`mod_` で始まるキーが1つも無い」で行う
+（`ui.MARK_PREFIX` / `ui.Screen.marked_by_a_mod`）。掃除に使うラベルも、
+**その MOD にしか無い文言**だけにすること ― ゲーム自身が同じ文言のボタンを出して
+いた場合、印では見分けようがない。
 
 ### 2.3 選択肢を変える手順
 
@@ -357,6 +366,22 @@ hud={'buttons': ['テスト討伐依頼A', 'クエストを探す', 'やめる',
 「片方がもう片方の末尾（または先頭）を含む」関係で、ゲームが塗るときに何かを
 足すか削るかしている。本文のラベルを文字列で探すなら完全一致を前提にしないこと
 （`112_` はここで一致タイプを段階に分けて拾っている）。
+
+**本文の打ち出し（タイプライタ）は `InstantaleApp.add_text_display(self, dt, context, index=-1)`**
+（`out/text_speed.log` の実測、2026-08-03。`211_probe_text_speed`）:
+
+| | 実測 |
+|---|---|
+| 1ティックで進む文字数 | **1文字**（平均 1.03〜1.11。まれに 2〜3）|
+| ティックの間隔 | `app.text_speed` 秒。**設定を変えると即座に変わる**（再起動不要）|
+| `text_speed=0.04` | 間隔 48〜50ms ＝ **20 文字/秒** |
+| `text_speed=0.08` | 間隔 80〜83ms ＝ **12 文字/秒** |
+| 言語 `ja` の既定 | **0.07**（`scripts.functions:get_default_text_speed_for_language`）|
+
+**間隔はフレーム境界に丸められる。** 60fps ＝ 16.7ms 刻みなので、0.04 は 3 フレーム
+（50.0ms）、0.08 は 5 フレーム（83.3ms）に乗る ― 実測の 49.4ms / 83.3ms と一致する。
+つまり**どれだけ小さい `text_speed` を入れても最速は「1フレーム1文字」＝ 60 文字/秒**
+で、そこが下限になる。
 
 高さはゲーム自身が `InstanTaleHUD.update_label_height()` で決め直す。
 ラベルの `line_height` や `text` を触ったら、`texture_update()` の後にこれを
@@ -559,6 +584,45 @@ app.world.characters     -> {id: Character}    Facility.owner はこの id（str
 | `quest_party_accompany_backgrounds` | クエスト同行者の背景（サマライザに渡る） |
 | `escaped_member_in_battle` | 戦闘から逃げたメンバー |
 | `is_party_member_talk_enabled` | 仲間に話しかけられるか |
+
+#### 画面のパーティ欄は3枠で固定（`instantale.exe` の定数表、main_023）
+
+名簿に何人入っていても、**画面に出せるのは3人まで**。HUD が枠を3つしか作らない。
+
+```
+bottom_info_layout          size_hint=(0.2, 0.88) pos_hint={center_x:0.88, y:0.1}
+  party_cells               range(0, 3)  ← ここが 3 で固定
+    ClickableFloatLayout    size_hint=(1, 0.33) / member_id を持つ
+      StencilFloatLayout
+        Image               立ち絵
+InstanTaleHUD.update_party_display(*args)   party_members（DictProperty）の変化で走る
+InstanTaleHUD.set_party_member_callback(member_index, callback)
+InstantaleApp.on_member_label_press(label_index)  -> party_cells[label_index].member_id
+                                                  -> process_party_member_choice(id)
+```
+
+- 4人目以降が出ないのは**枠が足りない**からで、`party_members` は欠けていない
+  （会話も戦闘も4人目を含めて進む）。枠を足せば出る（`116_ui_party_expand`）
+- 押したときの相手は `party_cells` の**添字**で決まる。枠を足すならこの並びに
+  追記する。並べ替えると、押した相手と話す相手が食い違う
+- 枠の中身（立ち絵の `source` がどのキーから来るか）は読めない。埋まっている枠と
+  `party_members` のその相手を突き合わせて、一致した場所を対応とみなすこと
+- **枠を複製しても枠線は付いてこない**（canvas の描画命令は写らない）。線を自分で
+  引くより `scripts.hud.new_hud` の `add_border(widget)` / `add_border_before(widget)`
+  を呼ぶ。色も太さも寸法追従（`update_border`）もゲームのものになる
+- **枠の `size_hint_y` は `0.33` であって 1/3 ではない。** 行数で割り直した比率
+  （1/4 = 0.25 など）を伸ばした帯に当てると、その差で**元から在る枠が数 px 動く**。
+  並べ直すときは比率ではなく実測の座標で置くこと（実機で確認、2026-08-03）
+- **`update_party_display` はパーティ欄（`bottom_info_layout`）の子を1つずつ
+  「枠」として塗る**（クラッシュ時の locals: `cells` len=6 / `member_ids` len=6 /
+  `i` / `cell`）。枠の中身を直に触るので、**枠でないものをこの入れ物に置くと
+  その瞬間に落ちる**（`IndexError: list index out of range`。`116_` が黒い板を
+  帯の子にして踏んだ。2026-08-03）。枠を足すのは良いが、それ以外は入れないこと
+- **選択肢ボタンの `disabled` を控えて書き戻さないこと。** ゲームは応答待ちの間
+  だけ選択肢を無効にする（`is_button_enabled` / `set_buttons_to_normal`）。その
+  瞬間の値を控えて後で書き戻すと、ゲームが有効に戻した後でも無効に落ちて
+  **選択肢が押せなくなる**（`116_` が実機で踏んだ。2026-08-03）。他人が
+  管理している状態は、控えた瞬間と書き戻す瞬間の間に持ち主が変えている
 
 外す処理は書かない。ゲーム自身のものを呼ぶ。
 

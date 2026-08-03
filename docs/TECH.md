@@ -78,13 +78,16 @@ runtime/instantale_modloader/
     patch.py      @patch / @wrap / alias再束縛 / 世代管理 / 未import保留 / safe / revert
     patch_registry.py  どの MOD がどこへ当てたかの台帳・重なり・未解決の報告
     config.py     MOD ごとの設定（mod.json の宣言 → settings/mod_settings.json → 定数）
+                  / ローダ自身の切り替え（settings/loader.json。デバッグモード）
     frames.py     フレームローカル採取・値の要約・呼び出し元の特定
     ui.py         選択肢 / 画面の塗り替え / 会話の閉じ方 / idle待ち / 施設の引き当て
     recon.py      実行時リコン（モジュール構造ダンプ）
 runtime/mods/     MOD 本体（1バグ・1機能 = 1フォルダ。入口は mod.json が名指し）
 runtime/mods/load_order.json  適用順（"order"）と無効一覧（"disabled"）
+runtime/mods/load_order.local.json  手元だけの適用順。在れば上に優先（git 管理外）
 settings/         利用者が変えたものだけ（無くてよい）
                   mod_settings.json … MOD の設定 / gui.json … ゲームの場所・窓の位置
+                  loader.json … デバッグモード（GUI とローダの両方が読む。§3.2.4）
 out/              ログ・リコン成果物・status.json（最後の boot の結果）
 tools/            上記に加え、オフライン検証・セーブ操作（ゲーム不要）
 docs/             README.md / TECH.md / GAME.md / VERIFICATION.md
@@ -101,8 +104,39 @@ found = instantale_modloader.discover()      # ゲームの中でも外でも同
 found["order"]      # 有効な MOD。適用順（依存の制約も解決済み）
 found["listed"]     # 一覧に出す順。無効なものも宣言された位置に含む
 found["manifests"]  # 名乗り・api・settings・依存（MOD のコードは import しない）
+found["debug"]      # "debug": true の MOD。デバッグモードが切なら order に居ない
+found["debug_mode"] # デバッグモードが入っているか（settings/loader.json。§3.2.4）
 found["problems"]   # 宣言と実体のずれ。人が読む行
+found["notes"]      # 直すべきずれではない知らせ（手元用の順序ファイルを使っている等）
 ```
+
+`problems` と `notes` を分けているのは、**未公開の MOD を手元で動かしている間ずっと
+赤が出る**状態を作らないため。赤が常態になると本当のずれが埋もれる。
+`check_mods.py --strict` は `notes` も問題に格上げする。
+
+#### 手元だけの適用順（`load_order.local.json`）
+
+まだ公開しない MOD を手元で動かすためのもの。`runtime/mods/load_order.local.json`
+が在れば、`load_order.json` の代わりに**丸ごと**これが使われる
+（`instantale_modloader.order_path` が「効いている順序ファイル」を1箇所で決める）。
+
+| なぜ要るか | |
+|---|---|
+| `load_order.json` は配布する構成そのもの | 開発中の MOD を書くと、配った先で「実体の無い記述」になる |
+| GUI は保存のたびに順序ファイルを書き戻す | 一覧に出ている MOD が全部書かれるので、消しても次の保存で戻ってくる |
+| コミットに紛れ込む | 未公開の MOD の名前が履歴に残る |
+
+仕掛けは3点。**どれか1つでも欠けると漏れる。**
+
+| 場所 | 何をしているか |
+|---|---|
+| `.gitignore` | `load_order.local.json` を除外（MOD のフォルダ自体は `.git/info/exclude` で各自が除外する） |
+| `tools/gui.py` | 書き戻し先を `ml.order_path()` に聞く。手元用が在る間は配布用を書き換えない |
+| `make_dist.bat` | `load_order.json` に載っていない MOD フォルダは**staging から落とす**（`[mods] skipping ...` が出る）。ここが最後の砦で、落とさないと未完成の MOD がリリースに入る |
+
+2つのファイルを混ぜないのは、差分から順序を組み立てる規則を増やさないため ―
+効いている順序は常に1ファイルを読めば分かる。何で動いているかは `notes` と
+`modloader.log` に必ず出る。
 
 ### 1.4 注入のタイミング
 
@@ -615,6 +649,7 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
 | 状況 | 挙動 |
 |---|---|
 | 制約が実体の無い / 無効な MOD を指している | 黙って捨てる。ただし `problems` に報告する |
+| 制約が伏せている MOD を指している | 黙って捨てる。**報告もしない**（§3.2.4） |
 | 制約が循環している | `load_order.json` の並びで動かす（ここで全滅させない）。報告する |
 | `conflicts` の相手が同時に有効 | 報告するだけで落とさない（下記） |
 
@@ -624,6 +659,43 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
 
 同梱 MOD の宣言はいまの `load_order.json` の並びをそのまま固定しているので、これを
 入れても適用順は変わらない。変わるのは「壊せなくなった」ことだけ。
+
+#### 3.2.4 開発者向けの MOD を伏せる（デバッグモード）
+
+計測 MOD（`2xx`）は原因を測るための道具で、遊ぶだけなら要らない。それが配布物では
+全部 `order` に載っていて、**利用者の環境で常時動いていた**。読み取り専用とはいえ、
+ポーリングや1文字ごとのログを描画の経路に載せるものもある。
+
+`mod.json` に印を付け、デバッグモードのあいだだけ動かす:
+
+```json
+{"entry": "probe.py", "api": 1, "debug": true}
+```
+
+切り替えは `settings/loader.json` の `{"debug": true}`。**GUI の `gui.json` ではない** ―
+あれは GUI しか読まない覚え書きだが、この値は**ゲームの中で `discover()` が読む**。
+両者が同じファイルを指せる場所は `settings/` だけで、GUI もローダも同じ
+`config.settings_dir()` を通っている。`mod_settings.json` にも混ぜない（あちらの形は
+「MOD フォルダ名 → 値」で、MOD でないキーを入れると `load_store()` の形が崩れる）。
+
+稼働の制御はそれだけで足りる。`boot()` が回すのは `order` なので、そこから外れれば
+読み込まれずパッチも当たらない。仕組みを別に足す必要は無い。
+
+伏せかたで効くのは次の3点で、いずれも**利用者の画面に余計なものを出さない**ため:
+
+| 場所 | すること | 理由 |
+|---|---|---|
+| `discover()` | `order` からは外し、`listed` には残す | GUI の一覧の並びは保存時にそのまま `order` へ書き戻される（`gui.py` の `save`）。`listed` から落とすと、利用者が保存した瞬間に順序ファイルから記述ごと消える |
+| `_order()` | 「無効化されています」「記載の無い MOD」の報告から外す | 切ったのは利用者ではない。伏せたはずのものが警告として出てくる |
+| `_sort_dependencies()` | 伏せた相手を指した制約は報告しない | `300_` の `"after": ["205_probe_player_events"]` が毎回「無効な MOD を指している」に出る |
+
+`tools/check_mods.py` は `discover(debug=True)` で呼ぶ。静的検査は**入っている MOD を
+全部見る**のが仕事で、利用者が今どちらに倒しているかで検査の範囲が変わってはいけない
+（切っているあいだだけ計測 MOD の `after` が誰にも確かめられない、という穴を作らない）。
+
+`load_order.local.json` の有無で代用しない案もあったが、「手元用の順序ファイルを
+置いている＝開発者」という暗黙の判定になる。明示的なフラグなら、不具合報告のときに
+利用者へ「デバッグモードを入れて再現してください」と頼める。
 
 ### 3.3 同じ場面に複数の MOD が乗るとき
 
@@ -674,6 +746,21 @@ MOD 側でやること: 対象が未 import でも `apply()` は普通に書い�
 | `replacing a previous patch layer on ...` | 前回注入の層を剥がした（正常） |
 | （この行が出ない） | 同一 boot 内で後段の MOD が包んだ＝先の層が保持されている |
 
+読み直されるのは**モジュールも同じ**。注入のたびに `sys.modules` から落としてから
+入れ直すものが3段ある。
+
+| 何を | どこで |
+|---|---|
+| ローダ本体（`instantale_modloader.*`） | 注入コードの冒頭（`tools/injector.py`） |
+| MOD の入口（`instantale_mod_<フォルダ名>`） | `_load_mod_file` |
+| **MOD の中の部品**（`instantale_mod_<フォルダ名>.*`） | `_load_mod_file`（入口を入れ直す直前） |
+
+3段目が要点。入口だけ読み直して `from . import panel` の相手を残すと、
+**新しい入口が古い部品を呼ぶ**。分割した MOD を直して注入し直したのに、
+部品に足したばかりの関数が `AttributeError: module ... has no attribute` になる
+（`116_ui_party_expand` で実際に踏んだ。2026-08-03）。しかも入口側のコードは
+新しいので、ログを読んでも「直したはずの行」で落ちているように見える。
+
 ### 3.6 1回きりの初期化（`ctx.on_ready`）
 
 `apply()` は1プロセスの中で何度も呼ばれる。手で注入し直したときと、未 import の
@@ -718,6 +805,39 @@ def apply(ctx):
 直されるので、モジュール変数に持つと印ごと消えて再実行されてしまう。
 
 `Clock` が無い環境（`tools/` のオフライン検証）ではその場で同期的に呼ばれる。
+
+#### 3.6.1 見張りを `on_ready` で立てるときの罠（2026-08-03 に踏んだ）
+
+**注入し直しても立ち上がらない。** 印はプロセスに残るので2回目は黙って捨てられ、
+`Clock` の予約は `revert_all()` でも取り消せない（`unload()` の但し書き）。結果、
+**古い版の見張りが回り続ける**。`211_probe_text_speed` で実際に踏んだ ― 計測を
+足した版を注入したのにログが1行も増えず、「ゲームが何も出していない」と読み違える
+ところだった。
+
+1回きりの初期化（掃除・状態ファイル）なら意図どおりだが、**注入し直すたびに
+入れ替わってほしいもの**（見張り・計測）は別の書き方が要る。組は2つ:
+
+```python
+POLL_TOKEN_ATTR = "__instantale_myprobe_poll__"      # 置き場所は sys（上と同じ理由）
+
+def apply(ctx):
+    token = "{:x}".format(id(state))        # この apply() 固有の値
+    setattr(sys, POLL_TOKEN_ATTR, token)    # いま有効な世代を宣言する
+
+    def start_poll():
+        def poll(_dt):
+            if getattr(sys, POLL_TOKEN_ATTR, None) != token:
+                return False                # 新しい注入が来た ＝ Clock から降りる
+            ...
+            return True
+        Clock.schedule_interval(poll, 1.0)
+
+    # キーに世代を混ぜる。混ぜないと2回目以降は積まれない
+    ctx.on_ready(start_poll, key="211_probe_text_speed:poll:{}".format(token))
+```
+
+`force=True` でも積み直せるが、あれは印を無視するだけで**古い見張りは止まらない**
+（二重に回る）。降りる側の合図まで含めてこの形にする。
 
 ### 3.7 誰がどこへ当てたか（台帳）
 
@@ -1011,7 +1131,14 @@ screen.mark_of(entry)        # 'offer'（自分のボタンでなければ None�
 
 キーを他の MOD と共有すると、相手の `on_button_press` が自分のボタンを握り潰す。
 同梱 MOD が使用中のキーは `mod_action`（`301_`）/ `mod_party_action`（`302_`）/
-`mod_mini_action`（`305_`）。
+`mod_mini_action`（`305_`）/ `mod_road_action`（`307_`）/ `mod_pardon_action`
+（`309_`）。
+
+**印のキーは必ず `ui.MARK_PREFIX`（`mod_`）で始めること。** 残骸の掃除
+（`prune_stale`）が「他の MOD が今その場に出しているボタン」を見分けるのに、この
+接頭辞だけを手がかりにしている（セーブに焼かれるのは `text` と `spec` だけなので、
+**印が1つでも残っている＝残骸ではない**）。接頭辞から外れた印を使うと、その MOD の
+ボタンは他の MOD の掃除で消される。
 
 #### 5.1.2 自前の選択肢を出して押下を拾う（最小の流れ）
 
@@ -1081,6 +1208,25 @@ ui.find_guild(area) / ui.find_facility(area, id) / ui.facility_name(app, facilit
 ui.facility_type_of(...) / ui.GUILD_FACILITY_TYPE
 ```
 
+HUD へ自前のウィジェットを1枚足すとき（`113_` / `116_`。GAME.md §2.3）:
+
+```python
+host = ui.overlay_host(hud)     # 置き場所。**HUD 直下ではない**
+host.add_widget(widget)         # 既定は先頭挿入＝一番上に描かれる
+setattr(widget, "_instantale_<mod>_<用途>", ...)   # ui.MOD_WIDGET_PREFIX に揃える
+```
+
+| 関数 | 何をするか |
+|---|---|
+| `overlay_host(hud)` | 足す相手を返す。HUD の子は増やさない（増やすと「画面の最初の子」を取る側から見える相手が変わり、アイテムの移動・装備が壊れる）。`children` の**古い側**から探すので、ゲームが一時的に出している窓や他の MOD のウィジェットを掴まない |
+| `added_by_a_mod(widget)` | `_instantale_` で始まるインスタンス属性を持つか ＝ MOD が足したウィジェットか |
+
+**自分のウィジェットに付ける控えは `ui.MOD_WIDGET_PREFIX`（`_instantale_`）で
+始めること。** `overlay_host` が「他の MOD が足したもの」を置き場所の候補から
+外すのに、この接頭辞だけを手がかりにしている。ボタン辞書の印
+（`ui.MARK_PREFIX` ＝ `mod_`）とは別で、あちらは**選択肢**、こちらは
+**ウィジェット**の印。
+
 パーティの名簿（`302_` が4回外して固めた手順。`306_` にも同じものが要ったので
 発見のあった mod ではなくここに置いてある。GAME.md §2.8）:
 
@@ -1148,6 +1294,11 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 | 画面に出す文字列に環境依存文字を使わない | cp932 の外（`▶` U+25B6・`»` U+00BB）と NEC/IBM 拡張（`①` U+2460）は、フォントや端末によって出ない・化ける・`print` した時点で `UnicodeEncodeError`（`308_` のテストが実際に落ちた）。判定は「cp932 に入り、かつ先頭バイトが 0x87 / 0xED-0xEE / 0xFA-0xFC でない」＝ JIS X 0208 の範囲。`tools/test_battle_damage_display.py` の `charset_verdict()` がそのまま使える |
 | `"choice"` の候補に空文字・空白だけの値を入れない | GUI は空欄を「未指定」（`None`）として扱うので、`allow_null` でない設定では選んだ瞬間に弾かれる（`tools/gui.py` の `_ok`）。一覧は読み取り専用なので戻すこともできない。「無し」を選ばせたいなら `"なし"` のような**名前**を値にして、コード側で空文字に読み替える（`308_` の `NO_PREFIX`） |
 | 選択肢の値の末尾に空白を持たせない | JSON でも GUI の一覧でも見えず、消えたことに気付けない。記号と本文の区切りはコード側の定数で足す（`308_` の `PREFIX_SEPARATOR`） |
+| 他人のボタンを消す判定に、自分の印が無いことだけを使わない | `refresh_choice_buttons` を包む掃除は**画面が何であれ**走るので、他の MOD が今その場に出しているボタンも「自分の印が無い」に見える。`302_` が `309_` の確認画面から `やめておく` を消していた（2026-08-03）。判定は `ui.Screen.marked_by_a_mod`（`mod_` で始まるキーが1つも無いこと）で行う |
+| 残骸の掃除に使う文言は、その MOD にしか無いものだけにする | `やめておく` / `やめる` のような汎用語は他の MOD もゲーム自身も出す。印が落ちている相手は文言でしか見分けられないので、汎用語を混ぜた時点でゲームのボタンを消す穴になる |
+| 表示中の**文字列**を手がかりに描画先のウィジェットを探さない | その文字列を書き換える MOD が入った時点で探索が空振りする。`117_` が本文を載せ替えたら `112_` がラベルを見失い、行間の修正が丸ごと効かなくなった（2026-08-03）。一度実測で属性名が分かったら**名前で引く**（`hud.text_display`）。文字列の探索は名前で引けなかったときの予備に降ろす（§2.32） |
+| ウィジェットの再描画（`texture_update()`）を自分から呼ばない | Kivy はテキストや行間を代入した時点で**次のフレームに作り直しを1回予約する**。そこへ MOD が自分でも呼ぶと二度手間になり、しかもその代金は**フレーム時間に乗る**ので、フックの中で測っている限り見えない。本文のラベルは1文字ごとに作り直されるので効き方が大きく、実測では 1文字 3回 × 15ms ＝ 45ms（ティック間隔 63.5ms の3分の2）を `112_` と `117_` の2本が食っていた（§2.34）。寸法が要るなら**次のフレームに読む**だけでよい（Kivy の作り直しのほうが先に走る） |
+| 入れ物の子を「先頭」で選ばない | Kivy の `children` は**新しい順**。先頭はゲームが一時的に出している窓や、他の MOD が足したウィジェットでありうる。画面が組まれた時点から居るものが欲しいなら**最後尾**から探す。HUD へウィジェットを足すときは `ui.overlay_host`（§5.1.3）を使い、自分で書かない（§2.33） |
 
 ### 6.3 計測と観測
 

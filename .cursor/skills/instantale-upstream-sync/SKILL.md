@@ -50,10 +50,11 @@ git diff --name-only --diff-filter=A HEAD@{1} upstream/main -- runtime/mods | Se
 ```
 
 自分の MOD と番号が重なっていたら、**自分側を +1000 帯へ動かす**（本家の番号を残す）。
-この fork の固有 MOD は最初から +1000（`1113_` / `1307_` など）で採番する。
+未マージの fork 専用だけ +1000（例: `1114_` / `1308_`）。本家にマージされたら
+本家の番号（`117_` / `311_` など）に揃え、旧 +1000 フォルダは消す。
 
 ```powershell
-git mv runtime/mods/113_fix_crime_attribution runtime/mods/1113_fix_crime_attribution
+git mv runtime/mods/114_message_viewport_height runtime/mods/1114_message_viewport_height
 ```
 
 移した後に追う場所:
