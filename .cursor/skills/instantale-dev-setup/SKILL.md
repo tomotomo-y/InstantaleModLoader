@@ -27,6 +27,11 @@ disable-model-invocation: true
 | `.bat` は ASCII のみ | その時のコードページで読まれるため、日本語を入れると環境によって解析が壊れる |
 | ツールから MOD を読むときは番号を書かない | `find_mod("_companion_travel")` のように番号を除いた名前で引く。番号を振り直しても壊れない |
 | MOD が書いてよいのは `out/` だけ | `runtime/mods/` は読む専用。設定は `settings/mod_settings.json`（ローダが管理） |
+| `texture_update()` を自分から呼ばない | Kivy が次フレームで作り直す。重ね呼びはフレームを食うがフック内計測には出ない |
+| `apply()` を跨ぐ状態は `sys` の store に載せる | 再注入で `apply()` が複数回走る。世代ごとに Queue/Lock/worker を作ると壊れる |
+| ボタン残骸は `ui.Screen.prune_stale` / `marked_by_a_mod` | 文言一致だけで他ボタンに印を刻むな |
+
+MOD 実装の詳細規約は skill `instantale-mod-conventions`（`.cursor/rules/instantale-mods.mdc` も参照）。
 
 64bit の Python 3.13 が要る。32bit では注入できない。
 
@@ -72,8 +77,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .cursor/skills/instantale-de
 読み込まれない。番号帯は分類のためだけ（`0xx` 調査 / `1xx` 修正 / `2xx` 計測 /
 `3xx` 追加）で、適用順は `load_order.json` と `mod.json` の `after` / `before` が決める。
 
-**未マージの fork 専用 MOD だけ番号を +1000 する**（例: `1114_` / `1308_`）。
-本家にマージされたら本家の番号に従う。本家同梱を直すときは番号を動かさない。
+**番号の使い分け:**
+
+| 場所 | 採番 |
+|---|---|
+| 本家 PR（`feat/*`） | `upstream/main` の空き **3 桁**。+1000 のまま出さない |
+| `personal/*` の未マージ固有 | 本家帯と共存するため **+1000** 可（例: `1114_` / `1308_`） |
+| 本家にマージされたあと | 本家番号に揃える（取り込みは `instantale-upstream-sync`） |
+
+本家同梱を直すときは番号を動かさない。規約の詳細は `instantale-mod-conventions`。
 
 コピー直後は `load_order.json` に載っていないので、GUI の一覧から並べるか
 `"order"` に自分で足す。`check_mods.py` が「記載の無い MOD」として報告する。

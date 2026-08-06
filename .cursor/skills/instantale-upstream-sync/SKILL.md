@@ -21,8 +21,8 @@ git log --oneline v1.1.0..upstream/main   # タグとの差を見る
 ```
 - [ ] 1. 作業ツリーを綺麗にする（未 commit があれば先に片付ける）
 - [ ] 2. personal ブランチで merge
-- [ ] 3. 番号衝突を洗う
-- [ ] 4. 衝突を解消する
+- [ ] 3. 番号衝突を洗う（本家が振った番号を優先）
+- [ ] 4. 衝突を解消する（本家の texture / store 修正を優先）
 - [ ] 5. verify.ps1 を通す
 - [ ] 6. commit して push
 ```
@@ -49,12 +49,17 @@ git merge upstream/main
 git diff --name-only --diff-filter=A HEAD@{1} upstream/main -- runtime/mods | Select-String "mod.json"
 ```
 
-自分の MOD と番号が重なっていたら、**自分側を +1000 帯へ動かす**（本家の番号を残す）。
-未マージの fork 専用だけ +1000（例: `1114_` / `1308_`）。本家にマージされたら
-本家の番号（`117_` / `311_` など）に揃え、旧 +1000 フォルダは消す。
+自分の MOD と番号が重なっていたら、**自分側を動かす**（本家の番号を残す）。
+
+- まだ本家に出していない固有 MOD: personal では **+1000** へ退避してよい
+- **本家にマージ済み**（または本家が振り直した）: 本家の番号（例: `117_` / `311_`）に揃え、旧 +1000 フォルダは消す
+- 本家が同梱 MOD に入れた修正（`texture_update` 削除、`sys` store 化など）は **本家版を優先**する
 
 ```powershell
+# 例: 未マージ固有を退避
 git mv runtime/mods/114_message_viewport_height runtime/mods/1114_message_viewport_height
+# 例: マージ後に本家番号へ寄せる
+git mv runtime/mods/1115_message_text_integrity runtime/mods/117_message_text_integrity
 ```
 
 移した後に追う場所:
@@ -81,6 +86,10 @@ python -c "import sys,json; sys.path.insert(0,'runtime'); import instantale_modl
 | `runtime/mods/load_order.json` | 本家の並びを土台にし、自分の MOD を制約を満たす位置へ足す |
 | `docs/*.md` | **本家版を採用**（`git checkout --theirs`）し、自分の MOD の記述を該当節へ載せ直す。テキストマージしない |
 | 改変した同梱 MOD | 本家の変更を取り込み、自分の変更を残す。両方の意図を確認する |
+| 本家がマージして振り直した固有 MOD | 本家フォルダ名を残し、personal の旧 +1000 を削除。`find_mod` ならテストは番号変更不要 |
+| 本家の負荷／世代修正 | `texture_update` の削除、`STATE_STORE_ATTR` 化などは本家を優先。こちらで戻さない |
+
+規約の詳細は skill `instantale-mod-conventions`。
 
 ### 5. 検証
 

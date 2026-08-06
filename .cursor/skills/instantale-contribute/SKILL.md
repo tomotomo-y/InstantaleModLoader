@@ -53,11 +53,13 @@ git checkout personal/v1.1 -- runtime/mods/1308_companion_travel tools/test_comp
 ### 番号を確認する
 
 本家は番号を先に使うことがある。PR に出す前に `upstream/main` の
-`runtime/mods/` と自分の番号が重なっていないか見る。重なっていたら自分側を
-+1000 帯へ動かす（手順は `instantale-upstream-sync` を参照）。
-未マージの fork 専用だけ +1000（`1114_` / `1308_` など）。本家マージ後は本家番号に揃える。
+`runtime/mods/` と番号が重なっていないか見る。
 
-テストは番号なしで MOD を引く形（`find_mod("_suffix")`）にしておく。
+**PR（`feat/*`）では本家の空き 3 桁帯を使う**（`1xx` 修正 / `3xx` 追加）。
+personal 用の +1000（`1114_` 等）のまま出さない。本家にマージされたら本家番号に従う。
+
+テストは必ず番号なしで MOD を引く（`find_mod("_suffix")`）。番号入りパスの直書き禁止。
+実装規約は skill `instantale-mod-conventions`。
 
 ### 検証してから出す
 

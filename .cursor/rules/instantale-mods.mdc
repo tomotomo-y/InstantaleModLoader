@@ -1,0 +1,18 @@
+---
+description: Instantale MOD / テスト編集時の必須規約（本家 TECH.md §6 準拠）
+globs: runtime/mods/**/*.py,runtime/mods/**/mod.json,tools/test_*.py
+alwaysApply: false
+---
+
+# Instantale MOD 必須規約
+
+MOD やオフラインテストを書く／直すときは次を守れ。詳細は skill
+`instantale-mod-conventions` と `docs/TECH.md` §6.2 / §3.4 / §2.4。
+
+- `texture_update()` を自分から呼ぶな。フック内の計測時間 ≠ フレーム負荷
+- 表示中の文字列でウィジェットを探すな。属性名（例: `hud.text_display`）で引け
+- ボタン残骸の掃除は `ui.Screen.prune_stale` / `marked_by_a_mod`。文言一致だけで他ボタンに印を刻むな
+- `apply()` を跨ぐ状態はモジュール変数に置くな。`sys` 上の store（`STATE_STORE_ATTR`）に載せろ
+- テストは `find_mod("_suffix")`。番号入りパスを直書きするな
+- セーブ構造に独自キーを足すな。印キーは他 MOD と被るな（`mod_` 接頭辞）
+- PR 用番号は本家の空き 3 桁帯。personal の未マージ固有だけ +1000 可
