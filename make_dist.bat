@@ -34,10 +34,10 @@ rem  requires the copyright notice to travel with every copy, so a package
 rem  without them is not a lawful redistribution. NOTICE states what the grant
 rem  does and does not cover (game-derived strings, GAME.md, the EULA question).
 rem
-rem  Never shipped: out\ and settings\ (both made at runtime), __pycache__ /
-rem  *.pyc, tools\test_*.py and the one-off save fixers, and
-rem  llm_replacements.txt -- that last one is the player's own copy of a mod's
-rem  data file, so only the shipped llm_replacements.default.txt goes in.
+rem  Never shipped: out\, state\ and settings\ (all three made at
+rem  runtime), __pycache__ / *.pyc, tools\test_*.py and the one-off save fixers, and
+rem  llm_replacements.txt / npc.json -- those last two are the player's own copy
+rem  of a mod's data file, so only the shipped *.default.* versions go in.
 rem
 rem    make_dist.bat           version comes from runtime\instantale_modloader
 rem    make_dist.bat 1.2.0     override the version string
@@ -156,7 +156,7 @@ for %%f in (gui.py injector.py watcher.py logrotate.py watch.bat check_mods.py) 
 
 echo   [loader] docs ...
 md "%LOADER%\docs" 2>nul
-for %%f in (README.md TECH.md GAME.md VERIFICATION.md) do (
+for %%f in (README.md MODS.md TECH.md GAME.md VERIFICATION.md) do (
   if exist "docs\%%f" copy /y "docs\%%f" "%LOADER%\docs\" >nul || goto :copyfail
 )
 
@@ -164,7 +164,7 @@ rem ===========================================================================
 rem  mods
 rem ===========================================================================
 echo   [mods] copying ...
-robocopy "runtime\mods" "%MODS%" /E /XD "__pycache__" "_template" /XF "*.pyc" "llm_replacements.txt" "load_order.json" "load_order.local.json" /NFL /NDL /NJH /NJS /NP >nul
+robocopy "runtime\mods" "%MODS%" /E /XD "__pycache__" "_template" /XF "*.pyc" "llm_replacements.txt" "npc.json" "load_order.json" "load_order.local.json" /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 (
   echo   ERROR: robocopy failed on runtime\mods ^(code %ERRORLEVEL%^).
   goto :fail
@@ -298,7 +298,7 @@ rem  breaks a different set of extractors.
 rem
 rem  So: open the archive and add each file under a forward-slash relative
 rem  name. Empty folders are dropped, which costs nothing here -- the loader
-rem  reads files, and out\ and settings\ are made at runtime anyway.
+rem  reads files, and out\, state\ and settings\ are made at runtime anyway.
 rem ---------------------------------------------------------------------------
 :zip
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { Add-Type -AssemblyName System.IO.Compression.FileSystem; $src=(Resolve-Path -LiteralPath '%~1').Path; $dst=[IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path,'%~2')); if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }; $base=Split-Path -Parent $src; $zip=[IO.Compression.ZipFile]::Open($dst,'Create'); try { Get-ChildItem -LiteralPath $src -Recurse -File | ForEach-Object { $rel=$_.FullName.Substring($base.Length+1).Replace('\','/'); [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$_.FullName,$rel,'Optimal') | Out-Null } } finally { $zip.Dispose() } } catch { Write-Host $_.Exception.Message; exit 1 }"

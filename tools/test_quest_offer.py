@@ -35,6 +35,8 @@ MODS_DIR = os.path.join(RUNTIME_DIR, "mods")
 if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
+import instantale_modloader as ml                      # noqa: E402
+
 
 def find_mod(suffix):
     """mod を **番号を除いた名前** で探す（番号は振り直されることがある）。"""
@@ -244,7 +246,7 @@ class InstantaleApp:
 # にはこのテスト自身**なので、`main.InstantaleApp = app_cls` がここのグローバル名を
 # 書き換えてしまう。素朴に `type("InstantaleApp", (InstantaleApp,), {})` と書くと
 # 2回目以降は「前回の派生クラス」から派生し、フックの層が積み上がって
-# 同じ処理が何度も走る（実際にそれで1件誤判定した）。
+# 同じ処理が何度も走る。
 BASES = {"app": InstantaleApp, "board": DisplayQuestChoice,
          "start": ConversationStartManager, "end": ConversationEndManager}
 
@@ -312,6 +314,9 @@ def install_fake_kivy():
 class FakeCtx:
     def __init__(self, out_dir):
         self.out_dir = out_dir
+        # 本番と同じく**別のフォルダ**にする（ローダの `state_dir`）。同じ場所を
+        # 指すと、状態を out/ に書く mod が検証を素通りする。
+        self.state_dir = os.path.join(out_dir, "state")
         self.hooks = {}
         self.errors = []
 
@@ -320,11 +325,24 @@ class FakeCtx:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
+    def state_path(self, *parts):
+        path = os.path.join(self.state_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
     def log(self, msg):
         pass
 
     def log_exc(self, msg):
         self.errors.append(msg)
+
+    # 本物の `ctx.write_json` / `write_text` と同じものを使う。ここを自前の
+    # open(..., "w") にすると、テストだけが「壊れない書き方」を通らなくなる。
+    def write_json(self, path, data, *, indent=1):
+        return ml.write_json(path, data, indent=indent, report=self.log_exc)
+
+    def write_text(self, path, text):
+        return ml.write_text(path, text, report=self.log_exc)
 
     def wrap(self, target, **kw):
         def decorator(func):
@@ -596,7 +614,7 @@ print("=== タイトル戻り・再注入後の残骸 ===")
 # `PhaseSpec.to_dict()` がセーブに書くのは text と spec だけで、**印は落ちる**
 # （実セーブ8件で確認。GAME.md §2.2）。タイトルへ戻る・ロード・再注入のあとは
 # 「印の無い自分のボタン」が復元されているので、印だけで重複を見ていると
-# 同じボタンが2つ並ぶ（ユーザー報告・2026-08-02）。
+# 同じボタンが2つ並ぶ。
 def stale(text):
     """セーブから復元された自前ボタン（印が落ちている）。"""
     return {"text": text, "spec": PhaseSpec("JustSetButtonToNormalPhase", [])}
@@ -631,8 +649,8 @@ check("印を持たない Screen では何も落とさない",
 # **他の MOD の印が付いていたら残骸ではない。**
 # セーブに焼かれるのは text と spec だけ ＝ 復元された残骸は印を1つも持たない。
 # 逆に印があれば、いま誰かが挿した生きているボタンなので触ってはいけない。
-# ここを見ていなかったため、`302_` が `309_`（役場の罰金）の確認画面から
-# キャンセルを消していた（2026-08-03。同じ文言・違う印のキー）。
+# ここを見ないと、`302_` が `309_`（役場の罰金）の確認画面からキャンセルを
+# 消すことになる（同じ文言・違う印のキー。VERIFICATION.md §2.31）。
 foreign = {"text": "依頼を受ける（話を切り上げる）", "mod_pardon_action": "cancel",
            "spec": PhaseSpec("JustSetButtonToNormalPhase", [])}
 other = [dict(foreign)]
@@ -656,6 +674,82 @@ app.buttons = talk_buttons("62") + [{"text": "ここで別れる",
 app.on_button_press(len(app.buttons) - 1)
 check("302_ のボタンはこちらでは素通しになる",
       app.pressed_by_game == ["ここで別れる"], app.pressed_by_game)
+
+# ============================================================ 311_ の人物像
+# mod どうしは import せず**同じファイルを読む**ことで繋がる（TECH.md §3.2.3）。
+# ここで見るのは「在れば添える」「無ければ何も足さない」の2つ。
+print("=== 311_ が覚えた人物像 ===")
+
+GEN_TARGET = "scripts.llm.llm_manager_world_generate:random_quest_generator"
+
+
+def press_generate(ctx_obj, app_obj):
+    """「この話から依頼を作る」を押し、生成側へ渡った `area_description` を返す。
+
+    **本物と同じ入れ子にする。** `random_quest_generator` はゲーム自身の
+    `generate_random_quest()` の内側で走るので、その外から呼んでも遅い ―
+    生成が終わった時点で mod は印を使い切って `None` に戻している。
+    """
+    seen = {}
+    board_cls = sys.modules["__main__"].DisplayQuestChoice
+    original = board_cls.generate_random_quest
+
+    def orig(world_overview, settlement_name, settlement_overview,
+             settlement_structure_description, area_description, quest_difficulty,
+             *args, **kwargs):
+        seen["area"] = area_description
+        return {"quest_title": "こぼれ話の依頼", "client_name": "テストNPC D"}
+
+    def generate_random_quest(self):
+        ctx_obj.hooks[GEN_TARGET](orig, "世界の概要", "テストの町A", "町の概要",
+                                  "町の構造", "エリアの説明", 41)
+        return original(self)
+
+    board_cls.generate_random_quest = generate_random_quest
+    try:
+        app_obj.refresh_choice_buttons()
+        app_obj.on_button_press(index_of(app_obj, "generate"))
+        clock.settle()
+    finally:
+        board_cls.generate_random_quest = original
+    return seen.get("area", "")
+
+
+def seed_persona(state_dir, record):
+    """`311_` が書くのと同じ場所・同じ形で控えを置く（`state/npc_profiles/`）。"""
+    path = os.path.join(state_dir, mod.NPC_MEMORY_DIRNAME,
+                        ml.state.world_filename("テスト世界"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with io.open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"62": record}, ensure_ascii=False))
+    return path
+
+
+mod, ctx, app = setup(history=history)
+persona_path = seed_persona(ctx.state_dir, {
+    "name": "テストNPC D", "profile": "石橋を叩いて渡る町の事務官。",
+    "about_player": "腕は認めているが、まだ全幅の信頼は置いていない。"})
+try:
+    area = press_generate(ctx, app)
+    check("依頼人の人物像が生成プロンプトに載る",
+          "石橋を叩いて渡る町の事務官。" in area, area[-400:])
+    check("その人物から見た冒険者の記録も載る",
+          "まだ全幅の信頼は置いていない。" in area, area[-400:])
+    check("人物像は会話の記録より後ろに置く",
+          "石橋を叩いて渡る" in area
+          and area.index("会話の記録") < area.index("石橋を叩いて渡る"),
+          area[-400:])
+    check("人物像を依頼の中身にしないよう釘を刺す",
+          "依頼の中身にしてはならない" in area, area[-400:])
+finally:
+    os.remove(persona_path)
+
+# `311_` を入れていない（＝ファイルが無い）ときは、何も足さずに通ること。
+mod, ctx, app = setup(history=history)
+area = press_generate(ctx, app)
+check("311_ が無ければ会話の記録だけを添える", "会話の記録" in area, area[-300:])
+check("311_ が無くても人物像の節は足さない",
+      "過去の会話から分かっていること" not in area, area[-300:])
 
 print()
 if failures:

@@ -54,6 +54,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime"))
 
 import injector                                  # noqa: E402
+import logrotate                                 # noqa: E402
 import watcher                                   # noqa: E402
 import instantale_modloader as ml                # noqa: E402
 from instantale_modloader import config as C     # noqa: E402
@@ -66,6 +67,11 @@ MODS_DIR = os.path.join(RUNTIME_DIR, "mods")
 # 配布用の順序ファイルへ書き戻される。
 OUT_DIR = os.path.join(ROOT, "out")
 STATUS_PATH = os.path.join(OUT_DIR, ml.STATUS_NAME)
+
+# MOD が持つ永続データ（進行中の道中、依頼の出所、NPC の控え）。out/ とは別。
+# 場所はローダに聞く（`ml.state_dir`）― ゲームの中で書く側と GUI で開く側とで
+# 同じ場所を組み立てる規則を2箇所に書かないため。
+STATE_DIR = ml.state_dir(RUNTIME_DIR)
 
 # 利用者が選んだものは全部 settings/ に集める（mod ごとの設定は
 # instantale_modloader.config が同じフォルダへ mod_settings.json を書く）。
@@ -458,6 +464,9 @@ def read_mods() -> dict:
             "after": manifest.get("after") or [],
             "before": manifest.get("before") or [],
             "debug": bool(manifest.get("debug")),
+            # 本体が取り込んだので降ろした mod。値は取り込まれた版（"main_024"）。
+            # 読み込みの扱いは debug と同じだが、表示では分ける（伏せた理由が違う）。
+            "superseded": manifest.get("superseded") or "",
         })
     return {"mods": mods, "disabled": disabled, "problems": found["problems"],
             "debug_mode": bool(found.get("debug_mode"))}
@@ -470,10 +479,13 @@ def write_order(names: list[str], disabled: set[str]) -> None:
     追いやすいのと、無効にした順で溜まっていくのを避けるため。
     """
     off = [n for n in names if n in disabled]
-    with open(ml.order_path(MODS_DIR), "w", encoding="utf-8") as fh:
-        json.dump({"order": names, "disabled": off}, fh,
-                  ensure_ascii=False, indent=2)
-        fh.write("\n")
+    # 落ちても壊れない書き方は `ml.write_json` に一本化してある。ここは MOD の
+    # 構成そのもの（適用順と有効/無効）なので、壊れると一覧が組み直せない。
+    # 失敗は例外にする ― `save()` が捕まえてダイアログに出す（config.py の
+    # `_save_settings_json` と同じ理由で、利用者の操作の結果だから）。
+    path = ml.order_path(MODS_DIR)
+    if not ml.write_json(path, {"order": names, "disabled": off}, indent=2):
+        raise OSError("cannot write {}".format(path))
 
 
 def read_config() -> dict:
@@ -482,10 +494,13 @@ def read_config() -> dict:
 
 
 def write_config(data: dict) -> None:
+    """`gui.json`（窓の位置など GUI だけの覚え書き）を書く。
+
+    失っても既定値で開き直せるだけなので、書けなくても黙って続ける。書き方は
+    他と揃える（規則は `ml.write_json` に一本化してある）。
+    """
     os.makedirs(SETTINGS_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
+    ml.write_json(CONFIG_PATH, data, indent=2)
 
 
 def update_config(**values) -> None:
@@ -889,6 +904,11 @@ class App(ttk.Frame):
         # メニューのチェックの見た目。実体は `self.debug_mode` の方で、
         # こちらは表示専用（`reload` が毎回 `set` で揃える）。
         self.debug_var = tk.BooleanVar(value=False)
+        # ログの世代管理。こちらは GUI 側に控えを持たず、チェックの状態が
+        # そのまま今の値になる（`reload` が logrotate に聞いて揃える）。
+        # 実体は debug と同じ settings/loader.json だが、**読むのはローダではなく
+        # 注入する側**（tools/logrotate.py）。
+        self.log_rotate_var = tk.BooleanVar(value=True)
         # 注入は別スレッドで動くので、進捗はキュー越しに受け取って
         # メインスレッドの after で描く（tkinter は他スレッドから触れない）。
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -963,6 +983,11 @@ class App(ttk.Frame):
         self.tree.tag_configure("off", foreground=PALETTE["text_faint"])
         # 前回の注入で入らなかった mod は赤。ログを開かずに気付けるように。
         self.tree.tag_configure("bad", foreground=PALETTE["danger"])
+        # 本体が取り込んだので降ろした mod。デバッグモードのときだけ並ぶので、
+        # **計測 MOD と一緒に見えることになる**。同じ見た目だと「なぜ出ているのか」が
+        # 混ざるため、こちらだけ色を変える（無効な行の灰色とも別にする ―
+        # 切ってあるのではなく、要らなくなったので降ろした、という違いがある）。
+        self.tree.tag_configure("superseded", foreground=PALETTE["text_sub"])
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_detail())
         self.tree.bind("<Button-1>", self._on_press)
@@ -1044,8 +1069,16 @@ class App(ttk.Frame):
         絞り込み（`_matches`）とは別物として扱う。絞り込みは利用者が今かけている
         条件で、解除すれば戻る。こちらは**存在しないものとして扱う**もので、
         件数の分母にも入れない。
+
+        伏せる理由は2つあり、扱いは同じ（`discover()` の `hide`）:
+
+          debug       計測用。開発者以外には意味が無い
+          superseded  ゲーム本体が同じ修正を取り込んだので降ろした
+
+        どちらもデバッグモードを入れれば出てくる。**表示だけは分ける**ので、
+        ここで一緒にするのは「出すか出さないか」の判定だけに留める。
         """
-        return mod["debug"] and not self.debug_mode
+        return (mod["debug"] or bool(mod.get("superseded"))) and not self.debug_mode
 
     def _known_mods(self) -> list[dict]:
         """利用者から見て「入っている」mod。件数の分母はこちら。"""
@@ -1177,14 +1210,22 @@ class App(ttk.Frame):
         m_run.add_separator()
         # 失敗したときの案内文が out/bootstrap.log を指すのに、そこへ行く手段が
         # どこにも無かった。
-        m_run.add_command(label="out/ フォルダを開く（ログ）",
+        m_run.add_command(label="out/ フォルダを開く（ログ。消してよい）",
                           command=self.open_out_dir)
+        # 「out/ を消してください」と案内できるのは、消えては困るものが別に
+        # 置いてあると示せるときだけ。開く手段もここに並べておく。
+        m_run.add_command(label="state/ フォルダを開く（MOD の記録。消すと巻き戻る）",
+                          command=self.open_state_dir)
         m_run.add_separator()
         # 絞り込み（`FILTERS`）ではなくメニューに置く。あちらは「表示だけ」の
         # 条件で揃えてあり、注入する中身まで変わる項目を混ぜると意味が濁る。
         m_run.add_checkbutton(label="デバッグモード（開発者向けの MOD を使う）",
                               variable=self.debug_var,
                               command=self._toggle_debug_mode)
+        # 切ると注入をまたいでログが積み上がる。複数回のプレイを追う検証で要る。
+        m_run.add_checkbutton(label="注入のたびにログを新しくする",
+                              variable=self.log_rotate_var,
+                              command=self._toggle_log_rotate)
         bar.add_cascade(label="実行", menu=m_run)
 
         master.configure(menu=bar)
@@ -1264,6 +1305,9 @@ class App(ttk.Frame):
         # 手で書き換えた場合にも、F5 で追いつけるようにしておく。
         self.debug_mode = found["debug_mode"]
         self.debug_var.set(self.debug_mode)
+        # 世代管理は logrotate に聞く。**GUI で覚えない**のが要点で、環境変数や
+        # logrotate.py の既定値でも変わるため、こちらで持つと実際と食い違う。
+        self.log_rotate_var.set(logrotate.enabled())
         self.settings = C.load_store(RUNTIME_DIR)
         self.status = read_status()
         self.dirty = False
@@ -1331,14 +1375,23 @@ class App(ttk.Frame):
                 tags = ("off",)
             elif result and result != "ok":
                 tags = ("bad",)
+            elif mod.get("superseded"):
+                tags = ("superseded",)
             # 設定を持つ mod だけ印を出す。持たない mod で「設定…」を押しても
             # 何も無いことが、一覧の時点で分かるように。
             changed = bool(self.settings.get(name))
             cfg = ("●" if changed else "○") if mod["settings"] else ""
+            # 色だけでは「なぜ並んでいるのか」が伝わらないので、名前の後ろに
+            # 取り込まれた版を出す。行そのものに書くのは、選ばないと分からない
+            # 状態にしないため（一覧を眺めるだけで仕分けられる）。
+            # **`mod["name_ja"]` は書き換えない** ― 絞り込みの対象は元の名前のまま。
+            label_ja = mod["name_ja"]
+            if mod.get("superseded"):
+                label_ja += "　〔{} で本体が取込〕".format(mod["superseded"])
             self.tree.insert("", "end", iid=name, tags=tags,
                              image=self.check_on if on else self.check_off,
                              values=(n if on else "-",
-                                     mod["name_ja"], mod["name_en"], cfg,
+                                     label_ja, mod["name_en"], cfg,
                                      mod["version"] or "-", mod["author"] or "-",
                                      RESULT_TEXT.get(result, result or "-")))
         self.shown_count = shown
@@ -1361,6 +1414,16 @@ class App(ttk.Frame):
         state = "無効" if mod["dir"] in self.disabled else "有効"
         bits = ["{}  /  entry: {}  /  API {}  /  {}".format(
             mod["dir"], mod["entry"], mod["api"], state)]
+        # 伏せられている理由は行の色だけでは伝わらないので、選んだら言葉で出す。
+        # 「戻すかどうか」を判断する材料なので、取り込まれた版まで書く。
+        if mod.get("superseded"):
+            bits.append("ゲーム本体が {} で同じ修正を取り込んだため降ろしています"
+                        "（デバッグモードのときだけ読み込まれます）。"
+                        "その版より古いゲームで遊ぶなら戻してください。"
+                        .format(mod["superseded"]))
+        elif mod["debug"]:
+            bits.append("開発者向けの計測 MOD です"
+                        "（デバッグモードのときだけ読み込まれます）。")
         desc = mod["desc_ja"] or "（説明なし）"
         if mod["desc_en"] and mod["desc_en"] != mod["desc_ja"]:
             desc += "\n" + mod["desc_en"]
@@ -1547,10 +1610,53 @@ class App(ttk.Frame):
         self.reload()           # 状態表示は件数で上書きされるので、案内はこの後
         if self.debug_mode:
             self._set_status("デバッグモードを入れました"
-                             "（開発者向けの MOD が一覧に出ます。次の注入から効きます）")
+                             "（計測用の MOD と、本体が取り込んだので降ろした MOD が"
+                             "一覧に出ます。次の注入から効きます）")
         else:
             self._set_status("デバッグモードを切りました"
-                             "（開発者向けの MOD は読み込まれません）")
+                             "（計測用と取込済みの MOD は読み込まれません）")
+
+    def _toggle_log_rotate(self) -> None:
+        """out/*.log を注入のたびに新しくするかを切り替える。
+
+        書き先はデバッグモードと同じ `settings/loader.json`。読むのは
+        `tools/logrotate.py` で、優先順位は
+        コマンドライン → 環境変数 → このファイル → logrotate.py の既定値。
+
+        切ると注入をまたいでログが積み上がる。**複数回のプレイを突き合わせる検証**
+        （前の版で出ていた印が出なくなったか、など）では、入れ替えられると比較の
+        土台ごと消えるので、そのあいだは切っておく。
+
+        `launch()` と違って未保存の並びには触らない。ログの設定は MOD の構成とは
+        無関係で、ここで保存を促すと関係の無い操作を巻き込む。
+        """
+        want = bool(self.log_rotate_var.get())
+        try:
+            flags = C.load_flags(RUNTIME_DIR)
+            flags[logrotate.SETTINGS_FLAG_KEY] = want
+            C.save_flags(RUNTIME_DIR, flags)
+        except Exception as exc:
+            # 書けなかったのにチェックだけ動いた状態にしない。
+            self.log_rotate_var.set(logrotate.enabled())
+            messagebox.showerror("設定を保存できませんでした",
+                                 f"{type(exc).__name__}: {exc}")
+            return
+
+        # 環境変数の方が強いので、書けても効かないことがある。黙って食い違うと
+        # 「切ったのに入れ替わる」と見えるため、その場で断っておく。
+        actual = logrotate.enabled()
+        self.log_rotate_var.set(actual)
+        if actual != want:
+            self._set_status(
+                "{} に保存しましたが、環境変数 {} が優先されるため今は{}のままです"
+                .format(C.FLAGS_NAME, logrotate.ENV_VAR,
+                        "ON" if actual else "OFF"))
+        elif actual:
+            self._set_status("注入のたびにログを新しくします"
+                             "（前回ぶんは .1 に残ります）")
+        else:
+            self._set_status("ログを入れ替えず追記し続けます"
+                             "（注入をまたいで比較したいときの設定です）")
 
     def save(self) -> None:
         try:
@@ -1643,6 +1749,11 @@ class App(ttk.Frame):
         """ログと status.json の置き場。注入に失敗したときの案内先。"""
         os.makedirs(OUT_DIR, exist_ok=True)
         self._open(OUT_DIR)
+
+    def open_state_dir(self) -> None:
+        """MOD が持つ永続データの置き場。**ログとは別**（消すと遊びが巻き戻る）。"""
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self._open(STATE_DIR)
 
     def _open(self, path: str) -> None:
         try:

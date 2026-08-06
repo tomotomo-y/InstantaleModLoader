@@ -49,19 +49,35 @@ id の採番・`world_dict['quests']` への登録・セーブまで面倒を見
 GAME.md §3「ゲーム自身のヘルパを探す」と同じ手口。
 
 印は1回で使い切る。掲示板から普通に生成した依頼は素通しする。
+
+## 依頼人の人物像（`311_npc_profile_memory` を入れている場合）
+
+同じ相手と何度も話していると、あちらが `state/npc_profiles/<世界名>.json` に
+人物像を貯めている。それを**読むだけ**添えて、`client_statement` の口ぶりを
+その人物に寄せる。依頼の中身は今の会話だけから決めさせる（人物像を中身に
+使わせると、話していない用件を持ち出す）。
+
+**mod を import はしない。** ローダは mod を `instantale_mod_<フォルダ名>` で
+登録するので、番号を振り直した瞬間に名前で掴む側が壊れる（TECH.md §3.2.3）。
+繋がるのは同じファイルを読むことによってで、ファイルが無ければ何も添えない。
 """
 
 import datetime
 import json
+import os
+import re
 import sys
 import time
 
 from instantale_modloader import ui
+from instantale_modloader.state import world_filename, world_key
 from instantale_modloader.frames import repr_value
 
 LOG_BASENAME = "quest_offer.log"
 
-# 「どの依頼がどの NPC 発か」の控え。**セーブには書かない。**
+# 「どの依頼がどの NPC 発か」の控え。**セーブには書かない。**置き場は
+# `state/`（`ctx.state_path`）― 消すと受注済みの依頼の出所が分からなくなる、
+# 遊びの続きに要るデータなので、ログと同じ場所には置かない。
 # クエスト辞書に独自キーを足すとセーブに焼かれるうえ、再読み込み後に
 # `Quest` インスタンスがそのキーを持つ保証が無い（`Quest.__init__` が何を
 # 写すかは読めない）。mod 側に持てば、ゲームのデータを一切汚さずに済む。
@@ -149,8 +165,33 @@ SETTLE = 0.4
 # こちらの action を知らずに握り潰す）。
 MARK = "mod_action"
 
+# 依頼人の人物像を、生成のプロンプトに添えるか。
+USE_NPC_MEMORY = True
+
+# `311_npc_profile_memory` が覚えた人物像の置き場所。**mod を import しない。**
+# ローダは mod を `instantale_mod_<フォルダ名>` で登録するので、番号を振り直した
+# 瞬間に名前で掴む側が壊れる（TECH.md §3.2.3）。共有してよいのはローダの
+# `instantale_modloader.*` だけなので、mod どうしは**同じ場所を読む**ことで繋ぐ。
+# ファイルが無ければ何も添えない ― 向こうを切っていても、まだ一度も会話して
+# いなくても成立する。
+NPC_MEMORY_DIRNAME = "npc_profiles"
+
+# 上のファイルから読む欄と、プロンプトでの見出し。向こうの `RECORD_KEYS` の
+# うち本文を持つ2つ。増えたら**ここに足すのはこちらの判断**（知らない欄を
+# 勝手に載せない）。
+NPC_MEMORY_FIELDS = (("profile", "人物像"), ("about_player", "冒険者への態度"))
+
+# 添える人物像の上限。依頼の生成には人物の輪郭があれば足りるので、
+# 会話の書き起こしより短くする。
+NPC_MEMORY_CHARS = 800
+
 # 自前ボタンに持たせる無害な spec は `ui.SAFE_CLS`
 # （`JustSetButtonToNormalPhase`）。mod 無しで押されても選択肢が戻るだけ。
+
+
+# ファイル名に使えない文字（Windows 禁則＋制御文字）。
+# **`311_` の `safe_world_filename` と同じ規則でなければ引けない。**
+_UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
 def _text(value, limit=200):
@@ -164,7 +205,7 @@ def _text(value, limit=200):
 
 def apply(ctx):
     log_path = ctx.out_path(LOG_BASENAME)
-    clients_path = ctx.out_path(CLIENTS_BASENAME)
+    clients_path = ctx.state_path(CLIENTS_BASENAME)
     state = {
         "saved_buttons": None,   # 一覧を出す前のボタン。やめる で戻す
         "npc_id": None,          # いま会話している相手
@@ -392,18 +433,35 @@ def apply(ctx):
         return None
 
     # ------------------------------------ どの依頼がどの NPC 発かの控え
-    def world_key(app):
-        """世界を見分ける名前。取れなければ '_'（1世界しか使わない前提に落ちる）。"""
-        world_dict = getattr(app, "world_dict", None)
-        if isinstance(world_dict, dict):
-            data = world_dict.get("world_data")
-            if isinstance(data, dict):
-                for key in ("world_name", "name", "title"):
-                    value = data.get(key)
-                    if isinstance(value, str) and value:
-                        return value
-        name = getattr(getattr(app, "world", None), "name", None)
-        return name if isinstance(name, str) and name else "_"
+
+    def npc_memory(app, npc_id):
+        """`311_npc_profile_memory` が覚えている依頼人の人物像。無ければ空文字。
+
+        **読むだけ。書かない。**（あちらの持ち物なので、こちらが触ると
+        「MOD が足したものは MOD が片付ける」が成立しなくなる。）
+        ディレクトリも作らない ― `311_` を切っている人の `state/` に、
+        使われない空のフォルダを置かないため（`ctx.state_path()` は親を作るので
+        ここでは使わない）。置き場所を分ける前の `out/` から拾い直すのは
+        あちらの仕事で、こちらは在るものを読むだけ。
+        """
+        if not USE_NPC_MEMORY or not npc_id:
+            return ""
+        path = os.path.join(ctx.state_dir, NPC_MEMORY_DIRNAME,
+                            world_filename(world_key(app)))
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return ""       # 無い・読めない・壊れている。どれも「添えない」
+        record = data.get(str(npc_id)) if isinstance(data, dict) else None
+        if not isinstance(record, dict):
+            return ""
+        lines = []
+        for key, label in NPC_MEMORY_FIELDS:
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                lines.append("{}: {}".format(label, value.strip()))
+        return _text("\n".join(lines), NPC_MEMORY_CHARS)
 
     def load_clients():
         try:
@@ -420,8 +478,9 @@ def apply(ctx):
         bucket[str(quest_id)] = {"npc_id": str(npc_id) if npc_id else "",
                                  "npc_name": npc_name or ""}
         try:
-            with open(clients_path, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=1)
+            # 途中で落ちても控えが壊れない書き方（`ctx.write_json`）。素朴に
+            # open(..., "w") で書くと、依頼の出所が丸ごと読めなくなる。
+            ctx.write_json(clients_path, data)
             write("remembered client: quest {!r} <- {!r} ({})".format(
                 quest_id, npc_name, npc_id))
         except Exception:
@@ -623,7 +682,10 @@ def apply(ctx):
         in_conversation = bool(getattr(app, "in_conversation", False))
 
         state["generating"] = True
-        state["inject"] = {"transcript": transcript, "npc_name": npc_name}
+        # 人物像はここで読んでおく。生成のフックは `execute` の別スレッドで
+        # 走るので、ゲームの状態（`world_key`）を触るのはこちら側に寄せる。
+        state["inject"] = {"transcript": transcript, "npc_name": npc_name,
+                           "persona": npc_memory(app, npc_id_at_start)}
         state["inject_at"] = time.monotonic()
         show_busy(app)
         say(app, "――話を整理して、依頼として書き起こしている……")
@@ -707,7 +769,7 @@ def apply(ctx):
     # ------------------- ゲームの掲示板を、その NPC 発の依頼だけに絞る＋生成を足す
     @ctx.wrap("__main__:DisplayQuestChoice.update_button_display", required=False)
     def quest_board_buttons(orig, self, *args, **kwargs):
-        """掲示板が並び終えた**後**に、絞り込みと自前項目の追加を行う。
+        """掲示板が並び終えた**後**に、絞り込みと自前項目の追加をする。
 
         **依頼ボタンは作らず、ゲームが作ったものを間引くだけ。** `quest_type` の
         語彙を知らずに済ませるのが設計の要点なので、組み立てには絶対に回らない
@@ -875,8 +937,8 @@ def apply(ctx):
         **必ず見える経路**をもう1本用意する。ボタンが並び直されるたびに
         通るので、どの画面から戻ってきても居続ける。
 
-        施設のルートメニューかどうかは**文字列ではなく spec で**判定する
-。「`DisplayTalkChoice` を呼ぶボタンがある」＝ 会話相手を選べる場所
+        施設のルートメニューかどうかは**文字列ではなく spec で**判定する。
+        「`DisplayTalkChoice` を呼ぶボタンがある」＝ 会話相手を選べる場所
         ＝ 施設のルートメニュー。「会話する」という表記に依存しないので
         言語設定が変わっても効く。依頼一覧そのもの（`QuestChoiceManager` が
         並ぶ）には `DisplayTalkChoice` が無いので、入れ子にはならない。
@@ -1038,9 +1100,23 @@ def apply(ctx):
             "--- 会話の記録 ---\n{transcript}\n--- 記録ここまで ---"
         ).format(npc=mark["npc_name"] or "依頼人", transcript=mark["transcript"])
 
+        # 過去の会話から分かっている依頼人の人となり（`311_` の控え）。
+        # **この会話の記録より後ろに置く。** 依頼の中身を決めるのはあくまで
+        # 今の会話で、人物像は client_statement の口ぶりを寄せるためのもの。
+        persona = mark.get("persona") or ""
+        if persona:
+            addition += (
+                "\n\n【依頼人「{npc}」について過去の会話から分かっていること】\n"
+                "client_statement の口ぶりと動機をこの人物像に沿わせること。\n"
+                "ただし、ここに書かれた事柄を依頼の中身にしてはならない"
+                "（依頼の中身は上の会話の記録だけから決める）。\n"
+                "--- 人物像 ---\n{persona}\n--- 人物像ここまで ---"
+            ).format(npc=mark["npc_name"] or "依頼人", persona=persona)
+
         merged = (area_description or "") + addition
-        write("inject: area_description {} -> {} chars (npc={!r})".format(
-            len(area_description or ""), len(merged), mark["npc_name"]))
+        write("inject: area_description {} -> {} chars (npc={!r}, persona={} chars)"
+              .format(len(area_description or ""), len(merged), mark["npc_name"],
+                      len(persona)))
         result = orig(world_overview, settlement_name, settlement_overview,
                       settlement_structure_description, merged,
                       quest_difficulty, *args, **kwargs)

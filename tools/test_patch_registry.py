@@ -337,7 +337,7 @@ def main():
 
         # 分割した mod を直して注入し直したとき、**中の部品も読み直される**こと。
         # 入口だけ読み直して部品を sys.modules に残すと、新しい入口が古い部品を
-        # 呼び続け、追加した関数が「無い」と言われる（実際に踏んだ。2026-08-03）。
+        # 呼び続け、追加した関数が「無い」と言われる。
         put("zebra/helper.py", "VALUE = 99\nFRESH = True\n")
         again = ml._load_mod_file(os.path.join(tmp_mods, "zebra", "whatever.py"))
         check(again.LOADED == 99,
@@ -721,7 +721,19 @@ def main():
 
     # 名乗りは mod.json から読む＝**mod のコードを1行も走らせずに**一覧が作れる。
     # GUI が他人の mod を並べるときに import せずに済む、という性質の確認。
-    short, incomplete, missing_entry = [], [], []
+    # 表示名の長さは検査しない（以前はここで幅を測っていた）。理由は2つある。
+    #
+    #   * 一覧の名前列は伸縮する（`gui.py` の COLUMNS は stretch=True）。固定幅で
+    #     切り落とされるわけではなく、窓を広げれば見えるし大きさは記憶される
+    #   * **測る対象がずれていた。** 行に描くのは mod.json の名前そのものではない
+    #     （superseded の MOD には `〔main_024 で本体が取込〕` が付く＝それだけで
+    #     旧上限を超える）。名前の側だけ短くしても、守りたかったものは守れない
+    #
+    # 実際にこの検査は、`121_ui_character_sheet` の正確な名前を弾いて
+    # 「検査を通すために名前を悪くする」方向に効いていた。名前は短く・詳細は
+    # description へ、という編集方針は残す価値があるが、それは書き方の約束
+    # （TECH.md）であって、機械が落とすべきずれではない。
+    incomplete, missing_entry = [], []
     for f in found:
         r = ml._manifest(mods_dir, f)
         if not os.path.isfile(os.path.join(mods_dir, f, r["entry"])):
@@ -729,18 +741,9 @@ def main():
         if not (r["version"] and r["author"] and r["description"]["en"]
                 and r["description"]["ja"] and r["name"]["en"] != f):
             incomplete.append(f)
-        # GUI の一覧に収まる長さか。全角は2文字ぶんとして数える。
-        # 上限は「一覧の名前列に置ける幅」の想定値（英語30 = 半角30文字、
-        # 日本語24 = 全角12文字）。長い説明は DESCRIPTION 側に置く。
-        for lang, limit in (("en", 30), ("ja", 24)):
-            text = r["name"][lang]
-            width = sum(2 if ord(c) > 0x2E80 else 1 for c in text)
-            if width > limit:
-                short.append("{} {} {}({})".format(f, lang, text, width))
     check(not incomplete, "全 mod が名乗りを持つ: {}".format(incomplete or "欠落なし"))
     check(not missing_entry,
           "全 mod の entry が実在する: {}".format(missing_entry or "欠落なし"))
-    check(not short, "表示名が一覧に収まる長さ: {}".format(short or "全て収まる"))
 
     # 並びが宣言と一致していること。順序は動作の前提なので、
     # 「順序ファイルに無くて末尾に回っている」状態を見逃さない。
@@ -762,6 +765,124 @@ def main():
     check(survey_result["order"] == [n for n in declared if n not in disabled],
           "適用順は宣言から無効なものを抜いた並び（切っている: {}）"
           .format(sorted(disabled) or "無し"))
+
+    print("=== 書き込み先（out/ と state/） ===")
+    # 役割で場所を分けているので、混ざっていないことと、置き場所を分ける前の
+    # `out/` に在るものを1度だけ引き取れることの2つを見る。
+    import shutil
+    import tempfile
+    sandbox = tempfile.mkdtemp(prefix="instantale_state_")
+    try:
+        s_out = os.path.join(sandbox, "out")
+        s_state = os.path.join(sandbox, "state")
+        sctx = ml.ModContext(s_out, os.path.join(_ROOT, "runtime"), s_state)
+
+        check(os.path.dirname(sctx.state_path("x.json"))
+              != os.path.dirname(sctx.out_path("x.log")),
+              "out_path と state_path は別のフォルダを指す")
+
+        # 引っ越し前の姿を作る: 永続データが out/ に在り、state/ には無い。
+        legacy = os.path.join(s_out, "legacy.json")
+        os.makedirs(s_out, exist_ok=True)
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write('{"kept": 1}')
+        moved = sctx.state_path("legacy.json")
+        check(os.path.exists(moved) and not os.path.exists(legacy),
+              "out/ に在った永続データは state/ へ移す（両方には残さない）")
+        with open(moved, encoding="utf-8") as fh:
+            check(fh.read() == '{"kept": 1}', "移した中身がそのまま読める")
+
+        # 2回目は何もしない。同じ名前のログが後から out/ にできても、
+        # 既に state/ 側が在れば触らない（上書きで巻き戻さないこと）。
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write("newer")
+        with open(moved, "w", encoding="utf-8") as fh:
+            fh.write('{"kept": 2}')
+        again = sctx.state_path("legacy.json")
+        with open(again, encoding="utf-8") as fh:
+            check(fh.read() == '{"kept": 2}',
+                  "state/ に在るものは out/ の同名ファイルで上書きされない")
+
+        # フォルダごとの引き取り（`311_` の `npc_profiles/`）。
+        os.makedirs(os.path.join(s_out, "bucket"), exist_ok=True)
+        with open(os.path.join(s_out, "bucket", "world.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("{}")
+        adopted = sctx.state_path("bucket")
+        check(os.path.isfile(os.path.join(adopted, "world.json"))
+              and not os.path.exists(os.path.join(s_out, "bucket")),
+              "フォルダも丸ごと引き取る（中のファイルを取り残さない）")
+
+        check(ml.state_dir(os.path.join(_ROOT, "runtime"))
+              == os.path.join(_ROOT, ml.STATE_DIR_NAME),
+              "既定の state/ は配布フォルダ直下（settings/ と同じ並び）")
+
+        # -- 壊れない書き方 ------------------------------------------------
+        # 残すデータは全てここを通す（`ctx.write_json` / `write_text`）。
+        # 素朴な open(..., "w") は開いた時点で切り詰めるので、途中で落ちると
+        # 中身が消える ― 読む側は壊れた JSON を {} に倒すため、消えたことに
+        # 気付けないまま次の更新で上書きされる。
+        print("=== 壊れない書き方（write_json / write_text） ===")
+        target = sctx.state_path("atomic.json")
+        check(sctx.write_json(target, {"a": 1}) is True,
+              "書けたら True を返す")
+        with open(target, encoding="utf-8") as fh:
+            check(json.load(fh) == {"a": 1}, "書いた内容がそのまま読める")
+
+        # 素直に書けない値でも `default=str` が文字列にして通す。**書けないより、
+        # 文字列になってでも残る方がよい**という判断なので、ここは成功が正しい。
+        check(sctx.write_json(target, {"odd": {1, 2}}) is True,
+              "JSON にできない値も文字列にして書く（default=str）")
+
+        # **途中で落ちても本体が無傷**であること。循環参照は `default` でも
+        # 救えないので、直列化の時点で失敗して書き込みまで到達しない。
+        loop = {}
+        loop["self"] = loop
+        before = open(target, encoding="utf-8").read()
+        check(sctx.write_json(target, loop) is False,
+              "書けなければ False を返す（例外を投げない）")
+        check(open(target, encoding="utf-8").read() == before,
+              "失敗しても元のファイルは無傷（切り詰められていない）")
+        check(not os.path.exists(target + ml.TEMP_SUFFIX),
+              "書きかけの .tmp を残さない")
+
+        # 置き換えであって追記ではない。短い内容で上書きしたときに前の内容が
+        # 尻に残らないこと（`os.replace` なので当然だが、規則として押さえる）。
+        sctx.write_json(target, {"long": "x" * 200})
+        sctx.write_json(target, {"s": 1})
+        with open(target, encoding="utf-8") as fh:
+            check(json.load(fh) == {"s": 1}, "短い内容で上書きしても前の内容が残らない")
+
+        # JSON にできない記録（1行1レコード）は write_text 側。
+        lines = sctx.state_path("lines.jsonl")
+        check(sctx.write_text(lines, '{"a":1}\n{"a":2}\n') is True,
+              "write_text も書けたら True")
+        with open(lines, encoding="utf-8") as fh:
+            check(len(fh.read().splitlines()) == 2, "1行1レコードで書ける")
+
+        # 親フォルダが無くても自分で作る（呼び出し側に makedirs を強いない）。
+        nested = os.path.join(s_state, "deep", "er", "n.json")
+        check(ml.write_json(nested, {"n": 1}) and os.path.isfile(nested),
+              "親フォルダが無ければ作ってから書く")
+
+        # **いちばん危ない窓**: 仮ファイルは書けたのに差し替えで落ちる場合。
+        # ここで本体が壊れると、隣に書く意味そのものが無くなる。
+        sctx.write_json(target, {"keep": "me"})
+        kept = open(target, encoding="utf-8").read()
+        saved_replace = ml.os.replace
+        ml.os.replace = lambda src, dst: (_ for _ in ()).throw(OSError("差し替え失敗"))
+        try:
+            check(sctx.write_json(target, {"lost": 1}) is False,
+                  "差し替えに失敗したら False")
+        finally:
+            ml.os.replace = saved_replace
+        check(open(target, encoding="utf-8").read() == kept,
+              "差し替えに失敗しても本体は前のまま")
+        check(not os.path.exists(target + ml.TEMP_SUFFIX),
+              "差し替えに失敗しても書きかけを片付ける")
+
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
 
     print()
     if _FAILS:

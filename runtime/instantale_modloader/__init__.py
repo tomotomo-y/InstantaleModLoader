@@ -24,16 +24,22 @@ mod は1フォルダで、名乗りは `mod.json`、中身は入口の `.py`:
             return orig(*args, **kwargs)
 
 `mod.json` は `entry` 以外すべて任意。名乗り（name / description / version / author）
-は書いてあればログと status() に出るだけだが、次の4つは動作に関わる:
+は書いてあればログと status() に出るだけだが、次の5つは動作に関わる:
 
     "api": 1                        前提にしているローダ API（下の API を参照）
     "after": ["101_fix_..."]         適用順の制約（_sort_dependencies）
     "settings": {...}               利用者が変えられる設定の宣言（config.py）
     "debug": true                   開発者向け。デバッグモードのときだけ動く（discover）
+    "superseded": "main_024"        本体がその版で同じ修正を取り込んだので降ろした
+
+`debug` と `superseded` は**読み込みの扱いが同じ**（どちらもデバッグモードのときだけ
+動く）。分けてあるのは伏せた理由が違うからで、GUI が表示で見分ける。計測のために
+作ったものと、要らなくなった修正とが同じ見た目で並んでいると、次にゲームが
+更新されたときに「どれを試しに戻すか」が分からなくなる。
 
 名乗りをコード側の変数ではなく JSON に置いているのは、**一覧を作るために mod を
 import しない**ため（GUI は無効な mod も壊れた mod も、走らせずに一覧へ出せる）。
-上の4つも同じ理由でここに置いてある。適用順も API の可否も伏せるかどうかも、
+上の5つも同じ理由でここに置いてある。適用順も API の可否も伏せるかどうかも、
 コードを1行も走らせる前に決まっていなければならない。
 
 ctx に何があるかは下の ModContext を参照。パッチの当て方は patch.py に
@@ -55,7 +61,7 @@ import time
 import traceback
 import uuid
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # mod との契約。`mod.json` の "api" がこれと突き合わされる。
 #
@@ -110,6 +116,101 @@ GAME_TOPLEVEL = {
 def is_game_module(name: str) -> bool:
     return name.split(".")[0] in GAME_TOPLEVEL
 
+
+# 配布フォルダ直下の書き込み先は3つある。**役割で分けてあり、混ぜない。**
+#
+#     settings/   利用者が決めたこと（mod の設定・GUI の覚え書き・デバッグモード）
+#     out/        mod が吐いたもの（ログ・リコン成果物・status.json）
+#     state/      mod が持つ永続データ（進行中の道中、依頼の出所、NPC の控え）
+#
+# 元は out/ が後ろ2つを兼ねていたが、性質が正反対だった。out/ は「消してよい・
+# 消せば静かになる」ものの置き場で、GUI は「ログを開く」の案内先として指し、
+# logrotate は注入のたびに中身を送る。永続データを同じ場所に置くと:
+#
+#   * 不具合報告で「out/ を消してから再現してください」と言えない
+#     （消すと進行中の依頼や NPC の記憶まで飛ぶ）
+#   * 世代管理の対象が「*.log だけ」という但し書きでしか守られない
+#   * 利用者が掃除のつもりで消したものが、遊びの続きだった
+#
+# 置き場所を分ければ、どちらも説明が1行で済む。out/ は捨ててよい。state/ は
+# セーブと同じ重みで残す。
+STATE_DIR_NAME = "state"
+
+
+def state_dir(runtime_dir: str) -> str:
+    """`state/` の場所。`runtime/` の1つ上＝配布フォルダ直下（`settings/` と同じ並び）。"""
+    return os.path.join(os.path.dirname(runtime_dir), STATE_DIR_NAME)
+
+
+#: 書きかけの一時ファイルに付ける拡張子。`write_json()` が使う。
+TEMP_SUFFIX = ".tmp"
+
+
+def write_text(path: str, text: str, *, report=None) -> bool:
+    """テキストを**壊れないように**書く。書けたら True、書けなければ False。
+
+    **残すデータを書くときは必ずここを通すこと。** `open(path, "w")` は開いた
+    時点でファイルを切り詰めるので、素朴に書くと書いている途中で落ちた瞬間に
+    中身が壊れる。読む側は壊れた JSON を黙って `{}` に倒すのが常なので、
+    **消えたことに気付けないまま次の更新で上書きされる**（NPC の記憶なら
+    1人ぶんだけが書かれ、他の全員が消える）。ゲームは落ちるものだという前提で
+    作っている（`001_crash_recorder` がある）以上、ここは落ちても壊れない形に
+    しておく必要がある。
+
+    やっていることは3つ:
+
+      1. 隣に `名前.tmp` として書く（本体は最後まで無傷）
+      2. `flush` + `fsync` で中身をディスクまで落とす。ここを省くと、電源断で
+         「差し替えは済んだが中身は空」になりうる
+      3. `os.replace` で差し替える。同じフォルダなので不可分に入れ替わる
+
+    **例外を投げない。** 呼ぶのはゲームのスレッドの中で、書けないことより
+    ゲームを巻き込むことの方が困る。成否は戻り値で返す（`311_` の
+    `save_bucket` が採っていた作法をここに寄せた）。
+
+    JSON なら `write_json()` を使う。こちらを直に使うのは、1行1レコードの
+    記録（`122_` の会話ログ）のように JSON 文書1つではないものを書くとき。
+    """
+    tmp = path + TEMP_SUFFIX
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        (report or log_exc)("cannot write {}".format(path))
+        try:
+            os.remove(tmp)      # 書きかけを残さない（残しても実害は無い）
+        except Exception:
+            pass
+        return False
+
+
+def write_json(path: str, data, *, indent: int = 1, sort_keys: bool = False,
+               report=None) -> bool:
+    """JSON を壊れないように書く。書けたら True、書けなければ False。
+
+    差し替えの作法は `write_text()` にある。分けてあるのは、**JSON にできない
+    記録**（1行1レコードの会話ログなど）にも同じ安全さが要るため ― 規則を
+    2箇所に書かないよう、土台はテキスト側に置いて JSON はその上に載せている。
+
+    `default=str` を付けてあるのは、記録に日時や `Path` が紛れても書けなく
+    ならないようにするため。**書けないより、文字列になってでも残る方がよい。**
+    """
+    try:
+        text = json.dumps(data, ensure_ascii=False, indent=indent,
+                          sort_keys=sort_keys, default=str) + "\n"
+    except Exception:
+        (report or log_exc)("cannot serialise {}".format(path))
+        return False
+    return write_text(path, text, report=report)
+
+
 # 「まだ import されていないモジュール」を待つ見張りの設定。
 # ゲームは LLM 系モジュールを最初のリクエストまで import しないので、
 # 起動直後に注入すると llama 系のフックが1つも載らない。詳しくは _arm_deferred。
@@ -125,6 +226,7 @@ _state: dict = {
     "api": API,
     "version": __version__,
     "out_dir": None,
+    "state_dir": None,
     "log_path": None,
     "mods": {},
     # mod フォルダ名 -> マニフェスト（名乗り / api / settings / 適用順の制約）。
@@ -219,6 +321,11 @@ class ModContext:
         ctx.log_exc(文字列) 例外をトレースバック付きで出す
         ctx.out_path(名前)  out/ 以下のパスを作る（親ディレクトリも作成）
 
+    書き込み先は2つあり、**役割で使い分ける**（STATE_DIR_NAME の説明を参照）:
+
+        ctx.out_path(名前)    ログ・調査の出力。消してよいもの
+        ctx.state_path(名前)  遊びの続きに要る永続データ。消すと巻き戻るもの
+
     それに加えて、1回だけ実行したい処理を預けられる:
 
         ctx.on_ready(関数)  プロセスにつき1回だけ、メインスレッドで実行する
@@ -230,9 +337,13 @@ class ModContext:
         ctx.api             ローダ API の番号（下位互換の分岐が要るとき用）
     """
 
-    def __init__(self, out_dir: str, runtime_dir: str):
+    def __init__(self, out_dir: str, runtime_dir: str, state_root: str | None = None):
         self.out_dir = out_dir
         self.runtime_dir = runtime_dir
+        # 既定は配布フォルダ直下の state/。オフライン検証が別の場所を指せるよう
+        # 引数でも受ける（out_dir と同じ扱い）。引数名を `state_dir` にしないのは、
+        # 場所を決める関数 `state_dir()` を中で呼べなくなるため。
+        self.state_dir = state_root or state_dir(runtime_dir)
         self.log = log
         self.log_exc = log_exc
         self.api = API
@@ -332,10 +443,78 @@ class ModContext:
         return True
 
     def out_path(self, *parts: str) -> str:
-        """out/ 以下のパスを返す。親ディレクトリは先に作っておく。"""
+        """out/ 以下のパスを返す。親ディレクトリは先に作っておく。
+
+        **消してよいもの**の置き場。ログ・調査の出力・status.json。注入のたびに
+        `tools/logrotate.py` が直下の `*.log` を1世代送る。遊びの続きに要るものは
+        `state_path()` へ。
+        """
         path = os.path.join(self.out_dir, *parts)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
+
+    def state_path(self, *parts: str) -> str:
+        """state/ 以下のパスを返す。親ディレクトリは先に作っておく。
+
+        **消すと巻き戻るもの**の置き場。進行中の道中、依頼の出所、NPC の控え。
+        セーブに書けない（または書きたくない）が、次に遊ぶときに要るデータ。
+
+        同じ名前が `out/` に在って `state/` に無ければ、**1度だけ移してくる**。
+        置き場所を分ける前に遊んでいた人の続きを、こちらで拾うため。移設は
+        `state/` 側が空のときだけなので、2回目以降は何もしない。
+        """
+        path = os.path.join(self.state_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            self._adopt_from_out(parts, path)
+        return path
+
+    def write_json(self, path: str, data, *, indent: int = 1) -> bool:
+        """JSON を壊れないように書く。書けたら True、書けなければ False。
+
+        **`state_path()` で取った場所へ書くときは必ずこれを使う。** 素朴に
+        `open(path, "w")` で書くと、途中で落ちた瞬間に控えが壊れる ― 読む側は
+        壊れた JSON を `{}` に倒すので、消えたことに気付けないまま次の更新で
+        上書きされる。詳しくはモジュール側の `write_text()` を参照。
+
+        失敗は例外ではなく戻り値で返る。記録にはこの MOD の名前が入るので、
+        どの MOD が書けなかったかがログから分かる。
+        """
+        return write_json(path, data, indent=indent, report=self.log_exc)
+
+    def write_text(self, path: str, text: str) -> bool:
+        """テキストを壊れないように書く。JSON なら `write_json()` を使う。
+
+        こちらを使うのは1行1レコードの記録のように、JSON 文書1つではないもの。
+        """
+        return write_text(path, text, report=self.log_exc)
+
+    def _adopt_from_out(self, parts: tuple, path: str) -> None:
+        """`out/<同じ名前>` が在れば `state/` へ移す（移設の跡はログに残す）。
+
+        コピーではなく移動にしてある。両方に残すと、次に読むのがどちらなのか
+        分からないファイルが `out/` に居座る（`out/` を消してよいという説明も
+        崩れる）。移せなかった場合は何もしない ― state/ 側が空のまま始まるだけで、
+        壊れるより巻き戻るほうがましなため。
+        """
+        legacy = os.path.join(self.out_dir, *parts)
+        if not os.path.exists(legacy) or os.path.abspath(legacy) == os.path.abspath(path):
+            return
+        try:
+            os.replace(legacy, path)
+        except OSError:
+            # ディレクトリの移設と、ドライブを跨ぐ場合。
+            try:
+                import shutil
+                shutil.move(legacy, path)
+            except Exception:
+                log_exc("state: cannot move {} to {}".format(legacy, path))
+                return
+        except Exception:
+            log_exc("state: cannot move {} to {}".format(legacy, path))
+            return
+        log("state: moved {} from out/ (kept as {})".format(
+            os.path.join(*parts), path))
 
     @property
     def mod_dir(self) -> str | None:
@@ -343,7 +522,8 @@ class ModContext:
 
             table = json.load(open(os.path.join(ctx.mod_dir, "data", "x.json")))
 
-        **読む専用**。書き込みは `ctx.out_path()`（out/ 以下）へ。mods/ は
+        **読む専用**。書き込みは `ctx.out_path()`（ログ）か `ctx.state_path()`
+        （永続データ）へ。mods/ は
         配布物そのもので、遊ぶ側が書き換わることを想定していない。
 
         apply() の外（`on_ready` の中など）では None になるので、フォルダを
@@ -365,13 +545,15 @@ class ModContext:
             "compiled    : {}\n"
             "modules     : {}\n"
             "out_dir     : {}\n"
+            "state_dir   : {}\n"
         ).format(sys.version.replace("\n", " "),
                  sys.executable,
                  # __compiled__ があれば Nuitka でビルドされたモジュール。
                  # 素の Python で動かしているのか、ゲームの中なのかの区別に使える。
                  "__compiled__" in dir(sys.modules.get("__main__", object())),
                  len(sys.modules),
-                 self.out_dir)
+                 self.out_dir,
+                 self.state_dir)
 
 
 # --------------------------------------------------------------------------
@@ -463,6 +645,7 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
          "disabled":  ["..."],                  切られているもの
          "debug":     {"200_probe_..."},        開発者向け。今は伏せられている
          "debug_mode": False,                   デバッグモードが入っているか
+         "superseded": {"101_...": "main_024"}, 本体が取り込んだので降ろしたもの
          "manifests": {名前: マニフェスト},      無効なものも壊れたものも含む
          "problems":  ["..."],                  宣言と実体のずれ。人が読む行
          "notes":     ["..."]}                  直すべきずれではない知らせ
@@ -487,7 +670,7 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
     if not os.path.isdir(mods_dir):
         return {"mods_dir": mods_dir, "order": [], "listed": [], "installed": [],
                 "disabled": [], "debug": set(), "debug_mode": False,
-                "manifests": {}, "notes": [],
+                "superseded": {}, "manifests": {}, "notes": [],
                 "problems": ["mods ディレクトリが無い: {}".format(mods_dir)]}
 
     installed = _installed(mods_dir)
@@ -500,7 +683,13 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
     debug_mode = (_config_module().debug_mode(os.path.dirname(mods_dir))
                   if debug is None else bool(debug))
     marked = {name for name in installed if (manifests[name] or {}).get("debug")}
-    hide = frozenset() if debug_mode else frozenset(marked)
+    # 本体が取り込んだので降ろした mod。伏せ方は計測系と同じだが、名前と一緒に
+    # 「どの版で取り込まれたか」を持ち回る（GUI がそこを表示で分ける）。
+    superseded = {name: (manifests[name] or {}).get("superseded")
+                  for name in installed
+                  if (manifests[name] or {}).get("superseded")}
+    hide = (frozenset() if debug_mode
+            else frozenset(marked) | frozenset(superseded))
 
     order, listed, disabled, problems, notes = _order(mods_dir, installed, hide)
 
@@ -519,6 +708,7 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
     return {"mods_dir": mods_dir, "order": order, "listed": listed,
             "installed": installed, "disabled": disabled,
             "debug": marked, "debug_mode": debug_mode,
+            "superseded": superseded,
             "manifests": manifests, "problems": problems, "notes": notes}
 
 
@@ -649,7 +839,7 @@ def _load_mod_file(path: str):
     # 読み直しているのに、`from . import panel` の相手は sys.modules に残るので、
     # 放っておくと **新しい入口 × 古い部品** で動く。分割した mod を直して
     # 注入し直したのに、入口が呼ぶ関数だけ古いままで AttributeError になる
-    # （`116_ui_party_expand` で実際に踏んだ。2026-08-03）。
+    # （分割した mod ＝ `116_` / `307_` / `309_` が該当する）。
     for cached in [key for key in sys.modules if key.startswith(name + ".")]:
         sys.modules.pop(cached, None)
     sys.modules[name] = module
@@ -740,6 +930,12 @@ def _manifest(mods_dir: str, name: str) -> dict:
         # 判定はここ＝**コードを読み込む前**に済む。名乗りと同じ理由で、外すために
         # 他人の mod を import することにならない。
         "debug": bool(data.get("debug")),
+        # ゲーム本体が同じ修正を取り込んだので降ろした mod。値はその版
+        # （例 "main_024"）。**読み込みの扱いは "debug" と同じ**で、違うのは
+        # 「なぜ伏せられているか」だけ ― 計測用に作ったものと、要らなくなった
+        # 修正とを一覧で見分けられないと、次にゲームが更新されたとき
+        # 「どれを試しに戻すか」が分からなくなる。
+        "superseded": text(data.get("superseded")),
         # 利用者が変えられる設定の宣言（config.py）。
         "settings": _config_module().normalize_decls(data.get("settings")),
     }
@@ -1025,6 +1221,10 @@ def boot(out_dir: str) -> dict:
 
     runtime_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ctx = ModContext(out_dir, runtime_dir)
+    # 場所は毎回ログに出す。out/ を消してくださいと頼めるのは、永続データが
+    # そこに無いと言い切れるときだけなので、どこを使っているかを残す。
+    _state["state_dir"] = ctx.state_dir
+    log("out {} | state {}".format(out_dir, ctx.state_dir))
 
     from . import config as _config
     from . import patch_registry as _registry
@@ -1179,16 +1379,10 @@ def write_status(out_dir: str | None = None) -> str | None:
     if not out_dir:
         return None
     path = os.path.join(out_dir, STATUS_NAME)
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(status(), fh, ensure_ascii=False, indent=2, default=str)
-            fh.write("\n")
-        return path
-    except Exception:
-        # 書けなくても boot は続ける。報告のためのファイルなので。
-        log_exc("cannot write {}".format(path))
-        return None
+    # 失っても次の注入で作り直される軽いファイルだが、書き方は他と揃える
+    # （「なぜここだけ素朴な open なのか」を残さない）。書けなくても boot は
+    # 続ける ― 報告のためのファイルなので、無くても遊べる。
+    return path if write_json(path, status(), indent=2) else None
 
 
 def unload(out_dir: str | None = None) -> dict:

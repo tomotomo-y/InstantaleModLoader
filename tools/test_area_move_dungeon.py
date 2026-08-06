@@ -39,6 +39,8 @@ OUT_DIR = os.path.normpath(os.path.join(HERE, os.pardir, "out", "test"))
 if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
+import instantale_modloader as ml                      # noqa: E402
+
 
 def find_mod(suffix):
     """mod を **番号を除いた名前** で探す（番号は振り直されることがある）。"""
@@ -457,6 +459,7 @@ def install_fake_functions(levels):
 class FakeCtx:
     def __init__(self, out_dir):
         self.out_dir = out_dir
+        self.state_dir = os.path.join(out_dir, "state")
         self.hooks = {}
         self.errors = []
         self.logs = []
@@ -466,11 +469,25 @@ class FakeCtx:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
+    def state_path(self, *parts):
+        """永続データの置き場。本番と同じく out/ とは**別のフォルダ**にする。"""
+        path = os.path.join(self.state_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
     def log(self, msg, level="INFO"):
         self.logs.append((level, msg))
 
     def log_exc(self, msg):
         self.errors.append(msg)
+
+    # 本物の `ctx.write_json` / `write_text` と同じものを使う。ここを自前の
+    # open(..., "w") にすると、テストだけが「壊れない書き方」を通らなくなる。
+    def write_json(self, path, data, *, indent=1):
+        return ml.write_json(path, data, indent=indent, report=self.log_exc)
+
+    def write_text(self, path, text):
+        return ml.write_text(path, text, report=self.log_exc)
 
     def wrap(self, target, **kw):
         def decorator(func):
@@ -516,7 +533,7 @@ def install(hooks, targets):
 HUD_CLS = install_fake_hud()
 CLOCK = install_fake_kivy()
 
-STATE_PATH = os.path.join(OUT_DIR, "road_travel.json")
+STATE_PATH = os.path.join(OUT_DIR, "state", "road_travel.json")
 LOG_PATH = os.path.join(OUT_DIR, "road_travel.log")
 
 

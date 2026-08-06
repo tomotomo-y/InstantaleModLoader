@@ -12,7 +12,7 @@
              `PhaseSpec` には自前クラス名を書かない
   生成     … ゲーム自身の `generate_random_quest()` を呼び、`area_description` に
              お題を足し、生成プロンプトの【討伐】を種類の札に差し替える
-  控え     … `out/test/mini_quests.json` に残り、**セーブには触らない**
+  控え     … `out/test/state/mini_quests.json` に残り、**セーブには触らない**
   進行     … 控えに在るクエストのときだけ referee プロンプトを書き換える。
              書き換えは system と user に**分かれて**入る（1メッセージに揃っていない）
   素通し   … 控えに無いクエスト・イベント処理・要約のプロンプトは1バイトも変えない
@@ -38,6 +38,8 @@ OUT_DIR = os.path.normpath(os.path.join(HERE, os.pardir, "out", "test"))
 
 if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
+
+import instantale_modloader as ml                      # noqa: E402
 
 
 def find_mod(suffix):
@@ -280,6 +282,7 @@ def install_fake_kivy():
 class FakeCtx:
     def __init__(self, out_dir):
         self.out_dir = out_dir
+        self.state_dir = os.path.join(out_dir, "state")
         self.hooks = {}
         self.errors = []
         self.logs = []
@@ -289,11 +292,25 @@ class FakeCtx:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
+    def state_path(self, *parts):
+        """永続データの置き場。本番と同じく out/ とは**別のフォルダ**にする。"""
+        path = os.path.join(self.state_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
     def log(self, msg, level="INFO"):
         self.logs.append((level, msg))
 
     def log_exc(self, msg):
         self.errors.append(msg)
+
+    # 本物の `ctx.write_json` / `write_text` と同じものを使う。ここを自前の
+    # open(..., "w") にすると、テストだけが「壊れない書き方」を通らなくなる。
+    def write_json(self, path, data, *, indent=1):
+        return ml.write_json(path, data, indent=indent, report=self.log_exc)
+
+    def write_text(self, path, text):
+        return ml.write_text(path, text, report=self.log_exc)
 
     def wrap(self, target, **kw):
         def decorator(func):
@@ -347,7 +364,7 @@ def setup(records=None):
     main.JustSetButtonToNormalPhase = JustSetButtonToNormalPhase
     main.PhaseSpec = PhaseSpec
 
-    record_path = os.path.join(OUT_DIR, "mini_quests.json")
+    record_path = os.path.join(OUT_DIR, "state", "mini_quests.json")
     os.makedirs(OUT_DIR, exist_ok=True)
     # ログは追記なので、消しておかないと**前回の実行の行を数えてしまう**
     # （「1度だけ記録する」の判定が実行のたびに増えて落ちた）。
@@ -565,7 +582,7 @@ check("知らない形なら何もしない（推測して壊さない）",
       MOD_MODULE.retire_to_return(object()) is False)
 check("形が読めなければ素通し（None も落ちない）",
       MOD_MODULE.retire_to_return({"game_master_statement": None}) is False)
-check("既定で有効（実機で2回外したので文面には頼らない）",
+check("既定で有効（文面での説得は効かないので戻り値で持つ）",
       MOD_MODULE.RETURN_INSTEAD_OF_RETIRE is True)
 
 # 実際のフック経由。控えに在る依頼のときだけ差し替わること。
@@ -718,7 +735,7 @@ check("解けば元の選択肢に戻る",
       _busy_app.hud.painted[-1] == ["A", "B"], _busy_app.hud.painted[-1])
 check("エラーを1件も出していない", ctx.errors == [], ctx.errors)
 
-record_path = os.path.join(OUT_DIR, "mini_quests.json")
+record_path = os.path.join(OUT_DIR, "state", "mini_quests.json")
 records = json.load(open(record_path, encoding="utf-8"))
 bucket = records.get("テスト世界", {})
 check("控えに残る", "44" in bucket, records)

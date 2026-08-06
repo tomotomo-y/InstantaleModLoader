@@ -98,7 +98,8 @@ from .journey import Journey
 
 LOG_BASENAME = "road_travel.log"
 
-# 進行中の道中の控え。**セーブには書かない。**
+# 進行中の道中の控え。**セーブには書かない。**置き場は `state/`
+# （`ctx.state_path`）。道中の途中で消えると、着くはずの街へ着けなくなる。
 STATE_BASENAME = "road_travel.json"
 
 # 確認画面に足すボタンの文字列。
@@ -109,7 +110,7 @@ ROAD_LABEL = "危険な道を行く"
 # ないので**印は落ちる**。落ちたものは下の印による重複判定をすり抜け、同じ
 # ボタンが2つ並んで復元された方は押しても無反応になる（`301_` で実際に起きた）。
 #
-# **ここは実機で観測した症状ではなく、保険**（2026-08-03）。`301_` / `309_` が
+# **ここは実機で観測した症状ではなく、保険。** `301_` / `309_` が
 # 踏んだのは `refresh_choice_buttons`（ゲームが組んだ一覧を塗り直すだけ）で、
 # こちらは徒歩・馬車が並び終えた後 ― 確認画面がそのつど一覧を組み直すビルド
 # なら残骸はゲーム自身が消している。組み直さないビルドがあっても壊れないよう、
@@ -288,7 +289,7 @@ def apply(ctx):
     screen = ui.Screen(ctx, write, tag="road travel", mark=MARK)
 
     # 道中の控え。注入し直しても前の層が書いたものを引き継ぐ（`journey.py`）。
-    journey = Journey(ctx.out_path(STATE_BASENAME), write,
+    journey = Journey(ctx.state_path(STATE_BASENAME), write,
                       ttl=PENDING_TTL, move_timeout=MOVE_TIMEOUT)
     journey.reload()
 

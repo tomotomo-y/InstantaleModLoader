@@ -65,12 +65,14 @@ import json
 import time
 
 from instantale_modloader import ui
+from instantale_modloader.state import world_key
 
 
 LOG_BASENAME = "mini_quest.log"
 
 # どの依頼がこの MOD 製かの控え。**セーブには書かない**（クエスト辞書に独自キーを
 # 足すとセーブに焼かれるうえ、再読み込み後に Quest がそのキーを持つ保証が無い）。
+# 置き場は `state/`（`ctx.state_path`）。消すと受注中の依頼が素の依頼に見える。
 RECORD_BASENAME = "mini_quests.json"
 
 # 掲示板に出すボタンの文言。
@@ -81,7 +83,7 @@ BOARD_LABEL = "軽い頼まれごとを探す"
 # ないので**印は落ちる**。落ちたものは下の印による重複判定をすり抜け、同じ
 # ボタンが2つ並んで復元された方は押しても無反応になる（`301_` で実際に起きた）。
 #
-# **ここは実機で観測した症状ではなく、保険**（2026-08-03）。`301_` / `309_` が
+# **ここは実機で観測した症状ではなく、保険。** `301_` / `309_` が
 # 踏んだのは `refresh_choice_buttons`（ゲームが組んだ一覧を塗り直すだけ）で、
 # こちらは掲示板が並び終えた後 ― 掲示板がそのつど一覧を組み直すビルドなら
 # 残骸はゲーム自身が消している。組み直さないビルドがあっても壊れないよう、
@@ -516,7 +518,7 @@ def _text(value, limit=120):
 # --------------------------------------------------------------------------
 def apply(ctx):
     log_path = ctx.out_path(LOG_BASENAME)
-    record_path = ctx.out_path(RECORD_BASENAME)
+    record_path = ctx.state_path(RECORD_BASENAME)
 
     state = {
         "pending": None,        # 生成待ちの印 {"kind": ..., "at": ...}
@@ -540,18 +542,6 @@ def apply(ctx):
     screen = ui.Screen(ctx, write, tag="mini quest", mark=MARK)
 
     # ------------------------------------------------------------ 控え
-    def world_key(app):
-        """世界を見分ける名前。取れなければ '_'（1世界しか使わない前提に落ちる）。"""
-        world_dict = getattr(app, "world_dict", None)
-        if isinstance(world_dict, dict):
-            data = world_dict.get("world_data")
-            if isinstance(data, dict):
-                for key in ("world_name", "name", "title"):
-                    value = data.get(key)
-                    if isinstance(value, str) and value:
-                        return value
-        name = getattr(getattr(app, "world", None), "name", None)
-        return name if isinstance(name, str) and name else "_"
 
     def load_records():
         try:
@@ -578,11 +568,9 @@ def apply(ctx):
             # 古いものから捨てる。id は採番順なので数値として並べられる。
             for stale in sorted(bucket, key=_id_sort)[:len(bucket) - MAX_RECORDS]:
                 bucket.pop(stale, None)
-        try:
-            with open(record_path, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=1)
-        except Exception:
-            ctx.log_exc("mini quest: cannot write {}".format(record_path))
+        # 途中で落ちても控えが壊れない書き方（`ctx.write_json`）。失敗は
+        # 例外ではなく戻り値で返るので、ここで捕まえる必要は無い。
+        ctx.write_json(record_path, data)
         state["titles"] = None      # 次の参照で読み直す
         write("remembered: quest {!r} {!r} kind={} world={!r}".format(
             quest_id, title, kind["key"], world_key(app)))

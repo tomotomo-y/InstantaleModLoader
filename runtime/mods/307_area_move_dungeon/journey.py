@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""進行中の道中の控え（`out/road_travel.json`）。**ゲームには触らない部分。**
+"""進行中の道中の控え（`state/road_travel.json`）。**ゲームには触らない部分。**
 
 危険な道は「押す → 生成 → 受注 → 踏破 → 移動」と長く、その間に
 ゲームの再起動も MOD の注入し直しも挟まりうる。だから状態は
@@ -24,6 +24,8 @@
 import json
 import os
 import time
+
+from instantale_modloader import write_json
 
 
 class Journey(object):
@@ -62,11 +64,13 @@ class Journey(object):
         return record
 
     def save(self):
-        try:
-            with open(self.path, "w", encoding="utf-8") as fh:
-                json.dump({"pending": self.record}, fh, ensure_ascii=False, indent=1)
-        except Exception:
-            self.write("WARN pending: cannot write {}".format(self.path))
+        # **この控えは注入をまたぐ。** 道中は「押す → 生成 → 受注 → 踏破 →
+        # 移動」と長く、その間にゲームの再起動も注入し直しも挟まりうる ―
+        # つまり落ちうる局面をまたいで書き続ける。素朴に open(..., "w") で
+        # 書くと、その瞬間に落ちれば道が切れる。差し替えの作法は
+        # `instantale_modloader.write_json` に一本化してある。
+        write_json(self.path, {"pending": self.record},
+                   report=lambda msg: self.write("WARN pending: " + msg))
         self._stat = self._file_stat()
 
     def reload(self):
