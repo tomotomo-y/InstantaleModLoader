@@ -45,5 +45,7 @@
     "311_npc_profile_memory",
     "1308_companion_travel"
   ],
-  "disabled": []
+  "disabled": [
+    "113_ui_text_expand"
+  ]
 }
