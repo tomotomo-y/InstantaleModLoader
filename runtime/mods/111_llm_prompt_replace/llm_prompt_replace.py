@@ -1,102 +1,69 @@
 # -*- coding: utf-8 -*-
 """LLM へ送る文章を、利用者が書いた置換ルールで書き換える。
 
-外部プロキシ（InstantaleLLMProxy）の `Proxy.Rules.cs` にある置換機能を、
-プロセスの中で同じ書式のまま動かす。**ルールファイルは流用できる**。
-プロキシ用に書いた `llm_replacements.txt` をそのまま読む（プロキシを入れて
-あれば探し出して読む。下の「ルールファイルの探索」）。
+外部プロキシ（InstantaleLLMProxy）の置換機能をプロセス内で同じ書式のまま動かす。
+プロキシ用に書いた `llm_replacements.txt` をこの MOD のフォルダへ置けばそのまま動く。
 
     置換前=>置換後            そのまま置き換える
     置換前=>置換後=>60        60% の確率で置き換える（0-100・省略時は 100）
     regex:正規表現=>$1…       置換前を正規表現として解釈する
     #tab:名前 / #offtab:名前  タブの区切り。`#offtab:` の中は全部無視
-    #off:… や行頭 #           コメント（プロキシ GUI の「有効」を外した行）
-    #memo:…                   ルールの覚え書き。`#` で始まるので読み飛ばす
+    #off:… や行頭 #           コメント（`#memo:…` も読み飛ばす）
 
-同じ「置換前」の行が複数あるときは**グループとして1回だけ抽選する**のもプロキシと
-同じ。確率の合計が 100 以下なら残りは無置換、100 を超えるなら `値/合計` の割合で
-必ずどれかに置き換わる。
+同じ「置換前」の行はグループとして**1回だけ抽選する**（プロキシと同じ。確率の合計が
+100 を超えるなら `値/合計` の割合で必ずどれかに置き換わる）。
 
 ## プロキシとの違い（同じルールでも扱いを変えている3点）
 
-プロキシが見ていたのは **HTTP ボディの文字列**、つまり `json.dumps` を通した後の
-JSON テキストだった。プロセスの中で見えるのは**復号済みの Python の文字列**なので、
-そのままでは同じルールが当たらない。
+プロキシは JSON エンコード後の HTTP ボディを見ていたが、ここで見えるのは復号済みの
+Python 文字列。そのままでは当たらないので:
 
-1. **`\\n` や `\\uXXXX` は実際の文字に直してから使う。** ボディの中では改行は
-   `\\n` の2文字で、日本語は `ensure_ascii=True` で `\\u3042` になっていた。
-   だから既存のルールには `…振ろう。\\n- narration:` のような書き方がある。
-   ここでは**置換後を必ず復号し**、置換前は「そのままの形」と「復号した形」の
-   両方を登録する（プロキシがエスケープ版を機械的に足していたのと同じ発想で、
-   向きが逆になっただけ）。**本物の `\\` を書きたいときは `\\\\`。**
-2. **正規表現の方言。** 置換後の `$1` / `${name}` / `$&` / `$$`（.NET）を
-   Python の後方参照へ読み替える。存在しない番号を指していたら、読み込み時に
-   警告して文字列として扱う（.NET と同じ挙動）。**パターン側は読み替えない**。
-   プロキシ向けの説明では「改行に当てるにはパターンに `\\\\n` と書く」（ボディの
-   中の `\\n` の2文字を狙う指定）だが、ここでは素直に `\\n` と書く。機械的に
-   直すと本物の `\\\\` を書いたパターンの意味が変わるので、変換はしない。
-3. **正規表現に時間制限が無い。** .NET には 1 秒のタイムアウトがあったが Python の
-   `re` には無く、途中で止められない。代わりに**照合に 1 秒以上かかったルールは
-   その場で捨てる**（`SLOW_REGEX_SECONDS`）。1回目の暴走は止められないので、
-   凝った後方参照や入れ子の繰り返しを書かないこと。
+1. **エスケープは復号してから使う。** 置換後は必ず復号し、置換前は素の形と復号形の
+   両方を登録する（`\\n` 入りの既存ルールを生かすため）。本物の `\\` は `\\\\`
+2. **置換後の `$1` / `${name}` / `$&` / `$$`（.NET）は Python の後方参照へ読み替える。**
+   存在しない番号は警告して文字列扱い。**パターン側は読み替えない**（改行は素直に `\\n`）
+3. **.NET の 1 秒タイムアウトの代わり**に、照合へ 1 秒以上かかった正規表現ルールを
+   以後捨てる（`SLOW_REGEX_SECONDS`。1回目の暴走だけは止められない）
 
 ## どこに仕掛けるか
 
-プロキシはゲームの外に居たので、送信の直前を1箇所で押さえられた。プロセスの中では
-経路が3つに分かれている（GAME.md §2.12）:
+`instantale_modloader.llm.wrap_outgoing` に渡すだけ。ローカル（llama.cpp）の
+3点も、クラウド（APIキー）の `llm_manager` 別名包みも、別名の後生えの見張りも、
+入れ子で通る地点を素通しする印も**あちらの担当**（v5 まではこのファイルが
+持っていたものを、`119_` が同じものを要ることになった時点でローダへ移した。
+TECH.md §3.2.3「写して回るものが出たら、それはローダの語彙」）。経路の実測と
+経緯は GAME.md §2.12 / VERIFICATION.md §2.24。
 
-    LlamaCppClient.chat                       messages（実際に流れるのはここ）
-    LlamaCppClient._apply_chat_template       messages（`102_` が使っている地点）
-    LlamaCppClient._post_with_model_loading_retry   payload["prompt"]（非ストリーム）
+こちらに残るのは**この MOD 固有の歯止め**1つだけ:
 
-どれが通るかはビルドと経路で変わるので3つとも仕掛ける。ただし**1回の推論で置換は
-1回だけ**にしないと、確率付きのルールが経路の数だけ抽選されて「60%」が
-60%にならない。そこで2重に歯止めを置く:
+  * **1回の推論で抽選は1回だけ。** 複数地点で抽選すると確率の分母が壊れる。
+    入れ子の地点はローダの印で素通しになるが、印が届かない別スレッド経路
+    （`chat` が返った後に別のスレッドが送る場合）は止められないので、
+    「自分が作った文章」のハッシュで二度目を止める（`306_` と同じ手口）。
+    `119_` は書き換えが冪等なので、あちらにこの受け皿は要らない
 
-  * **スレッドごとの印。** 外側のフックが置換したら、その呼び出しの間だけ印を立て、
-    内側のフックは素通しする（`306_` と同じ手口）
-  * **自分が作った文章を覚えておく。** 印が届かない経路（別スレッドで送る場合）でも、
-    同じ文字列が二度目に来たら触らない
+クラウド境界で見えるのは呼び出し側が渡した `message` だけで、send_request の中で
+足される部分（Gemini のスキーマ文など）には当たらない（GAME.md §1.8）。
 
-## 適用順
+## 適用順（`mod.json` の `after` / `before`）
 
-`105_`（スキーマ圧縮）より**後**に適用し、`305_`（ミニクエスト）より**前**に
-適用する（`mod.json` の `after` / `before`）。理由:
+`105_`（スキーマ圧縮）より後＝外側で、置換は**圧縮前**の本文を見る（「JSON安定化」
+タブがスキーマの repr を狙うため）。`305_`（ミニクエスト）より前＝内側で、あちらには
+書き換え前の本文を見せる（完全一致前提のため）。置換ルールが `103_` の目印を
+書き換えるとあちらが止まるのは、ルールを書く側の責任。
 
-  * `105_` の後＝**外側**なので、置換は**圧縮される前の本文**を見る。既存ルールの
-    「JSON安定化」タブ（`True=>true` など）はスキーマの repr を狙っているので、
-    先に圧縮されると当たらなくなる
-  * `305_` の前＝**内側**なので、`305_` は書き換えられていない本文を見る。あちらは
-    8つの文の完全一致を前提にしていて、**1つでも当たらなければ丸ごと諦める**
+## ルールファイル
 
-つまり置換ルールで `305_` の前提を壊すことはできない。逆に、置換ルールが
-`103_`（イベントログの削減）の目印「【今回のイベント内ログ】」を書き換えると
-あちらは何もしなくなる。ルールを書く側の責任。
+この MOD のフォルダの中だけ。**探索はしない**（TECH.md §3.1.1）:
 
-## ルールファイルの置き場所
+    llm_replacements.txt          利用者のルール。あればこちらを読む
+    llm_replacements.default.txt  同梱の既定。MOD 更新で上書きされるのはこちらだけ
+                                  （利用者のルールは配布物に無いので生き残る）
 
-この MOD のフォルダの中の2つだけ。**探索はしない**（MOD 単体の部品は MOD のフォルダで
-完結させる決まり: 外に出るのは `out\\` のログだけ。TECH.md §3.1.1）:
-
-    llm_replacements.txt          利用者のルール。**あればこちらを読む**
-    llm_replacements.default.txt  同梱の既定。利用者のものが無いときに読む
-
-2つに分けてあるのは、**MOD を新しい版に差し替えても利用者のルールが残る**ようにするため。
-更新で上書きされるのは配布物が持っているファイル（＝`.default.txt`）だけで、
-`llm_replacements.txt` は配布物に入っていないので生き残る。自分のルールを書くときは
-`.default.txt` を `llm_replacements.txt` としてコピーしてから編集する。プロキシ用に
-書いたファイルがあるなら、それを `llm_replacements.txt` として置けばそのまま動く。
-
-利用者のファイルを後から置いた（または消した）場合は、**次のリクエストで読む先が
-切り替わる**（切り替えは `[RULES]` に残る）。
-
-**変更はリクエストのたびに反映される**（更新時刻と大きさを見て読み直す）。保存の
-書き込み途中で読めなかった場合は前回のルールを使い続け、次のリクエストで再試行する。
-どちらも無ければ何もしない（置換しないだけで、警告にはしない）。
-
-`out\\prompt_bloat.log` に `[RULES]`（読込）・`[REPLACE]`（置換）・`[SKIP]`（確率で
-見送り）が出る。`102_` / `103_` / `105_` と同じファイルなので、置換と圧縮の
-どちらが先に効いたかが時系列で読める。
+変更は**リクエストのたびに反映**（更新時刻と大きさで読み直す。読めない間は前回の
+ルールで続け、無ければ何もしない）。`out\\prompt_bloat.log` に `[RULES]`（読込）・
+`[REPLACE]`（置換）・`[SKIP]`（確率で見送り）が出る。`102_` / `103_` / `105_` と
+同じファイルなので、置換と圧縮のどちらが先に効いたかを時系列で読める。
 """
 
 import collections
@@ -107,6 +74,8 @@ import random
 import re
 import threading
 import time
+
+from instantale_modloader.llm import wrap_outgoing
 
 # --------------------------------------------------------------------------
 # 設定（既定値。`mod.json` の "settings" が同じ値を宣言している）
@@ -128,11 +97,6 @@ OFFTAB_PREFIX = "#offtab:"
 SNIP_CHARS = 40              # ログに出す断片の長さ（プロキシの Snip と同じ）
 SLOW_REGEX_SECONDS = 1.0     # 照合にこれ以上かかった正規表現は以後使わない
 SEEN_TEXTS = 64              # 「自分が作った文章」を覚えておく件数
-
-# 仕掛ける先。3つとも `required=False`（ビルドによって無い可能性がある）。
-CHAT_TARGET = "llama_cpp_runtime_completion:LlamaCppClient.chat"
-TEMPLATE_TARGET = "llama_cpp_runtime_completion:LlamaCppClient._apply_chat_template"
-POST_TARGET = "llama_cpp_runtime_completion:LlamaCppClient._post_with_model_loading_retry"
 
 _RNG = random.Random()
 _RNG_LOCK = threading.Lock()
@@ -604,20 +568,8 @@ class RuleFile(object):
 # --------------------------------------------------------------------------
 # 「1回の推論で1回だけ」の歯止め
 # --------------------------------------------------------------------------
-_pass_local = threading.local()
-
-
-def begin_pass():
-    """このスレッドで既に置換したかを返し、印を立てる。"""
-    already = getattr(_pass_local, "active", False)
-    _pass_local.active = True
-    return already
-
-
-def end_pass(previous):
-    _pass_local.active = previous
-
-
+# 入れ子で通る地点を素通しする印はローダ側（`instantale_modloader.llm`）にある。
+# こちらが持つのは、その印が**届かない**場合の受け皿だけ。
 class Seen(object):
     """自分が作った文章を覚えておく輪。二度目に来たものは触らない。
 
@@ -651,15 +603,6 @@ class Seen(object):
             return self._mark(text) in self.marks
 
 
-def content_of(message):
-    """メッセージの本文。dict でなければ None（＝触らない）。"""
-    try:
-        content = message.get("content")
-    except Exception:
-        return None
-    return content if isinstance(content, str) else None
-
-
 # --------------------------------------------------------------------------
 # 注入
 # --------------------------------------------------------------------------
@@ -686,8 +629,12 @@ def apply(ctx):
 
     rules = RuleFile(mod_dir, report)
 
-    def run(site, texts):
-        """文章の並びにルールを当てる。変わらなければ None。"""
+    def run(texts, site):
+        """文章の並びにルールを当てる。変わらなければ None。
+
+        ローダ（`instantale_modloader.llm`）から、1回の推論で出ていく本文の
+        並びとして呼ばれる。引数の順はあちらの約束（`rewrite(texts, site)`）。
+        """
         groups = rules.current()
         if not groups:
             return None
@@ -727,98 +674,20 @@ def apply(ctx):
             result.append(new_text)
         return result if changed else None
 
-    def replace_messages(messages, site):
-        """messages の本文にルールを当てる。**元のリストは書き換えない**。
-
-        会話履歴としてゲーム側が同じ dict を持ち続けている可能性があるため、
-        浅い写しを作って差し替える（`105_` と同じ理由）。
-        """
-        if not isinstance(messages, list) or not messages:
-            return messages
-        spots = []
-        for index, message in enumerate(messages):
-            content = content_of(message)
-            if content:
-                spots.append((index, content))
-        if not spots:
-            return messages
-
-        result = run(site, [content for _index, content in spots])
-        if result is None:
-            return messages
-
-        new_messages = list(messages)
-        for (index, before), after in zip(spots, result):
-            if after == before:
-                continue
-            replacement = dict(new_messages[index])
-            replacement["content"] = after
-            new_messages[index] = replacement
-        return new_messages
-
-    def safely(what, fn, fallback):
-        try:
-            return fn()
-        except Exception:
-            # 置換に失敗しても文章はそのまま送る。ここで止める方が損害が大きい。
-            ctx.log_exc("replace: {} pass failed; sending the text untouched".format(what))
-            return fallback
-
-    # ------------------------------------------------------- chat（実際の経路）
-    @ctx.wrap(CHAT_TARGET, required=False)
-    def chat(orig, self, model, messages, format=None, *args, **kwargs):
-        previous = begin_pass()
-        try:
-            if not previous:
-                messages = safely("chat", lambda: replace_messages(messages, "chat"),
-                                  messages)
-            return orig(self, model, messages, format, *args, **kwargs)
-        finally:
-            end_pass(previous)
-
-    # ------------------------------------------ messages（102_ と同じ地点・保険）
-    @ctx.wrap(TEMPLATE_TARGET, required=False)
-    def apply_chat_template(orig, self, model, messages, timeout=None, *args, **kwargs):
-        previous = begin_pass()
-        try:
-            if not previous:
-                messages = safely("template",
-                                  lambda: replace_messages(messages, "template"),
-                                  messages)
-            return orig(self, model, messages, timeout, *args, **kwargs)
-        finally:
-            end_pass(previous)
-
-    # ------------------------------------------- payload（プロキシと同位置・保険）
-    @ctx.wrap(POST_TARGET, required=False)
-    def post_with_retry(orig, self, url, payload, timeout=None, *args, **kwargs):
-        previous = begin_pass()
-        try:
-            if not previous and isinstance(payload, dict):
-                prompt = payload.get("prompt")
-                if isinstance(prompt, str) and prompt:
-                    result = safely("payload", lambda: run("payload", [prompt]), None)
-                    if result and result[0] != prompt:
-                        # 呼び出し元の dict は変えず、浅い写しを渡す。
-                        payload = dict(payload)
-                        payload["prompt"] = result[0]
-            return orig(self, url, payload, timeout, *args, **kwargs)
-        finally:
-            end_pass(previous)
+    # 仕掛ける場所はローダの担当（`instantale_modloader.llm`）。ローカルの3点も
+    # クラウドの `llm_manager` 別名も、別名の後生えの見張りも向こうにある。
+    # こちらが渡すのは「この並びをどう書き換えるか」だけ。
+    hooks = wrap_outgoing(
+        ctx, run, label="prompt replace",
+        on_arm=lambda target: report(
+            "[RULES] 遅れて仕掛けた: {}".format(target), force=True))
 
     # 注入した時点で、作ったデータで正しさを確かめておく。実経路はゲームが LLM を
     # 呼ぶまで通らず、起動直後に通る保証が無いため（102_ / 105_ と同じ方針）。
     _verify(ctx)
 
     # どこに仕掛かったかと、どのルールファイルを読むのかを残す。
-    armed = []
-    for target in (CHAT_TARGET, TEMPLATE_TARGET, POST_TARGET):
-        try:
-            _owner, _name, value = ctx.resolve(target)
-        except Exception:
-            value = None
-        if value is not None:
-            armed.append(target.rpartition(".")[2])
+    armed = hooks.armed()
     groups = rules.current()
     ctx.log("prompt replace: armed on {} | {} | log {}".format(
         ", ".join(armed) if armed else "nothing (targets missing)",

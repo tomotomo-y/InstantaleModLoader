@@ -14,7 +14,9 @@
   打ち間違 … @patch は存在しない名前を黙って新設しない
   巻き戻し … apply() が例外で抜けても「実行中の MOD」が残らない
   1回きり  … on_ready は再 boot（再注入・当て直し）をまたいでも1回しか走らない
+  降り方   … ctx.superseded() が「次の boot」と「ローダごと読み直し」の両方で立つ
   無害化   … on_ready の中の例外はゲームへ漏らさない
+  読み分け … read_json は「無い」と「在るのに読めない」を区別し、後者を記録する
   探索     … mod.json を持つフォルダだけを拾い、入口の名前は mod.json が決める
   適用順   … load_order.json に従い、未記載は末尾・実体なしは飛ばす・壊れても動く
   名乗り   … mod.json の読み取り、英日の穴埋め、欠落時の既定値
@@ -450,7 +452,7 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("=== デバッグモード（開発者向けの MOD を伏せる）===")
-    # 実物と同じ配置を丸ごと作る。`settings/` は **runtime の隣**（TECH.md §3.2.4）
+    # 実物と同じ配置を丸ごと作る。`settings/` は **runtime の隣**（TECH.md §3.2.5）
     # なので、`runtime/mods` だけの temp では書き出し先がシステムの temp 直下に
     # なってしまう。配布物1つ分を temp に作って、その中で閉じる。
     dist = tempfile.mkdtemp(prefix="instantale_dist_")
@@ -650,6 +652,22 @@ def main():
     check(Holder().method(5) == ("method", 5),
           "メソッド対象でも self を保ったまま元に落ちる")
 
+    # `required=False` で**属性を新設**した patch が safe=True で壊れた場合。
+    # 元の実装が無い（old=None）ので、落とす先も無い ― ここで `None(...)` を
+    # 呼ぶと TypeError がゲームへ抜けて、safe の約束が破れる（踏む前に塞いだ）。
+    P.set_generation("gen_safe_new")
+
+    @P.patch("fakegame:invented", required=False, safe=True)
+    def invented():
+        raise RuntimeError("新設した側が壊れた")
+
+    try:
+        result = victim.invented()
+        check(result is None,
+              "新設＋safe で壊れても None に落ちる: {!r}".format(result))
+    except BaseException as exc:
+        check(False, "新設＋safe の例外がゲームへ抜けた: {!r}".format(exc))
+
     print("=== revert（注入をまたいで剥がせる）===")
     # 前の節に触られていない対象を使う。target_a には gen1 の層が乗っている。
     P.set_generation("gen_revert")
@@ -714,10 +732,23 @@ def main():
     on_disk = sorted(d for d in os.listdir(mods_dir)
                      if not d.startswith(("_", "."))
                      and os.path.isfile(os.path.join(mods_dir, d, "mod.json")))
-    check(sorted(found) == on_disk,
+    # 「全部見つかるか」は `installed`（在るもの全部）で見る。`listed` は一覧に
+    # 出す順で、宣言に無い開発中の mod（9xx）はそこから外れている ―
+    # GUI の保存で `load_order.json` に混ざらないようにするため（§2.6）。
+    installed = survey_result["installed"]
+    check(sorted(installed) == on_disk,
           "mod.json を持つフォルダが全て見つかる（{} 個）".format(len(on_disk)))
-    check(all(os.path.isdir(os.path.join(mods_dir, f)) for f in found),
+    check(all(os.path.isdir(os.path.join(mods_dir, f)) for f in installed),
           "見つかるのは全てフォルダ（単一ファイルの mod は残っていない）")
+
+    # 開発中の mod（9xx。TECH.md §2.6）は `load_order.json` にも配布物にも
+    # 入らない。以下の「同梱 mod として揃っているか」の検査からは外す ―
+    # 書きかけの一本でリリースする側の検査が止まらないようにするため。
+    # **外した名前は必ず出す。** 黙って減らすと、宣言の抜けを見逃す検査になる。
+    wip = [f for f in found if ml.is_wip(f)]
+    if wip:
+        print("  note 開発中のため同梱の検査から外す: {}".format(", ".join(wip)))
+    found = [f for f in found if f not in wip]
 
     # 名乗りは mod.json から読む＝**mod のコードを1行も走らせずに**一覧が作れる。
     # GUI が他人の mod を並べるときに import せずに済む、という性質の確認。
@@ -754,8 +785,12 @@ def main():
     order_file = ml.order_path(mods_dir)
     with open(order_file, encoding="utf-8") as fh:
         declared = json.load(fh)["order"]
-    check(found == declared,
-          "並びが {} の宣言どおり".format(os.path.basename(order_file)))
+    # 宣言の側からも開発中の mod を抜く。手元の `load_order.local.json` は
+    # 9xx を名指ししている（そうしないと動かない）ので、片側だけ抜くと今度は
+    # 手元でだけ赤くなる。
+    check(found == [n for n in declared if not ml.is_wip(n)],
+          "並びが {} の宣言どおり（開発中を除く）"
+          .format(os.path.basename(order_file)))
 
     # 適用順は「宣言の並びから、切られているものを抜いたもの」。切った mod が
     # 落ちること・**残りの順序が入れ替わらないこと**の両方をここで見る
@@ -765,6 +800,41 @@ def main():
     check(survey_result["order"] == [n for n in declared if n not in disabled],
           "適用順は宣言から無効なものを抜いた並び（切っている: {}）"
           .format(sorted(disabled) or "無し"))
+
+    print("=== superseded（自分より新しい注入が来たか）===")
+    # 自前のスレッドと Clock の繰り返しは `revert_all()` では止まらないので、
+    # 「降りるべきか」を MOD が自分で判定できる必要がある（§3.6.1）。
+    # 判定は2つあり、**片方だけでは足りない**。
+    saved_generation = ml._state.get("generation")
+    try:
+        ml._state["generation"] = "gen-now"
+        live = ml.ModContext(out_dir, os.path.join(_ROOT, "runtime"))
+        check(live.generation == "gen-now", "ctx は作られた時点の世代を控える")
+        check(live.superseded() is False, "同じ世代のあいだは降りない")
+
+        # 1. 同じローダで次の boot が走った（遅延当て直し・再注入）。
+        ml._state["generation"] = "gen-next"
+        check(live.superseded() is True, "次の boot が来たら降りる")
+
+        # 2. 注入し直してローダごと読み込み直された場合。古い ctx が握って
+        #    いる `_state` はもう誰も更新しないので、世代の比較だけでは
+        #    永遠に「まだ現役」に見える。**ここが自前の合言葉で抜けやすい**。
+        ml._state["generation"] = "gen-now"
+        check(live.superseded() is False, "戻せば現役（次の検査の前提）")
+        reloaded = types.ModuleType(ml.__name__)
+        reloaded._state = {"generation": "gen-now"}   # 別インスタンス＝読み直し後
+        saved_module = sys.modules[ml.__name__]
+        sys.modules[ml.__name__] = reloaded
+        try:
+            check(live.superseded() is True,
+                  "ローダごと読み直されたら、世代が同じでも降りる")
+        finally:
+            sys.modules[ml.__name__] = saved_module
+    finally:
+        if saved_generation is None:
+            ml._state.pop("generation", None)
+        else:
+            ml._state["generation"] = saved_generation
 
     print("=== 書き込み先（out/ と state/） ===")
     # 役割で場所を分けているので、混ざっていないことと、置き場所を分ける前の
@@ -880,6 +950,22 @@ def main():
               "差し替えに失敗しても本体は前のまま")
         check(not os.path.exists(target + ml.TEMP_SUFFIX),
               "差し替えに失敗しても書きかけを片付ける")
+
+        # -- 読み側（read_json）。「無い」と「在るのに読めない」を区別する --
+        fresh = os.path.join(sandbox, "read", "data.json")
+        silent = []
+        check(ml.read_json(fresh, {"d": 1}, report=silent.append) == {"d": 1},
+              "無いファイルは default に倒す")
+        check(not silent, "無いだけ（初回）なら記録しない")
+        sctx.write_json(fresh, {"x": 1})
+        check(sctx.read_json(fresh) == {"x": 1}, "書いたものがそのまま読める")
+        with open(fresh, "w", encoding="utf-8") as fh:
+            fh.write("{broken")      # 外部要因で壊れた控えを装う
+        told = []
+        check(ml.read_json(fresh, {}, report=told.append) == {},
+              "壊れていても default に倒す（mod は止めない）")
+        check(told and "cannot read" in told[0],
+              "ただし黙らない ― 消えたことが後から追える")
 
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)

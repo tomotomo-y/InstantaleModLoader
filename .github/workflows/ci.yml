@@ -44,8 +44,15 @@ jobs:
 
       # runtime/ だけが対象。tools/ は利用者の Python（3.13）で動くもので、
       # ゲームの中には入らないため 3.10 に縛る必要が無い。
+      #
+      # `-x` で外しているのは開発中の mod（9xx。TECH.md §2.6）。配布物にも
+      # `load_order.json` にも入らないものなので、書きかけの一本でリリースする側の
+      # 検査を止めない。除外は**番号帯という決まった形**で、個別の「既知の失敗」
+      # 一覧ではない ― リリースするときに正式な番号へ振り直せば自動で対象に戻る。
+      # `mods.9..._` の `.` は区切り記号（Windows は \\、それ以外は /）を
+      # どちらでも受けるため。
       - name: compileall runtime (3.10)
-        run: python -m compileall -q runtime
+        run: python -m compileall -q runtime -x "mods.9[0-9][0-9]_"
 
   # ------------------------------------------------------------------
   # 利用者の環境（3.13）で、静的検査とオフライン検証を通す。
@@ -59,8 +66,10 @@ jobs:
         with:
           python-version: "3.13"
 
+      # 開発中の mod（9xx）と、その検査（`test_wip_*.py`）は外す。理由は 3.10 の
+      # ジョブと同じ。
       - name: compileall
-        run: python -m compileall -q runtime tools
+        run: python -m compileall -q runtime tools -x "(mods.9[0-9][0-9]_|test_wip_)"
 
       # デコレータの対象と引数の食い違い、mod.json の entry、load_order の
       # 突き合わせ。構文が正しくてもゲームを落とすものはここで捕まる。
@@ -70,15 +79,32 @@ jobs:
       # tools/test_*.py は全てゲーム不要（偽のゲームを差し込んで走る）。
       # **1本でも落ちたら失敗**。除外一覧は置かない ― 一度置くと、そこに
       # 積まれたものが直ったかどうか誰も見なくなる。
+      #
+      # 出力は捨てずに控え、落ちた本のぶんだけ吐く。落ちるものの中には
+      # **手元では再現せずランナーでだけ出るもの**（背景スレッドの待ちが
+      # 間に合わない等）があり、名前だけ残しても手掛かりにならない。
+      # 通った本は今までどおり1行だけ。
       - name: offline tests
         shell: pwsh
         run: |
+          # `test_wip_*.py` は開発中の mod（9xx。TECH.md §2.6）の検査。CI では
+          # 走らせないが、**外したことは必ず出す** ― 黙って減らすと「全部通った」
+          # と読めてしまう。
+          $wip = Get-ChildItem tools/test_wip_*.py -ErrorAction SilentlyContinue |
+                 Sort-Object Name
+          foreach ($w in $wip) { Write-Host "  skip  $($w.BaseName)  (開発中)" }
+
           $failed = @()
-          foreach ($f in Get-ChildItem tools/test_*.py | Sort-Object Name) {
-            python $f.FullName > $null 2>&1
+          foreach ($f in Get-ChildItem tools/test_*.py |
+                         Where-Object { $_.Name -notlike 'test_wip_*' } |
+                         Sort-Object Name) {
+            $out = & python $f.FullName 2>&1
             if ($LASTEXITCODE -ne 0) {
               $failed += $f.BaseName
               Write-Host "  FAIL  $($f.BaseName)"
+              Write-Host "::group::$($f.BaseName) の出力"
+              $out | ForEach-Object { Write-Host $_ }
+              Write-Host "::endgroup::"
             } else {
               Write-Host "  ok    $($f.BaseName)"
             }
@@ -86,7 +112,7 @@ jobs:
           if ($failed) {
             Write-Host ""
             Write-Host "失敗: $($failed -join ', ')"
-            Write-Host "内容を見るには手元で該当のスクリプトを直接実行する。"
+            Write-Host "各本の出力は上の折り畳みに入っている。"
             exit 1
           }
 

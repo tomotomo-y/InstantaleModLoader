@@ -89,7 +89,7 @@ runtime/mods/load_order.json  適用順（"order"）と無効一覧（"disabled"
 runtime/mods/load_order.local.json  手元だけの適用順。在れば上に優先（git 管理外）
 settings/         利用者が変えたものだけ（無くてよい）
                   mod_settings.json … MOD の設定 / gui.json … ゲームの場所・窓の位置
-                  loader.json … デバッグモード（GUI とローダの両方が読む。§3.2.4）
+                  loader.json … デバッグモード（GUI とローダの両方が読む。§3.2.5）
 out/              ログ・リコン成果物・status.json（最後の boot の結果）。消してよい
 state/            MOD が持つ永続データ（§3.11）。消すと遊びが巻き戻る
 tools/            上記に加え、オフライン検証・セーブ操作（ゲーム不要）
@@ -108,8 +108,9 @@ found["order"]      # 有効な MOD。適用順（依存の制約も解決済み
 found["listed"]     # 一覧に出す順。無効なものも宣言された位置に含む
 found["manifests"]  # 名乗り・api・settings・依存（MOD のコードは import しない）
 found["debug"]      # "debug": true の MOD。デバッグモードが切なら order に居ない
-found["debug_mode"] # デバッグモードが入っているか（settings/loader.json。§3.2.4）
+found["debug_mode"] # デバッグモードが入っているか（settings/loader.json。§3.2.5）
 found["superseded"] # {MOD 名: 取り込まれた版}。伏せ方は debug と同じ
+found["wip"]        # 開発中（9xx）。順序ファイルに名前が無ければ読まない（§2.6）
 found["problems"]   # 宣言と実体のずれ。人が読む行
 found["notes"]      # 直すべきずれではない知らせ（手元用の順序ファイルを使っている等）
 ```
@@ -181,24 +182,22 @@ MOD が持つ永続データはそもそも `out/` に来ない（`state/`。§3
 python -m compileall -q runtime tools
 python tools/check_mods.py
 
-# 2. 該当するオフライン検証（ゲーム不要）
-python tools/test_patch_registry.py    # ローダ本体（台帳 / on_ready / 名乗り）
-python tools/test_state.py             # state/ の住所と壊れない書き込み
-python tools/test_arrival_event.py     # 300_
-python tools/test_quest_offer.py       # 301_
-python tools/test_party_leave.py       # 302_
-python tools/test_quest_end_guild.py   # 303_
-python tools/test_quest_end_keep.py    # 304_
-python tools/test_item_detail_autosize.py     # 109_
-python tools/test_character_name_sanitize.py  # 110_
+# 2. オフライン検証（ゲーム不要）。CI と同じく全件を走らせる
+Get-ChildItem tools/test_*.py | Sort-Object Name | ForEach-Object {
+  python $_.FullName > $null 2>&1
+  if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL  $($_.BaseName)" }
+  else                     { Write-Host "  ok    $($_.BaseName)" }
+}
+
+# 直している最中は、触った MOD のものだけを直接叩けばよい（落ちた内容が読める）
+python tools/test_patch_registry.py           # ローダ本体（台帳 / on_ready / 名乗り）
+python tools/test_state.py                    # state/ の住所と壊れない書き込み
+python tools/test_recon_archive.py            # 000_（リコンの退避が走る条件と名前）
 python tools/test_llm_prompt_replace.py       # 111_
-python tools/test_ui_text_spacing.py          # 112_
-python tools/test_ui_text_expand.py           # 113_
-python tools/test_ui_input_focus.py           # 114_
-python tools/test_ui_item_list_fit.py         # 115_
 python tools/test_ui_conversation_log.py      # 122_（113_ との並びの取り決めもここで見る）
-python tools/test_office_pardon.py     # 309_
-python tools/test_npc_profile_memory.py       # 311_（`301_` との取り決めもここで見る）
+python tools/test_new_character_level.py      # 123_
+python tools/test_npc_profile_memory.py       # 311_（301_ との取り決めもここで見る）
+python tools/test_event_ability_check.py      # 313_
 
 # 3. ローダ全体が読めるかの確認（フックは大半が保留になるが、import と apply() の失敗が出る）
 python -c "import sys; sys.path.insert(0,'runtime'); import instantale_modloader as l; print(l.boot('out/test/bootcheck'))"
@@ -266,8 +265,51 @@ Windows 専用（注入が Win32 API を直接叩く）で、Linux では実際�
 除外一覧は置いていない。`tools/test_*.py` は1本でも落ちたら CI が失敗する。
 「既知の失敗」の枠を作ると、そこに積まれたものが直ったかどうか誰も見なくなるため。
 
+**落ちた本は出力をそのまま吐く**（折り畳み1つ）。通った本は1行だけ。名前しか
+残さない作りにしていたところ、**手元では再現しない失敗**が出て手掛かりが何も
+残らなかったため（VERIFICATION.md §4「CI だけで落ちるもの」）。上の「手元で通った
+ものは CI でも通る」は**コマンドが同じという意味**で、環境まで同じという意味では
+ない ― 背景スレッドの待ちのように、ランナーの速さで結果が変わるものはありうる。
+
 `packaging` が zip の中身まで見るのは、`LICENSE` の入っていない配布物は誰も合法的に
 再配布できないから。MIT は著作権表示が複製に付いて回ることを要求する。
+
+**開発中の MOD（9xx）と `test_wip_*.py` だけは外してある**（§2.6）。これは番号帯と
+いう決まった形での除外で、「既知の失敗」の一覧ではない ― 正式な番号へ振り直した
+瞬間に、何もしなくても検査の対象へ戻る。外したものは CI のログに `skip` として出る。
+
+### 2.6 開発中の MOD（900番台）
+
+**まだ実機で確かめていない・作りかけの MOD は `900`〜`999` で採番する。**
+リリースすると決めたときに、番号帯に応じた正式な番号へ振り直す。
+
+| | 入れる | 入れない |
+|---|---|---|
+| Git | ○ 普通にコミットする | |
+| `load_order.local.json`（手元） | ○ ここに書けば手元では動く（§1.3） | |
+| `load_order.json`（配布の適用順） | | × |
+| 配布物（`make_dist.bat`） | | × `load_order.json` に無いものは staging から落ちる |
+| CI | | × `compileall` の `-x`、`check_mods.py` は `note` 扱い、`tools/test_wip_*.py` は走らせない |
+| `docs/MODS.md` | | × 同梱している MOD の一覧なので、載せると利用者が探して見つからない |
+
+**文書は MOD のフォルダに `DOC.md` として置く。** 遊び方も検証の記録も、`docs/` の
+4冊に書かずにそこへ書く。9xx は配布物に入らないので、その1枚も外へ出て行かない。
+リリースのときに各節を元の場所（`MODS.md` / `VERIFICATION.md` / `GAME.md` /
+`TECH.md`）へ戻す ― どの節をどこへ戻すかは `DOC.md` の先頭に表として持たせておく。
+検査は `tools/test_wip_<名前>.py` に置き、同じタイミングで `tools/test_<名前>.py`
+へ改名する。
+
+ローダ側の扱いは `is_wip()` の1箇所（`instantale_modloader/__init__.py`）。
+**順序ファイルに名前があれば普通に読み込み、無ければ黙って外す。**
+「`load_order.json` に記載の無い MOD」として報告しないのは、配布物に入らない
+ものを利用者の画面で警告しても直しようが無いため ― 伏せた mod を報告しない
+`debug` / `superseded` と同じ考え方（§3.2.5）。
+
+> **なぜ `mod.json` の旗ではなく番号帯なのか。** `debug` や `superseded` は
+> 「配るが伏せる」ので、旗を立てたまま何年でも同梱される。9xx は逆で、
+> **リリースする＝必ずフォルダ名を変える**。旗だと消し忘れたまま配ってしまうが、
+> 番号は変えない限り配布物に入らないので、消し忘れが事故にならない。
+> フォルダ一覧を見ただけで「これは配らない」と分かる利点もある。
 
 ---
 
@@ -297,9 +339,19 @@ InstantaleModLoader.bat        # GUI からゲームを起動して注入する�
 | `out/recon/targets.txt` | これが本命。`module:qualname(signature)` 形式で 1,585 件。`@ctx.wrap` にそのまま貼れる |
 | `out/recon/game_modules.txt` | ゲーム自身のモジュールの全属性ダンプ。擬似ソースとして読む |
 | `out/recon/modules.json` | 機械可読のインベントリ |
+| `out/recon/build.json` | このダンプが**どのビルドを見たものか**（Epic の版・ゲームの版・各ファイルの sha256） |
 
 読み方と、スキャンで見つからないもの（ネスト関数・クラスのメソッド）は
 [GAME.md §1](GAME.md) に集約してある。
+
+`out/recon/` は毎回同じ名前で上書きされるが、`build.json` と突き合わせて
+**ゲームが更新されていれば、上書きの前に前回ぶんが
+`out/recon_snapshots/<版>_<日付>.zip` へ退避される**。更新の前後で
+`targets.txt` を突き合わせれば、増えた対象・消えた対象がそのまま出る
+（GAME.md §1.5 に、退避があった版とそうでない版の実例がある）。退避が走るのは
+版が変わったときだけで、中身の差では走らない ― リコンは `sys.modules` を見るので
+**同じ版でも起動直後と長時間プレイ後で中身が変わる**（3452 と 4235）。中身の差を
+引き金にすると同じ版の zip が毎回増え、肝心の1回が埋もれる。
 
 #### 手順 1. 雛形をコピーする
 
@@ -494,13 +546,16 @@ def apply(ctx):
 | `ctx.log(...)` / `ctx.log_exc(...)` | `out/modloader.log` へ |
 | `ctx.out_path(name)` | `out/<name>` の絶対パス。MOD 専用ログはここへ（§3.11） |
 | `ctx.state_path(name)` | `state/<name>` の絶対パス。遊びの続きに要るデータはここへ（§3.11） |
+| `ctx.read_json(path, default)` | JSON を読む。無ければ `default`、**在るのに読めなければ**記録してから `default`（§3.11.1） |
 | `ctx.write_json(path, data)` | 落ちても壊れないように書く。成否を返す（§3.11.1）。**残すデータは必ずこれ** |
 | `ctx.write_text(path, text)` | 同上。JSON 文書1つではないもの（1行1レコードなど）用 |
 | `ctx.mod_dir` | いま apply() 中の MOD のフォルダ。同梱データを読む用（書くのは `out/` か `state/`） |
 | `ctx.on_ready(fn)` | プロセスにつき1回だけメインスレッドで実行（§3.6） |
+| `ctx.superseded()` | 自分より新しい注入が来たか。自前のスレッド・`Clock` の繰り返しはこれで降りる（§3.6.1） |
 | `ctx.patches()` | 対象 → 当てた MOD の一覧。自分より前の分が見える（§3.7） |
 | `ctx.config` / `ctx.setting(名前)` | この MOD に効いている設定値（§3.8） |
 | `ctx.api` / `ctx.version` | ローダの API 番号と版（§3.9） |
+| `ctx.generation` | この注入の世代。`on_ready` のキーに混ぜる用（§3.6.1） |
 
 `target` は `module:qualname` 形式（`llm_manager:quest_referee_event_resolve`、
 `llama_cpp_runtime_completion:LlamaCppClient.chat`）。
@@ -649,6 +704,8 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
 304_quest_end_keep_party   が 303_quest_end_party_to_guild を包む
 305_mini_quest             が 105_fix_schema_compact を包む（LlamaCppClient.chat を共有）
                              → 305_ が先に前提を書き換え、105_ がその後でスキーマを縮める
+215_probe_event_roll       が 313_event_ability_check を包む（quest_referee_event_evaluate_new を共有）
+                             → 計測は 313_ が動かした後の credibility を控える
 111_llm_prompt_replace     が 102_ / 103_ / 105_ を包み、305_ に包まれる
                              → 305_ の完全一致の前提を壊さず、置換は圧縮前の本文を見る
 ```
@@ -657,7 +714,7 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
 よい（`104_balance_area_bgm`）。番号を振り直すときは `load_order.json` も直すこと
 （フォルダ名を変えるので）。`check_mods.py` が食い違いを報告する。
 
-#### 3.2.2b MOD どうしは import しない。**ローダの語彙は共有する**
+#### 3.2.3 MOD どうしは import しない。**ローダの語彙は共有する**
 
 ローダは MOD を `instantale_mod_<フォルダ名>` で登録する。名前で掴むと**番号を
 振り直した瞬間に壊れる**ので、MOD が MOD を import することはしない。MOD どうしが
@@ -685,13 +742,26 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
   それだと `open()` が失敗し、広い `except` に吸われて控えが黙って空に倒れる。
   **この知識は `110_fix_character_name_path` が先に持っていた**のに隣へ届いていない
 
-いまは `instantale_modloader.state` に1つだけある:
+いまは2つある。**世界の住所**（`state`）と、**LLM へ出ていく文章が通る場所**
+（`llm`。§5.3）:
 
 ```python
 from instantale_modloader.state import world_filename, world_key
 
 path = ctx.state_path("npc_profiles", world_filename(world_key(app)))
 ```
+
+```python
+from instantale_modloader.llm import wrap_outgoing
+
+wrap_outgoing(ctx, rewrite, label="my mod")     # rewrite(texts, site) -> 並び / None
+```
+
+後者は `111_llm_prompt_replace` が v5 まで自分で持っていた。`119_` が同じものを
+要ることになった時点で（クラウドで効かないのは**仕掛ける場所を1か所しか
+知らなかった**ため）、写す前にローダへ移した ― 上の「写して回るものが出たら、
+それはローダの語彙」をそのまま適用した形。**どう書き換えるかは移していない**
+（あちらは確率つきの置換ルール、こちらは目印の差し替え。上の表のとおり）。
 
 > **`import state` ではなく関数を直に import する。** `301_` / `305_` は
 > `apply()` の中に `state = {...}` というローカル変数を持っている。モジュール名で
@@ -725,7 +795,7 @@ MOD から import された時点で、ここは `API = 1` と同格の約束に
 
 検査は `tools/test_state.py`。
 
-#### 3.2.3 順序の前提は MOD 自身に宣言させる
+#### 3.2.4 順序の前提は MOD 自身に宣言させる
 
 順序ファイルは利用者が触るもので、こういう前提を知らない。GUI で行をドラッグすれば
 壊せてしまう。文章で書いてあるだけでは守れないので、`mod.json` に書く:
@@ -744,7 +814,7 @@ MOD から import された時点で、ここは `API = 1` と同格の約束に
 | 状況 | 挙動 |
 |---|---|
 | 制約が実体の無い / 無効な MOD を指している | 黙って捨てる。ただし `problems` に報告する |
-| 制約が伏せている MOD を指している | 黙って捨てる。報告もしない（§3.2.4） |
+| 制約が伏せている MOD を指している | 黙って捨てる。報告もしない（§3.2.5） |
 | 制約が循環している | `load_order.json` の並びで動かす（ここで全滅させない）。報告する |
 | `conflicts` の相手が同時に有効 | 報告するだけで落とさない（下記） |
 
@@ -755,7 +825,16 @@ MOD から import された時点で、ここは `API = 1` と同格の約束に
 同梱 MOD の宣言はいまの `load_order.json` の並びをそのまま固定しているので、これを
 入れても適用順は変わらない。変わるのは「壊せなくなった」ことだけ。
 
-#### 3.2.4 開発者向けの MOD を伏せる（デバッグモード）
+> **`load_order.json` を機械的な番号順に並べ直さないこと。** 番号順は `after` /
+> `before` を4箇所で破る（`117`→`112` / `119`→`305` / `213`→`311` / `215`→`313`）。
+> 壊れはしない ― ローダが並べ替えて動かす ― が、**宣言と適用がずれる**ので
+> `check_mods.py` が「`after`/`before` に従って並べ替えた」を問題として出し、
+> `test_patch_registry` の「並びが宣言どおり」「適用順は宣言から無効なものを
+> 抜いた並び」の2件が落ちる（2026-08-09 に実際に起きている）。並べ替えるときは
+> 宣言を満たす並びのままにする。判定は手元で1回、
+> `python tools/check_mods.py` が問題 0 になるかで付く。
+
+#### 3.2.5 開発者向けの MOD を伏せる（デバッグモード）
 
 計測 MOD（`2xx`）は原因を測るための道具で、遊ぶだけなら要らない。それが配布物では
 全部 `order` に載っていて、利用者の環境で常時動いていた。読み取り専用とはいえ、
@@ -937,29 +1016,56 @@ def apply(ctx):
 ところだった。
 
 1回きりの初期化（掃除・状態ファイル）なら意図どおりだが、注入し直すたびに
-入れ替わってほしいもの（見張り・計測）は別の書き方が要る。組は2つ:
+入れ替わってほしいもの（見張り・計測）は別の書き方が要る。組は2つ ―
+**新しい版を必ず立てる**（キーに世代を混ぜる）ことと、**古い版が自分で降りる**
+（`ctx.superseded()`）こと:
 
 ```python
-POLL_TOKEN_ATTR = "__instantale_myprobe_poll__"      # 置き場所は sys（上と同じ理由）
-
 def apply(ctx):
-    token = "{:x}".format(id(state))        # この apply() 固有の値
-    setattr(sys, POLL_TOKEN_ATTR, token)    # いま有効な世代を宣言する
-
     def start_poll():
         def poll(_dt):
-            if getattr(sys, POLL_TOKEN_ATTR, None) != token:
+            if ctx.superseded():
                 return False                # 新しい注入が来た ＝ Clock から降りる
             ...
             return True
         Clock.schedule_interval(poll, 1.0)
 
     # キーに世代を混ぜる。混ぜないと2回目以降は積まれない
-    ctx.on_ready(start_poll, key="211_probe_text_speed:poll:{}".format(token))
+    ctx.on_ready(start_poll,
+                 key="211_probe_text_speed:poll:{}".format(ctx.generation))
+```
+
+自前のスレッドも同じで、`while True:` の頭で聞く:
+
+```python
+def watch():
+    while not ctx.superseded():
+        ...
+        time.sleep(POLL)
 ```
 
 `force=True` でも積み直せるが、あれは印を無視するだけで古い見張りは止まらない
 （二重に回る）。降りる側の合図まで含めてこの形にする。
+
+##### 降りる合図を MOD 側で作らない
+
+`ctx.superseded()` は**2つ**見ている。同じローダで次の boot が走った
+（`generation` が変わった）か、注入し直されて**ローダごと読み込み直された**か。
+後者では古い版が握っている `_state` はもう誰も更新しないので、世代を比べるだけ
+では永遠に「まだ現役」に見える ― `sys.modules` の中身が別の `_state` を持って
+いるかで見分けるしかない。
+
+以前は `206_` が `__main__` に、`211_` が `sys` に、それぞれ自前の合言葉を
+置いていた。どちらも2つ目の判定が無く、置き場所も判定も違う。**世代の持ち回りは
+ローダの語彙**（`state.py` の `world_key` と同じ話。§3.2.3）なので、MOD 側で
+作り直さない。
+
+> 似て見えるが**別のもの**が2つある。`118_batch_message_render` の
+> `state["generation"]` は「走っている一括表示の続きを止める」印で、本文が
+> 新しくなるたびに進む（注入とは無関係）。`311_npc_profile_memory` のワーカーは
+> 世代をまたいで**1本のまま使い続ける**のが正しい ― 待ち行列も錠も控えも `sys` に
+> 置いた1組を共有しているので（§3.4）、降ろすと処理中の抽出が消える。
+> `ctx.superseded()` を足すのは、**自分の世代のためだけに回しているもの**に限る。
 
 ### 3.7 誰がどこへ当てたか（台帳）
 
@@ -1054,7 +1160,7 @@ settings/mod_settings.json 利用者が選んだ値だけ
                  "default": "conversation",
                  "label": {"ja": "イベントの出方", "en": "Event style"},
                  "note":  {"ja": "narration は情景描写に一言足すだけ", "en": "..."}},
-  "COOLDOWN_MOVES":  {"type": "int",   "default": 3, "min": 0, "max": 99},
+  "COOLDOWN_VISITS": {"type": "int",   "default": 2, "min": 0, "max": 20},
   "CHANCE_OVERRIDE": {"type": "float", "default": null, "allow_null": true}
 }
 ```
@@ -1206,7 +1312,7 @@ journey_path = ctx.state_path("road_travel.json")  # 続きに要るデータ
 > 相手を切っている人の `state/` に、使われない空のフォルダを置かないため
 > （`301_` が `311_` の `npc_profiles/` を読む形）。
 
-#### 3.11.1 書くときは `ctx.write_json()` を通す
+#### 3.11.1 書くときは `ctx.write_json()`、読むときは `ctx.read_json()` を通す
 
 **`open(path, "w")` で残すデータを書かないこと。** 開いた時点でファイルを
 切り詰めるので、書いている途中で落ちるとその瞬間に中身が壊れる。読む側は
@@ -1216,9 +1322,18 @@ journey_path = ctx.state_path("road_travel.json")  # 続きに要るデータ
 残すデータの書き込みは落ちても壊れない形にしておく必要がある。
 
 ```python
+data = ctx.read_json(ctx.state_path("npc_profiles", "世界.json"), {})   # 読む
 ctx.write_json(ctx.state_path("npc_profiles", "世界.json"), bucket)  # -> True/False
 ctx.write_text(ctx.state_path("log.jsonl"), text)                    # JSON 文書でないもの
 ```
+
+**読み側にも同じ規則がある。** 素朴な `open` + 広い `except` で `{}` に倒すと、
+「無い（初回・正常）」と「**在るのに読めない**（ウイルス対策やインデクサの
+一時ロック・外部破損）」の区別が消える。後者を黙って倒したまま次の書き込みを
+すると、`write_json()` がいくら壊れない書き方でも**空に近い正本を無傷で作って
+しまう** ― 壊れずに、静かに失われる。`ctx.read_json()` は前者だけを黙って
+`default` に倒し、後者は記録してから倒す（mod は止めない。倒した先が読める
+ことより、消えたことが後から追えることが要点）。
 
 やっているのは3つ。隣に `名前.tmp` を書く → `flush` + `fsync` でディスクまで
 落とす → `os.replace` で差し替える。2つ目を省くと電源断で「差し替えは済んだが
@@ -1230,7 +1345,7 @@ ctx.write_text(ctx.state_path("log.jsonl"), text)                    # JSON 文�
 
 | 場面 | 使うもの |
 |---|---|
-| 残すデータ（`state/`）| **必ず** `ctx.write_json()` / `ctx.write_text()` |
+| 残すデータ（`state/`）| **必ず** `ctx.write_json()` / `ctx.write_text()`、読むのは `ctx.read_json()` |
 | ログの追記（`out/`）| `open(path, "a")` でよい。1行ずつ足すだけで、壊れても捨てられる |
 | 利用者の操作の結果 | 例外にする（`config.py` の `_save_settings_json`、`gui.py` の `write_order`）。GUI がダイアログに出す ― 黙って False を返すと、保存されていないのに保存されたように見える |
 
@@ -1470,6 +1585,56 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 1行だけで、例外は出ない）。文字列を期待するなら
 `value is not frames.MISSING and isinstance(value, str)` の順で書く。
 
+### 5.3 `instantale_modloader.llm`
+
+LLM へ**出ていく文章**を書き換えたい MOD が使う。仕掛ける場所（＝ゲームの読み方）
+だけを持ち、書き換えの中身は持たない。
+
+```python
+from instantale_modloader.llm import wrap_outgoing
+
+def rewrite(texts, site):
+    """この1回の推論で出ていく本文の並び。変えないなら None を返す。"""
+    return [t.replace("前", "後") for t in texts]
+
+hooks = wrap_outgoing(ctx, rewrite, label="my mod")
+hooks.armed()          # 今その名前がある対象（起動直後はクラウドの別名がまだ無い）
+```
+
+包む先は4種類。全部 `required=False`（ビルドと経路によって無い）:
+
+| 経路 | 対象 | site |
+|---|---|---|
+| ローカル | `LlamaCppClient.chat` | `chat` |
+| ローカル | `LlamaCppClient._apply_chat_template` | `template` |
+| ローカル | `LlamaCppClient._post_with_model_loading_retry` | `payload`（本文は prompt 1本） |
+| クラウド | `llm_manager:send_request` / `_with_no_structure` | プロバイダ名 / `+_ns` |
+
+引き受けているのは次の4つ。**MOD ごとに書くと必ずどれかが抜ける**（`119_` は
+最初の1つしか知らず、クラウドで丸ごと素通しになっていた）:
+
+- **クラウドはモジュール名で名指ししない。** 送信モジュールはプロバイダごとに
+  違ううえコンパイル済みなので、どの経路でも import される `llm_manager` の
+  **別名**を包む（`patch.py` の alias_scan が持ち主を全部張り替える）
+- **その別名は初期化時に後から生える。** ローダの保留はモジュール単位なので
+  属性の後生えは拾わない。無かったぶんは見張って当てる（`ctx.superseded()` で降りる）
+- **ローカル実行では `llm_manager` 境界に触らない。** `send_request` は内部で
+  別スレッドに降りてから `chat` を呼ぶため、印が届かず二重に当たる
+- **入れ子で通る地点は内側を素通しする。** 印は `wrap_outgoing` の呼び出しごとに
+  別なので、MOD どうしが互いを塞がない
+
+**面倒を見ないもの**は2つ。どちらも書き換えの中身しだいなので MOD 側の責任:
+
+- 印はスレッドに立つので、`chat` が返った後に**別のスレッド**が送る経路には
+  届かない。二度当たって困るなら自分で止める（`111_` は自分の出力のハッシュ、
+  `119_` は本文に自分の目印があるかで見る＝冪等）
+- **適用順は約束しない。** ローカルの3点は `mod.json` の `after` / `before` で
+  重なるが、クラウドの別名は**見張りが先に当てた方が内側**になる（後生えを待つ
+  時刻が MOD ごとに違う）。互いの書き換えが相手の目印を壊さない前提で書くこと
+
+クラウド境界で見えるのは呼び出し側が渡した `message` だけ。`send_request` の中で
+足される部分（Gemini のスキーマ文など）には当たらない（GAME.md §1.8）。
+
 ---
 
 ## 6. 落とし穴（ルール一覧）
@@ -1483,7 +1648,7 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 | 何度実行しても結果が変わらないように書く | 当て直し（§3.4）と再注入で `apply()` は何度も走る。フックが複数発火しても壊れない形にしておけば、フック選択が致命的でなくなる |
 | 同じ規則を2箇所に実装しない | 探索・適用順は `discover()`、設定は `config.py`。GUI もツールもそれを呼ぶ（§1.3） |
 | 同じ発見を2箇所に書かない | 実機で確かめた事実は `ui.py` / `frames.py` と GAME.md へ。MOD には設計判断だけ（§5） |
-| 順序の前提は文章ではなく `after` / `before` に書く | 文章は守られない。GUI で行を動かせば壊せる（§3.2.3） |
+| 順序の前提は文章ではなく `after` / `before` に書く | 文章は守られない。GUI で行を動かせば壊せる（§3.2.4） |
 | 利用者に触らせる値は `"settings"` に宣言する | コードの定数だけだと GUI から見えず、MOD の更新で消える（§3.8） |
 | `safe=True` を握り潰しの代わりに使わない | 例外はログに残るが見えなくなる。`safe hook failed` が出たら直す（§3.1.5） |
 | `on_ready` に `force=True` を残さない | 開発中の逃げ道。配ると当て直しのたびに副作用が起きる（§3.6） |
@@ -1553,6 +1718,7 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 | 「直してよい相手」を素データの名簿で決める | `120_`（`npcs` に id があるものだけ ＝ 敵と魔物とプレイヤーが自然に落ちる。`category` の値を知らずに済む） |
 | 生成物の質が要るところで、生成をやめて用意した表から選ぶ | `120_`（名前は音替えでも LLM でも当たり外れが出た。同梱の名簿から空いているものを引く形にすると、質が入力で決まる。引くたび引き直すが名前は落ち着く ― 結果を素データにも書くので、次に同じ NPC を見たときには衝突が無い。再現性を持たせようと `crc32(id)` で選んだ版は、世界をまたぐと同じ id が同じ名前になった） |
 | LLM の出力の揺れを、正規化した鍵で畳んでから裁く | `120_`（表記ゆれ・修飾語・姓名を落とした「読みの骨」で比べる。モデルを問わない） |
+| 本体が直ったら自動で降りる修正にする | `123_`（「新規開始だから」ではなく「レベルだけが他の値と食い違っているから」直す。食い違いそのものを条件にすると、本体が直った版では1行も動かず、手で編集したセーブも巻き込まない） |
 | 例外を条件付きで握り潰す | `100_`（`hWnd=None` のときだけ。それ以外は再送出） |
 | どのフックが効くか分からないので全部に仕掛ける（重複しても平気な書き方で） | `104_`（BGM）、`105_`（`chat` と `payload`） |
 
@@ -1566,6 +1732,9 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 | 外部（プロキシ）でやっていた加工をプロセス内へ移す | `102_` / `103_` / `105_`（判定条件と出力書式を揃える）、`111_`（ルールファイルの書式まで揃えるので、外部で書いたものをフォルダにコピーすれば動く。本文が復号済みなので `\n` / `\uXXXX` / `$1` の読み替えが要る） |
 | 利用者が編むデータファイルを持つ | `111_`（`mods/111_.../llm_replacements.txt` があればそれ、無ければ同梱の `.default.txt`。更新で消えない名前の分け方は §3.1.1。探索も外部参照もしない） |
 | 利用者が書いた規則をリクエストのたびに読み直す | `111_`（更新時刻と大きさを見る。読めない間は前回の規則で続ける＝保存の書き込み途中で壊れない。消えたら置換を止める） |
+| ゲームの式を読まずに、入口の値を動かして結果を動かす | `313_`（確率は `credibility*10+20` が上限で単調なので、判定に入る前の `credibility` を上げれば確率が下がることはない。式を推測せずに済む） |
+| 代入が通ったかを書いた後に読み直して確かめる | `313_`（スキーマ上は整数の項目に端数を入れる。入らなければ整数に丸めて入れ直し、落ちたことを1度だけ記録する。「たぶん通る」で進めない） |
+| 自前の manager 名で LLM に1問だけ聞く | `313_`（`mod_ability_for_action`。記録が `output_data/` に分かれるので後から質を見られる。`timeout` を必ず渡し、失敗したら語句の表へ降り、同じ入力は聞き直さない） |
 | 同じ加工を複数の地点に仕掛けても1回しか効かせない | `111_`（スレッドの印で内側を素通しし、自分が作った文章を覚えて別スレッド経由の二度目も止める。確率付きの加工はこれが無いと成立しない） |
 
 ### 7.3 UI・選択肢・会話
@@ -1599,6 +1768,7 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 | ゲームが計算した値を横取りして、別の相手にも同じことをする | `306_`（`Character.gain_exp` を包み、プレイヤーに入った点数を同行者へ写す。式は読まない） |
 | 複数の場面をまたぐ状態を `out/` の控えで持つ（再注入・再起動をまたぐ） | `307_`（移動の予約。段階を `offered` → `armed` → `ready` と進め、前提が崩れたら捨てる） |
 | 「いまその処理の中か」を自分のラッパの印で持つ | `306_`（`execute` を包んでスレッドごとの印。見張る対象を自分で包むので `MethodWatch` は使えない） |
+| 書き直しで落ちる情報を、控えから差し戻す | `311_`（人物像は毎回まるごと書き直され、確定した事実も数ターン後には本文から消える。記録済みの `facts` を抽出プロンプトへ戻すと、落ちた事実が戻り、同じ事実を毎ターン報告し直すのも止まる） |
 | ゲームが出さない数字を、状態の前後の差から出す | `308_`（1手の前後で全員の HP を比べる。ダメージの式も、誰が誰に当てたかの語彙も読まない） |
 | 差分の報告点を何箇所にも置いて二重に出さない | `308_`（台帳方式。「比べる → 出す → 台帳を今の値へ進める」を1つの操作にする。内側が先に報告すれば外側には差が残らないので、報告点をいくつ足しても重ならない） |
 
@@ -1609,6 +1779,8 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 | 読み取り専用で経路を特定する | `205_` / `206_` / `207_`（計測は修正より後＝外側に置く） |
 | `__getattr__` トリップワイヤ | `201_` |
 | 20Hz で画面状態の変化だけ拾う | `206_`（waitstate watcher） |
+| 残っている記録だけで先に詰める | `215_`（`output_data/` の LLM 記録とセーブのバックアップを突き合わせ、実機に行く前に候補を潰す。実機で見るのは「判定の瞬間にしか存在しない値」だけになる） |
+| 計測 mod が自分の測定でログを埋めない | `214_`（総当たりの呼び出しは `state["probing"]` で自分の記録から外す。包む前の素の関数を測る） |
 
 ---
 

@@ -14,6 +14,7 @@
     "109_fix_item_detail_autosize",
     "110_fix_character_name_path",
     "120_fix_npc_name_collision",
+    "123_fix_new_character_level",
     "111_llm_prompt_replace",
     "117_message_text_integrity",
     "112_ui_text_spacing",
@@ -48,7 +49,11 @@
     "309_office_pardon",
     "311_npc_profile_memory",
     "312_shop_restock",
-    "1308_companion_travel"
+    "313_event_ability_check",
+    "1308_companion_travel",
+    "215_probe_event_roll",
+    "213_probe_npc_memory",
+    "214_probe_new_character"
   ],
   "disabled": []
 }

@@ -60,7 +60,7 @@ save_area_json, save_world_json, api_key_manager, build_type, sdcpp_cuda
 |---|---|
 | ゲーム本体 | `C:\Program Files\Epic Games\Instantaleq6Ve7\instantale.exe` |
 | ランタイム | CPython 3.10.11 / Kivy / SDL2 |
-| `game_version` | `014`（`__main__.get_game_version()`）。Epic の `AppVersion: main_023` は別系統 |
+| `game_version` | `014`（`__main__.get_game_version()`）。Epic の `AppVersion`（現在 `main_025`）は別系統。読み方は §1.5 |
 | ロード済みモジュール | 4208（うち 3243 が Nuitka コンパイル済み）／ゲーム自身は 72 |
 | セーブ | `%LOCALAPPDATA%\Darmabeko\Instantale\` |
 | クラッシュログ | `<ゲームdir>\crash_log.txt`。更新で消えることがある（§1.5） |
@@ -69,6 +69,32 @@ save_area_json, save_world_json, api_key_manager, build_type, sdcpp_cuda
 ゲーム内部のバージョンは実行時に問い合わせること（Epic のマニフェストとは無関係）。
 
 ### 1.5 更新の記録
+
+#### main_024 → main_025（2026-08-09 に更新、同日リコン）
+
+`game_version` は `014` のまま（main_023 から3版すえ置き）。上がったのは Epic の
+`AppVersion` だけで、値は `%PROGRAMDATA%\Epic\EpicGamesLauncher\Data\Manifests\*.item` の
+`AppVersionString` から読める（ゲームを起動しなくても分かる。§1.4 の「別系統」の実体）。
+
+**新規キャラのレベル60が直った**（§2.36）。`InstantaleApp.start_game` の
+**同じ 876 行**が `experience_level=60` → `1` になっただけで、体力上限を組む
+883〜885 行（`get_max_physical_integrity(1) -> 10`）は変わっていない。
+こちらが「876 行だけが食い違っている」と読んだとおりの直し方。
+
+| MOD | 対応する修正 | 印 | 判定 |
+|---|---|---|---|
+| `123_fix_new_character_level` | 新規キャラがレベル60で始まる | `experience_level 60 -> 1` 0 件（`fixed 0`） | 本体が直した（§2.36） |
+
+> **リコンは上書きされる。** `out/recon/` は注入のたびに同じ名前で書き直されるので、
+> 更新前に退避していないと main_024 との差分が取れない（main_023 → main_024 では
+> 退避してあったので 68 ターゲット増を機械的に出せた）。今回は退避が無く、
+> 差分は出せていない。
+>
+> **この取りこぼしを受けて、退避は `000_recon` が自動でやるようにした。**
+> `out/recon/` の中身がどのビルドを見たものかを `build.json` に控えておき、次の回に
+> 版が変わっていれば、上書きする前に `out/recon_snapshots/<版>_<日付>.zip` へ固める。
+> 走るのは版が変わったときだけなので、同じ版を何度遊んでも zip は増えない。
+> 次の更新からは、更新後に一度起動するだけで差分の材料が揃う。
 
 #### main_023 → main_024（2026-08-05 に更新、同日リコン）
 
@@ -109,7 +135,7 @@ MOD が手を出したかどうかは、その MOD 自身の印で判定する�
 | `101_fix_npc_employ_price` | 高レベルNPCの雇用でクラッシュ | 上流プローブ＋リコン差分 | 本体が直した |
 | `110_fix_character_name_path` | 禁則文字を含む名前で画像が生成されない | `[NAMEFIX]` 実ゲームで 0 件 | 本体が直した（§2.15） |
 | `103_fix_eventlog_trim` | クエストログが際限なく溜まる | `[EVENTLOG]` 0 件（イベント5回） | 本体が直した |
-| `108_` | 売買画面 | なし | 未検証（能動的に起こせない） |
+| `108_` | 売買画面 | なし | 未検証（能動的に起こせない）。**判定が付かないまま 2026-08-09 に `superseded: main_024` で降ろした**（ユーザー判断。VERIFICATION.md §3.8.1） |
 
 `107_` の根拠（2026-08-05 16:54、会話から戦闘）:
 
@@ -156,6 +182,11 @@ BattleEndInFreeAction.end_phase done         in_battle=0  app.music = 'None'
 > 本体が名前を触らずに直しているなら、残す限りこちらだけが余計に改変する側に回る。
 > ただし main_024 では実ゲームで一度も発火していないので、急いで外す理由も無い。
 > 外すかどうかは、上の「保存名を確認できていない」が片付いてからでよい。
+
+> **`108_` はその後、別の理由で降ろした（2026-08-09）。** 「無害だから残す」は
+> こちらでは通るが、印でも症状でも判定が付かない ＝ **確かめようのないものを
+> 既定で配り続けることになる**ので、`superseded` でデバッグモード限定にした
+> （VERIFICATION.md §3.8.1）。`102_` は据え置き。
 
 > そこで `101_` に上流プローブを足した（§3）。包む前の素の関数を控えておき、
 > 注入のたびに `0..200` を総当たりする。2026-08-05 の結果:
@@ -238,7 +269,7 @@ SAVE_OBFUSCATION_KEY = b'Instantale_Save_Key_2026'              （§2.16）
 | | |
 |---|---|
 | `scripts.steam.server_process` | Steam 認証と課金。`auth_steam_and_get_jwt` / `get_ticket_hex` / `get_entitlement` / `subscription_start` / `subscription_wait` / `cancel_contract` / `upgrade_start` |
-| クラウドLLMのサブスクリプション | `hud_auto_configuration:AutoConfigurationScreen.use_cloud_subscription_process` / `hud_option:OptionAIScreen.show_subscription_screen` / `OptionLLMScreen.get_cloud_llm_list(cloud_billing_type=None)` / `check_device_info:get_setting_for_cloud_llm` |
+| クラウドLLMのサブスクリプション | `hud_auto_configuration:AutoConfigurationScreen.use_cloud_subscription_process` / `hud_option:OptionAIScreen.show_subscription_screen` / `OptionLLMScreen.get_cloud_llm_list(cloud_billing_type=None)` / `check_device_info:get_setting_for_cloud_llm`。**サブスクはゲーム側が未実装**（2026-08-08 時点。画面と関数はあるが生きているのは APIキー方式だけ。クラウド経路の検証は APIキーで行えば足りる） |
 | 装備の強化 | `__main__:EquipmentReinforcementStart` / `EquipmentReinforcementManager`（`calculate_modification(item_type, item_price)`）/ `InstantaleApp.reinforce_equipment` / `get_upgrade_equipment_price` / `toggle_reinforcement_inventory_window`、HUD 側は `set_reinforce_equipment_button_callback` / `toggle_reinforcement_inventory_visibility` |
 | `Item` に `upgrade_level` | `Item.__init__(..., grid_pos=None, upgrade_level=0)` |
 
@@ -321,7 +352,7 @@ main_024 のアナウンスには入っていない＝直っていない。ど�
   プロンプト本文に埋め込まれたスキーマの repr（§2.12）で、ゲームが直した
   「再生成時にスキーマが重複・増幅する」とは別物。プロンプト全体も小さくなっていて
   （`total_chars` が 580〜2164）、両方が効いた状態に見える
-- クラウドLLM経路は依然として未検証（§1.5 の注記のとおり）
+- クラウドLLM経路は素通りが確定し、`111_` は v4 で対処済み（§1.8・§2.12）
 
 > 0 件だけでは「不要になった」ことの証拠にならない。その操作を通していなければ、
 > 出番が来ていないのと区別が付かない。`102_` は発火していた操作を実際に通し、
@@ -350,11 +381,29 @@ main_024 のアナウンスには入っていない＝直っていない。ど�
 
 ### 1.8 影響を確かめていないこと（main_023）
 
-- クラウドLLM経路にプロンプト系 MOD が効くかは未確認。`102_` / `103_` / `105_` と
-  `301_` / `305_` は `llama_cpp_runtime_completion:LlamaCppClient.chat` と
-  `request_llm_inference_llama_cpp_completion:send_request*`（＝ローカルの llama.cpp）を
-  掴んでいる。サブスクリプション経路が別の送信口を通るなら、そこは素通りになる。
-  ローカル実行では従来どおり効いている（§1.6）
+- クラウドLLM経路はプロンプト系 MOD が**素通りになることが確定した**
+  （2026-08-08・APIキー利用者から「`111_` の置換が効かない」との報告。同日、
+  無料 Gemini の実機で経路を実測）。経路はプロバイダごとの
+  `request_llm_inference_*`（Gemini は `_gemini_test_streaming`）で、
+  `LlamaCppClient` を通らない（§2.12）。`111_` は v3 で gemini / any_server の
+  境界 `send_request*` を包み、Gemini 実機で `[REPLACE]` の発火を確認。v4 で
+  プロバイダに依存しない `llm_manager` の別名包みに置き換えた（OpenAI / Claude /
+  Alibaba / 任意互換サーバーもモジュール名を知らないまま届く。§2.12 のパターン。
+  v4 も Gemini 実機で発火確認済み・同日）。境界で見えるのは
+  呼び出し側が渡した `message` だけで、**send_request の中で足される部分
+  （Gemini なら `_schema_instruction` のスキーマ文）には当たらない**。
+  `102_` / `103_` / `105_` はクラウドでは素通りだが、**実害があるのは `103_` だけ**:
+  `102_` の対象バグはゲーム本体（main_023）で発生源から修正済み（§1.6。公式文言も
+  「ローカルLLM使用時」で、Gemini の再生成は壊れた部分木だけ修復する別実装なので
+  重複の仕組み自体が無いとみられる）。`105_` が削るスキーマ repr の埋め込みは
+  ローカル送信モジュール側の行いで、Gemini は `_schema_instruction` という別実装
+  （§2.12）＝対象がクラウドの本文に無いとみられる。`103_` の対象
+  （`quest_event_log` の肥大）はマネージャ層で起きるのでクラウドでも育つ＝素通りの
+  実害あり。`305_` は半分だけ素通り（プロンプトの書き換えは `LlamaCppClient.chat`
+  なので効かず、ミニクエストが普通の討伐依頼として生成される。撤退→達成の
+  差し替えは `llm_manager:quest_referee*` なので効く）。`301_` は `LlamaCppClient`
+  を使っておらず（差し込みは `llm_manager_world_generate:random_quest_generator` の
+  引数へ）、クラウドでも効く。ローカル実行では従来どおり効いている（§1.6）
 - 自由生成施設（`FreeFacilityManager`）の最中に `300_` の施設イベントが乗るか未確認。
   どちらも「施設に入ったとき」に働くので、二重に始まる余地がある（§2.5）
 - 四体以上の敵との戦闘を更新後にまだ通していない。公式修正が入った箇所なので、
@@ -939,6 +988,71 @@ DisplayQuestChoice                       get_active_quest_count() -> 5
 この性質のおかげで、討伐以外のクエストはプロンプトの差し替えだけで成立する
 （`305_mini_quest`）。ゲーム側のコードにもセーブにも触る必要が無い。
 
+#### フィールドイベントの成否判定（`credibility` と `<確率N%>`）
+
+道中のミニイベントで自由入力した行動が成功するかは、この順で決まる。
+
+```
+QuestEventManager(app, event_name, enemies_info, event_turn)
+  → llm_manager:quest_referee_event_evaluate_new(...)      = field_event_evaluator
+        result_type: certain_success / certain_failure / roll_required
+        roll_required なら narration・credibility(1-10)・reference_attribute(6能力値)
+  → ゲームが確率に変え、quest_event_log の末尾に `<確率N%: 成功>` を書き足す
+  → llm_manager:quest_referee_event_resolve(..., outcome, ...)  結末と効果
+```
+
+`resolve` が受け取るのは成功・失敗の結果だけで、確率も能力値も渡らない。
+**サイコロを振っているのは `QuestEventManager` の中**（コンパイル済みで読めない）。
+
+実測は `output_data/` の LLM 記録と、`saves/*/backups/` に残る `quest_event_log`
+の突き合わせ（2026-06-06〜08-08、8キャラ、判定 121 回）。
+
+| `credibility` | `*10+20` | 回数 | この値ちょうどだった回数 |
+|---|---|---|---|
+| 2 | 40% | 2 | 1 |
+| 3 | 50% | 13 | 5 |
+| 4 | 60% | 33 | 14 |
+| 5 | 70% | 21 | 10 |
+| 6 | 80% | 32 | 20 |
+| 7 | 90% | 19 | 8 |
+| 8 | 100% | 1 | 0 |
+
+- **確率が `credibility*10 + 20` を超えたことは一度も無い**（121 回・上振れ 0 回）。
+  半数（58回）はちょうどこの値で、残りは -2 〜 -40 の負の差だけが付く。
+  つまりこの式は上限で、差は必ず引き算の側にしか現れない
+- 実際の成否は宣言どおりの確率で出ている（上限90%の19回で15勝、上限60%の33回で
+  16勝）。**判定そのものは正直**で、体感の低さは確率の作り方の側にある
+- 全体の成功率は 59.5%（72勝49敗）
+- `reference_attribute` は 6 能力値から毎回選ばれているが（`dexterity` 80 /
+  `intelligence` 21 / `wisdom` 10 / `constitution` 8 / `strength` 2）、
+  **その能力値が高いことで確率が上がった回は無い**。能力値に振った差は結果に出ない
+- 評価の内訳は `roll_required` 121 / `certain_success` 10 / `certain_failure` 1。
+  **入力の 92% はサイコロに回る。**行動の内容で確定するのは 8% しかない
+- `credibility` は 4〜6 に 86/121 が集まる。プロンプトが
+  「手心を加えないこと。これは無理だろうと思えば迷わず1」と念を押している側で、
+  10 は一度も出ていない
+
+差（-2 〜 -40）が何に連動しているかは**未特定**。次は外れている:
+
+- 参照能力値の種類ではない。同じ時刻の別判定で、`dexterity` と `intelligence`
+  に同じ差が付いた回がある
+- 固定値でもない。同じキャラ・同じ能力値で、日をまたぐと差が動く
+- HP でも体力（`physical_integrity`）でもない。同じクエストの中で
+  -11 → 0 → -4 と往復した回がある（`エリス`、2026-08-01 01:31〜01:45）
+- レベルとは緩く相関する（レベルが上がるほど差 0 が増える）が、
+  例外が多く式にならない
+
+クエストの**外**の自由入力は別系統で、確率を LLM 自身が出す（§2.26）。
+
+判定の瞬間の値はセーブにも LLM の記録にも残らないので、**実機で立ち会うしかない**。
+`215_probe_event_roll` がその計測（`Character.calculate_attribute` が判定の窓の間に
+呼ばれるかを、呼び出し元ごと控える）。
+
+プロンプトの側も見ておくこと ― `field_event_evaluator` に渡る
+【プレイヤーのパーティ】にはプロフィール・人格・特質・装備しか入っておらず、
+**能力値は1つも書かれていない**。LLM は能力値を知らないまま
+`reference_attribute` を選んでいる。
+
 ### 2.10 戦闘・フラグ
 
 戦闘終了マネージャは3つあり、経路によって挙動が違う。
@@ -1070,9 +1184,64 @@ areas["7"]["bgm"] = "Assets/sounds/musics/town/solemn/Ambient 7 Loop.mp3"
 llama_cpp_runtime_completion:LlamaCppClient.chat                             上流
 llama_cpp_runtime_completion:LlamaCppClient._apply_chat_template             messages
 llama_cpp_runtime_completion:LlamaCppClient._post_with_model_loading_retry   payload
-scripts.llm.request_llm_inference_llama_cpp_completion:send_request*         リクエスト
+scripts.llm.request_llm_inference_llama_cpp_completion:send_request*         リクエスト（ローカル）
+scripts.llm.request_llm_inference_gemini_test_streaming:send_request*        リクエスト（Gemini・実測）
+scripts.llm.request_llm_inference_openai:send_request*                       リクエスト（OpenAI・実測）
+scripts.llm.request_llm_inference_claude:send_request*                       リクエスト（Claude・実測）
+scripts.llm.request_llm_inference_any_server:send_request*                   リクエスト（任意 OpenAI 互換サーバー用と推定・未実測）
 scripts.llm.llm_manager:*                                                    マネージャ群
 ```
+
+- **外部APIキー（クラウド）はプロバイダごとの `request_llm_inference_*` を通り、
+  `LlamaCppClient` を一切通らない**。使われるモジュールは1つだけが import され、
+  残りは `sys.modules` に載らない（Gemini セッションの実測・2026-08-08: gemini だけが
+  載り、llama_cpp_completion も any_server も `[not loaded]`）。UI の選択肢は
+  Gemini / OpenAI API / Claude API / Alibaba Cloud API / 任意 OpenAI 互換サーバー。
+  実測済みは Gemini（`_gemini_test_streaming`）・OpenAI（`_openai`）・
+  Claude（`_claude`）。Alibaba は未実測、any_server が任意互換サーバー用と
+  推定される。`LlamaCppClient` に仕掛けたプロンプト系 MOD はクラウドでは
+  素通りになる（`111_` で実際に報告があった）
+- OpenAI モジュールの内部（実測・2026-08-08）: 境界は Gemini と同形
+  （`send_request(manager_name, message, structure, model=None, max_tokens=30000,
+  timeout=None)`）。`openai.OpenAI` クライアント直で、`default_model =
+  'gpt-5.4-nano'`。Gemini に在ったストリーミング収集・JSON修復ループ・
+  `SCHEMA_IN_PROMPT` は**無い**（構造化出力を API に任せる作りとみられる＝
+  スキーマ文のプロンプト埋め込みも無いとみられる）。`save_output_log` /
+  `calculate_price` / `total_cost` は Gemini と同名で持つ
+- Claude モジュールの内部（実測・2026-08-08）: OpenAI 版と同構成。
+  `anthropic.Anthropic` クライアント直で、`default_model = 'claude-sonnet-5'`。
+  境界のシグネチャも同じ。ストリーミング収集・修復ループ・スキーマ埋め込みは無い
+- **プロバイダに依存しない仕掛け方（`111_` v4 のパターン）**: 送信モジュールを
+  名指しせず、`scripts.llm.llm_manager:send_request` /
+  `:send_request_with_no_structure` を包む。この2つは**使われる送信モジュールから
+  from-import した別名**（Gemini セッションの recon で `__module__` が gemini 側を
+  指すことを確認）なので、alias_scan（既定有効）が同じ関数を持つ全モジュール
+  （送信モジュール本体・`llm_manager_battle` などの別名）を張り替え、どの
+  プロバイダでも1箇所で効く。プロバイダ名はラップした元関数の `__module__` から
+  採れる。**ただしローカル実行では、この地点で本文を触ってはならない**。
+  `send_request` は内部で別スレッド（`send_request_on_id`）に降りてから
+  `LlamaCppClient` を呼ぶため、スレッド頼みの一回制御が効かず、`chat` 側の
+  フックと二重適用になる（`111_` は llama.cpp の送信モジュールが import されて
+  いるかで見分けて、ローカル時は素通ししている）。**もう1つの罠: この別名は
+  プロバイダの初期化時に生える。** 起動直後に注入すると `llm_manager` は
+  import 済みなのに `send_request` が**まだ無い**（Claude 選択の実機で観測・
+  2026-08-08。同じ apply の中で `llm_manager:conversation_starter` の wrap は
+  成立していたので、モジュールの有無ではなく属性の有無）。ローダの保留機構は
+  **モジュール単位**で、属性の後生えは当て直さない。`111_` v5 は無かった別名を
+  5秒ごとに見張って、生えた時点で包む（1時間で諦める・注入し直されたら
+  `ctx.superseded()` で降りる）
+- Gemini モジュールの内部（APIキー環境の recon dump・2026-08-08）:
+  `send_request(manager_name, message, structure, model=None, max_tokens=30000,
+  timeout=None)` / `send_request_with_no_structure(..., timeout=30)`。
+  `google.genai` の `Client` を直接使い、ストリーミングで受けて
+  （`_stream_and_collect`）、pydantic 検証に失敗した部分木だけを LLM に修復させる
+  ループを持つ（`_validate_with_repair` / `_regenerate_subtree`、最大3周・
+  修復用の system 文は `_REPAIR_SYSTEM_LINES`）。`SCHEMA_IN_PROMPT = True` で
+  スキーマ文（`_schema_instruction`）を **send_request の中で**足すので、境界の
+  `message` には入っていない。system 文は `_build_config(system_text, ...)` 経由
+  （Gemini の system_instruction）。`save_output_log` はローカル版と同名・同位置。
+  `default_model = 'gemini-3.5-flash'`、`calculate_price` / `total_cost` で
+  料金も追っている。他プロバイダを実測したら同様に recon dump を取ること
 
 - ストリーミング経路は `_post_with_model_loading_retry` を通らない。`prompt` と
   `json_schema` が揃う唯一の地点はそこだが、実際に流れるのは `chat` 側。位置が確信
@@ -1144,7 +1313,7 @@ scripts.llm.llm_manager:*                                                    マ
 | `random_quest_generator` / `settlement_quest_generator` | クエスト構造の生成 | 有（「【討伐】…を生成」「normal2-3種、miniboss1種、boss1種を必ず設定」） |
 | `quest_starter` / `quest_starter_with_party` | 開始ナレーション＋初期選択肢 | 無（構造を読んで描写するだけ） |
 | `quest_referee_with_free_action` / `quest_referee` | 毎ターンの進行判定 | 有（完了条件・battle 優先・ラスボス強制） |
-| `field_event_evaluator` | イベント中の入力を「確定」か「確率判定」に振り分け、説得力を1〜10で採点 | 無 |
+| `field_event_evaluator` | イベント中の入力を「確定」か「確率判定」に振り分け、説得力を1〜10で採点（判定の実体は §2.9 の「フィールドイベントの成否判定」） | 無 |
 | `quest_referee_event_resolve` / `_event_rewrite` | イベントの結末と効果（damage/heal/get_item/status/start_battle/no_effect） | 無 |
 | `quest_summarizer` ほか | 帰還後の要約 | 無 |
 
@@ -1222,6 +1391,98 @@ __main__:InstantaleApp.normalize_shop_inventory_prices(shop_obtainer, player_obt
 
 日付は世界に1つ（`world.days_elapsed`。セーブでは `world_data.days_elapsed`。
 実セーブで `3651` を確認）。進めているのは `InstantaleApp.elapse_days(days)`（§2.19）。
+
+### 2.13.2 アイテムの値付け
+
+アイテムの分類は2段になっている。粗いほうが `item_type`、細かいほうが
+`attributes` の中の `item_detail`。
+
+```
+scripts.items:Item.__init__(self, name, item_type, attributes, description,
+                            value, size, image_src, rarity, skill, obtainer,
+                            id, grid_pos=None, upgrade_level=0)
+```
+
+| 段 | 値 | どこから分かるか |
+|---|---|---|
+| `item_type` | `weapon` / `wearable` / `healing_item` / `consumable` / `utility` / `material` の6種 | 店の品揃え生成の構造化出力スキーマ（`output_data\<世界>\<PC>\shop_item_generator_ordinary\N.json` の system） |
+| `attributes["item_detail"]` | `small_weapon` `body_armor` `magical_material` … 32種 | 同じスキーマの `sub_type` と、本体の `Assets\images\item_candidates_dark\` のフォルダ名 |
+| `rarity` | `common` / `rare` / `magical` / `epic` / `legendary` / `mythic` の6段 | 同じスキーマ |
+| `value` | 1〜70 の価値段階 | 同じスキーマ（プロンプトに「最低が1で最高が70」と書かれている） |
+
+`sub_type` と `item_detail` は綴りが揃っていない（`weapon/small` は
+`small_weapon`、`herb` は `plant` になる）。**表の鍵にするなら `item_detail` の
+ほうを取る** ― アイテムに実際に書かれているのはこちら。
+
+`value` はその品が出たクエストの難易度と一致する。実セーブでは 21 種類の値が
+出たが、そのすべてがその世界の `quests[*].difficulty`（3〜53）か、より深い
+土地の難度に対応していた。`get_equipment_price(quest_difficulty)` /
+`get_heal_item_price` / `get_other_item_price` が返しているのはこの段階で、
+**gold ではない**。逆算する `get_*_level_from_price(item_price)` も同じ段階を
+扱う。gold に直すのは `get_item_base_price(item_instance)` /
+`get_randomized_item_price(item_instance)` のほう。
+
+#### 値段は `attributes` に書かれている
+
+```
+__main__:InstantaleApp.set_shop_price_for_owner(item_instance)    → attributes['買価']
+__main__:InstantaleApp.set_shop_price_for_player(item_instance)   → attributes['売価']
+__main__:InstantaleApp.normalize_shop_inventory_prices(shop_obtainer, player_obtainer)
+__main__:InstantaleApp.buy_item(item_instance) / sell_item(item_instance)
+```
+
+**`買価` と `売価` は排他**で、どちらか一方しか書かれない（実セーブ 151 個の
+アイテムで例外なし）。店の持ち物には `買価`、売買画面に出したプレイヤーの
+持ち物には `売価`。説明欄（§2.14）もここを読んで描く。
+
+`attributes` の並びは `item_detail` → 能力値 → 値段。能力値は種別ごとに違う。
+
+| `item_type` | 能力値の鍵 |
+|---|---|
+| `weapon` | `攻撃力` |
+| `wearable` | `防御力` |
+| `healing_item` | `回復` と `疲労負荷` |
+| `consumable` / `utility` / `material` | 無し（`item_detail` と値段だけ） |
+
+#### レア度が値段に効いていない
+
+実セーブ（`ヴェスティア`、Lv31 / 3651日）から拾った実額。
+
+| 品 | `value` | 能力値 | 買価 | 売価 |
+|---|---|---|---|---|
+| 短剣 common | 3 | 攻撃力 23 | 72 | ― |
+| 短剣 common | 20 | 攻撃力 96 | 463 | ― |
+| 短剣 magical | 48 | 攻撃力 245 | 1,831 | ― |
+| 革鎧 common | 48 | 防御力 227 | 1,833 | ― |
+| 薬 magical | 48 | 回復 198 | 353 | ― |
+| 魔法素材 magical | 24 | ― | 128 | ― |
+| 魔法素材 mythic | 24 | ― | ― | 19 |
+| 魔法素材 epic | 4 | ― | ― | 3 |
+| 財宝 mythic | 66 | ― | ― | 102 |
+| 遺物 mythic | 12 | ― | ― | 7 |
+
+読み取れること:
+
+- **買価はレア度でほとんど動かない。** 同じ `value` 24 の魔法素材が、magical で
+  買価 128、mythic で売価 19。段が3つ違っても額の桁は変わらない
+- **売価は `value` とほぼ同じ数字になる。** 能力値を持たない品では
+  `売価 ≒ value × 0.8〜1.0`（mythic の財宝 `value` 66 で 102）。買価と比べると
+  6分の1ほど
+- 買価は能力値に対して上に反る。攻撃力 23 → 72（3.1倍）に対し、
+  攻撃力 245 → 1,831（7.5倍）
+
+#### 物価の目安
+
+宿の主の台詞（実プレイのログ）が、この世界の物価をそのまま言っている。
+
+```
+簡易寝台なら10G、個室なら100G、それから、どうしてもって言うなら高級個室も1000G
+（3ヵ月単位の長期滞在、前払い）
+```
+
+比較用の他の値: NPC の雇用は難易度 76 で 5,045G（`get_npc_employ_price` の上端。
+VERIFICATION.md §2.2）。実セーブのプレイヤー所持金は 1,116,472G。**ゲームで一番高いアイテム
+（2,342G）より、宿の高級個室2部屋ぶんのほうが近い**という開きがある。
 
 ### 2.14 アイテム詳細ボックス
 
@@ -1354,12 +1615,42 @@ Character.calculate_current_required_exp_on_display()      表示用
 Character.calculate_current_gained_exp_on_display(gained)  表示用
 ```
 
+- **能力値はレベルでは伸びない**（セーブのバックアップで同一プレイヤーを追った実測。
+  `levelup()` が「能力値の更新まで持つ」というのは関数名からの推測で、実際には動かない）:
+
+  | レベル | `original_ability_scores`（筋・耐・敏・知・賢・魅） | 合計 |
+  |---|---|---|
+  | 3〜33 | 24・18・26・25・25・24 | 142 |
+  | 41〜73 | 26・22・26・26・25・24 | 149 |
+
+  30 レベル進んで合計 +7。動かしているのは宿の訓練（`VacationTrainManager` /
+  `get_training_price(attribute_average, experience_level)`）だけで、**作成時に
+  振った値がほぼそのまま最後まで続く**。能力値を基準にした調整を書くなら、
+  「レベルで伸びる」前提を置かないこと（`313_event_ability_check` が最初にこれを
+  外した。VERIFICATION.md §2.37）
+- **作成時の値は才能点（`point_use`）で決まり、既定はかなり低い。**
+  `characters/<名前>/character_sheet.json` の実測:
+
+  | キャラ | `point_use` | 合計 | 各値の幅 |
+  |---|---|---|---|
+  | テスト女性 / テスト男性 | 16 | 66 | 11 一律 |
+  | ヴァルカ・ヴォルガド | 31 | 71 | 9〜15 |
+  | ヴォルガ・クレイグ | 37 | 75 | 9〜16 |
+  | アーリ | 300 | 142 | 18〜26 |
+
+  つまり**普通に始めると各能力値は 9〜16**。24 前後という値は才能点を大量に
+  積んだキャラのもので、既定の姿ではない。セーブで見た上端は 30
+  （`original_ability_scores` の最大値。上限かどうかは未確認）。
+  能力値に閾値を置く調整は、9〜16 の側を基準にしないと**新規キャラで一度も
+  発火しない**（`313_` が実機1回目でこれを踏んだ。VERIFICATION.md §2.37）
 - `gain_exp` が内部でレベルまで上げるのか、呼び出し元が `check_levelup` →
   `levelup` を回すのかは読めない。両方に耐える書き方（レベルが動いていなければ
   `check_levelup` を聞く）にすること
 - 支給の点数を決めているのは `scripts.functions` 側:
   `get_training_experience_point(cleared_quest_difficulty)` /
-  `get_days_elapsed_experience_point(experience_level)` /
+  `get_days_elapsed_experience_point(experience_level)`（**点数ではなく率**。
+  総当たりの実測でレベル1→0.011・レベル13→0.174 と 1 未満の float を返す。
+  VERIFICATION.md §2.36 の `214_` のログ） /
   `get_enemy_exp_lvl(enemy_tier, quest_difficulty)` /
   `training_efficiency_ratio(alpha, beta, A, base=1.265)`。
   式を再現するより、支給された点数を写すほうが確実（`306_`）
@@ -1384,32 +1675,6 @@ Character.calculate_current_gained_exp_on_display(gained)  表示用
 「いま訓練の中か」を `frames.MethodWatch` で見るときは、その `execute` を自分で
 包んでいないことを確かめる。包んでいると、表に入るのはローダのラッパのコード
 オブジェクトになる。これは全パッチが共有しているので誤爆する（`306_` が踏んだ）。
-
-### 2.19 体力（スタミナ）は `physical_integrity`
-
-`Character.physical_integrity` / `max_physical_integrity`（`__init__` の既定は
-どちらも 100）。戦闘のHP（`current_hp` / `max_hp`）とは別物。
-
-同じプレイヤーを1晩追った実測（2026-08-01、`out/events.log` のダンプ3点）:
-
-| 時刻 | `physical_integrity` | `max_hp` | `exhausted` |
-|---|---|---|---|
-| 01:47 | 100 | 1560（`original_max_hp` と同じ） | `False` |
-| 01:49 | 50 | 1365 | `True` |
-| 02:03 | 0 | 1170 | `True` |
-
-- 土地の移動やクエストで減る。回復は医療施設
-  （`MedicalTreatmentManager(app, treatment_price)` /
-  `scripts.functions:get_heal_physical_integrity_barden(value)`）
-- 体力が減ると最大HPが下がる（1560 → 1365 → 1170。`original_max_hp` は
-  1560 のまま）。式は特定していないが、`physical_integrity` が上限を削る側
-- `exhausted`（bool）は 50/100 の時点で既に `True`。どの閾値で立つかは未特定。
-  減る量・回復量・`get_max_physical_integrity(level)` との関係も未確認
-- `current_hp` が `max_hp` を超えている状態を観測している（2591 > 1560）。
-  戦闘に入る時点で丸めていると思われるが未確認。HP を条件に使うなら
-  `current_hp <= max_hp` を前提にしないこと
-- 「体力が足りないなら断る」を書くならここを見る（`307_` の
-  `STAMINA_MIN_PERCENT`）
 
 ### 2.18 エリア移動（土地から土地へ）
 
@@ -1450,6 +1715,38 @@ process_choice(AreaMoveManager,       choice_text='馬車(1000G)')       [MainTh
   「ゲーム native の待機表示」の入口（`206_` が発火を確認済み）
 - LLM 側に `llm_manager:area_move_rejector(character_life_log, player,
   character_instance, worldview)` がある。同行者が移動を拒む経路と思われるが未検証
+
+### 2.19 体力（スタミナ）は `physical_integrity`
+
+`Character.physical_integrity` / `max_physical_integrity`（`__init__` の既定は
+どちらも 100）。戦闘のHP（`current_hp` / `max_hp`）とは別物。
+
+同じプレイヤーを1晩追った実測（2026-08-01、`out/events.log` のダンプ3点）:
+
+| 時刻 | `physical_integrity` | `max_hp` | `exhausted` |
+|---|---|---|---|
+| 01:47 | 100 | 1560（`original_max_hp` と同じ） | `False` |
+| 01:49 | 50 | 1365 | `True` |
+| 02:03 | 0 | 1170 | `True` |
+
+- 土地の移動やクエストで減る。回復は医療施設
+  （`MedicalTreatmentManager(app, treatment_price)` /
+  `scripts.functions:get_heal_physical_integrity_barden(value)`）
+- 体力が減ると最大HPが下がる（1560 → 1365 → 1170。`original_max_hp` は
+  1560 のまま）。式は特定していないが、`physical_integrity` が上限を削る側
+- `exhausted`（bool）は 50/100 の時点で既に `True`。どの閾値で立つかは未特定。
+  減る量・回復量は未確認
+- **上限はレベルで伸びる**（`get_max_physical_integrity(level)`）。同一プレイヤーを
+  追ったセーブの実測 ― レベル 1→10 / 5→11 / 8→12 / 15→15 / 22→19 / 25→22 /
+  30→26 / 41→34 / 49→39 / 50→40 / 55→42 / 58→43 / 73→50。式は未特定だが、
+  **`100` は既定値（`__init__`）で、実際に遊んで到達する値ではない**。
+  レベルに対して上限が合っていないセーブは、どこかが壊れている合図になる
+  （VERIFICATION.md §2.36 でこれを使って新規キャラのレベル60を切り分けた）
+- `current_hp` が `max_hp` を超えている状態を観測している（2591 > 1560）。
+  戦闘に入る時点で丸めていると思われるが未確認。HP を条件に使うなら
+  `current_hp <= max_hp` を前提にしないこと
+- 「体力が足りないなら断る」を書くならここを見る（`307_` の
+  `STAMINA_MIN_PERCENT`）
 
 ### 2.20 手配度（`area_history` の `lawfulness`）
 
@@ -1786,6 +2083,187 @@ llm_manager:conversation_facilitator_after_retrieval(..., retrieved_knowledge)
 して記憶に残るので、後の会話にも影響する（同じ相手が前の話を引きずる）。
 1回きりにしたいなら、差し込む条件の側で「まだ拾っていない手がかりだけ」と
 絞る。
+
+### 2.25 会話の記憶の実体（`current_log` / `relationship` / `conversation_resolver`）
+
+`213_probe_npc_memory` の実測（2026-08-08。会話2回・同一 NPC・ローカル LLM）。
+
+**書く側。** 会話の終了時（`app.in_conversation` が落ちる数秒前）に
+`conversation_resolver` というマネージャが回り、NPC に書くのは2箇所:
+
+- `current_log`（リスト）… `〈会話〉…` で始まる会話1回ぶんの要約が**追記**
+  される。2件目の要約は**1件目の全文を含んだ累積形**だった（153字 →
+  2件目が「1件目の全文＋続き」の411字）。つまり `current_log` 自体が
+  会話を重ねるほど同じ文を二重三重に抱えていく
+- `relationship`（dict）… `{"player": {affinity, affinity_text[],
+  relationship[], conversation_count}}`。`conversation_count` が加算される
+
+> **要約は必ずしも走らない（実測2件）。要約の入口は終了ボタンの manager
+> 1つしかない。** 呼び出し元は実測で確定している:
+>
+> ```
+> ConversationEndManager.execute (instantale.py:4419)
+>   -> finish_conversation (:4350)
+>   -> ConversationEndManager.resolve_conversation (:4380)
+>   -> llm_manager:conversation_resolver (llm_manager.py:824)   ※別スレッド
+> ```
+>
+> つまり「会話を終了する」の spec を**通らない**抜け方は、すべて要約を
+> 素通りする。実測した不発は2件:
+>
+> 1. 会話の途中で行動処理（`master_ai_facilitator_from_conversation`）へ
+>    進んだ後にセッションが終わった回（2026-08-08 15:30〜。アプリ終了との
+>    切り分けは未了）
+> 2. **会話を閉じないままタイトル/別セーブのロードへ抜けた回**
+>    （同 16:18〜。ハンスとの会話が放置され、要約されずに消えた）
+>
+> **走らない抜け方では、その会話はゲーム側のどこにも要約されない。**
+> 会話の記憶に乗る MOD は「要約は必ずしも走らない」前提で設計すること。
+> ターンごとに動く仕掛け（`311_` の抽出など）はこの取りこぼしの保険に
+> なる。発火の有無は `213_` を入れたまま抜け方を変えて閉じれば、
+> `out\npc_memory.log` の `resolver: 発火/不発` の行で読める。
+
+**`current_log` は一時置き場。移送の契機は日付の変更**（実機で確認・
+2026-08-08）。日が変わると中身が `life_log` の1エントリへ移り、
+`current_log` は空になる。エントリの形は
+`{day_start, day_end, summarized_count, content}` で、`content` は
+**`current_log` のリストをそのまま `str()` した文字列**。移った後も
+`life_log` として毎回全文プロンプトに載るので、「前の話を引きずる」経路は
+途切れない。`summarized_count` が在ることから、`life_log` はさらに
+`memory.memory_archive` へ畳まれる段があると読めるが、その契機は未実測。
+
+> **要約が薄いのは移送のせいではない。`resolver` の出力量が実質固定だから。**
+> 移送は `str()` の丸写しで内容を落とさない。落ちているのは**その前**で、
+> `resolver` が書く要約は会話の長さにほとんど依らず一定の短さになる
+> （実測: 3ターン→116字 / 3ターン→142字 / 5ターン→185字 /
+> **8ターン（`messages` が 5,597字まで育った会話）→118字**）。つまり
+> 長く濃い会話ほど捨てられる割合が大きい。日付変更のあとに
+> 「内容が大分落ちている」と感じるのは、薄い要約が初めて永続側に現れる
+> のがそこだからで、劣化はもう起きた後である。
+
+なお `current_log` が空になった後の次の会話終了では、`resolver` は過去の
+会話の内容まで含めて**1本に書き直した**要約を新規に書いた（実測268字。
+読み込みは `life_log` 経由と思われる）。書き直しのたびに固定の短さへ
+圧縮されるので、**この経路の情報は単調に減る一方**で、増えることはない。
+
+**`resolver` の頼み文に文字数の上限は無い**（`output_data/<世界>/<PC>/
+`conversation_resolver/N.json` の実物・2026-08-08）。要点だけ:
+
+```
+「今日の現在ログ」に続きとして書き足す形で、会話の内容(user, assistant に
+よって記述された履歴)を、一切情報を損なわないが簡潔に要約して下さい。
+客観的に、どこで誰と誰がどういう会話をしたかを記述する事。
+```
+
+出力スキーマは `{"summary": str}` の1欄だけ。つまり短さの原因は上限では
+なく、**「一切情報を損なわない」と「簡潔に」が同じ文で衝突していて、
+モデルが後者に倒れること**。加えて指示が求めているのは「どこで誰と誰が
+どういう会話をしたか」＝**会話の流れ**なので、確定した数値や条件は流れに
+乗ったものしか残らない（実測の126字要約では取引額の `5000Gold` は残り、
+8ターンの会話→118字では宿泊料金の体系が落ちた）。
+
+> 文字数の上限が無いということは、**`111_llm_prompt_replace` の置換ルール
+> 1行で言い回しを変えられる**ということでもある（新しい MOD が要らない）。
+> ただし要約が伸びた分は同じ相手との会話プロンプトに毎回全文載るので、
+> 伸ばす前に下の重複掃除で枠を空けるのが順序として正しい。
+
+**ゲーム側の記憶は重複を抱えたまま膨らむ（実測2種）。**
+
+- `current_log` の累積形（1件目の全文を含む2件目）が畳まれずにそのまま
+  `life_log` へ移るので、`life_log` の1エントリの中に**同一要約の5連
+  コピー**を含む実例があった（事務官エドガー・3エントリ計911字。この
+  911字は毎回全文プロンプトに載る）。会話の実内容は1行ぶんしかない
+- 会話中の行動を処理する `master_ai_facilitator_from_conversation` の
+  プロンプト（実測6,200〜8,100字）は、NPC のプロフィール行と性格行を
+  **4回ずつ**、プレイヤーへの感情行を2回含む（行単位の完全一致で損262字。
+  `102_` は `messages` の隣接重複しか見ないのでこれは畳めない）。この
+  経路は会話5関数を通らないため `311_` の注入も届かない ― 重複はゲーム
+  自身のプロンプト組み立てによるもの
+
+`memory` はセーブ表（§2.23）の顔ぶれに反して**この時点では動かない**。
+実体は5鍵の dict（`life_log` / `memory_archive` / `session_log` /
+`prior_area_summary` / `brief_summary`）で、会話2回の間ずっと
+`brief_summary: "ゲーム開始"` のままだった。更新契機は未実測
+（エリア移動・セッション区切りと推定）。`knowledge` も None のままで、
+会話系関数の第2引数 `character_life_log` は NPC・プレイヤーどちらの
+`life_log` とも一致しない空 dict だった。
+
+**読む側。** `send_request*` 境界での含有照合では、`profile` /
+`personality` / `current_log` / `relationship`（`affinity_text` の文）が
+**毎回・全文**プロンプトに載る。§2.24 の「同じ相手が前の話を引きずる」の
+実経路は `current_log` で、retrieval を待たず開始の第一声
+（`conversation_starter`）から載る。
+
+> **`311_npc_profile_memory` と併用したときの帰結。** 同じ会話の事実が
+> (a) `current_log` の要約 (b) `311_` の注入プロフィール (c) `311_` の
+> `about_player` の3箇所で**同一プロンプトに並ぶ**（実測: 2回目の会話は
+> プレイヤー入力11字に対して開始時点で2,206字）。しかも `current_log` の
+> 累積形により (a) 自体も膨らむ。3者は言い換えの関係で行単位の完全一致は
+> 無いため、`102_` の隣接重複除去では畳めない。`311_` 側の対応を考える
+> ときは、出来事の再記述（(a) と被る部分）を抽出から外すのが筋になる。
+
+なお会話系5関数の**先頭4引数**の並びは共通（§2.24）だが、5番目以降は
+関数ごとに違う（`conversation_starter` は `args[4]='NPC'` の文字列が挟まり、
+worldview 以降が1つ後ろへずれる）。5番目以降を読む MOD は位置を決め打ち
+しないこと。
+
+---
+
+### 2.26 クエストの外の判定（マスターAI の `roll_the_dice`）
+
+クエストに入っていないとき（街・施設・会話中）の自由入力は
+`master_ai_facilitator` / `master_ai_facilitator_from_conversation` が処理する。
+フィールドイベント（§2.9）とは**別系統で、仕組みも違う**。
+
+```
+プレイヤーの入力
+  → master_ai_facilitator          think / narration / process[] / finished
+       process の1つが roll_the_dice: {"type": "roll_the_dice", "chance_percent": 70}
+  → ゲームが振り、次のターンのプロンプトに <結果:成功> を差し込む
+  → 続きを master_ai_facilitator が処理する（finished=true まで繰り返す）
+```
+
+- **確率を決めているのは LLM 自身**。`chance_percent` をそのまま出力する。
+  フィールドイベントのように、ゲームが `credibility` から式で作るのではない
+- 差し戻されるのは `<結果:成功>` / `<結果:失敗>` **だけ**。確率は書かれない
+  （フィールドイベントの `<確率N%: 成功>` とは形が違う。判定の印を探すコードは
+  両方を見ること）
+- **プロンプトに能力値は1つも載っていない**（`能力値` / `strength` / `dexterity` /
+  `attribute` すべて 0 件）。参照能力値にあたる欄も無い。つまり
+  **クエスト外の判定にもキャラクタの能力値は入っていない**
+- 権限は 14 種（`roll_the_dice` / `join_to_player_party` / `move_gold` /
+  `get_gold` / `elapse_days` / `generate_item` / `move_item` / `deal_damage` /
+  `add_status_effect` / `npc_say` / `start_battle` / `arrest_player` /
+  `generate_npc`）。「時系列があるものは1段階目だけ実行して次のターンに回せ」と
+  指示されているので、ダイスを振った回は必ず `finished=false` で戻ってくる
+
+実測（`output_data/` の `master_ai_*` 2,021 件。`roll_the_dice` は 191 回、
+うち結果まで対応が取れたのが 168 回）:
+
+| LLM が指定した確率 | 回数 | 実測の成功率 |
+|---|---|---|
+| 30% 以下 | 10 | 10% |
+| 35〜45% | 18 | 44% |
+| 50% | 36 | 47% |
+| 60% | 49 | 71% |
+| 65〜70% | 45 | 62% |
+| 75% 以上 | 10 | 60% |
+
+- 全体で 56.5%（95勝73敗）。**振っている側は概ね正直**
+- 指定される確率は 50 / 60 / 70 に 134/191 が集まる。プロンプトの例文が
+  「まずは成功確率50%でダイスを振ろう」なので、そこへ引かれている
+- 対応付けは本文の並び（`chance_percent` の直後に現れる `<結果:…>`）で取った
+  文字列ベースなので、数件のずれは残りうる
+
+> クエスト中の自由入力は `quest_referee_with_free_action` が受ける（§2.9）。
+> こちらには `roll_the_dice` に相当する権限も確率の印も無く、
+> 進行（battle / field_event / move / retire）を選ぶだけ。**判定はしない。**
+
+`targets.txt` には `master_ai_facilitator_in_quest` /
+`master_ai_faciltiator_from_conversation_in_quest`（綴りはゲーム側のまま）も
+あるが、`output_data/` には出ていない。クエスト中の自由入力がここへ回る条件は
+未確認。**4つとも同じ形の応答**なので、この経路を触る MOD は4つとも見ること
+（`313_event_ability_check`）。
 
 ---
 
