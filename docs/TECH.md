@@ -191,7 +191,7 @@ Get-ChildItem tools/test_*.py | Sort-Object Name | ForEach-Object {
 
 # 直している最中は、触った MOD のものだけを直接叩けばよい（落ちた内容が読める）
 python tools/test_patch_registry.py           # ローダ本体（台帳 / on_ready / 名乗り）
-python tools/test_state.py                    # state/ の住所と壊れない書き込み
+python tools/test_state.py                    # state/ の保存先の決め方と壊れない書き込み
 python tools/test_recon_archive.py            # 000_（リコンの退避が走る条件と名前）
 python tools/test_llm_prompt_replace.py       # 111_
 python tools/test_ui_conversation_log.py      # 122_（113_ との並びの取り決めもここで見る）
@@ -446,9 +446,9 @@ runtime/mods/
     fix_timings/
         mod.json                名乗りと入口の宣言。ローダはまずこれを読む
         timings.py              入口。apply(ctx) を定義する
-    mini_quest/
+    area_move_dungeon/
         mod.json
-        quest.py                入口
+        area_move_dungeon.py    入口
         prompts.py              分割した中身（from . import prompts）
         data/quest_table.json   同梱データ（ctx.mod_dir から読む）
 ```
@@ -545,6 +545,7 @@ def apply(ctx):
 | `ctx.resolve(target)` | `(owner, name, value)` を返す。調査用 |
 | `ctx.log(...)` / `ctx.log_exc(...)` | `out/modloader.log` へ |
 | `ctx.out_path(name)` | `out/<name>` の絶対パス。MOD 専用ログはここへ（§3.11） |
+| `ctx.logger(name)` | その MOD 専用のログ関数（`out/<name>` に1行ずつ追記）。**自分で `open` を書かない**（§3.11.2） |
 | `ctx.state_path(name)` | `state/<name>` の絶対パス。遊びの続きに要るデータはここへ（§3.11） |
 | `ctx.read_json(path, default)` | JSON を読む。無ければ `default`、**在るのに読めなければ**記録してから `default`（§3.11.1） |
 | `ctx.write_json(path, data)` | 落ちても壊れないように書く。成否を返す（§3.11.1）。**残すデータは必ずこれ** |
@@ -702,12 +703,10 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
 206_probe_quest_flow       が 104_balance_area_bgm    を包む（save_area_json:generate_quest_area を共有）
 300_event_facility_arrival が 205_probe_player_events を包む
 304_quest_end_keep_party   が 303_quest_end_party_to_guild を包む
-305_mini_quest             が 105_fix_schema_compact を包む（LlamaCppClient.chat を共有）
-                             → 305_ が先に前提を書き換え、105_ がその後でスキーマを縮める
 215_probe_event_roll       が 313_event_ability_check を包む（quest_referee_event_evaluate_new を共有）
                              → 計測は 313_ が動かした後の credibility を控える
-111_llm_prompt_replace     が 102_ / 103_ / 105_ を包み、305_ に包まれる
-                             → 305_ の完全一致の前提を壊さず、置換は圧縮前の本文を見る
+111_llm_prompt_replace     が 102_ / 103_ / 105_ を包む
+                             → 置換は圧縮前の本文を見る
 ```
 
 帯は帯であって分類の軸ではない。ゲーム本体の挙動を変えるなら機能追加でも 100番台で
@@ -726,7 +725,7 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
 
 | 置き場所 | 例 |
 |---|---|
-| **ローダ**（共有する） | ゲームの読み方（`ui` / `frames`）、`state/` の住所（`state`）、壊れない書き込み（`ctx.write_json`） |
+| **ローダ**（共有する） | ゲームの読み方（`ui` / `frames`）、`state/` の保存先の決め方（`state`）、壊れない書き込み（`ctx.write_json`） |
 | **MOD**（共有しない） | その MOD 固有の判断 ― どの画面に何を出すか、プロンプトをどう書き換えるか |
 
 **写して回るものが出たら、それはローダの語彙**だと考えること。写した時点で
@@ -742,7 +741,26 @@ cp932 のコンソールでも化けず、grep もしやすい。`version` を�
   それだと `open()` が失敗し、広い `except` に吸われて控えが黙って空に倒れる。
   **この知識は `110_fix_character_name_path` が先に持っていた**のに隣へ届いていない
 
-いまは2つある。**世界の住所**（`state`）と、**LLM へ出ていく文章が通る場所**
+いまローダに移してあるものは次のとおり。**どれも「同じものが2本以上に写って
+いた」ことが移した理由**で、思い付きで足したものは1つも無い:
+
+| 何を | どこに | 写されていた本数 |
+|---|---|---|
+| 世界の見分け方と、そこから作るファイル名 | `state.world_key` / `world_key_of_dict` / `world_filename` | 5本 / 4本 |
+| LLM へ出ていく文章が通る場所 | `llm.wrap_outgoing`（§5.3） | 2本（`111_` / `119_`） |
+| LLM に1問だけ聞く呼び方 | `llm.ask` / `create_structure` / `as_dict`（§5.3） | 3本（`311_` / `313_` / `902_`） |
+| 後から生える別名の見張り | `llm.watch_aliases`（§5.3） | 2本（`wrap_outgoing` / `213_`） |
+| MOD 専用のログ | `ctx.logger`（§3.11.2） | **49本** |
+| 文字列を期待する読み方 | `frames.text_of`（§5.2） | 3本が別々に取り違えていた |
+| 走っている app の探し方 | `ui.find_app` | 7本 |
+| クエストの2つの格納先・id の並べ方 | `ui.quest_stores` / `id_sort_key` ほか（§5.1.3） | 3本 |
+| HUD に足すボタンの作り方・絵柄 | `ui.make_icon_button` / `paint_icon` ほか（§5.1.3） | 3本（`113_` / `116_` / `122_`） |
+| 所持金と「今は出さない」旗 | `ui.gold_of` / `add_gold` / `money` / `BUSY_FLAGS` | 3本 / 2本 |
+| 包む前の素の関数まで剥がす | `patch.unwrap` / `original_of`（§3.7） | 4本（うち2本は1段しか剥がしていなかった） |
+| 壊れない書き込み・読み込み | `ctx.write_json` / `read_json`（§3.11.1） | 3本 |
+| HUD への置き場所 | `ui.overlay_host`（§5.1.3） | 2本 |
+
+代表的な2つの書き方。**世界ごとの保存先**（`state`）と、**LLM へ出ていく文章が通る場所**
 （`llm`。§5.3）:
 
 ```python
@@ -763,7 +781,7 @@ wrap_outgoing(ctx, rewrite, label="my mod")     # rewrite(texts, site) -> 並び
 それはローダの語彙」をそのまま適用した形。**どう書き換えるかは移していない**
 （あちらは確率つきの置換ルール、こちらは目印の差し替え。上の表のとおり）。
 
-> **`import state` ではなく関数を直に import する。** `301_` / `305_` は
+> **`import state` ではなく関数を直に import する。** `301_` は
 > `apply()` の中に `state = {...}` というローカル変数を持っている。モジュール名で
 > 入れると、その代入によって**関数の中では `state` がローカル扱いになり**、
 > 参照が `UnboundLocalError` になる。読む側にとっても、元の呼び出し
@@ -923,6 +941,31 @@ MOD から import された時点で、ここは `API = 1` と同格の約束に
 `boot()` をやり直す（当て直しは手作業の再注入と同じ経路なので層は重ならない）。
 1つでも現れたら当て直す。上限は 8 回 / 1 時間。
 
+保留は「まだ来ていない」だけの印なので、**来ないと分かったら降ろす**。ゲームは選ばれた
+プロバイダの送信モジュールを1つだけ import するので（GAME.md §2.12）、クラウド実行では
+`llama_cpp_runtime_completion` が一生 import されない。見張りは 5 秒ごとに
+`instantale_modloader.llm.is_cloud_runtime()` を見て、そうと分かった時点でローカル専用の
+保留を `skipped` へ移し、`status.json` を書き直して降りる。
+
+| 台帳の種類 | 意味 |
+|---|---|
+| `deferred` | まだ来ていない。見張りが待っている |
+| `skipped` | 待つのをやめた。理由は detail に残る（`not used with openai` / `gave up after 3600s` / `re-apply limit reached`） |
+
+**`is_cloud_runtime()` は `is_local_runtime()` の否定ではない。** 最初の LLM リクエストまでは
+どちらも False で、そこで決めつけるとローカル実行の保留まで降ろしてしまう。降ろすのは
+「クラウドと分かった」ときだけ。判定に送信モジュールの前置き
+（`scripts.llm.request_llm_inference_`）を使うのは、Alibaba のモジュール名が未実測でも
+「llama.cpp ではない」ことは言えるため。
+
+降ろした分は消さずに残す。台帳の合計が合わなくなると、その MOD のフックがどこへ行ったのかを
+追えなくなる。GUI は件数だけを状態欄に出す（`この実行では通らない経路のフック N 件`）―
+失敗ではないので ⚠ には出さない。
+
+> これを入れる前は、クラウド利用者の GUI が「段階適用の途中（未 import 14 件）」を出し
+> 続けていた（14 件は全て llama.cpp 宛て）。件数が減らないので、正常な起動が毎回
+> 「途中で止まっている」ように見えていた。
+
 ```
 defer wrap llama_cpp_runtime_completion:LlamaCppClient.chat (... is not imported yet)
 deferred: waiting for llama_cpp_runtime_completion, scripts.llm.llm_manager (checking every 5s)
@@ -1077,7 +1120,7 @@ def watch():
 ```
 patches: 61 applied on 54 target(s) by 26 mod(s)
 overlapping targets (5):
-  llama_cpp_runtime_completion:LlamaCppClient.chat <- 105_fix_schema_compact/, 305_mini_quest/
+  llama_cpp_runtime_completion:LlamaCppClient.chat <- 105_fix_schema_compact/, 111_llm_prompt_replace/
 deferred (2): waiting for the module to be imported
   llm_manager:quest_referee_event_resolve (scripts.llm.llm_manager) <- 206_probe_quest_flow/
 UNRESOLVED (1): target not found in the running build
@@ -1299,7 +1342,7 @@ journey_path = ctx.state_path("road_travel.json")  # 続きに要るデータ
 | 理由 | 例 |
 |---|---|
 | セーブの構造を壊さずに足せない | NPC は33項目の並びが決まっている（`310_` の台帳） |
-| 足しても往復で残る保証が無い | `Quest` が独自キーを写すかは読めない（`301_` / `305_`） |
+| 足しても往復で残る保証が無い | `Quest` が独自キーを写すかは読めない（`301_` / `307_`） |
 
 置き場所を分ける前に遊んでいた人のデータは、`ctx.state_path()` が拾う。
 `state/` 側に無くて `out/` に同じ名前が在れば、1度だけ移してくる（フォルダも
@@ -1346,11 +1389,36 @@ ctx.write_text(ctx.state_path("log.jsonl"), text)                    # JSON 文�
 | 場面 | 使うもの |
 |---|---|
 | 残すデータ（`state/`）| **必ず** `ctx.write_json()` / `ctx.write_text()`、読むのは `ctx.read_json()` |
-| ログの追記（`out/`）| `open(path, "a")` でよい。1行ずつ足すだけで、壊れても捨てられる |
+| ログの追記（`out/`）| `ctx.logger()`（§3.11.2）。1行ずつ足すだけなので tmp→replace は通さない |
+
+#### 3.11.2 MOD 専用のログは `ctx.logger()` で作る
+
+```python
+write = ctx.logger("quest_offer.log")          # [時刻] 本文
+write = ctx.logger("bgm.log", tag="[BGMFIX]")  # [時刻] [BGMFIX] 本文
+write = ctx.logger("item_detail.log", stamp=False)   # 本文だけ
+```
+
+| 引数 | |
+|---|---|
+| `tag` | 時刻と本文の間に**そのまま**挟む（区切りの記号も込みで渡す）。角括弧の形（`"[BGMFIX]"`）と区切りの形（`LOG_TAG + ":"`）が両方使われていて、どちらも実機の記録として GAME.md / VERIFICATION.md に引用されている ― 体裁を揃えると、その引用が次のプレイのログと一致しなくなる |
+| `stamp` | 時刻を付けるか（既定 True）。自分で時刻を組み立てて渡す記録では False |
+| `label` | 書けなかったときに `modloader.log` へ出す名前。既定は MOD のフォルダ名 |
+
+書けなくても**例外にしない**（`ctx.log_exc` に残して素通り）。呼ぶのはゲームの
+スレッドの中で、記録が取れないことよりゲームを巻き込むことの方が困る。錠は
+中に持っているので、別スレッドから書く MOD（`213_` / `311_`）も自分で掛けなくてよい。
+
+**MOD のログはローダのログ（`ctx.log`）と分ける。** 何が起きたかはその MOD の
+記録に残したいが、`modloader.log` は全 MOD の共用なので、混ぜると1本を追うのに
+他の全部を読むことになる。
+
+> この7行は**42本の MOD に写されていた**（時刻付き・印付き・時刻なし・錠付きの
+> 4通りに枝分かれした状態で）。写して回るものはローダの語彙（§3.2.3）。
 | 利用者の操作の結果 | 例外にする（`config.py` の `_save_settings_json`、`gui.py` の `write_order`）。GUI がダイアログに出す ― 黙って False を返すと、保存されていないのに保存されたように見える |
 
 > **同じ規則を2箇所に書かない。** 以前は `311_` / `312_` / `122_` が同じ
-> tmp→fsync→replace を各自で持ち、一方で `301_` / `305_` / `307_` /
+> tmp→fsync→replace を各自で持ち、一方で `301_` / `307_` /
 > `config.save_store` は素の `open(..., "w")` のままだった。理屈は全部に等しく
 > 当てはまるのに、書いてある場所にだけ適用されている状態だった。仕組みは
 > `instantale_modloader.write_text()` の1箇所にあり、`write_json()` はその上に
@@ -1452,8 +1520,8 @@ screen.mark_of(entry)        # 'offer'（自分のボタンでなければ None�
 
 キーを他の MOD と共有すると、相手の `on_button_press` が自分のボタンを握り潰す。
 同梱 MOD が使用中のキーは `mod_action`（`301_`）/ `mod_party_action`（`302_`）/
-`mod_mini_action`（`305_`）/ `mod_road_action`（`307_`）/ `mod_pardon_action`
-（`309_`）。
+`mod_road_action`（`307_`）/ `mod_pardon_action`（`309_`）。開発中の MOD も
+それぞれ別のキーを持つ（`mod_mini_action` ほか）。
 
 印のキーは必ず `ui.MARK_PREFIX`（`mod_`）で始めること。 残骸の掃除
 （`prune_stale`）が「他の MOD が今その場に出しているボタン」を見分けるのに、この
@@ -1530,6 +1598,52 @@ ui.find_guild(area) / ui.find_facility(area, id) / ui.facility_name(app, facilit
 ui.facility_type_of(...) / ui.GUILD_FACILITY_TYPE
 ```
 
+クエストの格納先（`301_` / `307_` が共有。GAME.md §2.9）:
+
+```python
+ui.quest_stores(app)      # クエストが入っている2つの場所
+ui.quest_ids(app) / ui.quest_of(app, id) / ui.quest_value(quest, name, default)
+ui.set_quest_value(app, id, name, value, on_error=...)
+ui.id_sort_key            # id を**数として**並べる鍵（sorted(..., key=) に渡す）
+```
+
+`id_sort_key` を通すのは、ゲームの id が採番順の**文字列**だから。素の
+`sorted()` は辞書順なので `"10" < "9"` になり、「いちばん新しい id」を採ると
+1回の生成で複数増えた回だけ取り違える（`301_` が実際にそうなっていた）。
+
+所持金と「今は画面を出さない」状態（`309_` / `901_` / `902_` が共有）:
+
+```python
+ui.gold_of(app) / ui.add_gold(app, amount, on_error=...) / ui.money(value)
+ui.BUSY_FLAGS            # 戦闘中・会話中など。`300_` は in_shopping を外して使う
+```
+
+`gold_of` は **`bool` を弾く**（Python では `True` が `int` なので、素朴な
+`isinstance` だと `gold = True` を所持金 1 として通してしまう）。
+
+**読むのはどちらでもよいが、書くときは必ず両方。** 片方だけ直すと画面の表示と
+保存内容がずれる。`quest_value` はインスタンスでも dict でも同じ書き方で読める。
+
+HUD に足す自前のボタン（`113_` / `116_` / `122_` が共有）:
+
+```python
+ui.CORNERS / ui.AS_TEXT / ui.upx(value) / ui.window_size()
+ui.clamp_into_window(widget)          # 置いた後に必ず通す（はみ出すと押せない）
+ui.make_icon_button(text=, size=, square=, font_name=, pos_hint=)
+ui.icon_strokes(icon, flipped)        # 共有の絵柄（二重山形・山形・矢印・枠）
+ui.paint_icon(button, strokes, attr=, key=, width=, alpha=, log_exc=)
+ui.show_widget(widget, visible)       # 隠すときは押せなくもする
+```
+
+`paint_icon` は**変わったときだけ**引き直す（位置・大きさ・太さ・濃さと `key`
+を控えて突き合わせる）。本文は1文字ずつ増え、パーティ欄は HP が動くたびに
+塗り直されるので、毎回引くと無駄が積み上がる。控えの名前は
+`ui.MOD_WIDGET_PREFIX` で始めること（`overlay_host` の見分けに使う）。
+
+**MOD 固有の絵柄はローダに足さない。** `113_` の「伸縮」、`116_` の「人」、
+`122_` の本や吹き出しはその MOD だけの語彙なので、MOD のフォルダに置いて
+`ui.icon_strokes()` に落とす形にする。
+
 HUD へ自前のウィジェットを1枚足すとき（`113_` / `116_`。GAME.md §2.3）:
 
 ```python
@@ -1564,6 +1678,7 @@ ui.character_of(app, id) / ui.character_name(app, id)
 ### 5.2 `instantale_modloader.frames`
 
 ```python
+frames.text_of(obj, name)  # 文字列を期待する読み方。文字列でなければ None（下記）
 frames.caller()            # 呼び出し元の連鎖。段数では数えない（wrap の層が挟まる）
 frames.owner_of(code)      # method_1 / execute の持ち主クラスを名指しする
 frames.attr(obj, name)     # hasattr を使わない存在確認
@@ -1582,8 +1697,27 @@ frames.MISSING             # 「属性が無い」を None と区別する番兵
 `MISSING` が**文字列**であることは型の検査もすり抜ける。 `isinstance(value, str)`
 は「属性が無い」を弾けない ― `118_` が本文をこれで受けて、`"<missing>"` を本文だと
 思ったまま照合し続けていた（実機でクリックの打ち切りが毎回不発。症状はログの
-1行だけで、例外は出ない）。文字列を期待するなら
-`value is not frames.MISSING and isinstance(value, str)` の順で書く。
+1行だけで、例外は出ない）。
+
+**文字列を期待するなら `frames.text_of()` を使う。**
+
+```python
+text = frames.text_of(widget)                 # 文字列でなければ None
+font = frames.text_of(label, "font_name")
+```
+
+番人は**2つとも文字列**（属性が無ければ `"<missing>"`、property の評価が
+失敗すれば `"<... while reading>"`）なので、`attr()` で受けて `isinstance` で
+弾くやり方は片方しか塞げない。`text_of()` は番人を作らずに読むので、
+「無い」も「読めない」も一様に `None` になる。区別が要るときだけ `attr()` を使う。
+
+同じ罠を3本が別々に踏んでいる。`118_`（本文）、`115_`（`text` を持たない飾りの
+ウィジェットが一覧の「行」に数えられ、**一覧が丸ごと棄却されていた**）、
+`116_`（本文ラベルが None のとき `"<missing>"` をフォント名として代入）。
+
+値を照合するだけなら、**既定値を明示する**のでもよい（`frames.attr(w, "text", None)`）。
+`109_` の `text_size` はこれで、既定を省くと `"<missing>"[0]` が `"<"` になり
+幅として通ってしまう。
 
 ### 5.3 `instantale_modloader.llm`
 
@@ -1634,6 +1768,39 @@ hooks.armed()          # 今その名前がある対象（起動直後はクラ�
 
 クラウド境界で見えるのは呼び出し側が渡した `message` だけ。`send_request` の中で
 足される部分（Gemini のスキーマ文など）には当たらない（GAME.md §1.8）。
+
+#### MOD から LLM に1問だけ聞く（`llm.ask`）
+
+書き換えではなく**自分から聞く**側の口。こちらも「どこから呼ぶか」がゲームの
+読み方なのでローダが持つ。
+
+```python
+from instantale_modloader import llm
+
+text = llm.ask(ctx, "mod_my_question", [{"role": "user", "content": "..."}],
+               timeout=30, label="my mod", write=write)
+
+structure = llm.create_structure(ctx, "MyAnswer", {"attribute": (str, ...)})
+data = llm.ask(ctx, "mod_my_question", message, timeout=30, structure=structure)
+```
+
+| 決まり | 理由 |
+|---|---|
+| **`timeout` はキーワードで必ず渡す**（既定値を置いていない） | ゲーム側の既定は無期限。1回返らないと呼んだ側が永久に止まる ― `311_` は抽出を1本のワーカーで直列に回しているので以後の抽出が全部止まり、`300_` は情景描写のスレッドを巻き込む |
+| `message` は**必ずリスト** | 素の文字列は `send_request_on_id` で `TypeError`（GAME.md §2.12）。`ask` が `list()` に通す |
+| `manager_name` は MOD 専用の名前にする | `output_data/` に別々に残り、後から質を見られる |
+| 返却は `as_dict` で均す | pydantic のモデル・辞書・JSON 文字列のどれで来るかは版とプロバイダで変わる |
+| 返却の型に **`Literal` を使わない** | 候補が空の `Literal[]` は pydantic が拒否してゲームごと落ちる（`203_` が実際の落ち方を押さえている） |
+
+**送信モジュールを名指ししないこと。** プロバイダごとに違ううえ、名指しの一覧は
+必ず古くなる ― `300_` と `311_` は `llama_cpp` と `any_server` の2つしか知らない
+まま、Gemini / OpenAI / Claude では毎回空振りしていた（`generate_line` が
+`skip:` を出し続け、`311_` はフォールバックを失っていた）。`resolve_send()` は
+`llm_manager` の別名を先に見て、無ければ**前置きで**送信モジュールを走査する。
+
+`timeout` を受け付けない未実測のプロバイダでは `TypeError` で失敗して None を
+返す（呼び側は LLM を使わない道へ降りる）。渡さずに呼び直さないのは、
+**止まらないことのほうが大事**だから。
 
 ---
 
@@ -1719,7 +1886,7 @@ hooks.armed()          # 今その名前がある対象（起動直後はクラ�
 | 生成物の質が要るところで、生成をやめて用意した表から選ぶ | `120_`（名前は音替えでも LLM でも当たり外れが出た。同梱の名簿から空いているものを引く形にすると、質が入力で決まる。引くたび引き直すが名前は落ち着く ― 結果を素データにも書くので、次に同じ NPC を見たときには衝突が無い。再現性を持たせようと `crc32(id)` で選んだ版は、世界をまたぐと同じ id が同じ名前になった） |
 | LLM の出力の揺れを、正規化した鍵で畳んでから裁く | `120_`（表記ゆれ・修飾語・姓名を落とした「読みの骨」で比べる。モデルを問わない） |
 | 本体が直ったら自動で降りる修正にする | `123_`（「新規開始だから」ではなく「レベルだけが他の値と食い違っているから」直す。食い違いそのものを条件にすると、本体が直った版では1行も動かず、手で編集したセーブも巻き込まない） |
-| 例外を条件付きで握り潰す | `100_`（`hWnd=None` のときだけ。それ以外は再送出） |
+| 失敗を握り潰す前に、必ず引数と型を記録する | `100_`（元の呼び出しが失敗したら値と型を残し、自前のプロトタイプで直接呼び直す。それも駄目なら諦めて `None`。**再送出はしない** ― 通るのは終了処理の中だけで、ここで投げてもゲームを巻き込むだけだから。代わりに、握り潰した回が全部ログに残る） |
 | どのフックが効くか分からないので全部に仕掛ける（重複しても平気な書き方で） | `104_`（BGM）、`105_`（`chat` と `payload`） |
 
 ### 7.2 プロンプトと LLM
@@ -1727,8 +1894,8 @@ hooks.armed()          # 今その名前がある対象（起動直後はクラ�
 | 手口 | 見る MOD |
 |---|---|
 | 関数の引数を書き換える（出力の形は変えない） | `103_`（`quest_event_log`）、`105_`（`messages`）、`301_`（`area_description` に会話を添える） |
-| ゲームのプロンプトの前提そのものを差し替える | `305_`（討伐前提の8つの文を実データで裏を取ってから置換。1つでも当たらなければ丸ごと諦める） |
-| 判定は全メッセージを繋いで、書き換えは各メッセージに | `305_`（進行判定は1文目が system・クエスト名が user と分かれている）、`111_`（確率の抽選も繋いだ本文に対して1回） |
+| ゲームのプロンプトの前提そのものを差し替える | 開発中の MOD（討伐前提の8つの文を実データで裏を取ってから置換。1つでも当たらなければ丸ごと諦める。§2.6） |
+| 判定は全メッセージを繋いで、書き換えは各メッセージに | `111_`（確率の抽選も繋いだ本文に対して1回）。目印が system と user に散っているプロンプトでは、これでないと当たらない |
 | 外部（プロキシ）でやっていた加工をプロセス内へ移す | `102_` / `103_` / `105_`（判定条件と出力書式を揃える）、`111_`（ルールファイルの書式まで揃えるので、外部で書いたものをフォルダにコピーすれば動く。本文が復号済みなので `\n` / `\uXXXX` / `$1` の読み替えが要る） |
 | 利用者が編むデータファイルを持つ | `111_`（`mods/111_.../llm_replacements.txt` があればそれ、無ければ同梱の `.default.txt`。更新で消えない名前の分け方は §3.1.1。探索も外部参照もしない） |
 | 利用者が書いた規則をリクエストのたびに読み直す | `111_`（更新時刻と大きさを見る。読めない間は前回の規則で続ける＝保存の書き込み途中で壊れない。消えたら置換を止める） |
@@ -1741,15 +1908,16 @@ hooks.armed()          # 今その名前がある対象（起動直後はクラ�
 
 | 手口 | 見る MOD |
 |---|---|
-| 自前の選択肢ボタンを足して押下を横取りする | `301_` / `302_` / `305_`（`on_button_press` + 独自キー） |
-| ゲーム本来のフェーズを自分から起こす | `300_`（`ConversationStartManager`）、`301_` / `305_`（`DisplayQuestChoice`） |
+| 自前の選択肢ボタンを足して押下を横取りする | `301_` / `302_`（`on_button_press` + 独自キー） |
+| ゲーム本来のフェーズを自分から起こす | `300_`（`ConversationStartManager`）、`301_`（`DisplayQuestChoice`） |
 | 引数の語彙を知らないまま、ゲームのボタンの `args` を写して同じ処理を起こす | `307_`（`AreaMoveManager` の `mode`。確認画面から読み取って控え、後で同じ値で起こす） |
 | 会話を正しく閉じてから次へ進む | `301_` / `302_`（`ui.Screen.end_conversation`） |
-| 待機表示で画面の繋ぎ目を隠す | `301_` / `305_`（`ui.Screen.busy_on` / `busy_off(restore=False)`） |
+| 待機表示で画面の繋ぎ目を隠す | `301_`（`ui.Screen.busy_on` / `busy_off(restore=False)`） |
 | 手が空くのを待ってから実行する | `300_` / `303_`（`ui.Screen.when_idle`） |
 | 選択肢の枠を使わず、HUD へ自前のウィジェットを1枚足す | `113_`（`Button` を `pos_hint` で隅に置く。`add_widget` の既定は先頭挿入＝一番上に描かれる。フォントは本文のラベルから写す。Kivy の既定に日本語が無いため） |
 | 他の MOD が置いたウィジェットの隣に並ぶ | `122_`（相手は HUD の控え（`_instantale_expand_button`）から引き、大きさを写して `pos` / `size` に束ねる。塗り直しを待つと1手ぶん遅れて追いかけることになる。相手が居なければ相手と同じ置き方に落ちる） |
-| ゲームの画面を一切動かさずに読み物を出す | `122_`（`ModalView` に `ScrollView` + `Label` を1枚。書体は本文のラベルから写す。版差のあるプロパティ（`background_color` / `overlay_color`）は持っているほうにだけ効かせる） |
+| ゲームの画面を一切動かさずに読み物を出す | `122_`（`ModalView` に `ScrollView` + 縦に並べた `Label`。書体は本文のラベルから写す。版差のあるプロパティ（`background_color` / `overlay_color`）は持っているほうにだけ効かせる） |
+| 長い文章を Label 1枚に入れない | `122_`（Kivy の Label は中身を1枚のテクスチャに焼くので、GPU の上限（多くの環境で 16384px）を超えると**例外も出さずに何も描かれない**。塊に割って複数枚で持つ。VERIFICATION.md §3.21） |
 | 流れて消える情報を、追記専用の控えとして残す | `122_`（`state/` に JSON Lines で1行1件。途中で落ちても壊れるのは最後の1行だけで、読む側はその行を捨てる。上限の倍まで伸びたら隣に書いて差し替える） |
 | ゲームが決めた寸法を、元に戻せる形で変える | `109_` / `113_`（設計値はウィジェット自身に控える。MOD 側の変数に持つと、注入し直したときに変えた後の値を設計値として控える） |
 | はみ出した一覧を、位置も中身の大きさも変えずに収める | `115_`（`GridLayout` の `cols` を増やして折り返す。ウィジェットを移し替えないので、ゲームの開閉の後始末と衝突しない） |

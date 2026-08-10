@@ -61,7 +61,7 @@ import time
 import traceback
 import uuid
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 # mod との契約。`mod.json` の "api" がこれと突き合わされる。
 #
@@ -522,6 +522,61 @@ class ModContext:
         path = os.path.join(self.out_dir, *parts)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
+
+    def logger(self, name: str, *, tag: str = None, stamp: bool = True,
+               label: str = None):
+        """この MOD 専用のログ関数を作る。`out/<name>` に1行ずつ追記する。
+
+            write = ctx.logger("quest_offer.log")
+            write("offered 3 quest(s)")     # -> [2026-08-10T12:34:56.789] offered ...
+
+        **MOD のログはローダのログ（`ctx.log`）と分ける。** 何が起きたかは
+        その MOD の記録に残したいが、`modloader.log` は全 MOD の共用なので、
+        混ぜると1本を追うのに他の全部を読むことになる。
+
+        | 引数 | |
+        |---|---|
+        | `tag` | 時刻と本文の間に**そのまま**挟む印（区切りの記号も込みで渡す）。`"[FLAGFIX]"` なら `[時刻] [FLAGFIX] 本文`、`"quest-end:"` なら `[時刻] quest-end: 本文` |
+        | `stamp` | 時刻を付けるか。既定 True。自分で時刻を組み立てて渡す記録では False |
+        | `label` | 書けなかったときに `modloader.log` へ出す名前。既定は MOD のフォルダ名 |
+
+        `tag` を逐語にしてあるのは、**既にあるログの見た目を変えないため**。
+        角括弧の形（`[BGMFIX]`）と区切りの形（`quest-end:`）が両方使われていて、
+        どちらも実機の記録として GAME.md / VERIFICATION.md に引用されている。
+        ここで体裁を揃えると、その引用が次のプレイのログと一致しなくなる。
+
+        書けなくても**例外にしない**（`ctx.log_exc` に残して素通り）。呼ぶのは
+        ゲームのスレッドの中で、記録が取れないことよりゲームを巻き込むことの
+        方が困る。ログの追記なので `write_text()` の tmp→replace は通さない
+        （1行ずつ足すだけで、壊れても捨てられる。TECH.md §3.11.1 の表）。
+
+        **`out/` へ書くこと自体に意味がある。** 注入のたびに
+        `tools/logrotate.py` が1世代送るので、1回のプレイぶんだけが残る。
+
+        以前はこの7行が**42本の MOD に写されていた**（時刻付き・印付き・
+        時刻なし・錠付きの4通りに枝分かれした状態で）。写して回るものは
+        ローダの語彙（TECH.md §3.2.3）。
+        """
+        path = self.out_path(name)
+        whose = label or (self._mod or "mod")
+        lock = threading.Lock()
+
+        def write(text):
+            try:
+                line = str(text).rstrip("\n")
+                if tag:
+                    line = "{} {}".format(tag, line)
+                if stamp:
+                    line = "[{}] {}".format(
+                        datetime.datetime.now().isoformat(timespec="milliseconds"),
+                        line)
+                with lock:
+                    with open(path, "a", encoding="utf-8") as fh:
+                        fh.write(line + "\n")
+            except Exception:
+                self.log_exc("{}: write failed".format(whose))
+
+        return write
 
     def state_path(self, *parts: str) -> str:
         """state/ 以下のパスを返す。親ディレクトリは先に作っておく。
@@ -1248,11 +1303,48 @@ def _superseded(generation: str) -> bool:
     return current is not None and getattr(current, "_state", None) is not _state
 
 
+def _settle_unused_local(out_dir: str, pending: list) -> list:
+    """ローカル（llama.cpp）専用の保留を、クラウドと分かった時点で降ろす。
+
+    ゲームは選ばれたプロバイダの送信モジュールを**1つだけ** import する
+    （GAME.md §2.12）。クラウドなら `llama_cpp_runtime_completion` は一生
+    import されないので、待ち続けても当たらない。それでも `deferred` に居座ると
+    GUI は「段階適用の途中」と言い続け、注入のたびに無駄な見張りが立つ。
+
+    戻り値は**待ち続けるべきモジュール**の並び。降ろすのは「クラウドと分かった」
+    ときだけで、起動直後（プロバイダ未確定）は何もしない ― `is_cloud_runtime()` は
+    `is_local_runtime()` の否定ではなく、どちらも False の時間帯がある。そこで
+    決めつけると、ローカル実行の保留まで降ろしてしまう。
+    """
+    from . import llm as _llm
+    from . import patch_registry as _registry
+
+    local = [name for name in pending if name in _llm.LOCAL_ONLY_MODULES]
+    if not local or not _llm.is_cloud_runtime():
+        return pending
+    providers = [name[len(_llm.REQUEST_MODULE_PREFIX):]
+                 for name in _llm.request_modules()
+                 if name != _llm.LOCAL_REQUEST_MODULE] or ["cloud"]
+    moved = _registry.settle_deferred(local, "not used with " + "/".join(providers))
+    log("deferred: {} in use; {} hook(s) for {} will not be waited for "
+        "(that path is not taken in this run)".format(
+            "/".join(providers), moved, ", ".join(local)))
+    # 台帳が変わったので書き直す。GUI は status.json しか見ていないので、
+    # ここで書かないと「途中」のまま残る（それがこの関数を足した動機）。
+    write_status(out_dir)
+    return [name for name in pending if name not in local]
+
+
 def _deferred_loop(out_dir: str, generation: str, pending: list) -> None:
     deadline = time.monotonic() + DEFERRED_TIMEOUT
     while time.monotonic() < deadline:
         time.sleep(DEFERRED_POLL)
         if _superseded(generation):
+            return
+        # プロバイダが決まるのは最初の LLM リクエスト＝この見張りが立った後の
+        # ことがある。だから arm のときだけでなく、毎回見る。
+        pending = _settle_unused_local(out_dir, pending)
+        if not pending:
             return
         arrived = [name for name in pending if sys.modules.get(name) is not None]
         if not arrived:
@@ -1268,9 +1360,14 @@ def _deferred_loop(out_dir: str, generation: str, pending: list) -> None:
             # ここで投げるとゲーム側のスレッドを道連れにするので、記録だけして降りる。
             log_exc("deferred re-apply failed")
         return
+    from . import patch_registry as _registry
+    late = [n for n in pending if sys.modules.get(n) is None]
     log("deferred: gave up after {:.0f}s; still not imported: {}".format(
-        DEFERRED_TIMEOUT, ", ".join(n for n in pending if sys.modules.get(n) is None)),
-        level="WARN")
+        DEFERRED_TIMEOUT, ", ".join(late)), level="WARN")
+    # 見張りが降りた以上、もう当たらない。`deferred` のまま残すと「まだ待って
+    # いる」と読めてしまうので、諦めたことを台帳に書いて status.json へ流す。
+    if _registry.settle_deferred(late, "gave up after {:.0f}s".format(DEFERRED_TIMEOUT)):
+        write_status(out_dir)
 
 
 def _arm_deferred(out_dir: str, generation: str) -> None:
@@ -1286,12 +1383,17 @@ def _arm_deferred(out_dir: str, generation: str) -> None:
     再注入と同じ経路で、世代管理（patch.py）が前の層を置き換えるので重ならない。
     """
     from . import patch as _patch
-    pending = _patch.pending_modules()
+    from . import patch_registry as _registry
+    # 見張りを立てる前に、待っても無駄と分かっているものを降ろす。当て直しの
+    # boot はプロバイダが決まった後に走るので、この時点で片付くことが多い。
+    pending = _settle_unused_local(out_dir, _patch.pending_modules())
     if not pending:
         return
     if _state["deferred_boots"] >= MAX_DEFERRED_BOOTS:
         log("deferred: already re-applied {} time(s); not watching again for {}".format(
             _state["deferred_boots"], ", ".join(pending)), level="WARN")
+        if _registry.settle_deferred(pending, "re-apply limit reached"):
+            write_status(out_dir)
         return
     log("deferred: waiting for {} (checking every {:.0f}s)".format(
         ", ".join(pending), DEFERRED_POLL))

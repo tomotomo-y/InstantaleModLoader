@@ -63,6 +63,11 @@
 いる間もゲームの画面はそのまま。書体は本文のラベルから写す（Kivy の既定には
 日本語が無く、写さないと豆腐になる）。開いた直後は**いちばん下**（＝最新）を出す。
 
+中身は **Label 1枚ではなく、縦に並べた複数枚**で持つ。Kivy の Label は中身を
+1枚のテクスチャに焼くので、GPU の上限（多くの環境で 16384px）を超えた瞬間に
+**何も描かれない** ― 実機で 500 件を1枚に入れて窓が空になった（2026-08-10）。
+件数が増えれば必ず踏むので、`VIEW_CHUNK_CHARS` ごとの塊に割ってある。
+
 開いている最中に新しい本文が来たら、その場で足す。下まで読んでいたときだけ
 下へ追従する（途中を読んでいる人の位置を動かさない）。
 
@@ -77,7 +82,6 @@
 import datetime
 import json
 import os
-import re
 import sys
 import weakref
 
@@ -145,16 +149,12 @@ PLACEMENTS = (NEXT_TO_EXPAND, IN_FRAME)
 # 枠の内側に置くときの余白（px。113 の `FRAME_INSET` と同じ値）。
 FRAME_INSET = 8.0
 
-# 隅と `pos_hint` の対応。縁からわずかに内側へ入れる（113 と同じ）。
-CORNERS = {
-    "右上": {"right": 0.995, "top": 0.995},
-    "左上": {"x": 0.005, "top": 0.995},
-    "右下": {"right": 0.995, "y": 0.005},
-    "左下": {"x": 0.005, "y": 0.005},
-}
+# 隅と `pos_hint` の対応。ボタンの作り方ごとローダに集約してある
+# （`113_` / `116_` と共有。TECH.md §3.2.3）。
+CORNERS = ui.CORNERS
 
 # 絵柄に「文字」を選んだときの呼び名。
-AS_TEXT = "文字"
+AS_TEXT = ui.AS_TEXT
 
 # ラベルから親を何段まで上へたどるか（ラベル → 入れ物 → ScrollView → HUD）。
 MAX_UP = 6
@@ -176,6 +176,14 @@ VIEW_BORDER_WIDTH = 1.5
 VIEW_BORDER_ALPHA = 0.8
 VIEW_CLOSE = "×"
 VIEW_EMPTY = "まだ記録がありません。"
+
+# Label 1枚に入れる文字数の上限と、その間隔（px）。**1枚に全部入れない**
+# （`view_blocks` の説明。テクスチャの上限を超えると何も描かれない）。
+VIEW_CHUNK_CHARS = 1200
+VIEW_GAP = 8
+
+# 窓を開くときに組む文字数の上限。あふれるのは古いほう。
+VIEW_MAX_CHARS = 200000
 
 # 記録の上限（`out/conversation_log.log` に出す診断の行数）。本文そのものは
 # `state/` の側に残るので、こちらは「どこへ置いたか」「拾えたか」だけ。
@@ -209,20 +217,48 @@ def entry_text(entry):
     return text if isinstance(text, str) else ""
 
 
-def view_text(entries):
-    """窓に出す本文。古い順に並べ、間に1行あける。"""
-    blocks = []
-    for entry in entries:
-        text = entry_text(entry)
-        if not text:
-            continue
-        head = short_time(entry.get("t")) if SHOW_TIME else ""
-        blocks.append(("── {} ──\n".format(head) if head else "") + text)
-    return "\n\n".join(blocks) if blocks else VIEW_EMPTY
+def entry_block(entry):
+    """1件ぶんの見出しと本文。"""
+    text = entry_text(entry)
+    if not text:
+        return ""
+    head = short_time(entry.get("t")) if SHOW_TIME else ""
+    return ("── {} ──\n".format(head) if head else "") + text
+
+
+def view_blocks(entries):
+    """窓に出す本文を、**Label 1枚ぶんずつの塊**にして古い順に返す。
+
+    全部を1枚に入れてはいけない。Kivy の Label は中身を1枚のテクスチャに焼くので、
+    GPU の上限（多くの環境で 16384px）を超えた瞬間に**何も描かれない** ―
+    実機で 500 件を1枚に入れて窓が空になったのがこれ（2026-08-10）。
+    件数が増えるほど確実に踏むので、塊に割って複数枚で持つ。
+
+    それでも組む量には上限を置く（`VIEW_MAX_CHARS`）。件数の上限を大きくした人の
+    窓が、開くたびに何十万字を組み直すことにならないように ― あふれるのは
+    **古いほう**で、新しい本文は必ず出る。
+    """
+    blocks = [block for block in (entry_block(entry) for entry in entries) if block]
+    kept, total = [], 0
+    for block in reversed(blocks):
+        total += len(block)
+        if kept and total > VIEW_MAX_CHARS:
+            break
+        kept.append(block)
+    kept.reverse()
+    chunks, current = [], ""
+    for block in kept:
+        if current and len(current) + len(block) > VIEW_CHUNK_CHARS:
+            chunks.append(current)
+            current = block
+        else:
+            current = block if not current else current + "\n\n" + block
+    if current:
+        chunks.append(current)
+    return chunks or [VIEW_EMPTY]
 
 
 def apply(ctx):
-    log_path = ctx.out_path(LOG_BASENAME)
     # 控えの置き場。**ここで1回だけ引く**（`ctx.state_path` は `out/` に同じ名前が
     # 在ればフォルダごと移してくる。1ファイルずつ引くと、まだ触っていない世界の
     # 控えが `out/` に残る）。
@@ -243,14 +279,7 @@ def apply(ctx):
         setattr(sys, STATE_STORE_ATTR, store)
     warned = set()
 
-    def write(text):
-        try:
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write("[{}] {}\n".format(
-                    datetime.datetime.now().isoformat(timespec="milliseconds"), text))
-        except Exception:
-            # 記録のせいでゲームを落とさない。
-            ctx.log_exc("conversation log: write failed")
+    write = ctx.logger(LOG_BASENAME)
 
     def note(text):
         if store["logged"] < MAX_LOG:
@@ -439,40 +468,12 @@ def apply(ctx):
             return None
         return button
 
-    def window_size():
-        try:
-            from kivy.core.window import Window
-            return float(Window.width), float(Window.height)
-        except Exception:
-            return 0.0, 0.0
-
-    def upx(value):
-        """ゲームの拡縮（`scripts.hud.new_hud:upx`）に合わせる。無ければ素の値。"""
-        module = sys.modules.get("scripts.hud.new_hud")
-        scale = getattr(module, "upx", None) if module is not None else None
-        if callable(scale):
-            try:
-                return float(scale(value))
-            except Exception:
-                pass
-        return float(value)
+    window_size = ui.window_size
+    upx = ui.upx
 
     def clamp(widget):
         """窓の内側へ寄せる。`pos_hint` を持たない相手にだけ効く。"""
-        win_width, win_height = window_size()
-        if not win_width or not win_height:
-            return
-        try:
-            if widget.x + widget.width > win_width:
-                widget.x = win_width - widget.width
-            if widget.x < 0:
-                widget.x = 0
-            if widget.y + widget.height > win_height:
-                widget.y = win_height - widget.height
-            if widget.y < 0:
-                widget.y = 0
-        except Exception:
-            ctx.log_exc("conversation log: clamp failed")
+        ui.clamp_into_window(widget)
 
     # -- 絵柄 ----------------------------------------------------------------
     def strokes():
@@ -504,63 +505,30 @@ def apply(ctx):
         return []
 
     def paint_icon(button):
-        """ボタンにアイコンを描き直す。**変わったときだけ**（毎フレーム描かない）。"""
+        """ボタンにアイコンを描き直す。**変わったときだけ**（毎フレーム描かない）。
+
+        引き直すかの判定はローダ側（`ui.paint_icon`）に集約してある
+        （`113_` / `116_` と共有）。**向きは持たない** ― この MOD の絵柄は
+        押しても反転しないので、控えに `expanded` を混ぜない。
+        """
         if ICON == AS_TEXT:
             return
-        signature = (ICON, ICON_WIDTH, ICON_ALPHA,
-                     tuple(frames.attr(button, "pos", ()) or ()),
-                     tuple(frames.attr(button, "size", ()) or ()))
-        if frames.attr(button, ICON_ATTR, None) == signature:
-            return
-        try:
-            from kivy.graphics import Color, Line
-        except Exception:
-            return            # 線が引けない環境（オフライン検証）
-        try:
-            group = button.canvas.after
-            group.clear()
-            x, y = float(button.x), float(button.y)
-            width, height = float(button.width), float(button.height)
-            group.add(Color(1, 1, 1, float(ICON_ALPHA)))
-            for points in strokes():
-                flat = []
-                for fx, fy in points:
-                    flat.extend((x + fx * width, y + fy * height))
-                group.add(Line(points=flat, width=upx(ICON_WIDTH),
-                               cap="round", joint="round"))
-            setattr(button, ICON_ATTR, signature)
-        except Exception:
-            ctx.log_exc("conversation log: could not draw the icon")
+        ui.paint_icon(button, strokes(), attr=ICON_ATTR, key=(ICON,),
+                      width=ICON_WIDTH, alpha=ICON_ALPHA,
+                      log_exc=lambda msg: ctx.log_exc("conversation log: " + msg))
 
     # -- ボタン --------------------------------------------------------------
     def make_button(hud, label):
-        try:
-            from kivy.uix.button import Button
-        except Exception:
-            warn_once("button", "kivy Button unavailable; no log button will be shown")
-            return None
-        height = upx(BUTTON_SIZE)
-        width = height if ICON != AS_TEXT else height * 2.0
-        button = Button(text="" if ICON != AS_TEXT else LABEL_OPEN,
-                        size_hint=(None, None), size=(width, height),
-                        pos_hint=dict(CORNERS.get(BUTTON_CORNER, {}))
-                        if BUTTON_CORNER not in PLACEMENTS else {})
-        # 日本語を出すのでフォントは本文から写す（既定の書体では豆腐になる）。
-        font = frames.attr(label, "font_name")
-        if isinstance(font, str) and font:
-            button.font_name = font
-        button.font_size = height * 0.45
-        if ICON != AS_TEXT:
-            # 背景を消す。`background_normal` を空にしないと、色を透明にしても
-            # 既定のテクスチャがうっすら残る。
-            for name, value in (("background_normal", ""), ("background_down", ""),
-                                ("background_disabled_normal", ""),
-                                ("background_color", (0, 0, 0, 0)),
-                                ("border", (0, 0, 0, 0))):
-                try:
-                    setattr(button, name, value)
-                except Exception:
-                    pass      # そのプロパティを持たないビルドでも描画は成り立つ
+        """ボタンを1枚作る（背景消し・フォント写し・大きさはローダの作法）。"""
+        button = ui.make_icon_button(
+            text="" if ICON != AS_TEXT else LABEL_OPEN,
+            size=BUTTON_SIZE, square=(ICON != AS_TEXT),
+            font_name=frames.text_of(label, "font_name"),
+            pos_hint=(dict(CORNERS.get(BUTTON_CORNER, {}))
+                      if BUTTON_CORNER not in PLACEMENTS else {}))
+        if button is None:
+            warn_once("button",
+                      "kivy Button unavailable; no log button will be shown")
         return button
 
     def match_size(button, other):
@@ -820,30 +788,27 @@ def apply(ctx):
         header.add_widget(title)
         header.add_widget(close)
 
+        # 本文は**Label 1枚ではなく縦に並べた複数枚**で持つ（`view_blocks`）。
+        # 縦の BoxLayout は先に足したものが上に来るので、古い順に足せばそのまま
+        # 上から古い順に並ぶ。高さは中身（`minimum_height`）が決める。
         scroll = ScrollView(do_scroll_x=False)
-        body = Label(text=view_text(entries), markup=False,
-                     halign="left", valign="top", size_hint_y=None)
-        if isinstance(font_name, str) and font_name:
-            soft_set(body, "font_name", font_name)
-        if font_size:
-            soft_set(body, "font_size", font_size)
-        soft_set(body, "line_height", VIEW_LINE_HEIGHT)
-
-        def fit(*_args):
-            # 折り返し幅は入れ物に合わせる。高さは中身が決める（`texture_size`）。
-            body.text_size = (max(scroll.width - upx(VIEW_PAD) * 2, 1), None)
-
-        body.bind(texture_size=lambda instance, value: setattr(
-            instance, "height", value[1]))
-        scroll.bind(width=fit)
-        fit()
-        scroll.add_widget(body)
+        column = BoxLayout(orientation="vertical", size_hint_y=None,
+                           padding=upx(VIEW_PAD), spacing=upx(VIEW_GAP))
+        column.bind(minimum_height=lambda instance, value: setattr(
+            instance, "height", value))
+        scroll.add_widget(column)
 
         root.add_widget(header)
         root.add_widget(scroll)
         view.add_widget(root)
         view.bind(on_dismiss=lambda *_args: store.update({"view": None}))
-        store["view"] = {"view": view, "body": body, "scroll": scroll, "key": key}
+        opened = {"view": view, "column": column, "scroll": scroll, "key": key,
+                  "font_name": font_name, "font_size": font_size, "chunks": [],
+                  "empty": not entries}
+        store["view"] = opened
+        chunks = view_blocks(entries)
+        for chunk in chunks:
+            add_chunk(opened, chunk)
         try:
             view.open()
         except Exception:
@@ -853,21 +818,67 @@ def apply(ctx):
         # 開いた直後はいちばん下（＝最新）を出す。中身の高さが決まるのは
         # 次のフレームなので、そこで寄せる。
         schedule(lambda: soft_set(scroll, "scroll_y", 0))
-        note("opened the window with {} entr(y/ies) for {!r}".format(len(entries), key))
+        note("opened the window with {} entr(y/ies) for {!r} in {} label(s)".format(
+            len(entries), key, len(chunks)))
+
+    def add_chunk(opened, text):
+        """本文の塊を1枚の Label にして窓の下へ足す。
+
+        折り返し幅は**自分の幅**から決める（親の幅に `size_hint_x=1` で従うので、
+        入れ物の寸法を別途たどらなくてよい）。高さは中身が決める。
+        """
+        try:
+            from kivy.uix.label import Label
+        except Exception:
+            return None
+        label = Label(text=text, markup=False, halign="left", valign="top",
+                      size_hint_y=None)
+        font_name, font_size = opened.get("font_name"), opened.get("font_size")
+        if isinstance(font_name, str) and font_name:
+            soft_set(label, "font_name", font_name)
+        if font_size:
+            soft_set(label, "font_size", font_size)
+        soft_set(label, "line_height", VIEW_LINE_HEIGHT)
+        label.bind(width=lambda instance, value: setattr(
+            instance, "text_size", (value, None)))
+        label.bind(texture_size=lambda instance, value: setattr(
+            instance, "height", value[1]))
+        column = opened["column"]
+        label.text_size = (column.width, None)
+        column.add_widget(label)
+        opened["chunks"].append(label)
+        return label
 
     def refresh_view(key):
-        """開いている窓に新しい本文を映す。**読んでいる位置は動かさない。**
+        """開いている窓に**来たぶんだけ**足す。読んでいる位置は動かさない。
+
+        全部を組み直さないのは、窓を開いたまま遊べる限り本文は何度も来るから。
+        最後の塊に入るならそこへ継ぎ足し、あふれるなら次の1枚にする。
 
         下まで読んでいた（`scroll_y` が 0 付近）ときだけ下へ追う。途中を読んで
         いる人の位置を動かすと、本文が来るたびに読みかけの行が飛ぶ。
         """
-        view = store.get("view")
-        if not isinstance(view, dict) or view.get("key") != key:
+        opened = store.get("view")
+        if not isinstance(opened, dict) or opened.get("key") != key:
             return
-        scroll, body = view["scroll"], view["body"]
+        entries = store["buckets"].get(key) or []
+        block = entry_block(entries[-1]) if entries else ""
+        if not block:
+            return
+        scroll = opened["scroll"]
         try:
             at_bottom = float(frames.attr(scroll, "scroll_y", 0.0)) <= 0.01
-            body.text = view_text(store["buckets"].get(key) or [])
+            if opened.get("empty"):
+                # 「まだ記録がありません」を出していた窓。1件目が来たので外す。
+                for label in opened["chunks"]:
+                    opened["column"].remove_widget(label)
+                del opened["chunks"][:]
+                opened["empty"] = False
+            last = opened["chunks"][-1] if opened["chunks"] else None
+            if last is not None and len(last.text) + len(block) <= VIEW_CHUNK_CHARS:
+                last.text = last.text + "\n\n" + block
+            else:
+                add_chunk(opened, block)
         except Exception:
             ctx.log_exc("conversation log: could not refresh the window")
             return
