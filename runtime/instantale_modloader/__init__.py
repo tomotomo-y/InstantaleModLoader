@@ -61,7 +61,7 @@ import time
 import traceback
 import uuid
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # mod との契約。`mod.json` の "api" がこれと突き合わされる。
 #
@@ -528,7 +528,7 @@ class ModContext:
         """この MOD 専用のログ関数を作る。`out/<name>` に1行ずつ追記する。
 
             write = ctx.logger("quest_offer.log")
-            write("offered 3 quest(s)")     # -> [2026-08-10T12:34:56.789] offered ...
+            write("offered 3 quest(s)")     # -> [YYYY-MM-DDThh:mm:ss.mmm] offered ...
 
         **MOD のログはローダのログ（`ctx.log`）と分ける。** 何が起きたかは
         その MOD の記録に残したいが、`modloader.log` は全 MOD の共用なので、
@@ -542,7 +542,7 @@ class ModContext:
 
         `tag` を逐語にしてあるのは、**既にあるログの見た目を変えないため**。
         角括弧の形（`[BGMFIX]`）と区切りの形（`quest-end:`）が両方使われていて、
-        どちらも実機の記録として GAME.md / VERIFICATION.md に引用されている。
+        どちらも実機の記録として GAME.md / VERIFICATION_LOG.md に引用されている。
         ここで体裁を揃えると、その引用が次のプレイのログと一致しなくなる。
 
         書けなくても**例外にしない**（`ctx.log_exc` に残して素通り）。呼ぶのは

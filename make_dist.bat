@@ -35,7 +35,7 @@ rem  without them is not a lawful redistribution. NOTICE states what the grant
 rem  does and does not cover (game-derived strings, GAME.md, the EULA question).
 rem
 rem  Never shipped: out\, state\ and settings\ (all three made at
-rem  runtime), __pycache__ / *.pyc, tools\test_*.py and the one-off save fixers, and
+rem  runtime), __pycache__ / *.pyc, tools\tests\test_*.py and the one-off save fixers, and
 rem  llm_replacements.txt / npc.json -- those last two are the player's own copy
 rem  of a mod's data file, so only the shipped *.default.* versions go in.
 rem
@@ -142,7 +142,7 @@ if errorlevel 8 (
   goto :fail
 )
 
-rem  The GUI, the injector and the console watcher. test_*.py and the one-off
+rem  The GUI, the injector and the console watcher. tools\tests\ and the one-off
 rem  save fixers are development harnesses and stay out.
 echo   [loader] tools ...
 md "%LOADER%\tools" 2>nul
@@ -154,11 +154,19 @@ for %%f in (gui.py injector.py watcher.py logrotate.py watch.bat check_mods.py) 
   copy /y "tools\%%f" "%LOADER%\tools\" >nul || goto :copyfail
 )
 
+rem  Every .md under docs\ ships. Naming them one by one is how
+rem  VERIFICATION_LOG.md was silently left out of 1.6.0 after the split: the
+rem  file was added, README kept listing it as part of the installed tree, and
+rem  nothing here or in CI noticed. docs\ holds only documents meant for the
+rem  player or the mod author, so the wildcard is the honest rule. The zip check
+rem  in .github\workflows\ci.yml asserts that each of them arrived.
 echo   [loader] docs ...
 md "%LOADER%\docs" 2>nul
-for %%f in (README.md MODS.md TECH.md GAME.md VERIFICATION.md) do (
-  if exist "docs\%%f" copy /y "docs\%%f" "%LOADER%\docs\" >nul || goto :copyfail
+if not exist "docs\README.md" (
+  echo   ERROR: docs\README.md is missing.
+  goto :fail
 )
+copy /y "docs\*.md" "%LOADER%\docs\" >nul || goto :copyfail
 
 rem ===========================================================================
 rem  mods
