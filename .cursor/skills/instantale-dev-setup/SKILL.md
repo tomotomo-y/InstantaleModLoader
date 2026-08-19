@@ -61,7 +61,7 @@ python tools/injector.py --unload
 powershell -NoProfile -ExecutionPolicy Bypass -File .cursor/skills/instantale-dev-setup/scripts/verify.ps1
 ```
 
-内訳は `compileall runtime tools` → `tools/check_mods.py` → 全 `tools/test_*.py`。
+内訳は `compileall runtime tools` → `tools/check_mods.py` → `tools/tests/test_*.py`（`test_wip_*` は skip）と、残っている `tools/test_*.py`。
 `check_mods.py` が捕まえるのは構文では出ないずれ:
 
 - `@ctx.wrap` の対象名と実際の引数の並びの食い違い
