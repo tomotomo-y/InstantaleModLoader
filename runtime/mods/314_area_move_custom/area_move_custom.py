@@ -54,14 +54,17 @@
 307_ は「危険な道」の到着の移動中にゲームの `徒歩で目指す...` を握り潰すので、
 こちらが外側に居ると先に置き換えてしまい、307_ の伏せが効かなくなる。
 
-利用者向けの説明は MODS.md の `314_` の項、検証の経過は VERIFICATION.md §3.27。
+遊び方の説明は MODS.md の `314_` の項、検証の経過は VERIFICATION.md §3.27。
 """
 
-import re
+import sys
 
 from instantale_modloader import ui
 
 LOG_BASENAME = "area_move_custom.log"
+
+#: 控えの置き場（`sys` の属性名）。注入し直しをまたいで残す。
+STATE_STORE_ATTR = "__instantale_area_move_custom_store__"
 
 # ボタンには何も足さないが、`ui.Screen` の道具（say / apply_buttons）を使うので印のキーは他の MOD と別にして持つ（TECH.md
 # §3.3）。
@@ -122,8 +125,9 @@ COACH_MODES = ("coach",)
 # 移動中の文言をどれと見なすかの手掛かり。
 # どれも実測の文言に当たる形（徒歩 `徒歩で目指す。長旅だ...` ／ 馬車
 # `1000ゴールドを支払った。快適な旅だ...`。2026-08-17、`217_probe_area_move`）。
+# 通貨の語そのものは手掛かりにしない（`130_` が表記を差し替えると外れるため）。
 # 窓の中でしか見ないので短くてよい。
-DEPART_MARKS = ("で目指す", "長旅だ", "ゴールドを支払った", "快適な旅")
+DEPART_MARKS = ("で目指す", "長旅だ", "を支払った", "快適な旅")
 ARRIVE_MARKS = ("辿り着いた",)
 
 # 素のゲームの値。
@@ -136,10 +140,9 @@ GAME_WALK_DAYS = 90
 GAME_COACH_DAYS = 14
 GAME_COACH_PRICE = 1000
 
-# ラベルから料金を読む形。
-# `馬車(1000G)` → 1000。
-# 桁区切りが入っても読める。
-PRICE_RE = re.compile(r"(\d[\d,]*)\s*G")
+# ラベルから料金を読むのはローダの語彙（`ui.parse_coin`。`315_` と共有）。
+# `馬車(1000G)` → 1000。桁区切りが入っても読める。
+# 通貨の表記が差し替えられていれば（`130_`）`馬車(1000円)` も読む。
 
 # 手持ちが設定した運賃に足りないときの一言。
 REFUSE_TEXT = "（{name}代{price}Gに足りない ― 手持ち{gold}G）"
@@ -156,11 +159,17 @@ class _SafeDict(dict):
 
 
 def fmt(template, **values):
-    """設定のテンプレートを埋める。壊れたテンプレートでも素の文字列で返す。"""
+    """設定のテンプレートを埋める。壊れたテンプレートでも素の文字列で返す。
+
+    埋めた後に通貨の表記を今の表記へ直す（`130_` が差し替えていれば
+    `馬車(1000G・14日)` → `馬車(1000円・14日)`）。
+    設定のテンプレートは素のゲームの言い方（`G`）のままでよい。
+    """
     try:
-        return str(template).format_map(_SafeDict(values))
+        filled = str(template).format_map(_SafeDict(values))
     except Exception:
-        return str(template)
+        filled = str(template)
+    return ui.rewrite_coins(filled)
 
 
 def kind_of_mode(mode):
@@ -200,34 +209,33 @@ def move_options(buttons):
     return found
 
 
-def parse_price(text):
-    """ラベルから素の運賃を読む。読めなければ None。"""
-    match = PRICE_RE.search(text or "")
-    if match is None:
-        return None
-    try:
-        return int(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
-
-
 def apply(ctx):
     log_path = ctx.out_path(LOG_BASENAME)
     write = ctx.logger(LOG_BASENAME)
     screen = ui.Screen(ctx, write, tag="area move custom", mark=MARK)
 
-    state = {
-        # いま `AreaMoveManager.execute` の中に居るかの窓。
-        # 中身は _open_window。
-        "window": None,
-        # 確認画面のラベルから読み取った素の運賃（読めた最新の値）。
-        "game_price": None,
-        # 自分が最後に書いた馬車のラベル。
-        # 画面がラベルを組み直さないビルドで
-        # update_button_display がもう一度来たとき、**自分の書いた
-        # 300G を素の運賃として読み込まない**ための目印。
-        "our_coach_label": None,
-    }
+    # **置き場は `sys`。** `apply()` は1プロセスで何度も走り、
+    # 当て直しは背景スレッドの `boot()` から来る（未 import のモジュールが
+    # 現れた時＝最初の LLM リクエストの時）。移動や滞在の最中にそれが挟まると、
+    # ここで作り直した空の器を新しいラッパが握り、窓や予算が None のまま
+    # 日数の頭打ちが効かなくなる。「2週間」の滞在が素の30日を、
+    # 調整した徒歩が素の90日を消費する。
+    # `311_` / `312_` が控えを `sys` に置いているのと同じ理由。
+    state = getattr(sys, STATE_STORE_ATTR, None)
+    if state is None:
+        state = {
+            # いま `AreaMoveManager.execute` の中に居るかの窓。
+            # 中身は _open_window。
+            "window": None,
+            # 確認画面のラベルから読み取った素の運賃（読めた最新の値）。
+            "game_price": None,
+            # 自分が最後に書いた馬車のラベル。
+            # 画面がラベルを組み直さないビルドで
+            # update_button_display がもう一度来たとき、**自分の書いた
+            # 300G を素の運賃として読み込まない**ための目印。
+            "our_coach_label": None,
+        }
+        setattr(sys, STATE_STORE_ATTR, state)
 
     def days_limit(kind):
         """その手段に設定で変えられた日数。素の値のまま（触らない）なら None。"""
@@ -291,7 +299,7 @@ def apply(ctx):
             days = days_limit("coach")
             if days is None:
                 days = GAME_COACH_DAYS
-            parsed = parse_price(old)
+            parsed = ui.parse_coin(old)
             shown_price = int(COACH_PRICE) if fare_changed() else \
                 (parsed if parsed is not None else GAME_COACH_PRICE)
             new = fmt(COACH_BUTTON, name=COACH_NAME, price=shown_price,
@@ -329,7 +337,7 @@ def apply(ctx):
                               argv[1], old))
                     continue
                 if kind == "coach" and old != state["our_coach_label"]:
-                    price = parse_price(old)
+                    price = ui.parse_coin(old)
                     if price is not None:
                         state["game_price"] = price
                 new = relabel(kind, old)
@@ -447,7 +455,7 @@ def apply(ctx):
         料金を変えているときは、ゲームが引き落とす前に「素の運賃
         − 設定額」のぶんだけ所持金をずらしておく（前払い調整）。
         ゲームは素の運賃(1000)を 1回引くだけなので、差し引きはちょうど設定額。
-        「1000引いて500返す」のような紛らわしい動きを画面に出さない（実機で利用者が踏んだ。
+        「1000引いて500返す」のような紛らわしい動きを画面に出さない（実機で踏んだ。
         引いてから返す方式だと、支払い直後の所持金表示が1000引かれた値のまま残る）。
         ずらした直後に描画は走らないので、増えた瞬間が画面に見えることもない。
         """
@@ -564,10 +572,13 @@ def apply(ctx):
     # 実経路はエリア移動を1回するまで通らない。
     # ラベルの読み書きだけは作ったデータで先に確かめておく（`103_` /
     # `215_` と同じ方針）。
-    parsed = parse_price("馬車(1,000G)")
+    # 通貨の表記は `130_` が差し替えていることがあるので、
+    # 見本のほうも同じ表記へ通してから突き合わせる。
+    parsed = ui.parse_coin(ui.rewrite_coins("馬車(1,000G)"))
     sample = fmt(COACH_BUTTON, name="馬車", price=1000, days=7)
     survives = fmt("{name}と{typo}", name="徒歩")
-    if parsed == 1000 and sample == "馬車(1000G・7日)" and survives == "徒歩と{typo}":
+    expected = ui.rewrite_coins("馬車(1000G・7日)")
+    if parsed == 1000 and sample == expected and survives == "徒歩と{typo}":
         ctx.log("verified: reads the fare from a label and formats templates")
     else:
         ctx.log("VERIFY FAILED: parsed={!r} sample={!r} survives={!r}".format(

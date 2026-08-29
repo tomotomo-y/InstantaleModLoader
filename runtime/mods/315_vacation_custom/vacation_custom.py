@@ -61,14 +61,18 @@
   `306_party_train_exp` も `VacationTrainManager.execute` を包むが、
   こちらは外側から重なるだけ
 
-利用者向けの説明は MODS.md の `315_` の項、検証の経過は VERIFICATION.md §3.28。
+遊び方の説明は MODS.md の `315_` の項、検証の経過は VERIFICATION.md §3.28。
 """
 
+import sys
 import re
 
 from instantale_modloader import llm, ui
 
 LOG_BASENAME = "vacation_custom.log"
+
+#: 控えの置き場（`sys` の属性名）。注入し直しをまたいで残す。
+STATE_STORE_ATTR = "__instantale_vacation_custom_store__"
 
 # ボタンには何も足さないが、`ui.Screen` の道具（say）を使うので印のキーは他の MOD と別にして持つ（TECH.md
 # §3.3）。
@@ -167,10 +171,11 @@ GAME_NAMES = {"kennel": "犬小屋", "simple": "簡易寝台", "private": "個�
               "luxury": "高級個室"}
 GAME_PRICES = {"kennel": 0, "simple": 10, "private": 100, "luxury": 1000}
 
-# ラベルから料金と月数を読む形。
-# `個室(100G)` → 100。
+# ラベルから月数を読む形。
 # `宿泊する(3ヵ月)` → 3。
-PRICE_RE = re.compile(r"(\d[\d,]*)\s*G")
+# 料金を読むのはローダの語彙（`ui.parse_coin`。`314_` と共有）。
+# `個室(100G)` → 100。通貨の表記が差し替えられていれば
+# （`130_`）`個室(100円)` も読む。
 MONTHS_RE = re.compile(r"(\d+)\s*ヵ月")
 
 # 「Nヵ月泊まることにした。」を見分ける手掛かり（実測の文言）。
@@ -215,22 +220,17 @@ class _SafeDict(dict):
 
 
 def fmt(template, **values):
-    """設定のテンプレートを埋める。壊れたテンプレートでも素の文字列で返す。"""
+    """設定のテンプレートを埋める。壊れたテンプレートでも素の文字列で返す。
+
+    埋めた後に通貨の表記を今の表記へ直す（`130_` が差し替えていれば
+    `個室(100G)` → `個室(100円)`）。
+    設定のテンプレートは素のゲームの言い方（`G`）のままでよい。
+    """
     try:
-        return str(template).format_map(_SafeDict(values))
+        filled = str(template).format_map(_SafeDict(values))
     except Exception:
-        return str(template)
-
-
-def parse_price(text):
-    """ラベルから料金を読む。読めなければ None。"""
-    match = PRICE_RE.search(text or "")
-    if match is None:
-        return None
-    try:
-        return int(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
+        filled = str(template)
+    return ui.rewrite_coins(filled)
 
 
 def parse_age(value):
@@ -301,31 +301,41 @@ def apply(ctx):
     write = ctx.logger(LOG_BASENAME)
     screen = ui.Screen(ctx, write, tag="vacation custom", mark=MARK)
 
-    state = {
-        # いま `VacationStartManager.execute` の中に居るかの窓（宿代）。
-        "window": None,
-        # 週単位の宿泊の、いまの1泊ぶんの日数の予算。
-        # {"left": 残り日数, "spent": 消費, "length": "2週間"}。
-        # 月単位・デフォルトでは None。
-        # `VacationStartManager.execute` ごとに積み直す。
-        "block": None,
-        # 宿泊のマネージャの `execute` の中に居る深さ。
-        # 予算と文言の置き換えはこの窓の中でしか使わない（窓の外の日数送り・文言には
-        # 1バイトも触らない）。
-        "depth": 0,
-        # 画面で観測した「quality → ラベルの素の料金」の対。
-        # 部屋の見分けはこの対だけで行う（モジュール docstring を参照）。
-        "price_by_quality": {},
-        # 自分が書いたラベル。
-        # 組み直さない画面でもう一度来たとき、
-        # 設定後の料金を素の料金として読み込まないための目印（`314_` と同じ）。
-        "our_labels": set(),
-        # 一度ログに残した印（毎フレーム書かないため）。
-        "logged_unknown": set(),
-        "age_warned": False,
-        # 宿泊の話に見えるのに手掛かりへ当たらなかった本文を残した数。
-        "prompt_misses": 0,
-    }
+    # **置き場は `sys`。** `apply()` は1プロセスで何度も走り、
+    # 当て直しは背景スレッドの `boot()` から来る（未 import のモジュールが
+    # 現れた時＝最初の LLM リクエストの時）。移動や滞在の最中にそれが挟まると、
+    # ここで作り直した空の器を新しいラッパが握り、窓や予算が None のまま
+    # 日数の頭打ちが効かなくなる。「2週間」の滞在が素の30日を、
+    # 調整した徒歩が素の90日を消費する。
+    # `311_` / `312_` が控えを `sys` に置いているのと同じ理由。
+    state = getattr(sys, STATE_STORE_ATTR, None)
+    if state is None:
+        state = {
+            # いま `VacationStartManager.execute` の中に居るかの窓（宿代）。
+            "window": None,
+            # 週単位の宿泊の、いまの1泊ぶんの日数の予算。
+            # {"left": 残り日数, "spent": 消費, "length": "2週間"}。
+            # 月単位・デフォルトでは None。
+            # `VacationStartManager.execute` ごとに積み直す。
+            "block": None,
+            # 宿泊のマネージャの `execute` の中に居る深さ。
+            # 予算と文言の置き換えはこの窓の中でしか使わない（窓の外の日数送り・文言には
+            # 1バイトも触らない）。
+            "depth": 0,
+            # 画面で観測した「quality → ラベルの素の料金」の対。
+            # 部屋の見分けはこの対だけで行う（モジュール docstring を参照）。
+            "price_by_quality": {},
+            # 自分が書いたラベル。
+            # 組み直さない画面でもう一度来たとき、
+            # 設定後の料金を素の料金として読み込まないための目印（`314_` と同じ）。
+            "our_labels": set(),
+            # 一度ログに残した印（毎フレーム書かないため）。
+            "logged_unknown": set(),
+            "age_warned": False,
+            # 宿泊の話に見えるのに手掛かりへ当たらなかった本文を残した数。
+            "prompt_misses": 0,
+        }
+        setattr(sys, STATE_STORE_ATTR, state)
 
     def slot_of_quality(quality):
         """部屋を見分ける。当たらなければ None（＝何も触らない）。
@@ -375,7 +385,7 @@ def apply(ctx):
         quality = str(argv[1])
         old = entry.get("text") or ""
         if old not in state["our_labels"]:
-            price = parse_price(old)
+            price = ui.parse_coin(old)
             if price is None:
                 return                      # 料金の無いラベル（まだ宿泊する 等）
             # 素の料金はここで控える（前払い調整の基準）。
@@ -758,8 +768,11 @@ def apply(ctx):
     # ------------------------------------------------------------ 自己検証
     # 実経路は宿に泊まるまで通らない。
     # ラベルの読み書きと期間の計算だけは作ったデータで先に確かめておく（`314_` と同じ方針）。
-    parsed = parse_price("個室(1,000G)")
+    # 通貨の表記は `130_` が差し替えていることがあるので、
+    # 見本のほうも同じ表記へ通してから突き合わせる。
+    parsed = ui.parse_coin(ui.rewrite_coins("個室(1,000G)"))
     sample = fmt(ROOM_BUTTON, name="大部屋", price=30)
+    room_label = ui.rewrite_coins("大部屋(30G)")
     survives = fmt("{name}と{typo}", name="個室")
     def stay_field(choice, age, scaling, key):
         stay = compute_stay(choice, age, scaling)
@@ -780,7 +793,7 @@ def apply(ctx):
         stay_field("1週間", None, True, "days") == 7,     # 年齢が読めない
         parse_age("28歳") == 28 and parse_age(None) is None,
     )
-    if parsed == 1000 and sample == "大部屋(30G)" \
+    if parsed == 1000 and sample == room_label \
             and survives == "個室と{typo}" and all(stays):
         ctx.log("verified: reads prices from labels, formats templates, and "
                 "computes the stay lengths with the age bonus")

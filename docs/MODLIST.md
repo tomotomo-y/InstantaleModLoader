@@ -8,7 +8,8 @@
 手で書き換えても次の生成で消える。
 直す先は各 MOD の `mod.json` か MODS.md の見出し。
 
-同梱 65 本（基盤 2 / 修正 30 / 追加 14 / 計測 19）。
+同梱 84 本（基盤 2 / 修正 32 / 追加 26 / 計測 24）。
+うち 11 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
 
 並びはフォルダ名順。
 適用順はこれとは別で、GUI の `順` 列（`load_order.json`）が持つ。
@@ -35,7 +36,7 @@
 
 ---
 
-## 修正（30本）
+## 修正（32本）
 
 ゲームのバグ・不便を直す。
 
@@ -52,6 +53,7 @@
 | [`108_fix_shop_inventory_overflow`](MODS.md#108_fix_shop_inventory_overflow-売買画面を開くと落ちるのを直す) | 売買画面クラッシュの修正 | 売買画面を開くと落ちるのを直す | - | 取込済 main_024 |
 | [`109_fix_item_detail_autosize`](MODS.md#109_fix_item_detail_autosize-アイテムの説明が途中で切れるのを直す) | アイテム説明欄の拡張 | アイテムの説明が途中で切れるのを直す | 1 |  |
 | [`110_fix_character_name_path`](MODS.md#110_fix_character_name_path-名前のせいでnpcの画像が作れないのを直す) | キャラクタ名の正規化 | 名前のせいでNPCの画像が作れないのを直す | - | 取込済 main_024 |
+| [`1114_message_viewport_height`](MODS.md#1114_message_viewport_height-本文の表示領域を常時広げる) | 本文の表示領域を広げる | 本文の表示領域を常時広げる | 1 |  |
 | [`111_llm_prompt_replace`](MODS.md#111_llm_prompt_replace-llm-への指示文を置換ルールで書き換える) | LLM への指示文を置換 | LLM への指示文を置換ルールで書き換える | 2 |  |
 | [`112_ui_text_spacing`](MODS.md#112_ui_text_spacing-広すぎる本文の行間を詰める) | 本文の行間を詰める | 広すぎる本文の行間を詰める | 2 |  |
 | [`113_ui_text_expand`](MODS.md#113_ui_text_expand-本文の表示域をボタンで広げる) | 本文の表示域を広げる | 本文の表示域をボタンで広げる | 10 |  |
@@ -71,17 +73,19 @@
 | [`127_llm_response_speed`](MODS.md#127_llm_response_speed-ローカル-llm-の応答を速くする) | ローカルLLMの応答を速くする | ローカル LLM の応答を速くする | 4 |  |
 | [`128_item_image_variety`](MODS.md#128_item_image_variety-アイテム画像の偏りを均す) | アイテム画像の均し | アイテム画像の偏りを均す | 4 |  |
 | [`129_balance_item_price`](MODS.md#129_balance_item_price-アイテムの値段を付け直す) | アイテムの値付けの調整 | アイテムの値段を付け直す | 19 |  |
+| [`130_currency_unit`](MODS.md#130_currency_unit-通貨の呼び名と所持金の表示を変える) | 通貨の表記を変更する | 通貨の呼び名と所持金の表示を変える | 5 |  |
 
 ---
 
-## 追加（14本）
+## 追加（26本）
 
 ゲームに無かった遊びを足す。
 
 | フォルダ | GUI の名前 | 何をするか | 設定 | 状態 |
 |---|---|---|---|---|
-| [`300_event_facility_arrival`](MODS.md#300_event_facility_arrival-施設でnpcから話しかけてくる) | 施設でNPCが話しかける | 施設でNPCから話しかけてくる | 12 |  |
-| [`301_quest_from_conversation`](MODS.md#301_quest_from_conversation-会話から依頼を受けられる) | 会話から依頼を受ける | 会話から依頼を受けられる | 7 |  |
+| [`1308_companion_travel`](MODS.md#1308_companion_travel-npcを連れて歩ける) | NPCを連れて歩く | NPCを連れて歩ける | 5 |  |
+| [`300_event_facility_arrival`](MODS.md#300_event_facility_arrival-施設でnpcから話しかけてくる) | 施設でNPCが話しかける | 施設でNPCから話しかけてくる | 13 |  |
+| [`301_quest_from_conversation`](MODS.md#301_quest_from_conversation-会話から依頼を受けられる) | 会話から依頼を受ける | 会話から依頼を受けられる | 10 |  |
 | [`302_leave_party_in_conversation`](MODS.md#302_leave_party_in_conversation-会話から仲間と別れられる) | 会話で仲間と別れる | 会話から仲間と別れられる | 1 |  |
 | [`303_quest_end_party_to_guild`](MODS.md#303_quest_end_party_to_guild-解散した仲間を町のギルドに残す) | 解散先をいまの町に | 解散した仲間を町のギルドに残す | 2 |  |
 | [`304_quest_end_keep_party`](MODS.md#304_quest_end_keep_party-クエストをクリアしても解散しない) | クエスト後も解散しない | クエストをクリアしても解散しない | 2 |  |
@@ -94,10 +98,21 @@
 | [`313_event_ability_check`](MODS.md#313_event_ability_check-行動の成否判定に能力値を効かせる) | 行動判定に能力値を効かせる | 行動の成否判定に能力値を効かせる | 9 |  |
 | [`314_area_move_custom`](MODS.md#314_area_move_custom-エリア移動の日数料金文言を変える) | 街移動のカスタマイズ | エリア移動の日数・料金・文言を変える | 10 |  |
 | [`315_vacation_custom`](MODS.md#315_vacation_custom-宿の宿泊期間部屋宿代を変える) | 宿泊のカスタマイズ | 宿の宿泊期間・部屋・宿代を変える | 14 |  |
+| [`316_bounty_hunter`](MODS.md#316_bounty_hunter-手配されていると追手が来る) | 賞金稼ぎが襲ってくる | 手配されていると追手が来る | 15 |  |
+| [`317_reputation`](MODS.md#317_reputation-評判と二つ名) | 評判と二つ名 | 評判と二つ名 | 8 |  |
+| [`318_area_difficulty_growth`](MODS.md#318_area_difficulty_growth-土地が育つ依頼の難易度が上がる) | 依頼クリアで難易度上昇 | 土地が育つ（依頼の難易度が上がる） | 7 |  |
+| [`319_battle_tactics`](MODS.md#319_battle_tactics-戦闘を複数手の駆け引きにする) | 戦闘のバランス調整とバフ・デバフの有効化 | 戦闘を複数手の駆け引きにする | 16 |  |
+| [`320_guild_adventurer_recruit`](MODS.md#320_guild_adventurer_recruit-ギルドの冒険者の補充) | ギルドの冒険者の補充 | ギルドの冒険者の補充 | 2 |  |
+| [`321_area_chronicle`](MODS.md#321_area_chronicle-エリアの状況を更新依頼クリアで案内文が変わる) | エリアの状況を更新 | エリアの状況を更新（依頼クリアで案内文が変わる） | 4 |  |
+| [`322_battle_bgm`](MODS.md#322_battle_bgm-戦闘bgmを置いた曲から選んで鳴らす) | 戦闘BGMの選曲 | 戦闘BGMを置いた曲から選んで鳴らす | 2 |  |
+| [`401_battle_character_context`](MODS.md#401_battle_character_context-戦闘の審判へ同行者の人物と装備を見せる) | 戦闘キャラクター情報補完 | 戦闘の審判へ同行者の人物と装備を見せる | - |  |
+| [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | パーティーメンバー：アイテム受け渡し | 仲間とアイテムを受け渡しできる | - |  |
+| [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | NPC同士の認知と関係記憶 | NPC同士がお互いを認知し、関係を覚える | 5 |  |
+| [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | パーティーメンバーと話す | パーティーメンバー全員と話す | 7 |  |
 
 ---
 
-## 計測（19本）
+## 計測（24本）
 
 ゲームは変えない。`out\` にログを残すだけ。デバッグモードのときだけ読み込まれる。
 
@@ -122,3 +137,37 @@
 | `216_probe_llm_overlap` | LLM リクエストの多重送信をプロセス内で数える（`127_` の `--parallel 1` によるキュー待ちが実プレイでどれだけ起こるか） |
 | `217_probe_area_move` | エリア移動の未実測部分を録る |
 | `218_probe_vacation` | 宿の宿泊の未実測部分を録る |
+| `219_probe_crash_log` | 本体のクラッシュ記録が落ちる呼び出しを見分ける |
+| `220_probe_bounty_hunter` | 手配度に応じて追手を出す MOD（`316_`）を書くための下調べ |
+| `221_probe_item_level` | 品物のレベルを誰が決めているかを録る |
+| `222_probe_battle_mechanics` | 戦闘の数の作られ方を録る |
+| `223_probe_party_equipment` | 本体のアイテム popup と `ItemEquipManager` / `ItemUnequipManager` の入口を観測し、素のゲームが実際に誰の `equipments` を書き換えるかを測る（`402_party_inventory_transfer` が NPC の装備を直書きし続けるかを決める材料） |
+
+---
+
+## 提供を受けた MOD
+
+外部の MOD 作者から提供を受けて同梱している 11 本。
+
+**番号の帯では数えられない。**
+いま提供を取り込む先は出どころの帯（`4xx`）だが、
+その帯が出来る前に取り込んだものは種別どおりの帯に入っており、
+番号を振り直すと遊んでいる人の `state\` と設定が行方不明になるので動かしていない。
+数える先は `mod.json` の `author` で、この表もそこから組む。
+
+権利の所在は [NOTICE](../NOTICE) が持つ。
+提供者がここに居て NOTICE に居なければ `tools/check_mods.py` が止める。
+
+| フォルダ | 提供 | 取り込み |
+|---|---|---|
+| [`1114_message_viewport_height`](MODS.md#1114_message_viewport_height-本文の表示領域を常時広げる) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い応答が途中で切れるのを直す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`118_batch_message_render`](MODS.md#118_batch_message_render-本文の出し方逐次一括と既読の色を選ぶ) | yoshinari/tomotomo-y 様 | 提供者と共同 |
+| [`119_fix_crime_attribution`](MODS.md#119_fix_crime_attribution-他人の犯罪が主人公のものになるのを直す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`1308_companion_travel`](MODS.md#1308_companion_travel-npcを連れて歩ける) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| `223_probe_party_equipment` | MoririnJP 様 | そのまま取り込み |
+| [`311_npc_profile_memory`](MODS.md#311_npc_profile_memory-npcが会話の内容を覚える) | yoshinari/tomotomo-y 様 | 提供者と共同 |
+| [`401_battle_character_context`](MODS.md#401_battle_character_context-戦闘の審判へ同行者の人物と装備を見せる) | MoririnJP 様 | そのまま取り込み |
+| [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | MoririnJP 様 | そのまま取り込み |
+| [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | MoririnJP 様 | そのまま取り込み |
+| [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | MoririnJP 様 | 提供者と共同 |

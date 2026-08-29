@@ -30,7 +30,7 @@ GUI に出るだけだが、次の5つは動作に関わる:
 
     "api": 1                        前提にしているローダ API（下の API を参照）
     "after": ["101_fix_..."]         適用順の制約（_sort_dependencies）
-    "settings": {...}               利用者が変えられる設定の宣言（config.py）
+    "settings": {...}               GUI から変えられる設定の宣言（config.py）
     "debug": true                   開発者向け。デバッグモードのときだけ動く（discover）
     "superseded": "main_024"        本体がその版で同じ修正を取り込んだので降ろした
 
@@ -67,7 +67,7 @@ import time
 import traceback
 import uuid
 
-__version__ = "1.7.0"
+__version__ = "1.9.0b"
 
 # mod との契約。`mod.json` の "api" がこれと突き合わされる。
 #
@@ -129,7 +129,7 @@ def is_game_module(name: str) -> bool:
 
 # 配布フォルダ直下の書き込み先は3つある。**役割で分けてあり、混ぜない。**
 #
-#     settings/   利用者が決めたこと（mod の設定・GUI の覚え書き・デバッグモード）
+#     settings/   設定したこと（mod の設定・GUI の覚え書き・デバッグモード）
 #     out/        mod が吐いたもの（ログ・リコン成果物・status.json）
 #     state/      mod が持つ永続データ（進行中の道中、依頼の出所、NPC の控え）
 #
@@ -140,7 +140,7 @@ def is_game_module(name: str) -> bool:
 #   * 不具合報告で「out/ を消してから再現してください」と言えない
 #     （消すと進行中の依頼や NPC の記憶まで飛ぶ）
 #   * 世代管理の対象が「*.log だけ」という但し書きでしか守られない
-#   * 利用者が掃除のつもりで消したものが、遊びの続きだった
+#   * 掃除のつもりで消したものが、遊びの続きだった
 #
 # 置き場所を分ければ、どちらも説明が1行で済む。out/ は捨ててよい。state/ は
 # セーブと同じ重みで残す。
@@ -208,7 +208,7 @@ def write_json(path: str, data, *, indent: int = 1, sort_keys: bool = False,
     """JSON を壊れないように書く。書けたら True、書けなければ False。
 
     差し替えの作法は `write_text()` にある。
-    分けてあるのは、**JSON にできない記録**（1行1レコードの会話ログなど）にも同じ安全さが要るため ― 規則を 2箇所に書かないよう、
+    分けてあるのは、**JSON にできない記録**（1行1レコードの会話ログなど）にも同じ安全さが要るため。規則を 2箇所に書かないよう、
     土台はテキスト側に置いて JSON はその上に載せている。
 
     `default=str` を付けてあるのは、記録に日時や
@@ -236,7 +236,7 @@ def read_json(path: str, default=None, *, report=None):
     後者が危ないのは、読んだ側が**その結果を次の書き込みの土台にする**から。
     `write_json()` でいくら壊れない書き方をしても、
     読み側が壊れた控えを黙って `{}` に倒せば、
-    次の書き込みは空に近い正本を**無傷で**作ってしまう ― 壊れずに、静かに失われる。
+    次の書き込みは空に近い正本を**無傷で**作ってしまう。壊れずに、静かに失われる。
     だからここは必ず記録を残す。
 
     倒した先が `default` なのは変わらない（読めない控えのために
@@ -382,7 +382,7 @@ class ModContext:
 
     設定とローダの版:
 
-        ctx.config          この mod に効いている設定値（mod.json の宣言 + 利用者の選択）
+        ctx.config          この mod に効いている設定値（mod.json の宣言 + 選んだ値）
         ctx.setting(名前)   その1件だけ引く
         ctx.api             ローダ API の番号（下位互換の分岐が要るとき用）
     """
@@ -546,6 +546,21 @@ class ModContext:
         """
         return _superseded(self.generation)
 
+    def refresh_status(self) -> str | None:
+        """`out/status.json` を今の台帳で書き直す。書けたらそのパス。
+
+        `boot()` は最後に一度だけ書き出して降りるので、
+        **その後に設置したフック**（`apply()` を抜けた後の見張りスレッドが
+        `ctx.wrap` するもの）は報告に出ない。
+        台帳には載っているのにファイルが古い、という食い違いになる。
+        遅れて設置した側からこれを呼べば揃う。
+
+        `apply()` の中では呼ばない。
+        まだ他の mod が控えている段階で書いても、次の boot の締めで
+        上書きされるだけで意味が無い。
+        """
+        return write_status(self.out_dir)
+
     def out_path(self, *parts: str) -> str:
         """out/ 以下のパスを返す。親ディレクトリは先に作っておく。
 
@@ -665,7 +680,7 @@ class ModContext:
         """JSON を読む。無ければ `default`。**在るのに読めなければ**記録してから `default`。
 
         `state_path()` で取った場所を読むときは必ずこれを使う。
-        理由はモジュール側の `read_json()` にある ― 素朴な `open` + 広い
+        理由はモジュール側の `read_json()` にある。素朴な `open` + 広い
         `except` で `{}` に倒すと、一時的に読めなかっただけの控え（ロック・破損）が「無かったこと」になり、**次の
         `write_json()` が空に近い正本を無傷で作る**。
         読めなかった記録にはこの MOD の名前が入るので、
@@ -678,7 +693,7 @@ class ModContext:
 
         **`state_path()` で取った場所へ書くときは必ずこれを使う。**
         素朴に `open(path, "w")` で書くと、
-        途中で落ちた瞬間に控えが壊れる ― 読む側は壊れた JSON を `{}` に倒すので、
+        途中で落ちた瞬間に控えが壊れる。読む側は壊れた JSON を `{}` に倒すので、
         消えたことに気付けないまま次の更新で上書きされる。
         詳しくはモジュール側の `write_text()` を参照。
 
@@ -701,7 +716,7 @@ class ModContext:
         コピーではなく移動にしてある。
         両方に残すと、次に読むのがどちらなのか分からないファイルが
         `out/` に居座る（`out/` を消してよいという説明も崩れる）。
-        移せなかった場合は何もしない ― state/ 側が空のまま始まるだけで、
+        移せなかった場合は何もしない。state/ 側が空のまま始まるだけで、
         壊れるより巻き戻るほうがましなため。
         """
         legacy = os.path.join(self.out_dir, *parts)
@@ -788,7 +803,7 @@ KINDS = ("core", "fix", "probe", "feature")
 #: `load_order.json` は配布する構成そのものなので、
 #: 開発中の MOD を書くと配った先で「実体の無い記述」になり、
 #: GUI で保存するたびに書き戻されて毎回コミットに紛れ込む。
-#: 利用者のファイルが同梱ぶんに優先する形は `111_` の置換ルールと同じ（TECH.md
+#: 手元のファイルが同梱ぶんに優先する形は `111_` の置換ルールと同じ（TECH.md
 #: §3.1.1）。
 ORDER_LOCAL_NAME = "load_order.local.json"
 
@@ -849,7 +864,7 @@ def is_wip(name: str) -> bool:
     読み込むのは「順序ファイルに名前があり（手元の
     `load_order.local.json`）、**かつデバッグモードのとき**」だけ（`debug` /
     `superseded` と同じ伏せ方）。
-    順序ファイルに名前が無ければ黙って外す ― 配布物に入らないものなので、
+    順序ファイルに名前が無ければ黙って外す。配布物に入らないものなので、
     「記載の無い MOD」として報告しても直しようが無い。
     """
     return len(name) >= 3 and name[:3].isdigit() and name[0] == "9"
@@ -882,15 +897,15 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
     `order` と `listed` を分けているのは、無効な mod には適用順が無い一方で、
     一覧では**宣言された位置に置いたままにしたい**から。
     表示順を「有効なものの後」にすると、
-    GUI で切って保存するたびにその mod が末尾へ移動してしまう（利用者は順序を触っていないのに
+    GUI で切って保存するたびにその mod が末尾へ移動してしまう（順序は触っていないのに
     `load_order.json` が書き換わる）。
 
     ゲームの中でも外でも同じ結果になる（ファイルを読むだけで、
     mod のコードは一切 import しない）。
 
     `debug` を渡すとデバッグモードの設定（`settings/loader.json`）を無視してそちらに従う。
-    `tools/check_mods.py` が `True` で呼ぶためにある ― 静的検査は **入っている
-    mod を全部見る**のが仕事で、利用者が今どちらに倒しているかで検査の範囲が変わってはいけない（切っている間だけ計測 mod の
+    `tools/check_mods.py` が `True` で呼ぶためにある。静的検査は **入っている
+    mod を全部見る**のが仕事で、デバッグモードを今どちらに倒しているかで検査の範囲が変わってはいけない（切っている間だけ計測 mod の
     `after` が誰にも確かめられない、という穴を作らない）。
     """
     mods_dir = mods_dir or _mods_dir()
@@ -904,9 +919,9 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
     manifests = {name: _manifest(mods_dir, name) for name in installed}
 
     # 開発者向けの mod（計測系）は、デバッグモードを入れている間だけ動く。
-    # 伏せるのは `order` からだけで、`listed`（GUI の一覧）には残す ― 一覧の並びは保存時にそのまま
+    # 伏せるのは `order` からだけで、`listed`（GUI の一覧）には残す。一覧の並びは保存時にそのまま
     # `order` へ書き戻されるので（gui.py の `save`）、
-    # ここで落とすと利用者が保存した瞬間に順序ファイルから記述ごと消える。
+    # ここで落とすと GUI で保存した瞬間に順序ファイルから記述ごと消える。
     debug_mode = (_config_module().debug_mode(os.path.dirname(mods_dir))
                   if debug is None else bool(debug))
     marked = {name for name in installed if (manifests[name] or {}).get("debug")}
@@ -976,12 +991,12 @@ def _order(mods_dir: str, found: list[str],
 
     手元用の
     `load_order.local.json` が在ればそちらを**丸ごと**使う（`ORDER_LOCAL_NAME`）。
-    混ぜないのは、2つのファイルの差分から順序を組み立てる規則を増やしたくないため
-    ― 効いている順序は常に1ファイルで読める。
+    混ぜないのは、2つのファイルの差分から順序を組み立てる規則を増やしたくないため。
+    効いている順序は常に1ファイルで読める。
 
     `hide` に挙げた mod は適用順から外す（デバッグモードが切のときの計測 mod。
     `discover()` が渡す）。
-    `disabled` と違って**報告もしない** ― 切ったのは利用者ではないので、
+    `disabled` と違って**報告もしない**。切ったのは設定ではなくローダなので、
     「無効化されています」「記載の無い MOD」を出すと、
     伏せたはずのものが警告として画面に出てくる。
     切られていることを必ず見せる `disabled` とは目的が逆なので、
@@ -1012,8 +1027,8 @@ def _order(mods_dir: str, found: list[str],
         order = []
 
     # 開発中の mod（9xx）は、この順序ファイルが名指ししているものだけ読み込む。
-    # 名前が無いものは `hide` と同じ扱いにする ― 適用もしないし報告もしない。
-    # 配布物には入らないので、利用者の画面に「記載の無い
+    # 名前が無いものは `hide` と同じ扱いにする。適用もしないし報告もしない。
+    # 配布物には入らないので、配った先の画面に「記載の無い
     # MOD」として出しても直しようが無い（`is_wip` の説明を参照）。
     named = {name for name in order if isinstance(name, str)}
     undeclared_wip = {name for name in found
@@ -1025,8 +1040,8 @@ def _order(mods_dir: str, found: list[str],
         disabled = []
     off = {name for name in disabled if isinstance(name, str)}
     skipped = sorted(off & set(found))
-    # 報告するのは利用者が切ったものだけ。
-    # 伏せている mod は `skipped` に残す（利用者の「切る」選択そのものは消さない。
+    # 報告するのは `disabled` で切ったものだけ。
+    # 伏せている mod は `skipped` に残す（「切る」選択そのものは消さない。
     # GUI が保存で書き戻すため）が、警告としては出さない。
     told = [name for name in skipped if name not in hide]
     if told:
@@ -1046,8 +1061,8 @@ def _order(mods_dir: str, found: list[str],
     # GUI の保存は `listed` をそのまま `order` へ書き戻すので（gui.py の `save`）、
     # 残しておくと、順序ファイルを開いて保存しただけで
     # `load_order.json` に開発中の名前が入ってしまう。
-    # 残す理由（保存で記述ごと消えるのを防ぐ）もこちらには無い
-    # ― まだどこにも書かれていない mod なので、消える記述が無い。
+    # 残す理由（保存で記述ごと消えるのを防ぐ）もこちらには無い。
+    # まだどこにも書かれていない mod なので、消える記述が無い。
     listed = [name for name in listed if name not in undeclared_wip]
 
     known = set(found) - off - hide
@@ -1202,20 +1217,50 @@ def _manifest(mods_dir: str, name: str) -> dict:
         # 名乗りと同じ理由で、外すために他人の mod を import することにならない。
         "debug": bool(data.get("debug")),
         # mod 自身が名乗る種別（`KINDS` の1つ）。GUI の「種別」列がこれを読む。
-        # フォルダ名の番号帯から**導かない** ― 帯は帯であって分類の軸ではない
+        # フォルダ名の番号帯から**導かない**。帯は帯であって分類の軸ではない
         # （TECH.md §3.2.2。挙動を変えるなら機能追加でも 1xx に置いてよい）ので、
         # どれに属するかは mod 自身に言わせる。無指定・語彙の外は ""。
         "kind": kind,
         # ゲーム本体が同じ修正を取り込んだので降ろした mod。
         # 値はその版（例 "main_024"）。
         # **読み込みの扱いは "debug" と同じ**で、
-        # 違うのは「なぜ伏せられているか」だけ ― 計測用に作ったものと、
+        # 違うのは「なぜ伏せられているか」だけ。計測用に作ったものと、
         # 要らなくなった修正とを一覧で見分けられないと、
         # 次にゲームが更新されたとき「どれを試しに戻すか」が分からなくなる。
         "superseded": text(data.get("superseded")),
-        # 利用者が変えられる設定の宣言（config.py）。
+        # GUI から変えられる設定の宣言（config.py）。
         "settings": _config_module().normalize_decls(data.get("settings")),
+        # MOD 同梱の道具（設定画面から別プロセスで開く。`908_` §4 の契約）。
+        # {"entry": "tool.py", "label": {...}, "note": {...}}。無ければ None。
+        # GUI が起動するだけで、ローダ本体は読まない。
+        "tool": _tool_decl(name, data.get("tool")),
     }
+
+
+def _tool_decl(name: str, raw) -> dict | None:
+    """`"tool"` の宣言を均す。壊れていれば None（GUI にボタンを出さない）。"""
+    if not isinstance(raw, dict):
+        if raw is not None:
+            log("{}: \"tool\" がオブジェクトではない。無視する".format(name), level="WARN")
+        return None
+    entry = raw.get("entry")
+    if not isinstance(entry, str) or not entry.strip():
+        log("{}: \"tool\" に \"entry\" が無い。無視する".format(name), level="WARN")
+        return None
+
+    def localized(key, fallback):
+        value = raw.get(key)
+        if isinstance(value, str):
+            return {"ja": value, "en": value}
+        if isinstance(value, dict):
+            ja = value.get("ja") or value.get("en") or fallback
+            en = value.get("en") or value.get("ja") or fallback
+            return {"ja": str(ja), "en": str(en)}
+        return {"ja": fallback, "en": fallback}
+
+    return {"entry": entry.strip(),
+            "label": localized("label", "道具を開く"),
+            "note": localized("note", "")}
 
 
 def api_status(manifest: dict) -> tuple[str | None, str]:
@@ -1250,7 +1295,7 @@ def _sort_dependencies(order: list[str], manifests: dict,
                        silent: frozenset = frozenset()) -> tuple[list[str], list[str]]:
     """`after` / `before` を満たす並びに直す。`(並び, 報告)` を返す。
 
-    `load_order.json` の並びは利用者が触るもので、**動作の前提を知らない**。
+    `load_order.json` の並びは手で触るもので、**動作の前提を知らない**。
     「計測は修正より外側」「305_ は 105_ より先」といった関係は、
     これまでドキュメントにしか無く、GUI で行を動かせば無警告で壊せた。
     それを mod 自身に宣言させて、ここで満たす。
@@ -1260,11 +1305,11 @@ def _sort_dependencies(order: list[str], manifests: dict,
 
     やっているのは安定なトポロジカルソート。
     **基準の並びは `load_order.json`** で、制約に触れない mod の相対順は動かさない。
-    利用者が並べ替えた意図を、制約を満たす範囲でそのまま残すため。
+    並べ替えた意図を、制約を満たす範囲でそのまま残すため。
 
     存在しない mod や無効な mod を指した制約は黙って捨てる（消した
     mod の記述が残っていても壊れないように。順序ファイルの扱いと同じ）。
-    ただし**報告は残す** ― 利用者が切った相手を指していることは、
+    ただし**報告は残す**。切った相手を指していることは、
     順序が変わる理由として見えていてよい。
 
     `silent` に挙げた相手を指した制約は、報告もしない。
@@ -1272,7 +1317,7 @@ def _sort_dependencies(order: list[str], manifests: dict,
     これを報告すると `300_event_facility_arrival` の
     `"after": ["205_probe_player_events"]` が「無効な
     mod を指している」として毎回警告に出る。
-    利用者から見れば存在しないはずの mod の名前が出てくることになる。
+    画面から見れば存在しないはずの mod の名前が出てくることになる。
 
     循環していたら**基準の並びをそのまま返す**。
     ここで例外にすると mod が全滅する。
@@ -1348,7 +1393,7 @@ def _check_conflicts(order: list[str], manifests: dict) -> list[str]:
     このローダは同じ対象に複数の mod を重ねるのが正常な使い方で（patch_registry.py）、
     どちらを外すべきかはローダには決められない。
     片方を黙って落とすより、両方動かして名指しする方が筋が通る。
-    外すのは利用者の判断（`load_order.json` の "disabled"）。
+    外すのは `load_order.json` の "disabled"。
     """
     notes: list[str] = []
     active = set(order)
@@ -1442,7 +1487,7 @@ def _settle_unused_local(out_dir: str, pending: list) -> list:
 
     戻り値は**待ち続けるべきモジュール**の並び。
     降ろすのは「クラウドと分かった」ときだけで、
-    起動直後（プロバイダ未確定）は何もしない ― `is_cloud_runtime()` は
+    起動直後（プロバイダ未確定）は何もしない。`is_cloud_runtime()` は
     `is_local_runtime()` の否定ではなく、どちらも False の時間帯がある。
     そこで決めつけると、ローカル実行の保留まで降ろしてしまう。
     """
@@ -1466,7 +1511,32 @@ def _settle_unused_local(out_dir: str, pending: list) -> list:
     return [name for name in pending if name not in local]
 
 
-def _deferred_loop(out_dir: str, generation: str, pending: list) -> None:
+def _owner_modules(owners) -> list[str]:
+    """持ち主待ちの対象が属するモジュール名。台帳の `detail` と同じ形。
+
+    `patch._pending_owners` が持っているのは**対象**（`pkg.mod:Cls.method`）だが、
+    台帳へ積むときの `detail` は**モジュール名**で、
+    `patch_registry.settle_deferred()` もモジュール名で引く。
+    ここを `"__main__"` 決め打ちにすると、`_defer_if_still_loading` が
+    実行途中と見て降ろした `scripts.llm.embedding` のような保留が
+    見張りの終了後も `deferred` のまま status.json に残る。
+    """
+    from . import patch as _patch
+    names = []
+    for target in owners:
+        try:
+            mod_name, _qual = _patch.split_target(target)
+        except Exception:
+            continue        # 積むときに通っている以上ここへは来ないが、念のため
+        if mod_name not in names:
+            names.append(mod_name)
+    return sorted(names)
+
+
+def _deferred_loop(out_dir: str, generation: str, pending: list,
+                   owners: list = ()) -> None:
+    from . import patch as _patch
+    owners = list(owners)
     deadline = time.monotonic() + DEFERRED_TIMEOUT
     while time.monotonic() < deadline:
         time.sleep(DEFERRED_POLL)
@@ -1476,16 +1546,29 @@ def _deferred_loop(out_dir: str, generation: str, pending: list) -> None:
         # LLM リクエスト＝この見張りが立った後のことがある。
         # だから arm のときだけでなく、毎回見る。
         pending = _settle_unused_local(out_dir, pending)
-        if not pending:
+        if not pending and not owners:
             return
         arrived = [name for name in pending if sys.modules.get(name) is not None]
-        if not arrived:
+        # 持ち主待ちは `sys.modules` では分からない。
+        # `__main__` は最初から居るので、実際に引けるかで見る。
+        ready = _patch.owners_ready() if owners else []
+        if not arrived and not ready:
             continue
         # 1つでも来たら当て直す。
         # 全部揃うのを待つと、片方が永久に来ない場合（エリアを生成しなければ
         # save_area_json は載らない）に全部が道連れになる。
         # 当て直した後は残りの保留に対して新しい見張りが立つ。
-        log("deferred: {} imported; re-applying mods".format(", ".join(arrived)))
+        #
+        # **対象は数だけ書く。**
+        # 名前を並べると1行が 4,874 文字になる（実測 2026-08-19。
+        # `__main__` のクラスが揃った瞬間に 115 件が同時に来る）。
+        # 読むのは「何を待っていたか」ではなく「当て直しが走ったか」なので、
+        # ここは件数で足りる。対象ごとの1行は `defer wrap ...` として
+        # 保留にした時点で既に出ている。
+        note = list(arrived)
+        if ready:
+            note.append("{} target(s) whose owner appeared".format(len(ready)))
+        log("deferred: {} arrived; re-applying mods".format(", ".join(note)))
         _state["deferred_boots"] += 1
         try:
             boot(out_dir)
@@ -1496,7 +1579,10 @@ def _deferred_loop(out_dir: str, generation: str, pending: list) -> None:
         return
     from . import patch_registry as _registry
     late = [n for n in pending if sys.modules.get(n) is None]
-    log("deferred: gave up after {:.0f}s; still not imported: {}".format(
+    if owners:
+        # 持ち主待ちも同じ理由で降ろす。台帳を引く鍵はモジュール名（`_owner_modules`）。
+        late = late + [n for n in _owner_modules(owners) if n not in late]
+    log("deferred: gave up after {:.0f}s; still not resolvable: {}".format(
         DEFERRED_TIMEOUT, ", ".join(late)), level="WARN")
     # 見張りが降りた以上、もう当たらない。
     # `deferred` のまま残すと「まだ待っている」と読めてしまうので、
@@ -1525,17 +1611,24 @@ def _arm_deferred(out_dir: str, generation: str) -> None:
     # 当て直しの boot はプロバイダが決まった後に走るので、
     # この時点で片付くことが多い。
     pending = _settle_unused_local(out_dir, _patch.pending_modules())
-    if not pending:
+    # 「持ち主のクラスがまだ生えていない」も同じ見張りで待つ（`patch._pending_owners`）。
+    # ゲームは `__main__` を上から組み立てていくので、
+    # インタプリタ初期化の時点では `World` も `InstantaleApp` もまだ無い。
+    owners = _patch.pending_owners()
+    if not pending and not owners:
         return
+    waiting = pending + (["__main__ の組み立て"] if owners else [])
     if _state["deferred_boots"] >= MAX_DEFERRED_BOOTS:
         log("deferred: already re-applied {} time(s); not watching again for {}".format(
-            _state["deferred_boots"], ", ".join(pending)), level="WARN")
-        if _registry.settle_deferred(pending, "re-apply limit reached"):
+            _state["deferred_boots"], ", ".join(waiting)), level="WARN")
+        settle = pending + [n for n in _owner_modules(owners) if n not in pending]
+        if _registry.settle_deferred(settle, "re-apply limit reached"):
             write_status(out_dir)
         return
     log("deferred: waiting for {} (checking every {:.0f}s)".format(
-        ", ".join(pending), DEFERRED_POLL))
-    threading.Thread(target=_deferred_loop, args=(out_dir, generation, pending),
+        ", ".join(waiting), DEFERRED_POLL))
+    threading.Thread(target=_deferred_loop,
+                     args=(out_dir, generation, pending, owners),
                      name="instantale_modloader.deferred", daemon=True).start()
 
 
@@ -1604,7 +1697,7 @@ def boot(out_dir: str) -> dict:
     if not os.path.isdir(mods_dir):
         log("no mods dir at {}".format(mods_dir), level="WARN")
     else:
-        # 利用者が選んだ設定値。
+        # 選んだ設定値。
         # 全 mod ぶんまとめて1回読む。
         chosen = _config.load_store(runtime_dir)
         log("{} mod(s) in {}".format(len(names), mods_dir))
@@ -1614,7 +1707,7 @@ def boot(out_dir: str) -> dict:
             # ローダ API の可否を**コードを読み込む前に**判定する。
             # 名乗りが JSON にあるからここで撥ねられる。
             # 扱えない mod を import してから AttributeError で落ちるのに比べ、
-            # 利用者に読める形で止まる。
+            # 画面に読める形で止まる。
             verdict, reason = api_status(manifest)
             if verdict:
                 log("{}: {}".format(fname, reason), level="WARN")
@@ -1721,7 +1814,7 @@ def write_status(out_dir: str | None = None) -> str | None:
     台帳も適用結果も、これまでプロセスの中にしか無かった。
     `status()` は用意されていたが**呼ぶ側が存在せず**、
     GUI は注入が成功したかどうかしか出せていなかった（「28個中3個が
-    apply-error」は利用者がログを自力で開かないと分からない）。
+    apply-error」はログを自力で開かないと分からない）。
 
     ゲームの中から問い合わせる経路を作るには注入をもう1本増やすことになるので、
     boot の最後に**こちらから書き出す**。
@@ -1737,7 +1830,7 @@ def write_status(out_dir: str | None = None) -> str | None:
     path = os.path.join(out_dir, STATUS_NAME)
     # 失っても次の注入で作り直される軽いファイルだが、
     # 書き方は他と揃える（「なぜここだけ素朴な open なのか」を残さない）。
-    # 書けなくても boot は続ける ― 報告のためのファイルなので、無くても遊べる。
+    # 書けなくても boot は続ける。報告のためのファイルなので、無くても遊べる。
     return path if write_json(path, status(), indent=2) else None
 
 

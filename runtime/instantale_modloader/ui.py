@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 
@@ -333,6 +334,128 @@ def money(value):
         return "{:,}".format(int(value))
     except (TypeError, ValueError):
         return str(value)
+
+
+# --------------------------------------------------------------------------
+# 通貨の表記（`130_` が決め、`309_` / `314_` / `315_` / `902_` が使う）
+# --------------------------------------------------------------------------
+#: 素のゲームの言い方。長い形と短い形の2つある（GAME.md §2.29）。
+#: 画面も、ゲームが LLM へ送る指示文も、この2つで書かれている。
+COIN_LONG = "ゴールド"
+COIN_SHORT = "G"
+
+#: 数のすぐ後ろに来る短い形。
+#: `馬車(1000G)` `Doghouse (0G)` `貴族権(1,000,000G)` に当たり、
+#: `8GB` や `GUI` には当たらない（後ろに英数字が続かないことを見ている）。
+#: 埋める前のテンプレート（`}` の直後）も拾うのは、
+#: 自由生成施設の値段が `傷薬を煎じてもらう({price.salve}G)` の形で来るため。
+_COIN_SHORT_RE = re.compile("(?<=[0-9０-９}])[ 　]?G(?![A-Za-z0-9])")
+
+#: 英語表示の長い形（`You paid 1000 gold.`）。
+#: **数の後ろでしか当たらない**（素材や色の `gold` を巻き込まないため）。
+#: 英語の所持金ラベル（`Gold:`）には当たらない。
+_COIN_LONG_EN_RE = re.compile("(?<=[0-9０-９}]) gold(?![A-Za-z])")
+
+#: 今の表記。`set_currency` だけが書き換える。
+_coin_names = {"long": COIN_LONG, "short": COIN_SHORT}
+
+#: 額を読む形を短い形ごとに控える（`parse_coin`）。
+_coin_price_res = {}
+
+
+def _clean_name(value, fallback):
+    """表記として使える文字列だけを通す。使えなければ `fallback`。
+
+    表記を空にできてしまうと `1000` と `1000G` の区別が画面から消えるので、
+    空白だけの指定は「指定なし」として扱う。
+    """
+    if not isinstance(value, str):
+        return fallback
+    value = value.strip()
+    return value if value else fallback
+
+
+def _rewrite_coins(text, long_name, short_name):
+    """`text` の中の**素の表記**を、渡された表記へ直す。"""
+    if long_name != COIN_LONG:
+        if COIN_LONG in text:
+            text = text.replace(COIN_LONG, long_name)
+        if "gold" in text:
+            text = _COIN_LONG_EN_RE.sub(" " + long_name, text)
+    if short_name != COIN_SHORT and "G" in text:
+        text = _COIN_SHORT_RE.sub(short_name, text)
+    return text
+
+
+def set_currency(long_name=None, short_name=None):
+    """通貨の表記を決める。**決まった** `(長い形, 短い形)` を返す。
+
+    決めるのは MOD 1本だけ（同梱では `130_currency_unit`）。
+    ここが持つのは表記だけで、額の計算には何も関わらない。
+
+    **何度通しても結果が変わらない表記しか受け取らない。**
+    `rewrite_coins` は画面と LLM の両方の経路で走るので、
+    同じ文が二度通ることがある。
+    新しい表記の中に素の表記が残っていると
+    （`ゴールド` → `金ゴールド`）そのたびに伸びていくため、
+    決める時点で1度だけ確かめ、当てはまらない指定は素の言い方のまま据え置く。
+    受け取らなかったことは戻り値が指定と違うことで分かる（呼ぶ側が記録する）。
+    """
+    long_name = _clean_name(long_name, COIN_LONG)
+    short_name = _clean_name(short_name, COIN_SHORT)
+
+    # 3つの当たり方（長い形・短い形・英語の長い形）を1本に並べた見本。
+    probe = "1000" + COIN_SHORT + COIN_LONG + " 1000 gold"
+    once = _rewrite_coins(probe, long_name, short_name)
+    if _rewrite_coins(once, long_name, short_name) != once:
+        long_name, short_name = COIN_LONG, COIN_SHORT
+
+    _coin_names["long"] = long_name
+    _coin_names["short"] = short_name
+    return (long_name, short_name)
+
+
+def currency_names():
+    """今の `(長い形, 短い形)`。素のままなら `("ゴールド", "G")`。"""
+    return (_coin_names["long"], _coin_names["short"])
+
+
+def rewrite_coins(text):
+    """文中の通貨の表記を今の表記へ直す。素のままなら何もしない。
+
+    文字列でない値はそのまま返す（`scripts.languages:tr` には
+    文字列以外も来る）。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    return _rewrite_coins(text, _coin_names["long"], _coin_names["short"])
+
+
+def parse_coin(text):
+    """ラベルから額を読む。読めなければ `None`。
+
+    **素の `G` と今の短い形の両方を読む**
+    （`馬車(1000G)` も `馬車(1000円)` も 1000）。
+    表記を差し替えた後の画面から素の運賃を読み取る側（`314_` / `315_`）が、
+    差し替えの有無を気にしなくて済むようにするため。
+
+    桁区切りは落とす。数の**前**に付ける記号（`$1000`）は読めない。
+    """
+    short = _coin_names["short"]
+    pattern = _coin_price_res.get(short)
+    if pattern is None:
+        units = [re.escape(COIN_SHORT)]
+        if short != COIN_SHORT:
+            units.insert(0, re.escape(short))
+        pattern = re.compile(r"(\d[\d,]*)\s*(?:" + "|".join(units) + ")")
+        _coin_price_res[short] = pattern
+    match = pattern.search(text or "")
+    if match is None:
+        return None
+    try:
+        return int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def gold_of(app):
@@ -652,11 +775,55 @@ def is_idle(app):
 
 
 # --------------------------------------------------------------------------
+# ゲーム内の日付（GAME.md §2.16）
+# --------------------------------------------------------------------------
+def game_day(app):
+    """いまのゲーム内日数。読めなければ `None`。
+
+    日付は**世界に1つ**（`world.days_elapsed`）で、
+    進めるのは `InstantaleApp.elapse_days`（宿泊と移動はここを大きく飛ばす）。
+
+    `app` でも `World` インスタンスでも受ける。
+    `World.__init__` を包む場面では `app.world` がまだ埋まっていないため
+    （`areas_of_world` と同じ理由）。
+
+    実行時の世界がまだ無いとき（ロードの途中）は `world_dict["world_data"]`
+    から拾う。5本の MOD が各自でこれを読んでいて、
+    **その受け皿を持っていたのは `312_` だけ**だった
+    ― 他の4本はロード中に呼ぶと `None` に倒れる。
+
+    `float` で入っていても `int` にして返す（日数として使う側は整数を期待する）。
+    `True` は `int` の仲間だが日数ではないので弾く。
+    """
+    for holder in (getattr(app, "world", None), app):
+        value = getattr(holder, "days_elapsed", None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+    world_dict = getattr(app, "world_dict", None)
+    data = world_dict.get("world_data") if isinstance(world_dict, dict) else None
+    value = data.get("days_elapsed") if isinstance(data, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+# --------------------------------------------------------------------------
 # エリアの引き当て（GAME.md §2.7）
 # --------------------------------------------------------------------------
 def world_areas(app):
     """エリア表 `{id: Area}`。**属性名ではなく中身で見分ける。**"""
-    world = getattr(app, "world", None)
+    return areas_of_world(getattr(app, "world", None))
+
+
+def areas_of_world(world):
+    """`World` インスタンスから直接引く側。
+
+    `World.__init__` を包む場面では `app.world` がまだ埋まっていない
+    （いま作っている最中）ので、`app` ではなく world を受ける入口が要る
+    （`318_` の `live_store` と同じ理由）。
+    """
     if world is None:
         return {}
     for name in ("areas", "area_dict", "areas_dict"):
@@ -690,6 +857,94 @@ def current_area(app):
 
 def area_id_of(area):
     return str(getattr(area, "id", "")) if area is not None else ""
+
+
+# --------------------------------------------------------------------------
+# 手配度（GAME.md §2.20）
+# --------------------------------------------------------------------------
+# 治安上の立場は土地ごとに `Character.area_history` へ入っている:
+#
+#     area_history = {"0": {"residency": {...}, "achievements": [...],
+#                           "lawfulness": 10}, ...}
+#
+# 平常値は 10 で、小さいほど手配が重く、0 未満で犯罪者（実プレイで -40 を観測）。
+# ゲーム側に読み書きのヘルパは無いので値を直に触る。
+# ここに置いてあるのは読み方だけで、**いくつから手配とみなすかは MOD の判断**。
+LAWFULNESS_KEY = "lawfulness"
+
+
+def area_history_of(character):
+    """エリアごとの記録 `{area_id: 記録}`。読めなければ `None`。"""
+    value = getattr(character, "area_history", None)
+    return value if isinstance(value, dict) else None
+
+
+def area_record(character, area_id):
+    """そのエリアの記録。無ければ `None`（＝一度も訪れていない）。
+
+    id は保存されるときに文字列になるが、実行中に int で入っていることも
+    ありうるので、素の引きが外れたら文字列に均して引き直す。
+    """
+    history = area_history_of(character)
+    if history is None or area_id in (None, ""):
+        return None
+    if area_id in history:
+        return history[area_id]
+    wanted = str(area_id)
+    for key, value in history.items():
+        if str(key) == wanted:
+            return value
+    return None
+
+
+def lawfulness_of(entry):
+    """記録の手配度。読めなければ `None`。
+
+    `bool` を弾いているのは `isinstance(True, int)` が真だから。
+    True を手配度 1 と読むと、そこから金額や敵の強さまで計算してしまう。
+    """
+    if entry is None:
+        return None
+    value = entry.get(LAWFULNESS_KEY) if isinstance(entry, dict)         else getattr(entry, LAWFULNESS_KEY, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def set_lawfulness(entry, value):
+    """記録の手配度を書き戻す。書けたら `True`。
+
+    **項目を新設しないのは呼ぶ側の責任**（先に `lawfulness_of` で読めた記録にしか
+    渡さない）。ここで無条件に作ると、手配度を持たないビルドにそれらしい項目が
+    生えて、以後どちらが本物か分からなくなる。
+    """
+    if entry is None:
+        return False
+    try:
+        if isinstance(entry, dict):
+            entry[LAWFULNESS_KEY] = int(value)
+        else:
+            setattr(entry, LAWFULNESS_KEY, int(value))
+    except Exception:
+        return False
+    return True
+
+
+def lawfulness_by_area(character):
+    """`{area_id(str): 手配度}`。読めなかったエリアは入れない。
+
+    エリア id を文字列に均すのは、セーブと実行中で型が違いうるから
+    （`area_record` と同じ理由）。
+    """
+    history = area_history_of(character)
+    if not history:
+        return {}
+    values = {}
+    for key, entry in history.items():
+        value = lawfulness_of(entry)
+        if value is not None:
+            values[str(key)] = value
+    return values
 
 
 # --------------------------------------------------------------------------
@@ -1615,3 +1870,60 @@ class Screen(object):
             except Exception:
                 self._oops("ConversationEndManager({!r}) failed".format(args))
         return None
+
+
+# ---------------------------------------------------------------- ダメージの出どころ
+# 戦闘で HP を動かす mod と、その増減を画面に出す mod の受け渡し。
+# `319_battle_tactics` が「この増減は『泥の浸食』のぶん」と控え、
+# `308_battle_damage_display` が行に出どころを添える
+# （毎ターンの継続ダメージは地の文と切り離れて出るので、
+# 出どころが無いと新しいバグに見える。mod どうしは import しない ―
+# 共有の語彙はここへ。TECH.md §3.2.3）。
+
+#: 控えの寿命（秒）。報告点は同じ1手の中にあるので、実際は1秒も生きない。
+#: 表示側が居ない（308_ を切っている）ときに積もらないための時限。
+_DAMAGE_NOTE_TTL = 12.0
+_DAMAGE_NOTE_CAP = 32
+
+_damage_notes = []
+
+
+def note_damage(name, amount, label):
+    """HP をこれから動かす側が、増減の出どころを控える。
+
+    `amount` は実際に動かした量（符号は見ない）。
+    """
+    now = time.monotonic()
+    _damage_notes[:] = [note for note in _damage_notes
+                        if now - note[0] <= _DAMAGE_NOTE_TTL]
+    _damage_notes.append((now, str(name), int(round(abs(amount))), str(label)))
+    del _damage_notes[:-_DAMAGE_NOTE_CAP]
+
+
+def take_damage_notes(name, amount):
+    """`name` の増減 `amount` に合う出どころを取り出して消す。無ければ None。
+
+    1件がぴったり合えばその名前。
+    複数の控えの合計が合えば「・」で繋いだ名前
+    （毒と燃焼が同じ報告に畳まれると、表示側には合計しか見えないため）。
+    どちらでもなければ何も消さない（他人の増減に他人の出どころを貼らない）。
+    """
+    now = time.monotonic()
+    _damage_notes[:] = [note for note in _damage_notes
+                        if now - note[0] <= _DAMAGE_NOTE_TTL]
+    amount = int(round(abs(amount)))
+    mine = [note for note in _damage_notes if note[1] == str(name)]
+    if not mine:
+        return None
+    for note in mine:
+        if note[2] == amount:
+            _damage_notes.remove(note)
+            return note[3]
+    if sum(note[2] for note in mine) == amount:
+        labels = []
+        for note in mine:
+            _damage_notes.remove(note)
+            if note[3] not in labels:
+                labels.append(note[3])
+        return "・".join(labels)
+    return None

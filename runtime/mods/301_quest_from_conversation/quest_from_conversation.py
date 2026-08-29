@@ -67,8 +67,34 @@ mod を import はしない。
 ローダは mod を `instantale_mod_<フォルダ名>` で登録するので、
 番号を振り直した瞬間に名前で掴む側が壊れる（TECH.md §3.2.3）。
 繋がるのは同じファイルを読むことによってで、ファイルが無ければ何も添えない。
+
+## 片付いた依頼を依頼人との会話に伝える
+
+依頼を片付けてから依頼人と話しても、あちらは「まだ出発していないのか」と言う。
+会話のプロンプトに毎回載るのは
+`profile` / `personality` / `current_log` / `relationship` の4つで（GAME.md §2.25）、
+このうち会話の外の出来事が入るのは `current_log` だけ。
+そこを書くのは会話終了時の `conversation_resolver` なので、
+依頼の結末はこの経路に入らない。
+
+`quest.config['status']` は片付くと `'incomplete'` から `'completed'` へ変わる。
+その事実だけを、会話5関数の `character_instance` を浅く複製して
+`profile` の末尾に添える。
+どの依頼がこの相手のものかは掲示板の絞り込みと同じ `quest_belongs_to()` で判じる。
+判定を2つ持つと、掲示板に出る依頼と会話で言及される依頼がずれる。
+
+複製するのは**受け取ったオブジェクト**で、控えておいた元の人物ではない。
+`311_` も同じ第4引数を書き換えるので、
+届く `character_instance` はあちらが人物像を足した複製であることがある。
+元から組み直すと、その層を捨てることになる。
+
+適用順は宣言しない。
+`mod.json` に `"before"` を書くと、`_sort_dependencies` の報告は
+`problems` に積まれるので、相手を切っただけでこちらに問題が出る。
+どちらが外側でも成り立つように作る（`talking_npc_id` が相手の id の引き方を持つ）。
 """
 
+import copy
 import os
 import sys
 import time
@@ -176,6 +202,16 @@ SETTLE = 0.4
 # 向こうの `on_button_press` がこちらの action を知らずに握り潰す）。
 MARK = "mod_action"
 
+# 仲間になっている NPC を依頼人から外すか。
+# 外すと、パーティに居る相手との会話には
+# 「依頼を受ける」も「この話から依頼を作る」も出ない。
+#
+# 同行している相手に依頼を出してもらうと、
+# 受注した時点でその相手はもう隣に居る。
+# 依頼人が現地へ付いて来ている形になり、依頼として成り立たない。
+# 名簿の読み方はローダに寄せてある（`ui.party_ids`。`302_` と共有。GAME.md §2.8）。
+EXCLUDE_PARTY_MEMBERS = True
+
 # 依頼人の人物像を、生成のプロンプトに添えるか。
 USE_NPC_MEMORY = True
 
@@ -197,6 +233,34 @@ NPC_MEMORY_FIELDS = (("profile", "人物像"), ("about_player", "冒険者への
 # 添える人物像の上限。
 # 依頼の生成には人物の輪郭があれば足りるので、会話の書き起こしより短くする。
 NPC_MEMORY_CHARS = 800
+
+# ------------------------------------ 片付いた依頼を依頼人との会話に伝える
+# 会話のプロンプトに毎回載る4つの欄に、依頼の結末が入る場所は無い（GAME.md §2.25）。
+# 切ると、片付けた後でも依頼人は「まだ出発していないのか」と言い続ける。
+TELL_COMPLETED_QUESTS = True
+
+# 一度に伝える件数。新しいものから数える。
+# プロンプトは実測で既に 6,200〜8,100 字ある（GAME.md §2.25）ので、
+# 依頼の履歴でそこを埋めない。
+# 会話で意味を持つのは直近に片付けたものだけ。
+MAX_COMPLETED_TOLD = 3
+
+# 添える本文。
+# 見出しで囲って解釈の仕方を指示で与える組み方は `311_` の
+# `PROFILE_HEADING` / `ELAPSED_BODY` と同じ。
+#
+# 言うのは「完了しているという事実」と「記憶と食い違ったらこちらを取る」の2つだけ。
+# `current_log` の要約は「依頼を頼んだ」で止まっているので、
+# 事実を並べるだけでは古い記憶の方が勝つ。
+# 逆に「この話をしろ」とは言わない。
+# 言うと、別の用件で話しかけても毎回依頼の話から始まる。
+COMPLETED_HEADING = "【この人物が出した依頼のうち、既に片付いているもの】"
+COMPLETED_ITEM = "・{title}"
+COMPLETED_BODY = (
+    "これらはいずれも完了済みで、{player}は頼まれた事柄を果たし終えている。"
+    "過去のやり取りの記憶にこれと食い違う内容があっても、"
+    "片付いているという事実の方を正しいものとして話す。"
+    "ただし、この話題を自分から切り出す必要は無い。")
 
 # 自前ボタンに持たせる無害な spec は `ui.SAFE_CLS`（`JustSetButtonToNormalPhase`）。
 # mod 無しで押されても選択肢が戻るだけ。
@@ -227,6 +291,13 @@ def apply(ctx):
         # 依頼が0件だと依頼ボタンの有無では掲示板だと判定できないので、印で持つ。
         # 何か押されたら降りる（押せばその画面からは離れる）。
         "board_open": False,
+        # 会話への注入の結末。同じ結末が続く間はログに書かない。
+        # 会話の LLM は1ターンに何度も回るので、
+        # 毎回書くとこのログが会話で埋まる（`311_` の `note_inject` と同じ手）。
+        "last_inject": None,
+        # ボタンを出さなかった理由。こちらも同じ理由が続く間は書かない。
+        # `refresh_choice_buttons` は並べ直しのたびに走る。
+        "last_skip": None,
     }
     INJECT_TTL = 300.0
 
@@ -424,6 +495,14 @@ def apply(ctx):
         npc_id = state["npc_id"]
         if npc_id is None:
             return
+        # 同行している相手の話は控えない。
+        # 控えると、会話を出た後に施設側から「この話から依頼を作る」で
+        # 拾えてしまう（`OFFER_SITES` に "facility" を入れている場合）。
+        if is_party_member(app, npc_id):
+            note_skip("party member {!r} ({}): talk not remembered".format(
+                frames.short(getattr(npc_of(app, npc_id), "name", ""), 40),
+                npc_id))
+            return
         text = transcribe(app, npc_id)
         if not text:
             return
@@ -438,6 +517,29 @@ def apply(ctx):
             state["last_talk"]["npc_name"], len(text), KEEP_TRANSCRIPT_MOVES))
 
     npc_of = ui.character_of
+
+    # 名簿の読み方はローダに寄せてある（`302_` と共有。GAME.md §2.8）。
+    # `app.party` が list とも dict とも限らず、
+    # 実行時とセーブで形が違うので、自前で読まない。
+    party_ids = ui.party_ids
+
+    def is_party_member(app, npc_id):
+        """その相手はいま同行しているか。設定が切なら常に False。
+
+        同行している相手に依頼を出してもらうと、
+        受注した時点でその相手はもう隣に居る。
+        依頼人が現地へ付いて来ている形になるので、既定では依頼人から外す。
+        """
+        if not EXCLUDE_PARTY_MEMBERS or not npc_id:
+            return False
+        try:
+            return str(npc_id) in party_ids(app)
+        except Exception:
+            # 名簿が読めないことを理由にボタンを消さない。
+            # 消す側に倒すと、名簿の形が変わった版で機能が丸ごと出なくなる。
+            ctx.log_exc("quest offer: cannot read the party roster")
+            return False
+
 
     # ------------------------------------ どの依頼がどの NPC 発かの控え
 
@@ -474,13 +576,34 @@ def apply(ctx):
                 lines.append("{}: {}".format(label, value.strip()))
         return frames.short("\n".join(lines), NPC_MEMORY_CHARS)
 
+    # 控えの写し。`None` = まだ一度も読んでいない。
+    # 触るのは1件ずつの `.get()` だけで、走査はしない。
+    # 書くのは行動のスレッド、読むのは LLM のスレッドなので、
+    # 走査していると「読んでいる最中に大きさが変わった」に当たりうる。
+    clients = {"data": None}
+
     def load_clients():
-        # このファイルは全世界ぶんが1つなので、読めない1回を黙って {} に倒すと、
-        # 次の remember_client が全世界の出所を空で書き直してしまう。
-        # 「無い（初回）」だけを黙って倒し、
-        # 「在るのに読めない」は記録に残す（ctx.read_json）。
+        """「どの依頼がどの NPC 発か」の控え。一度読んだら覚えておく。
+
+        会話への注入は LLM が回るたびに走り、
+        その中で依頼1件ごとに `quest_belongs_to` を通る。
+        読むたびにファイルを開くと、会話1ターンで何十回もディスクを叩くことになる。
+        **このファイルを書くのはこの mod だけ**なので、
+        書いた内容をそのまま持てば足りる（`311_` の `load_bucket` が同じ理由で同じことをしている）。
+
+        このファイルは全世界ぶんが1つなので、読めない1回を黙って {} に倒すと、
+        次の remember_client が全世界の出所を空で書き直してしまう。
+        「無い（初回）」だけを黙って倒し、
+        「在るのに読めない」は記録に残す（ctx.read_json）。
+        """
+        data = clients["data"]
+        if data is not None:
+            return data
         data = ctx.read_json(clients_path, {})
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        clients["data"] = data
+        return data
 
     def remember_client(app, quest_id, npc_id, npc_name):
         """この依頼はこの NPC 発、と控える。セーブには触らない。"""
@@ -498,6 +621,11 @@ def apply(ctx):
             write("remembered client: quest {!r} <- {!r} ({})".format(
                 quest_id, npc_name, npc_id))
         else:
+            # 書けなかったので、手元の写しはディスクと食い違っている。
+            # 捨てて次に読み直させる。
+            # 持ち続けると、この起動の間だけ出所が在るように見えて、
+            # 次の起動で消えるという掴みにくい消え方をする。
+            clients["data"] = None
             write("WARN could not remember the client of quest {!r} "
                   "(the offer will look like nobody's)".format(quest_id))
 
@@ -547,13 +675,20 @@ def apply(ctx):
                                     "ConversationEndManager")
         if entry is None:
             write("end conversation: no ConversationEndManager button; aborting")
+            # 待機表示は必ず解く。
+            # ここは `show_busy` を出したまま呼ばれる経路（`open_quest_board`）が
+            # あり、解かずに降りると点のアニメーションが 0.3 秒ごとに描き直され、
+            # 送信ボタンも `is_button_enabled` も落ちたまま戻らない。
+            # 再起動以外に抜ける手が無くなる。
+            clear_busy(app)
             say(app, "（今は依頼の話を切り出せない）")
             return
         # 会話が閉じるので、会話中のボタンへ戻る道は捨てる。
         state["saved_buttons"] = None
         screen.end_conversation(
             app, entry, follow_up, end_text=END_TEXT,
-            on_abort=lambda _reason: say(app, "（今は依頼の話を切り出せない）"),
+            on_abort=lambda _reason: (clear_busy(app),
+                                      say(app, "（今は依頼の話を切り出せない）")),
             poll=END_POLL, timeout=END_TIMEOUT)
 
     def open_quest_board(app, choice_text=OFFER_LABEL):
@@ -811,7 +946,7 @@ def apply(ctx):
     def restrict_board(app, buttons):
         """会話から開いた掲示板を「その NPC の依頼 ＋ やめる」だけにする。
 
-        会話の流れで受注する画面なので、**通常のクエスト画面のボタンは出さない**（ユーザー指示・2026-08-02）。
+        会話の流れで受注する画面なので、**通常のクエスト画面のボタンは出さない**（2026-08-02）。
         落ちるのは:
 
           * ゲーム自身の「クエストを探す」（`QuestSearchManager`）。ここで
@@ -936,6 +1071,191 @@ def apply(ctx):
         ui.set_quest_value(app, quest_id, name, value,
                            on_error=lambda msg: ctx.log_exc("quest offer: " + msg))
 
+    # ------------------------- 片付いた依頼を会話のプロフィールに添える
+    def player_name_of(app):
+        # 文言に混ぜるので、引けないときは空にせず一般名詞に倒す。
+        return frames.short(getattr(getattr(app, "player", None), "name", ""),
+                            40) or "冒険者"
+
+    def talking_npc_id(app, npc):
+        """会話の相手の id。**`world.characters` との同一性では引かない。**
+
+        `311_` も同じ第4引数を書き換えるので、
+        あちらが外側に居ると、届く `character_instance` は浅い複製になる。
+        複製は `world.characters` のどの値とも同一ではないから、
+        同一性で走査する引き方（`311_` の `npc_id_of`）はそのとき必ず空振りする。
+        `.id` は複製にも写るので先に見る
+        （Character が `id` を持つことは実測済み。`out/events.log` の属性ダンプ）。
+
+        属性が読めなかったときの後ろ盾を2つ置く。
+        `app.in_conversation` は相手の id の文字列で、
+        `state["npc_id"]` は `ConversationStartManager` で控えた分。
+
+        `.id` が鍵と同じ値かは、先頭の1体でしか確かめられていない（GAME.md §2.7）。
+        素のオブジェクトが届いたときは同一性でも引けるので、
+        両方引けた回だけ突き合わせて、食い違ったら記録する。
+        当て推量で動き続けるより、ずれていることが見えている方がよい。
+        """
+        by_attr = getattr(npc, "id", None)
+        by_attr = str(by_attr) if by_attr is not None and str(by_attr) else ""
+        by_identity = ""
+        characters = getattr(getattr(app, "world", None), "characters", None)
+        if isinstance(characters, dict):
+            for key, candidate in characters.items():
+                if candidate is npc:
+                    by_identity = str(key)
+                    break
+        if by_attr and by_identity and by_attr != by_identity:
+            note_inject("WARN character id disagrees: .id={!r} but "
+                        "world.characters key={!r}".format(by_attr, by_identity))
+            return by_identity
+        if by_attr:
+            return by_attr
+        if by_identity:
+            return by_identity
+        in_conversation = getattr(app, "in_conversation", None)
+        if isinstance(in_conversation, str) and in_conversation:
+            return in_conversation
+        return state["npc_id"] or ""
+
+    def completed_quests_of(app, npc_id, npc_name):
+        """この NPC が出した依頼のうち、片付いているもののタイトル。
+
+        判定は `config['status'] == 'completed'` の1点だけ。
+        観測できているのは `'incomplete'` と `'completed'` の2値だけなので
+        （`206_` の census。`out/quest_flow.log`）、達成と放棄は見分けない。
+        いつ終わったかも見ない。
+        `QuestEndManager` を包めば終わった日も取れるが、
+        包んだ瞬間にこの mod は依頼の結末を追う mod になる。
+        ここでやるのは事実を1つ運ぶことだけ。
+
+        誰の依頼かは掲示板の絞り込みと**同じ** `quest_belongs_to` で判じる。
+
+        `quest_of` は先に見つかった側を返す。
+        `config` を持たない形で入っている依頼は黙って飛ばす
+        （読めないものを完了扱いにしない）。
+        """
+        if MAX_COMPLETED_TOLD <= 0:
+            return []
+        found = []
+        for quest_id in quest_ids(app):
+            quest = quest_of(app, quest_id)
+            if quest is None:
+                continue
+            config = quest_value(quest, "config", None)
+            if not isinstance(config, dict) or config.get("status") != "completed":
+                continue
+            if not quest_belongs_to(app, quest_id, npc_id, npc_name):
+                continue
+            found.append((quest_id,
+                          frames.short(quest_value(quest, "quest_title", "依頼"), 60)))
+        # 新しいものから数える。
+        # id は採番順なので、大きいものほど後に作られた依頼。
+        # 並べ直すのは、`quest_ids` が返す順が2つの格納先の合併で決まるため
+        # （素の `sorted` は辞書順で "10" < "9" になる。`ui.id_sort_key`）。
+        found.sort(key=lambda pair: ui.id_sort_key(pair[0]))
+        return [title for _qid, title in found[-MAX_COMPLETED_TOLD:]]
+
+    def completed_block(app, npc_id, npc_name):
+        """プロフィール欄に足す本文。言うことが無ければ空文字。"""
+        titles = completed_quests_of(app, npc_id, npc_name)
+        if not titles:
+            return ""
+        return "{}\n{}\n{}".format(
+            COMPLETED_HEADING,
+            "\n".join(COMPLETED_ITEM.format(title=title) for title in titles),
+            COMPLETED_BODY.format(player=player_name_of(app)))
+
+    def note_inject(message):
+        """注入の結末を残す。同じ結末が続く間は書かない。
+
+        会話の LLM は1ターンに何度も回るので、
+        毎回書くとこのログが会話で埋まる（`311_` の `note_inject` と同じ）。
+        """
+        if state["last_inject"] == message:
+            return
+        state["last_inject"] = message
+        write(message)
+
+    def note_skip(message):
+        """ボタンを出さなかった理由を残す。同じ理由が続く間は書かない。"""
+        if state["last_skip"] == message:
+            return
+        state["last_skip"] = message
+        write("no offer: " + message)
+
+    def with_quest_facts(label, args, kwargs):
+        """NPC の浅い複製の `profile` に、片付いた依頼の事実を足した引数を組み直す。
+
+        会話5関数は先頭4引数の並びが同じなので、ここ1つで足りる（GAME.md §2.25）。
+
+        **複製するのは受け取ったオブジェクト**で、控えておいた元の人物ではない。
+        `311_` が外側に居ると、届くのはあちらが人物像を足した複製になる。
+        元から組み直すと、その層を捨てることになる。
+
+        素通りするときも黙っては降りない。
+        理由が残らないと、注入が効いていないことに気付けない。
+        """
+        npc = kwargs.get("character_instance")
+        if npc is None and len(args) >= 4:
+            npc = args[3]
+        if npc is None:
+            note_inject("{}: no character_instance (args={}, kwargs={})".format(
+                label, len(args), sorted(kwargs)))
+            return args, kwargs
+        app = find_app()
+        if app is None:
+            note_inject("{}: no running app".format(label))
+            return args, kwargs
+        npc_id = talking_npc_id(app, npc)
+        # 名前の切り詰めは 40 字に揃える。
+        # `remember_client` が控える名前も `current_talk` 経由で 40 字なので、
+        # ここを変えると長い名前で `quest_belongs_to` の名前照合が外れる。
+        npc_name = ui.character_name(app, npc_id, fallback="") if npc_id else ""
+        if not npc_name:
+            npc_name = frames.short(getattr(npc, "name", ""), 40)
+        if not npc_id and not npc_name:
+            note_inject("{}: cannot name the character ({})".format(
+                label, type(npc).__name__))
+            return args, kwargs
+        addition = completed_block(app, npc_id, npc_name)
+        if not addition:
+            note_inject("{}: no completed quest for {!r} ({})".format(
+                label, npc_name, npc_id))
+            return args, kwargs
+        base = getattr(npc, "profile", "")
+        if base is None:
+            base = ""
+        if not isinstance(base, str):
+            note_inject("{}: profile is {}".format(label, type(base).__name__))
+            return args, kwargs
+        try:
+            clone = copy.copy(npc)
+        except Exception as exc:
+            note_inject("{}: cannot copy {} ({})".format(
+                label, type(npc).__name__, type(exc).__name__))
+            return args, kwargs
+        clone.profile = (base.rstrip() + "\n\n" + addition
+                         if base.strip() else addition)
+        note_inject("{}: {!r} ({}) +{} chars into profile".format(
+            label, npc_name, npc_id, len(addition)))
+        if "character_instance" in kwargs:
+            merged = dict(kwargs)
+            merged["character_instance"] = clone
+            return args, merged
+        merged = list(args)
+        merged[3] = clone
+        return tuple(merged), kwargs
+
+    def inject(orig, label, args, kwargs):
+        """引数を組み直してから元の関数へ。元の関数は必ず1回だけ呼ぶ。"""
+        if TELL_COMPLETED_QUESTS:
+            try:
+                args, kwargs = with_quest_facts(label, args, kwargs)
+            except Exception:
+                ctx.log_exc("quest offer: cannot tell the completed quests")
+        return orig(*args, **kwargs)
+
     # ================================================================ フック
     def has_offer_button(buttons):
         return any(isinstance(b, dict) and b.get(MARK) == "offer" for b in buttons)
@@ -1026,6 +1346,16 @@ def apply(ctx):
                 # 二重化も「押しても無反応」も同時に消える。
                 screen.prune_stale(buttons, OUR_LABELS)
                 at, where = offer_slot(buttons)
+                # 同行している相手には出さない。
+                # 相手は画面の「会話を終了する」から読む（`302_` の手。`ui.conversation_partner`）。
+                # `state["npc_id"]` でも引けるが、
+                # いま並んでいるボタンから読む方が画面と食い違わない。
+                if where == "conversation":
+                    partner, _entry = ui.conversation_partner(buttons)
+                    if is_party_member(self, partner):
+                        note_skip("party member {!r} ({}): not a client".format(
+                            ui.character_name(self, partner), partner))
+                        at = None
                 if at is not None:
                     # 会話画面には「この話から依頼を作る」も置く。
                     # 掲示板を経由しないので会話を閉じずに生成できる。
@@ -1096,6 +1426,11 @@ def apply(ctx):
                     type(buttons).__name__))
                 return result
             if has_offer_button(buttons):
+                return result
+            partner, _entry = ui.conversation_partner(buttons)
+            if is_party_member(self, partner):
+                note_skip("party member {!r} ({}): not a client".format(
+                    ui.character_name(self, partner), partner))
                 return result
             if insert_offer_button(buttons, len(buttons) - 1, "conversation"):
                 refresh(self)
@@ -1211,8 +1546,39 @@ def apply(ctx):
             write("inject: generator returned {}".format(frames.repr_value(result)))
         return result
 
-    ctx.log("quest from conversation: sites={} list={} generation={} log={}".format(
-        "/".join(OFFER_SITES),
-        LIST_MODE if (LIST_MODE != "mod" or QUEST_TYPE_FOR_CHOICE is not None)
-        else "mod->game (quest_type unverified)",
-        ENABLE_GENERATION, log_path))
+    # ------------------- 会話5関数に「片付いた依頼」を伝える
+    # 5本ともプロフィール欄を通して伝える（引数を足さない）。
+    # 出力にも呼び出し側にも影響しないのは
+    # `random_quest_generator` の `area_description` と同じ理屈。
+    #
+    # `master_ai_facilitator_from_conversation` はこの5本を通らないので、
+    # そちらには届かない（GAME.md §2.25。`311_` と同じ限界）。
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator", required=False)
+    def conversation_facilitator(orig, *args, **kwargs):
+        return inject(orig, "facilitator", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_after_retrieval",
+              required=False)
+    def conversation_facilitator_after_retrieval(orig, *args, **kwargs):
+        return inject(orig, "facilitator[retrieval]", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_in_quest",
+              required=False)
+    def conversation_facilitator_in_quest(orig, *args, **kwargs):
+        return inject(orig, "facilitator[quest]", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_starter", required=False)
+    def conversation_starter(orig, *args, **kwargs):
+        return inject(orig, "starter", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_starter_in_quest",
+              required=False)
+    def conversation_starter_in_quest(orig, *args, **kwargs):
+        return inject(orig, "starter[quest]", args, kwargs)
+
+    ctx.log("quest from conversation: sites={} list={} generation={} "
+            "completed_note={} log={}".format(
+                "/".join(OFFER_SITES),
+                LIST_MODE if (LIST_MODE != "mod" or QUEST_TYPE_FOR_CHOICE is not None)
+                else "mod->game (quest_type unverified)",
+                ENABLE_GENERATION, TELL_COMPLETED_QUESTS, log_path))

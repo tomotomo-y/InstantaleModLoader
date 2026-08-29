@@ -22,10 +22,15 @@ DISPLAY_CHARS = 1000
 TRUNCATED_NOTICE = "［表示負荷を抑えるため、前の本文は省略］\n"
 
 def apply(ctx):
+    # HUD ごとの控え。
+    # 載せ替えるときに切り落とす前置き（`prefix`）を次の1文字へ持ち越すために要る。
+    # 弱参照を張れない相手には `WeakKeyDictionary` が TypeError を出すので、
+    # そのときだけ id 引きの辞書へ倒す。
     states = weakref.WeakKeyDictionary()
     fallback_states = {}
 
     def state_for(hud):
+        """この HUD の控えを取り出す。無ければ作る。"""
         try:
             state = states.get(hud)
             if state is None:
@@ -37,6 +42,11 @@ def apply(ctx):
                 id(hud), {"prefix": "", "pending": False})
 
     def label_for(hud):
+        """載せ替えてよい表示ラベルだけを返す。
+
+        `text` と `texture_update()` が揃っていないものは相手にしない。
+        ゲームの外（オフライン検証）や、まだ組み上がっていない HUD がここへ来る。
+        """
         label = frames.attr(hud, "text_display")
         if label in (None, frames.MISSING):
             return None
@@ -47,6 +57,11 @@ def apply(ctx):
         return label
 
     def settle(hud, label, state):
+        """載せ替えたラベルの高さを、次のフレームで1回だけ出し直す。
+
+        本文は1文字ずつ伸びるので `limit_display` はその回数だけ呼ばれる。
+        `pending` は、同じ予約をその回数だけ積まないための旗。
+        """
         if state["pending"]:
             return
 
@@ -77,6 +92,15 @@ def apply(ctx):
             ctx.log_exc("message text integrity: could not schedule height update")
 
     def limit_display(hud, value):
+        """ラベルを「前置き + 省略通知 + 末尾 DISPLAY_CHARS 文字」へ載せ替える。
+
+        前置き（`state["prefix"]`）を控える理由と、それが貼り付いたままになる
+        未検証の穴は VERIFICATION.md §3.29 にまとめてある。
+        要点だけ: 塗る相手は `display_text` ではなく画面の
+        `text_display.text` で、この2つは一致しない（GAME.md §2.3）。
+        載せ替えた後は `endswith` が二度と成立しないので、
+        切り出せる機会は1回しかなく、持ち越すしかない。
+        """
         state = state_for(hud)
         if not value:
             state["prefix"] = ""
@@ -101,7 +125,10 @@ def apply(ctx):
 
     @ctx.wrap("scripts.hud.new_hud:InstanTaleHUD.update_display_text", safe=True)
     def update_display_text(orig, self, instance=None, value=None, *args, **kwargs):
+        # 先にゲームへ塗らせて、その後のラベルだけを載せ替える。
         result = orig(self, instance, value, *args, **kwargs)
+        # 材料はゲームが持っている本文を優先する。
+        # 通知の `value` は呼び出し元によっては渡らないので、控えの方が確か。
         canonical = frames.attr(self, "display_text")
         if not isinstance(canonical, str):
             canonical = value

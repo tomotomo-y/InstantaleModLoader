@@ -10,6 +10,7 @@
     "ja": "会話から NPC に同行を持ちかける。雇用（パーティ）は使わず、施設間は無条件に、土地を跨ぐときは本人の判断で付いて来る"
   },
   "version": "1",
+  "kind": "feature",
   "author": "yoshinari/tomotomo-y",
   "after": [
     "300_event_facility_arrival"

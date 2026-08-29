@@ -10,6 +10,7 @@
     "ja": "メッセージ表示領域を下端固定で拡張し、ウィンドウ高から求める全画面切替と半透明の黒背景を追加する"
   },
   "version": "1",
+  "kind": "fix",
   "author": "yoshinari/tomotomo-y",
   "after": [
     "112_ui_text_spacing"

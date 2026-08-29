@@ -1,0 +1,912 @@
+# -*- coding: utf-8 -*-
+"""NPC 同士の認知と関係を覚える。`311_` の記録は読むだけで、変更しない。
+
+`311_npc_profile_memory` が覚えるのは「その人物」と「その人物から見たプレイヤー」で、
+仲間同士がお互いをどう見ているかはどこにも残らない。
+この MOD は会話が1手進むたびに、会話相手と同行の仲間の間の関係
+（A から見た B、B から見た A。対称にしない）を LLM に抽出させ、
+`state/npc_social_memory/<世界>.json` に控える。
+次の会話では、会話相手の profile の末尾に同行者の情報とその関係を足して渡す
+（本体の NPC には書かない。浅い複製に足す）。
+
+## 読むもの
+
+311 と共有 UI 部品に合わせ、会話参加者だけをその場で読み取る。
+全 NPC の character_value は捕捉・保持しない。
+311 の state は mtime とサイズを見て、動いたときだけ読み直す。
+書くのは自分の state だけ。
+
+## 抽出
+
+会話の写し（参加者・書き起こし・既存の記録）をメインスレッドで取り、
+1本のワーカーで直列に LLM を呼ぶ（ワーカーは app を触らない）。
+応答の検証は `normalize_result` 1本にまとめ、構造化・非構造化の両経路が同じ道を通る。
+構造化経路を一度使えなかった provider では以後その経路を試さない
+（試すたびに `EXTRACT_TIMEOUT` を2本ぶん待つため）。
+残す事実の件数はプロンプトも設定（`FACT_LOG_LIMIT`）から出す。
+
+自前の manager_name（`MANAGER_EXTRACT`）を付けるので、
+抽出のプロンプトも `output_data/` に残る（GAME.md §2.12）。
+"""
+import copy
+import datetime
+import sys
+import typing
+
+from instantale_modloader import frames, jobs, llm, ui
+from instantale_modloader.state import WorldStore, world_key
+
+# ---- 設定（既定値は mod.json の "settings" と一致させること。
+#      `tools/check_mods.py` が AST で突き合わせる）------------------------
+# 関係抽出に載せる直近のやり取りの数
+CONVERSATION_TURNS = 10
+
+# NPC→NPC関係記録の目標長（保存・注入では切らない）
+RELATION_CHARS = 600
+
+# 方向ごとに残す事実の件数（0 で記録しない）
+FACT_LOG_LIMIT = 10
+
+# 会話相手へ同行NPCの人物情報も見せるか
+INJECT_PARTY_PROFILE = True
+
+# 1回の関係抽出で扱うNPCの上限
+MAX_PARTICIPANTS = 6
+
+LOG_BASENAME = "npc_social_memory.log"
+
+# 世界ごとの控えを置くフォルダ（`ctx.state_path` の下）。
+# ファイル名は `instantale_modloader.state.world_filename` が作る。
+# ここに同じ規則を写さないこと（TECH.md §3.2.3）。
+STATE_DIRNAME = "npc_social_memory"
+
+# 311 の控え。**読むだけ**で、こちらからは書かない。
+PROFILE_STATE_DIRNAME = "npc_profiles"
+
+# 会話参加者から読むゲーム側の項目と、その長さの上限。
+CHARACTER_FIELDS = ("profile", "personality", "job")
+CHARACTER_FIELD_CHARS = 400
+CHARACTER_TOTAL_CHARS = 1000
+
+# 311と同じく、抽出へ差し戻す既知の事実は短く再提示する。
+FACT_RECALL = 10
+FACT_RECALL_CHARS = 800
+
+# 311 から借りてくる本文の上限。
+PROFILE_CHARS = 600
+ABOUT_PLAYER_CHARS = 600
+
+# 会話へ注入する1項目ぶんの上限と、書き起こし1行の上限。
+INJECT_FIELD_CHARS = 500
+TRANSCRIPT_LINE_CHARS = 400
+
+# 自前の `manager_name`。
+# これを付けると自分のプロンプトも
+# `output_data/<世界>/<PC>/<manager_name>/N.json` に残る（GAME.md §2.12）。
+MANAGER_EXTRACT = "mod_npc_social_memory_extract"
+
+# 抽出に渡す制限時間（秒）。必ず渡す。
+# 抽出は1本のワーカーで直列に回しているので、1回返らないと以後が全部止まる。
+EXTRACT_TIMEOUT = 120
+
+# 抽出に載せる書き起こしの長さ（長すぎると要点が薄まる）。
+CONVERSATION_CHARS = 2600
+
+# 待ち行列へ積んだままにする仕事の上限。
+# 溢れたら古い方を捨てる（新しい会話ほど関係に効くため）。
+MAX_PENDING = 8
+
+# ワーカーと控えの置き場所。
+# **`apply()` の中で作ってはいけない**（TECH.md §3.4）。
+# `apply()` は再注入と遅延当て直しで何度も走り、そのたびに worker が None に戻る。
+# `sys` に置けば世代をまたいで同じ1組を共有できる。
+STORE_ATTR = "__instantale_npc_social_memory_store__"
+
+#: 会話相手の profile の末尾へ足す塊の見出し。
+HEADING = "【現在この場に同行している人物】"
+
+def _field(record, key):
+    """控えの1項目を、前後の空白を落とした文字列で返す。無ければ空文字。"""
+    value = record.get(key) if isinstance(record, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return ""
+
+
+def normalize_result(data, allowed_ids):
+    """応答を403内部形式へ揃える。ID検証・自己参照除外・重複方向除外はここだけで行う。
+
+    構造化経路と非構造化経路の両方がここへ来る。
+    2箇所に同じ検証を書くと、片方だけ直したときに黙ってすり抜ける。
+    """
+    if not isinstance(data, dict):
+        return None
+    if not llm.truthy(data.get("changed", True)):
+        return []
+    rows = data.get("relations")
+    if not isinstance(rows, list):
+        return None
+
+    allowed = {str(x) for x in allowed_ids}
+    out = []
+    seen = set()
+    for row in rows:
+        # nested create_model は provider により model のまま返る場合もある。
+        row = llm.as_dict(row)
+        if not isinstance(row, dict):
+            continue
+        observer = str(row.get("observer_id", "")).strip()
+        target = str(row.get("target_id", "")).strip()
+        if observer not in allowed or target not in allowed:
+            continue
+        if observer == target or (observer, target) in seen:
+            continue
+        relationship = row.get("relationship")
+        if not isinstance(relationship, str) or not relationship.strip():
+            continue
+        raw_facts = row.get("new_facts")
+        if not isinstance(raw_facts, list):
+            raw_facts = []
+        facts = [x.strip() for x in raw_facts if isinstance(x, str) and x.strip()]
+        out.append((observer, target, relationship.strip(), facts))
+        seen.add((observer, target))
+    return out
+
+
+def bounded_facts(items):
+    """事実を重複除去し、各 observer->target につき FACT_LOG_LIMIT 件までにする。
+
+    入力は `{"at", "text"}` の dict でも素の文字列でもよく、出力は必ず dict。
+    古い形の控えを読むときの正規化も兼ねる。残すのは新しい側（末尾）。
+    """
+    if not isinstance(items, list):
+        return []
+
+    out = []
+    seen = set()
+    for item in items:
+        if isinstance(item, dict):
+            text = item.get("text")
+            entry = dict(item)
+        else:
+            text = item
+            entry = {}
+        if not isinstance(text, str) or not text.strip():
+            continue
+        text = text.strip()
+        if text in seen:
+            continue
+        seen.add(text)
+        entry["text"] = text
+        out.append(entry)
+
+    if FACT_LOG_LIMIT <= 0:
+        return []
+    return out[-FACT_LOG_LIMIT:]
+
+def normalize_bucket(bucket):
+    """旧403 stateも読み込み時に311のような簡潔な形へ整える。"""
+    if not isinstance(bucket, dict):
+        return {}, False
+
+    changed = False
+    for observer in bucket.values():
+        if not isinstance(observer, dict):
+            continue
+        relations = observer.get("relations")
+        if not isinstance(relations, dict):
+            continue
+        for relation in relations.values():
+            if not isinstance(relation, dict) or "facts" not in relation:
+                continue
+            old = relation.get("facts")
+            new = bounded_facts(old)
+            if old != new:
+                relation["facts"] = new
+                changed = True
+    return bucket, changed
+
+
+def parse_result(result, allowed_ids):
+    """非構造化応答からJSONを1つ取り出し、`normalize_result` へ渡す。
+
+    囲みを剥がして JSON を拾うところはローダの語彙（`llm.parse_json`）。
+    """
+    if not isinstance(result, str):
+        return None
+    data = llm.parse_json(result)
+    if data is None:
+        return None
+    return normalize_result(data, allowed_ids)
+
+
+def apply(ctx):
+    state_dir = ctx.state_path(STATE_DIRNAME)
+    write = ctx.logger(LOG_BASENAME)
+    # ここでは Clock への予約（`screen.schedule`）にだけ使う。選択肢は作らない。
+    screen = ui.Screen(ctx, write, tag="npc social memory")
+
+    # プロセスに1つだけ置く共有の棚（apply() が何度走っても同じものを使う）。
+    store = getattr(sys, STORE_ATTR, None)
+    if not isinstance(store, dict):
+        store = {
+            # 世界ごとの 403 の控え。出し入れと錠はローダの語彙（`state.WorldStore`）
+            "worlds": WorldStore(ctx, STATE_DIRNAME, normalize=normalize_bucket),
+            # 311 の控えを読むだけの窓（`own=False`。フォルダは作らない）
+            "profiles": WorldStore(ctx, PROFILE_STATE_DIRNAME, own=False),
+            "worker": None,          # 抽出の背景スレッド（`jobs.Worker`）。作るのは `extract` が出来てから
+            "last_inject": None,     # 直前に書いた注入の結末（同じ文言を繰り返さない）
+            "last_skip": None,       # 抽出を見送った直前の理由（同上）
+        }
+        setattr(sys, STORE_ATTR, store)
+
+    # 既に在る store（注入し直し）にも、後から足した棚を用意する。
+    store.setdefault("no_structure", False)  # 構造化経路を諦めたか
+
+    worlds = store["worlds"].rebind(ctx, write)
+    profiles = store["profiles"].rebind(ctx)
+    # 「読んで、書き換えて、書く」を1つの錠の中で行う（再入可）。
+    data_lock = worlds.lock
+
+    # ------------------------------------------------------------ 403 の控え
+    # `state/npc_social_memory/<世界>.json` の形:
+    #   {
+    #     "<observer_id>": {
+    #       "name": "見る側の名前",
+    #       "relations": {
+    #         "<target_id>": {
+    #           "name": "見られる側の名前",
+    #           "relationship": "observer から見た target の現在の要約（毎回書き直し）",
+    #           "facts": [{"at": "YYYY-MM-DDThh:mm:ss", "text": "確定した事実"}, ...],
+    #           "updated": "YYYY-MM-DDThh:mm:ss"
+    #         }
+    #       }
+    #     }
+    #   }
+    # A→B と B→A は別の記録。`facts` は追記専用で FACT_LOG_LIMIT 件まで。
+
+    def load_bucket(key):
+        """世界1つぶんの控えを返す。最初の1回だけファイルを読み、以後は控え。
+
+        読んだときに形が古ければ整えて書き戻す（`normalize_bucket`。
+        403自身のstateだけを移行する。311や本体データには書かない）。
+        返す dict は控えと同一なので、書き換えたら `save_bucket` で保存する。
+        """
+        return worlds.load(key)
+
+    def save_bucket(key, bucket):
+        """控えを書く。`ctx.write_json` の戻り値（書けたか）をそのまま返す。"""
+        return worlds.save(key, bucket)
+
+    # ------------------------------------------------------------ 311 の控え（読むだけ）
+
+    def profile_bucket_311(key):
+        """311 の控えを返す。311 はワーカーで書き換えるので更新時刻で見張る。
+
+        1ターンに会話系フックが何本も走るので、動いていない間まで読み直さない
+        （見張りは `WorldStore.load(fresh=True)`）。
+        読むだけの窓なので `own=False`。
+        311 を切っている人の `state/` に空のフォルダを作らない（TECH.md §3.11）。
+        """
+        return profiles.load(key, fresh=True)
+
+    def memory_311(key, npc_id):
+        """311 が育てた人物像と、その人物から見たプレイヤー。無ければ空文字。
+
+        311 の控えは `{npc_id: {"profile": ..., "about_player": ..., "facts": ...}}`。
+        ここで読むのは2欄だけで、長さも上限で切る。
+        """
+        record = profile_bucket_311(key).get(str(npc_id))
+        if not isinstance(record, dict):
+            return {"profile": "", "about_player": ""}
+        return {
+            "profile": frames.short(_field(record, "profile"), PROFILE_CHARS),
+            "about_player": frames.short(_field(record, "about_player"),
+                                         ABOUT_PLAYER_CHARS),
+        }
+
+    # ------------------------------------------------------------ 参加者を読む
+
+    def character_text(character):
+        """311と同じく、現在の会話参加者から必要な項目だけ読む。"""
+        if character is None:
+            return ""
+
+        blocks = []
+        total = 0
+        for field in CHARACTER_FIELDS:
+            value = getattr(character, field, None)
+            if value in (None, "", [], {}):
+                continue
+            text = frames.short(value, CHARACTER_FIELD_CHARS)
+            if not text:
+                continue
+            line = "{}: {}".format(field, text)
+            remain = CHARACTER_TOTAL_CHARS - total
+            if remain <= 0:
+                break
+            if len(line) > remain:
+                # 端数が短すぎると読めない断片になるだけなので、そこで打ち切る。
+                if remain > 80:
+                    blocks.append(line[:remain])
+                break
+            blocks.append(line)
+            total += len(line) + 1
+        return "\n".join(blocks)
+
+    def npc_id_of(app, npc):
+        """会話関数に渡された Character（`npc`）の id を、共有UI部品で特定する。全NPC走査はしない。
+
+        `app.in_conversation` が今の会話相手の id。渡された `npc` がその実体なら即決。
+        実体が違っていても（他の MOD が浅い複製を渡してくる場合）、会話相手の id が
+        引けるならそれを正本にする。どちらでもなければ仲間の中から同一instanceを探す。
+        """
+        current = getattr(app, "in_conversation", None)
+        if current is not None and ui.character_of(app, current) is npc:
+            return str(current)
+        # 会話関数の引数が浅い複製でも、会話相手IDを正本にする。
+        if current is not None and ui.character_of(app, current) is not None:
+            return str(current)
+        for candidate in ui.party_member_ids(app):
+            if ui.character_of(app, candidate) is npc:
+                return str(candidate)
+        return ""
+
+    def participant_ids(app, conversation_id):
+        """抽出に載せる NPC の id。会話相手を先頭に、同行の仲間を続ける。上限 MAX_PARTICIPANTS（最低2）。"""
+        ids = [str(conversation_id)] if conversation_id else []
+        for member_id in ui.party_member_ids(app):
+            member_id = str(member_id)
+            if member_id and member_id not in ids:
+                ids.append(member_id)
+        return ids[:max(2, int(MAX_PARTICIPANTS))]
+
+    def people_of(app, ids):
+        """抽出に渡す1人ぶんの材料（id・名前・ゲーム側の項目・311 の2欄）を id ごとに組む。"""
+        key = world_key(app)
+        out = []
+        for npc_id in ids:
+            character = ui.character_of(app, npc_id)
+            if character is None:
+                continue
+            memory = memory_311(key, npc_id)
+            out.append({
+                "id": str(npc_id),
+                "name": ui.character_name(app, npc_id, fallback="その人物"),
+                "character": character_text(character),
+                "memory_profile": memory["profile"],
+                "about_player": memory["about_player"],
+            })
+        return out
+
+    def player_name_of(app):
+        """プレイヤーの名前。属性名が版で揺れるので候補を順に見る。"""
+        player = getattr(app, "player", None)
+        for attr in ("name", "character_name", "player_name"):
+            value = getattr(player, attr, None) if player is not None else None
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for attr in ("player_name", "character_name"):
+            value = getattr(app, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "プレイヤーキャラクター"
+
+    # ------------------------------------------------------------ 関係の読み書き
+
+    def relation_record(key, observer_id, target_id):
+        """observer → target の記録（上の形の一番内側の dict）。無ければ空の dict。"""
+        observer = load_bucket(key).get(str(observer_id), {})
+        relations = observer.get("relations", {}) if isinstance(observer, dict) else {}
+        record = relations.get(str(target_id), {}) if isinstance(relations, dict) else {}
+        return record if isinstance(record, dict) else {}
+
+    def recent_facts(record):
+        """抽出へ差し戻す既知の事実を古い順で返す。件数と文字数の両方で頭打ちにする。"""
+        log = record.get("facts") if isinstance(record, dict) else None
+        if not isinstance(log, list):
+            return []
+
+        texts = []
+        total = 0
+        for item in reversed(bounded_facts(log)):
+            text = item.get("text") if isinstance(item, dict) else item
+            if not isinstance(text, str) or not text.strip():
+                continue
+            text = text.strip()
+            total += len(text) + 2
+            if len(texts) >= FACT_RECALL or total > FACT_RECALL_CHARS:
+                break
+            texts.append(text)
+        return list(reversed(texts))
+
+    def update_relation(key, observer_id, observer_name,
+                        target_id, target_name, summary, new_facts):
+        """抽出の結果1方向ぶんを控えへ書く。ワーカースレッドから呼ばれる。
+
+        `relationship` は `summary` で丸ごと置き換え、`new_facts` は既知と重複しない
+        ものだけ末尾に追記する。要約も事実も変わっていなければファイルは書かない。
+        """
+        with data_lock:
+            bucket = load_bucket(key)
+
+            observer = bucket.get(str(observer_id))
+            if not isinstance(observer, dict):
+                observer = {"name": observer_name, "relations": {}}
+                bucket[str(observer_id)] = observer
+            observer["name"] = observer_name
+
+            relations = observer.get("relations")
+            if not isinstance(relations, dict):
+                relations = {}
+                observer["relations"] = relations
+
+            record = relations.get(str(target_id))
+            if not isinstance(record, dict):
+                record = {}
+                relations[str(target_id)] = record
+
+            old = _field(record, "relationship")
+            record["name"] = target_name
+            old_facts = bounded_facts(record.get("facts"))
+            known = {x.get("text") for x in old_facts if isinstance(x, dict)}
+
+            fresh = []
+            for fact in new_facts or []:
+                if not isinstance(fact, str) or not fact.strip():
+                    continue
+                fact = fact.strip()
+                if fact not in known:
+                    known.add(fact)
+                    fresh.append(fact)
+
+            record["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+            record["relationship"] = summary
+            if FACT_LOG_LIMIT > 0:
+                log = old_facts   # 同じlistを伸ばす。下の changed の比較もこれを見る
+                stamp = datetime.datetime.now().isoformat(timespec="seconds")
+                for fact in fresh:
+                    log.append({"at": stamp, "text": fact})
+                record["facts"] = bounded_facts(log)
+            else:
+                record.pop("facts", None)
+
+            changed = (old != summary
+                       or old_facts != record.get("facts", [])
+                       or bool(fresh))
+            if not changed:
+                return
+            if save_bucket(key, bucket):
+                write("updated {} -> {}: {} -> {} chars, +{} facts".format(
+                    observer_name, target_name, len(old), len(summary), len(fresh)))
+
+    # ------------------------------------------------------------ 会話への注入
+
+    def note_inject(message):
+        """同じ内容を続けて書かない（1ターンに会話系フックが何本も走るため）。"""
+        if store["last_inject"] != message:
+            store["last_inject"] = message
+            write(message)
+
+    def note_skip(message):
+        """抽出を見送った理由。同じ理由が続く間は1度だけ書く。"""
+        if store["last_skip"] != message:
+            store["last_skip"] = message
+            write("extract skipped: " + message)
+
+    def social_block(app, observer_id):
+        """会話相手（observer）の profile の末尾へ足す文。同行者が居なければ空文字。
+
+        同行者1人につき: 名前と id、（設定が入なら）ゲーム側の基本情報と 311 の2欄、
+        そして 403 が記録した「observer から見たその同行者」。記録が無い相手には
+        「捏造せず現在の会話から判断せよ」と書いて、初対面か既知かを LLM に決めさせない。
+        """
+        key = world_key(app)
+        blocks = []
+        for target_id in ui.party_member_ids(app):
+            target_id = str(target_id)
+            if target_id == str(observer_id):
+                continue
+            character = ui.character_of(app, target_id)
+            if character is None:
+                continue
+
+            name = ui.character_name(app, target_id, fallback="同行者")
+            lines = ["- {} (id={})".format(name, target_id)]
+            if INJECT_PARTY_PROFILE:
+                memory = memory_311(key, target_id)
+                raw = character_text(character)
+                if raw:
+                    lines.append("  ゲーム側の基本情報（短縮）: "
+                                 + frames.short(raw, INJECT_FIELD_CHARS))
+                if memory["profile"]:
+                    lines.append("  311の人物像（短縮）: "
+                                 + frames.short(memory["profile"], INJECT_FIELD_CHARS))
+                if memory["about_player"]:
+                    lines.append("  {}から見た{}: {}".format(
+                        name, player_name_of(app),
+                        frames.short(memory["about_player"], INJECT_FIELD_CHARS)))
+
+            relationship = _field(relation_record(key, observer_id, target_id),
+                                  "relationship")
+            lines.append("  403が記録した関係（短縮）: " + (
+                frames.short(relationship, RELATION_CHARS) if relationship else
+                "（このMODにはまだ確定した記録がない。初対面か既知かを捏造せず、"
+                "現在の会話・ゲーム側の記録から判断すること）"))
+            blocks.append("\n".join(lines))
+
+        if not blocks:
+            return ""
+        return (HEADING + "\n"
+                "以下の人物は現在プレイヤーと同行し、この会話の場にいる。"
+                "あなたが演じるのは会話相手であるあなた自身だけで、"
+                "同行者の台詞を代行してはならない。"
+                "ただし存在・発言・既知の関係は認識してよい。\n"
+                + "\n".join(blocks))
+
+    def with_context(label, args, kwargs):
+        """会話関数に渡すNPCを、社会記録を足した**浅い複製**に差し替える。
+
+        本体のNPCには書かない。書くと世界の人物像そのものが伸び続ける。
+        会話関数（conversation_facilitator など）は第4引数（index 3）または
+        keyword `character_instance` で会話相手の Character を受け取る。
+        その `profile` の末尾に `social_block` を足した複製を同じ位置へ戻す。
+        """
+        npc = kwargs.get("character_instance")
+        if npc is None and len(args) >= 4:
+            npc = args[3]
+        app = ui.find_app()
+        if npc is None or app is None:
+            return args, kwargs
+
+        observer_id = npc_id_of(app, npc)
+        if not observer_id:
+            return args, kwargs
+
+        block = social_block(app, observer_id)
+        if not block:
+            note_inject(label + ": no party social context")
+            return args, kwargs
+
+        try:
+            clone = copy.copy(npc)
+        except Exception:
+            ctx.log_exc("npc social memory: cannot copy NPC")
+            return args, kwargs
+
+        base = getattr(npc, "profile", "")
+        if not isinstance(base, str):
+            return args, kwargs
+        clone.profile = (base.rstrip() + "\n\n" + block) if base.strip() else block
+        note_inject("{}: {} +{} social chars".format(
+            label, ui.character_name(app, observer_id), len(block)))
+
+        if "character_instance" in kwargs:
+            new_kwargs = dict(kwargs)
+            new_kwargs["character_instance"] = clone
+            return args, new_kwargs
+        new_args = list(args)
+        new_args[3] = clone
+        return tuple(new_args), kwargs
+
+    def inject(orig, label, args, kwargs):
+        """会話系の包みの共通部。差し替えに失敗しても本体は元の引数で必ず呼ぶ。"""
+        try:
+            args, kwargs = with_context(label, args, kwargs)
+        except Exception:
+            ctx.log_exc("npc social memory: injection failed")
+        return orig(*args, **kwargs)
+
+    # ------------------------------------------------------------ 抽出の材料
+
+    def transcribe(app, conversation_id):
+        """直近のやり取りを1本の文字列にする。ゲーム自身の整形をまず使う。
+
+        `app.current_conversation_history` は `[{"role": "user"|"assistant", "content": ...}]`。
+        本体の `conversation_history_to_text` が使えれば、本体と同じ「名前: 台詞」の形になる
+        （assistant を会話相手の名で描く）。使えなければ role のまま並べる。
+        末尾 CONVERSATION_CHARS 文字だけ残す。
+        """
+        history = getattr(app, "current_conversation_history", None)
+        if not isinstance(history, list) or not history:
+            return ""
+
+        recent = history[-CONVERSATION_TURNS:]
+        npc = ui.character_of(app, conversation_id)
+        module = sys.modules.get("scripts.llm.context_manager")
+        to_text = getattr(module, "conversation_history_to_text", None) if module else None
+        if to_text is not None and npc is not None:
+            try:
+                text = to_text(recent, getattr(app, "player", None), npc)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()[-CONVERSATION_CHARS:]
+            except Exception as error:
+                write("conversation_history_to_text failed: {}: {}".format(
+                    type(error).__name__, error))
+
+        lines = ["{}: {}".format(item.get("role", "?"),
+                                 frames.short(item.get("content"), TRANSCRIPT_LINE_CHARS))
+                 for item in recent if isinstance(item, dict)]
+        return "\n".join(lines)[-CONVERSATION_CHARS:]
+
+    def snapshot(app, conversation_id):
+        """抽出に必要なものだけを、その場で写し取る（ワーカーは app を触らない）。
+
+        メインスレッドで呼ぶ。参加者・書き起こし・既存の記録を素の dict / str に
+        写しておけば、ワーカーは Kivy のオブジェクトに触らずに済む。
+        参加 NPC が2人未満（会話相手だけ）なら関係は生まれないので見送る。
+        """
+        ids = participant_ids(app, conversation_id)
+        people = people_of(app, ids)
+        if len(people) < 2:
+            note_skip("fewer than two NPC participants: {}".format(ids))
+            return None
+
+        transcript = transcribe(app, conversation_id)
+        if not transcript:
+            note_skip("conversation transcript is empty")
+            return None
+
+        key = world_key(app)
+        existing = {}
+        for observer in people:
+            for target in people:
+                if observer["id"] == target["id"]:
+                    continue
+                record = relation_record(key, observer["id"], target["id"])
+                existing[(observer["id"], target["id"])] = (
+                    _field(record, "relationship"), recent_facts(record))
+        return {"world": key, "people": people,
+                "transcript": transcript, "existing": existing}
+
+    def build_messages(snap):
+        """抽出 LLM へ渡す messages と、許す id の一覧を返す。
+
+        1通目に指示・参加者一覧・人ごとの材料・新しい会話を全部載せ、
+        2通目は本体の行動指定と同じ形の短い1行。
+        """
+        people = snap["people"]
+        ids = [person["id"] for person in people]
+        app = ui.find_app()
+        player_name = player_name_of(app) if app is not None else "プレイヤーキャラクター"
+
+        participant_index = "\n".join(
+            "- id={} / 名前={}".format(person["id"], person["name"])
+            for person in people
+        )
+
+        # 人ごとにまとめて並べる（読む側が1人ぶんを続けて追えるように）。
+        sections = []
+        for person in people:
+            blocks = [
+                "【{}の基本情報】\n{}".format(
+                    person["name"], person["character"] or "（取得できず）"),
+                "【311:別MODにより、形成された{}の現在情報】\n{}".format(
+                    person["name"], person["memory_profile"] or "（まだ記録なし）"),
+                "【311: 別MODにより、形成された{}から見た{}】\n{}".format(
+                    person["name"], player_name,
+                    person["about_player"] or "（まだ記録なし）"),
+            ]
+            for target in people:
+                if target["id"] == person["id"]:
+                    continue
+                relationship, facts = snap["existing"].get(
+                    (person["id"], target["id"]), ("", []))
+                body = relationship or "（まだ記録なし）"
+                if facts:
+                    body += "\n既知facts: " + " / ".join(facts)
+                blocks.append(
+                    "【403: 過去のやり取りより追加された、{}から見た{}の人物像】\n{}".format(
+                        person["name"], target["name"], body))
+            sections.append("\n\n".join(blocks))
+
+        # 残す件数は設定（FACT_LOG_LIMIT）で決まる。プロンプトに固定値を書くと、
+        # 設定を動かした瞬間に「頼んだ件数」と「残る件数」がずれる。
+        if FACT_LOG_LIMIT > 0:
+            fact_rule = ("- new_factsは今回新しく確定し今後も意味を持つNPC間の事実だけ。"
+                         "既知factsの言い換えは禁止。1方向につき最大{}件までとし、"
+                         "過去の事実はrelationshipの要約へ圧縮する。".format(FACT_LOG_LIMIT))
+        else:
+            fact_rule = ("- new_factsは保存しない設定なので、常に空配列にする。"
+                         "確定した事実はrelationshipの要約へ織り込む。")
+
+        prompt = """あなたはNPC同士の社会的記憶の記録係だ。
+参加NPCの基本情報、311が形成した現在情報、そのNPCから見た{player_name}、
+403が過去のやり取りから形成したNPC同士の人物像、そして新しい会話を材料に、
+NPCが別のNPCをどう認識しているかを更新せよ。
+- {player_name}についての記録は作らない。
+- observer_id/target_id は参加NPCのidをそのまま使う。
+- A→BとB→Aは別で、対称にしない。
+- observer自身の基本情報にある性格・価値観・感情傾向（嫉妬心、執着、好奇心、怒りやすさ等）を反応判断に使う。
+- 「311: 別MODにより、形成された○○から見た{player_name}」は重要な材料である。{player_name}への親愛・恋愛感情・執着・競争心等が既にあるなら、{player_name}と別NPCとのやり取りを目撃して、その別NPCへの嫉妬・警戒・好感・対抗心等が生じることはあり得る。ただし人物設定と会話内容から自然に判断し、機械的に嫉妬させない。
+- 大事件だけでなく、軽い嫉妬、興味、好印象、違和感、警戒、親近感など、今後のNPC同士の振る舞いに影響し得る小さな変化も記録してよい。
+- 会話に根拠のない面識・好意・敵意を捏造しない。
+- 同行して同じ会話を聞いているNPCは、その場で明示された発言・事実を認知したものとしてよい。
+- relationship は相手を誰として認識し、どう評価・信頼・警戒・親愛・敵視しているか等を短い現在要約として統合する。時系列のあらすじや追記ログは書かない。
+- 既存記録に無い変化が無い方向はrelationsに出さない。初めて相手の存在を認知したこと自体は記録してよい。
+{fact_rule}
+- relationshipは各方向おおむね{chars}文字以内。
+- JSONオブジェクト1つだけ返す。
+出力: {{"changed":"true または false","relations":[{{"observer_id":"id","target_id":"id","relationship":"更新後全文","new_facts":["新事実"]}}]}}
+changed=falseならrelations=[]。""".format(player_name=player_name,
+                                          chars=RELATION_CHARS,
+                                          fact_rule=fact_rule)
+
+        content = (prompt
+                   + "\n\n【参加NPC】\n" + participant_index
+                   + "\n\n" + "\n\n".join(sections)
+                   + "\n\n【新しい会話】\n" + snap["transcript"])
+        return [{"role": "user", "content": content},
+                {"role": "user", "content": "<行動: NPC同士の関係記録を更新する>"}], ids
+
+    # ------------------------------------------------------------ 抽出
+
+    def max_tokens_for(ids):
+        """応答の上限トークン。方向の数 × 要約の長さの目安で、最低 1200。"""
+        return max(1200, RELATION_CHARS * max(2, len(ids)))
+
+    def ask_structured(messages, ids):
+        """最新版llm共通部品の構造化出力を優先する。使えなければNone。
+
+        応答の型を2段（relations の1行 → 全体）で作り、`llm.ask` に渡す。
+        `create_structure` が None を返すのは本体の create_model がまだ無いとき。
+        """
+        relation = llm.create_structure(
+            ctx, "NpcSocialRelationUpdate",
+            {"observer_id": (str, ...), "target_id": (str, ...),
+             "relationship": (str, ...), "new_facts": (typing.List[str], ...)},
+            label="npc social memory")
+        if relation is None:
+            return None
+
+        structure = llm.create_structure(
+            ctx, "NpcSocialMemoryUpdate",
+            {"changed": (str, ...), "relations": (typing.List[relation], ...)},
+            label="npc social memory")
+        if structure is None:
+            return None
+
+        return llm.ask(ctx, MANAGER_EXTRACT, messages, timeout=EXTRACT_TIMEOUT,
+                       structure=structure, max_tokens=max_tokens_for(ids),
+                       label="npc social memory", write=write)
+
+    def extract(snap):
+        """抽出1回ぶん。ワーカースレッドで走る。
+
+        構造化経路 → 使えなければ素の JSON 経路の順に試し、`normalize_result` が
+        返した方向ごとの行を `update_relation` で控えへ書く。
+        """
+        messages, ids = build_messages(snap)
+
+        rows = None
+        if not store["no_structure"]:
+            structured = ask_structured(messages, ids)
+            rows = normalize_result(structured, ids) if structured is not None else None
+            if rows is None:
+                # 一度失敗したproviderで毎回試すと、失敗のたびに
+                # EXTRACT_TIMEOUT を2本ぶん待つことになる。以後は非構造化だけにする。
+                store["no_structure"] = True
+                write("extract: structured route unusable; "
+                      "falling back to plain JSON from now on")
+
+        if rows is None:
+            # 構造化出力を使えないproviderだけ旧no-structure経路へ降りる。
+            result = llm.ask(ctx, MANAGER_EXTRACT, messages, timeout=EXTRACT_TIMEOUT,
+                             max_tokens=max_tokens_for(ids),
+                             label="npc social memory", write=write)
+            rows = parse_result(result, ids)
+
+        if rows is None:
+            write("extract: unreadable response; no change")
+            return
+        if not rows:
+            write("extract: nothing to change")
+            return
+
+        by_id = {person["id"]: person for person in snap["people"]}
+        for observer_id, target_id, relationship, facts in rows:
+            if observer_id in by_id and target_id in by_id:
+                update_relation(snap["world"],
+                                observer_id, by_id[observer_id]["name"],
+                                target_id, by_id[target_id]["name"],
+                                relationship, facts)
+
+    # ------------------------------------------------------------ ワーカー
+
+    # 抽出は背景で1件ずつ（LLM を待つのでゲームのスレッドでは回せない）。
+    # 待ち行列・直列のスレッド・溢れたら古い方から捨てる・仕事が無ければ畳む、は
+    # ローダの語彙（`jobs.Worker`）。ここに残すのは何をログに出すかだけ。
+    worker = store["worker"] = (
+        store["worker"]
+        or jobs.Worker(ctx, extract, name="npc_social_memory",
+                       label="npc social memory", max_pending=MAX_PENDING,
+                       write=write)
+    ).rebind(ctx, extract, write)
+
+    def enqueue(app, conversation_id):
+        """会話を写して待ち行列に積み、ワーカーが居なければ起こす。メインスレッドで呼ぶ。
+
+        溢れたら古い仕事から捨てる（新しい会話ほど関係に効く）。
+        """
+        snap = snapshot(app, conversation_id)
+        if snap is None:
+            return
+        if not worker.enqueue(snap):
+            return
+        store["last_skip"] = None
+        write("extract queued: participants={} character={} 311profile={} "
+              "about_player={} transcript={} chars".format(
+                  [p["name"] for p in snap["people"]],
+                  [len(p["character"]) for p in snap["people"]],
+                  [len(p["memory_profile"]) for p in snap["people"]],
+                  [len(p["about_player"]) for p in snap["people"]],
+                  len(snap["transcript"])))
+
+    def schedule_extract(app):
+        """会話が1手進んだときの入口。次のフレームに `enqueue` を予約する。
+
+        フックの戻り時点ではなく次のフレームで写すのは、本体が同じ手の処理
+        （履歴への追記など）を終えてから読むため。
+        """
+        app = app or ui.find_app()
+        if app is None:
+            note_skip("no running app")
+            return
+        conversation_id = getattr(app, "in_conversation", None)
+        if not isinstance(conversation_id, str) or not conversation_id:
+            note_skip("in_conversation is {!r}".format(conversation_id))
+            return
+        if not screen.schedule(lambda: enqueue(app, conversation_id)):
+            note_skip("could not schedule next-frame snapshot")
+
+    # ================================================================ フック
+    # 2種類ある。
+    #   conversation_continued（通常／依頼中）: プレイヤーが1手入力した後。抽出の予約。
+    #   conversation_facilitator / starter（5本）: NPC の返答を作る LLM 呼び出し。
+    #       渡される Character を差し替えて同行者の情報を読ませる（注入）。
+    # どれも本体の戻り値はそのまま返す。
+
+    @ctx.wrap("__main__:ConversationPhaseManager.conversation_continued",
+              required=False)
+    def conversation_continued(orig, self, choice_text, *args, **kwargs):
+        result = orig(self, choice_text, *args, **kwargs)
+        try:
+            schedule_extract(getattr(self, "app", None))
+        except Exception:
+            ctx.log_exc("npc social memory: cannot schedule extraction")
+        return result
+
+    @ctx.wrap("__main__:ConversationInQuestPhase.conversation_continued",
+              required=False)
+    def conversation_continued_in_quest(orig, self, choice_text, *args, **kwargs):
+        result = orig(self, choice_text, *args, **kwargs)
+        try:
+            schedule_extract(getattr(self, "app", None))
+        except Exception:
+            ctx.log_exc("npc social memory: cannot schedule extraction")
+        return result
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator", required=False)
+    def facilitator(orig, *args, **kwargs):
+        return inject(orig, "facilitator", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_after_retrieval",
+              required=False)
+    def facilitator_after_retrieval(orig, *args, **kwargs):
+        return inject(orig, "facilitator[retrieval]", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_in_quest",
+              required=False)
+    def facilitator_in_quest(orig, *args, **kwargs):
+        return inject(orig, "facilitator[quest]", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_starter", required=False)
+    def starter(orig, *args, **kwargs):
+        return inject(orig, "starter", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_starter_in_quest",
+              required=False)
+    def starter_in_quest(orig, *args, **kwargs):
+        return inject(orig, "starter[quest]", args, kwargs)
+
+    ctx.log("npc social memory: state={}/ (311 state read only)".format(state_dir))

@@ -31,10 +31,12 @@
 ゲームが決めた配置を「最低の高さ」としてそのまま残し、**文字がそれ以上を要求したときだけ、
 その分だけ伸ばす**。
 
-1. 各ラベルの `text_size` を `(元の幅, None)` にして `texture_update()` を呼ぶ。
-   Kivy が折り返した結果の高さが `texture_size[1]` に出る。
+1. 各ラベルの書体・行間・余白を写した**画面に出ない複製**（`kivy.core.text.Label`）を
+   `(元の幅, None)` で焼き、その高さを読む（`_probe_height`）。
    これが文字の要求する高さ。
    幅はこちらで決めない（ゲームの 316/300 のまま）。
+   表示中のラベルは測定に使わない（測るだけでテクスチャが焼き直され、
+   `text_size` も測定用の値のまま残るため。同関数の説明）。
 2. 高さは `max(要求, ゲームの設計値)`。
    普通の長さのアイテムでは設計値が勝つので **見た目は今までと1px も変わらない**。
 3. 箱の高さ ＝ 余白と隙間（設計のまま）＋ 各ラベルの高さ。
@@ -86,6 +88,9 @@ from instantale_modloader import frames, ui
 
 LOG_BASENAME = "item_detail_autosize.log"
 
+#: 設計値の置き場（`sys` の属性名）。注入し直しをまたいで残す。
+DESIGN_STORE_ATTR = "__instantale_item_detail_designs__"
+
 # ログに残す組み合わせの上限。
 # 1アイテムにつき1件なので少しでいい。
 MAX_LOG = 60
@@ -122,7 +127,16 @@ def apply(ctx):
 
     # 箱ごとの設計値。
     # 箱が捨てられたら一緒に消えるよう弱参照で持つ。
-    designs = weakref.WeakKeyDictionary()
+    #
+    # **置き場は `sys`。** `apply()` は1プロセスで何度も走るので、
+    # ここで作り直すと2回目の注入が「1回目に広げた箱」を測り直して
+    # それを設計として覚える。`design["heights"]` は下限に使うので、
+    # 以後その箱は二度と縮まなくなる（`112_` / `113_` が設計を
+    # ウィジェット側に貼っているのと同じ理由）。
+    designs = getattr(sys, DESIGN_STORE_ATTR, None)
+    if designs is None:
+        designs = weakref.WeakKeyDictionary()
+        setattr(sys, DESIGN_STORE_ATTR, designs)
     logged = set()
 
     write = ctx.logger(LOG_BASENAME)
@@ -221,37 +235,89 @@ def apply(ctx):
                 fresh["heights"] = [old if now == was else now
                                     for now, was, old
                                     in zip(fresh["heights"], applied, design["heights"])]
+            # 余白も測り直せない。
+            # `margins` は「箱の幅 − 折り返し幅」で採るが、折り返し幅は
+            # こちらが `resize()` で書いた値なので、箱だけが別の幅に
+            # 組み直されると**負の余白**になり、本文が箱より広く折り返される。
+            # 余白は幅ではなく設計の側の値なので、前のを引き継ぐ。
+            if any(value < 0 for value in fresh["margins"]):
+                write("margins looked wrong ({}); keeping the design's {}".format(
+                    [round(v, 1) for v in fresh["margins"]],
+                    [round(v, 1) for v in design["margins"]]))
+                fresh["margins"] = list(design["margins"])
         designs[box] = fresh
         return fresh
 
     # -- 文字が要求する高さ ------------------------------------------------
     #: 測った結果の控え。
-    #: `(本文, 幅, 書体の大きさ) -> 高さ`。
+    #: `(本文, 幅, 書体の大きさ, 行間, 書体) -> 高さ`。
+    #: 書体と行間まで鍵に入れるのは、下の複製がその2つを明示的に受け取るため
+    #: （表示中のラベル側が変わっても控えが古いままにならない）。
     measured = {}
 
-    def needed_height(label, width):
-        """`(幅, None)` で折り返させて、出来上がったテクスチャの高さを読む。
+    def _probe_height(label, text, width):
+        """**画面に出ていない複製**で折り返しの高さを測る。読めなければ None。
 
-        測り終えたら `text_size` は呼び出し側が入れ直す。
-        ここでは戻さない（どのみち直後に確定値を入れるので、二度手間になる）。
+        `kivy.core.text.Label` は Kivy がラベルの中身を焼くのに使っている当のもので、
+        ウィジェットではないので画面には出ない。
+        表示中のラベルから書体・大きさ・行間・余白を写して同じ条件で焼く。
+
+        表示中のラベルを測定器にしない。
+        前の版は `label.text_size = (幅, None)` を書いてから
+        `texture_update()` を呼んでいたが、これには2つ困りごとがあった:
+
+        * 測るだけでテクスチャが焼き直される。
+          幅の候補を試す `resize` のループは1回のホバーで
+          ラベル3枚 × 最大6周ぶん呼ぶので、**表示中の箱を測定のために
+          18回焼き直す**ことになる（`112_` / `117_` が同じ形で打ち出しを
+          1.6 倍遅くしていた。VERIFICATION_LOG.md §2.34）
+        * 測り終えた時点で `text_size` が `(幅, None)` のまま残る。
+          確定値は呼び出し側が入れ直すが、その前に `capture()` が走ると
+          **測定用の値を設計値として控える**
+
+        複製で測れば表示中のラベルには指一本触れない。
+        `118_batch_message_render` の `measured_height` と同じ手（あちらが先に
+        確立した。同じ計測なので寄せてある）。
+        """
+        try:
+            from kivy.core.text import Label as CoreLabel
+        except Exception:
+            return None       # 画面の無い環境（オフライン検証）
+        options = {
+            "text": text or "",
+            "font_size": frames.attr(label, "font_size", 12),
+            "text_size": (width, None),
+            "line_height": frames.attr(label, "line_height", 1.0),
+        }
+        font_name = frames.attr(label, "font_name")
+        if isinstance(font_name, str) and font_name:
+            options["font_name"] = font_name
+        padding = frames.attr(label, "padding")
+        if isinstance(padding, (list, tuple)) and len(padding) == 4:
+            options["padding"] = tuple(padding)
+        try:
+            probe = CoreLabel(**options)
+            probe.refresh()
+            return float(probe.texture.size[1])
+        except Exception:
+            return None
+
+    def needed_height(label, width):
+        """その幅で折り返したときに文字が要求する高さ。
 
         同じ本文を同じ幅で測り直さない。
-        `update_content` はマウスが動くたびに走り、
-        そのたびにラベル3枚 × 幅の候補ぶん `texture_update()` を呼ぶことになる。
-        テクスチャの作り直しはフレーム時間に乗るので、
-        フックの中で測っている限り見えない（`112_` / `117_` が同じ形で打ち出しを
-        1.6 倍遅くしていた。VERIFICATION_LOG.md §2.34）。
+        `update_content` はマウスが動くたびに走るので、
+        控えが無いと1ホバーごとに測り直すことになる。
         """
         key = (frames.text_of(label), round(float(width), 1),
-               frames.attr(label, "font_size", None))
+               frames.attr(label, "font_size", None),
+               frames.attr(label, "line_height", None),
+               frames.attr(label, "font_name", None))
         if key in measured:
             return measured[key]
-        label.text_size = (width, None)
-        label.texture_update()
-        try:
-            height = float(label.texture_size[1])
-        except Exception:
-            return 0.0
+        height = _probe_height(label, key[0], width)
+        if height is None:
+            return 0.0        # 測れない ＝ 設計値のまま（`measure` の `max`）
         if len(measured) > MEASURE_CACHE_MAX:
             measured.clear()
         measured[key] = height

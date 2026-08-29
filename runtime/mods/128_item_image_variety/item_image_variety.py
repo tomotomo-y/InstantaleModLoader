@@ -6,43 +6,45 @@
 乱数が無い argmax なので、外見文が定型化している品種では同じ画像に集中する（実測: potion は 52個中35個が同じ1枚。
 調査の全数値は VERIFICATION.md §3 の 128_ の項）。
 
-やることは2つ。
+仕様は2行に尽きる（版6でここへ立ち返って作り直した）:
 
-1. 候補を広げて使用回数最少を選ぶ。
-   類似度が top1 の SIM_FLOOR 倍以上の候補を最大 TOP_K 件とり、
-   その中で使用回数が最少の画像を選ぶ（同数なら類似度の高いほう）。
-   乱数は使わない。
-   同じ外見文が連続しても、2個目からはまだ使っていない候補へ順に流れる。
-2. 辞書の欠落を補う。
-   画像フォルダにあるのに埋め込み辞書に無い画像（document 105 / creature_part 171 /
-   mushroom 28 / accessory 1 の計305枚）は素のゲームでは一度も選ばれない。
-   この MOD が同梱する `data/<item_detail>.json`（キャプションを付けて同じ埋め込み空間で作った追加辞書。作り方も同
-   §3）を実行時に合成して、選択肢に加える。
+- **同じアイテムの再入手は同じ絵**（同じ敵の同じドロップ・再ドロップ）
+- **別のアイテムには別の絵**（別名なのに同じ見た目、を避ける）
 
-使用回数の履歴はその世界で過去に見せた絵の累計（版3）。
-避けたいのは見た目の再登場そのもの（消費・クラフトで消えた素材や、別ダンジョンの別系統の敵から出る別名の同じ絵も含む。）
-なので、当該画像の選んだ回数を `state/item_image/<世界>.json` に世界ごとに永続化する。
-これにより再起動・別セッションをまたいで効く。
-世界の見分け方は`instantale_modloader.state.world_key`（`122_` / `311_` と同じ）。
+これを1つの表で達成する。**「外見文 → 絵」の対応を世界ごとに
+`state/item_image/<世界>.json` へ永続化**し、
 
-世界の走査（版2の機構）は**下限の取り込み**として残す。
-世界替わりの初回に`app.world_dict` の全アイテムの `image_src` を数え、控えの値と大きいほうを取る。
-MOD 導入前から世界に在る絵や、控えを消した／失った場合の取りこぼしがここで埋まる。
-合算にしないのは、控えはその絵を選んだ時点で既に数えているため（二重数えになる）。
+- 対応表にある外見文 → その絵を返す（ログは `kept`）。
+  ドロップの定義（名前と外見文）はクエスト生成時に作られてセーブに保存される
+  ので、同じドロップは必ず同じ外見文で来る ― 名前の解決は要らない
+- 初めての外見文 → 類似度が top1 の SIM_FLOOR 倍以上の候補を最大 TOP_K 件とり、
+  **対応表でまだ使われていない（使用数最少の）絵**を割り当てる（同数なら
+  類似度の高いほう。乱数は無い）。ログは `chose`
 
-セーブには何も足さない ― 選ばれた image_src がアイテムに書かれるのは素のゲームと同じ。
-履歴を消してやり直したいときは該当世界の`state/item_image/<世界>.json` を消せばよい（次の選定で世界の中身から数え直す）。
+使用数は対応表の値から数えるので、別のカウントは持たない。過去の版が
+`counts` として残した累計は `legacy_counts` として読み、使用数の下駄に
+足し続ける（見せた履歴を捨てないため。新規には書かない）。
 
-対象はゲーム側の関数1つだけ。
-`__main__` に別名があるので張り替えはローダに任せる:
+併せて、素の埋め込み辞書に無い305枚（document 105 / creature_part 171 /
+mushroom 28 / accessory 1）の追加辞書 `data/<item_detail>.json` を実行時に
+合成して選択肢に加える（キャプションを付けて同じ埋め込み空間で作ったもの。
+作り方は build/README.md）。
+
+セーブには何も足さない。選ばれた image_src がアイテムに書かれるのは素の
+ゲームと同じ。履歴を消してやり直したいときは該当世界の
+`state/item_image/<世界>.json` を消せばよい。
+
+対象はゲーム側の関数1つだけ。`__main__` への別名の張り替えはローダに任せる:
 
     Embedding.get_similar_id:get_similar_embedding_id(query_text, item_sub_type)
 """
 
 import os
 import sys
+import threading
 
-from instantale_modloader.state import world_filename, world_key
+from instantale_modloader.state import (UNKNOWN_WORLD, world_filename,
+                                        world_key)
 
 # 候補を類似度上位から最大何件まで広げるか。
 TOP_K = 10
@@ -73,101 +75,72 @@ def apply(ctx):
     # ctx.mod_dir / ctx.state_path は apply() の外を当てにしない。ここで控える。
     mod_dir = ctx.mod_dir
     state_dir = ctx.state_path("item_image")
+    # 品物の生成は LLM のワーカースレッドから来る（同時に2本まで観測済み）。
+    # 表の読み書きも控えの書き出しもここで直列化する。
+    # `ctx.write_json` は隣に `<名前>.tmp` を書いてから差し替える形なので、
+    # 2本が同時に通ると **片方が書きかけの tmp をもう片方が置き換える**。
+    # 控えが壊れ、次の `read_json` で丸ごと失われる。
+    lock = threading.Lock()
     state = {
-        "world": None,  # counts を数えた世界（world_key）。替わったら読み直す
-        "file": None,   # その世界の控え（state/item_image/<世界>.json）
-        "counts": {},   # (sub_type, key) -> 過去に見せた累計（下限は世界の中身）
-        "pools": {},    # sub_type -> (keys, 正規化済み行列) のキャッシュ
+        "world": None,   # images を読んだ世界（world_key）。替わったら読み直す
+        "file": None,    # その世界の控え（state/item_image/<世界>.json）
+        "images": {},    # (sub_type, 外見文) -> 絵。この表が仕様の本体
+        "legacy": {},    # (sub_type, 絵) -> 旧版が数えた累計。使用数の下駄
+        "usage": {},     # (sub_type, 絵) -> 使用数（images の値 + legacy から導出）
+        "pools": {},     # sub_type -> (keys, 正規化済み行列, キー集合) のキャッシュ
         "logged": 0,
-        "extra_total": 0,
     }
 
-    def iter_world_items(world_dict):
-        """世界の辞書からアイテムの dict を全部たどる（§2.13 の3つの置き場所）。"""
-        player = world_dict.get("player_data")
-        if isinstance(player, dict):
-            inventory = player.get("inventory")
-            if isinstance(inventory, dict):
-                yield from inventory.values()
-        npcs = world_dict.get("npcs")
-        if isinstance(npcs, dict):
-            for npc in npcs.values():
-                inventory = npc.get("inventory") if isinstance(npc, dict) else None
-                if isinstance(inventory, dict):
-                    yield from inventory.values()
-        areas = world_dict.get("areas")
-        if isinstance(areas, dict):
-            for area in areas.values():
-                nodes = area.get("nodes") if isinstance(area, dict) else None
-                if not isinstance(nodes, dict):
-                    continue
-                for node in nodes.values():
-                    facilities = node.get("facilities") if isinstance(node, dict) else None
-                    if not isinstance(facilities, dict):
-                        continue
-                    for facility in facilities.values():
-                        config = facility.get("config") if isinstance(facility, dict) else None
-                        goods = config.get("goods") if isinstance(config, dict) else None
-                        if isinstance(goods, dict):
-                            yield from goods.values()
-                        elif isinstance(goods, list):
-                            yield from goods
-
-    def ensure_world_counts():
-        """世界が替わっていたら、その世界の履歴（控え + 世界の中身）を読み直す。"""
+    def ensure_world():
+        """世界が替わっていたら、その世界の対応表を読み直す。"""
         app = getattr(sys.modules.get("__main__"), "instantale_app", None)
-        world = world_key(app) if app is not None else "_"
+        world = world_key(app) if app is not None else UNKNOWN_WORLD
         if world == state["world"]:
             return
+        if world == UNKNOWN_WORLD:
+            # 世界名が読めない窓（読み込み中・新規作成中）。実在の世界として
+            # 扱うと通った全世界の対応が1ファイルに混ざるので、控えを持たずに
+            # その場をしのぐ（`902_city_case` と同じ判断）。
+            state.update(world=world, file=None, images={}, legacy={}, usage={})
+            log("seed: the world name is unreadable; not keeping the table for now")
+            return
         path = os.path.join(state_dir, world_filename(world, ".json"))
-
-        # 過去に見せた累計の控え。
-        counts = {}
+        images = {}
+        legacy = {}
         stored = ctx.read_json(path, default=None)
-        if isinstance(stored, dict) and isinstance(stored.get("counts"), dict):
-            for name, n in stored["counts"].items():
-                folder, _, stem = name.partition("/")
-                if folder and stem and isinstance(n, int) and n > 0:
-                    counts[(folder, stem)] = n
-        kinds = len(counts)
+        if isinstance(stored, dict):
+            for label, key in (stored.get("images") or {}).items():
+                folder, _, text = label.partition("/")
+                if folder and text and isinstance(key, str) and key:
+                    images[(folder, text)] = key
+            # 旧版（〜版5）の counts は「過去に見せた累計」。捨てずに下駄として残す。
+            for label, n in (stored.get("legacy_counts")
+                             or stored.get("counts") or {}).items():
+                folder, _, key = label.partition("/")
+                if folder and key and isinstance(n, int) and n > 0:
+                    legacy[(folder, key)] = n
+        usage = dict(legacy)
+        for (folder, _text), key in images.items():
+            spot = (folder, key)
+            usage[spot] = usage.get(spot, 0) + 1
+        state.update(world=world, file=path, images=images,
+                     legacy=legacy, usage=usage)
+        log("seed {!r}: {} texts mapped, legacy {} kinds".format(
+            world, len(images), len(legacy)))
 
-        # 世界に既に居る絵を下限として合成する（合算すると二重数えになる）。
-        # MOD 導入前から居る絵と、控えを消した／失った場合の取りこぼしがここで埋まる。
-        seen = 0
-        world_dict = getattr(app, "world_dict", None)
-        if isinstance(world_dict, dict):
-            snapshot = {}
-            for item in iter_world_items(world_dict):
-                src = item.get("image_src") if isinstance(item, dict) else None
-                if not isinstance(src, str) or "item_candidates" not in src:
-                    continue
-                parts = src.replace("\\", "/").rsplit("/", 2)
-                if len(parts) < 3:
-                    continue
-                spot = (parts[-2], os.path.splitext(parts[-1])[0])
-                snapshot[spot] = snapshot.get(spot, 0) + 1
-                seen += 1
-            for spot, n in snapshot.items():
-                if counts.get(spot, 0) < n:
-                    counts[spot] = n
-            log("seed {!r}: stored {} kinds + world {} items -> {} kinds".format(
-                world, kinds, seen, len(counts)))
-        else:
-            log("seed {!r}: stored {} kinds; world_dict unavailable".format(world, kinds))
-        state["world"] = world
-        state["file"] = path
-        state["counts"] = counts
-
-    def persist_counts():
-        """控えを書く。失敗はローダが記録する（ゲームには流れない）。"""
+    def persist():
+        """対応表を書く。失敗はローダが記録する（ゲームには流れない）。"""
         if not state["file"]:
             return
-        data = {"counts": {"{}/{}".format(folder, stem): n
-                           for (folder, stem), n in sorted(state["counts"].items())}}
+        data = {"images": {"{}/{}".format(folder, text): key
+                           for (folder, text), key in sorted(state["images"].items())}}
+        if state["legacy"]:
+            data["legacy_counts"] = {"{}/{}".format(folder, key): n
+                                     for (folder, key), n in sorted(state["legacy"].items())}
         ctx.write_json(state["file"], data)
 
     def load_pool(sub_type):
-        """素の辞書と同梱の追加辞書を合成して (keys, tensor) を返す。"""
+        """素の辞書と同梱の追加辞書を合成して (keys, tensor, キー集合) を返す。"""
         if sub_type in state["pools"]:
             return state["pools"][sub_type]
         import json
@@ -191,9 +164,8 @@ def apply(ctx):
         keys = list(table)
         matrix = torch.tensor([table[k] for k in keys], dtype=torch.float32)
         matrix = matrix / matrix.norm(dim=1, keepdim=True).clamp_min(1e-12)
-        pool = (keys, matrix)
+        pool = (keys, matrix, frozenset(keys))
         state["pools"][sub_type] = pool
-        state["extra_total"] += len(keys) - n_base
         log("pool {}: base={} merged={}".format(sub_type, n_base, len(keys)))
         return pool
 
@@ -202,8 +174,18 @@ def apply(ctx):
         pool = load_pool(item_sub_type)
         if pool is None:
             return orig(query_text, item_sub_type, *args, **kwargs)
-        keys, matrix = pool
-        ensure_world_counts()
+        keys, matrix, key_set = pool
+        ensure_world()
+
+        # 同じ外見文には同じ絵。埋め込みの計算より先に引けるので、再入手は速い。
+        with lock:
+            kept = state["images"].get((item_sub_type, query_text))
+            if kept is not None and kept in key_set:
+                if state["logged"] < LOG_LIMIT:
+                    state["logged"] += 1
+                    log("{}: kept {} for {!r}".format(
+                        item_sub_type, kept, query_text[:80]))
+                return kept
 
         query = emb_mod.text_to_embedding(query_text)
         query = query.detach().reshape(-1).to(dtype=matrix.dtype)
@@ -213,19 +195,21 @@ def apply(ctx):
         top_sim, top_idx = sims.max(dim=0)
         top_sim = float(top_sim)
         if top_sim <= 0:
-            # 近い候補がまったく無い。
-            # 広げても意味が無いので素の挙動どおり。
+            # 近い候補がまったく無い。広げても意味が無いので素の挙動どおり。
             chosen = int(top_idx)
         else:
             order = sims.argsort(descending=True)[:TOP_K].tolist()
             qualified = [i for i in order if float(sims[i]) >= top_sim * SIM_FLOOR]
-            chosen = min(
-                qualified,
-                key=lambda i: state["counts"].get((item_sub_type, keys[i]), 0))
+            with lock:
+                chosen = min(
+                    qualified,
+                    key=lambda i: state["usage"].get((item_sub_type, keys[i]), 0))
         key = keys[chosen]
-        state["counts"][(item_sub_type, key)] = \
-            state["counts"].get((item_sub_type, key), 0) + 1
-        persist_counts()
+        with lock:
+            state["images"][(item_sub_type, query_text)] = key
+            spot = (item_sub_type, key)
+            state["usage"][spot] = state["usage"].get(spot, 0) + 1
+            persist()
 
         if state["logged"] < LOG_LIMIT:
             state["logged"] += 1
