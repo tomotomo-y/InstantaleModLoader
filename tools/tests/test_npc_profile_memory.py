@@ -1510,6 +1510,74 @@ def test_turn_survives_a_failing_extraction():
     run.cleanup()
 
 
+def test_party_talk_defers_auto_extract_and_accepts_external_transcript():
+    """404 併用時は自動抽出を止め、1人ぶんの外部台本も積める"""
+    run = Run(answers=FOUND)
+    sys.__dict__[MOD.PARTY_TALK_STORE] = {"active": True}
+    try:
+        phase = ConversationPhaseManager(run.app, "自由入力")
+        reply = phase.conversation_continued("お前の故郷はどこだ")
+        Clock.pump()
+        check(reply == Facilitator.reply, "返答が返らない: {!r}".format(reply))
+        check("defer to 404" in run.log(),
+              "パーティー会話中の見送りが無い: {}".format(run.log()[-400:]))
+        check(run.profile() == "", "自動抽出が走った: {!r}".format(run.profile()))
+        api = getattr(sys, MOD.STATE_STORE_ATTR)["api"]["enqueue_transcript"]
+        ok = api(run.app, "77",
+                 "冒険者: 故郷は？\n傭兵ガロ: 北の村だ\n薬売りミラ: へえ")
+        check(ok is True, "外部 enqueue が失敗した")
+        run.wait_finished(1)
+        check(run.profile() == FOUND, "外部台本の抽出が残らない: {!r}".format(
+            run.profile()))
+        check("extract queued (external)" in run.log(),
+              "外部キューの印が無い: {}".format(run.log()[-400:]))
+        prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
+        check("薬売りミラ: へえ" in prompt,
+              "外部台本が載っていない: {}".format(prompt[:300]))
+    finally:
+        if MOD.PARTY_TALK_STORE in sys.__dict__:
+            del sys.__dict__[MOD.PARTY_TALK_STORE]
+        run.cleanup()
+
+
+def test_group_extract_updates_all_participants():
+    """404 終了時の一括抽出は1回で複数人を更新する"""
+    group = (
+        '{"changed":"true","people":['
+        '{"npc_id":"77","profile":"' + FOUND + '","about_player":"冒険者を頼っている",'
+        '"new_facts":["故郷は北の村"]},'
+        '{"npc_id":"88","profile":"薬売り。好奇心が強い。","about_player":"話を聞いていた",'
+        '"new_facts":[]}]}'
+    )
+    check(MOD.normalize_group_result(
+        {"changed": "true", "people": [
+            {"npc_id": "77", "profile": "A", "about_player": "B", "new_facts": ["f"]},
+            {"npc_id": "99", "profile": "x"}]},
+        ["77", "88"]) == [("77", {"profile": "A", "about_player": "B",
+                                  "new_facts": ["f"]})],
+          "参加していない id を落とさない")
+    run = Run(answers=group)
+    try:
+        api = getattr(sys, MOD.STATE_STORE_ATTR)["api"]["enqueue_group_transcript"]
+        ok = api(run.app, ["77", "88"],
+                 "冒険者: 故郷は？\n傭兵ガロ: 北の村だ\n薬売りミラ: へえ")
+        check(ok is True, "一括 enqueue が失敗した")
+        run.wait_finished(1)
+        check(run.profile("77") == FOUND,
+              "77 の人物像が残らない: {!r}".format(run.profile("77")))
+        check(run.profile("88") == "薬売り。好奇心が強い。",
+              "88 の人物像が残らない: {!r}".format(run.profile("88")))
+        check("extract queued (group)" in run.log(),
+              "一括キューの印が無い: {}".format(run.log()[-400:]))
+        prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
+        check("薬売りミラ: へえ" in prompt and "傭兵ガロ" in prompt,
+              "一括台本が載っていない: {}".format(prompt[:400]))
+        check(prompt.count("【新しい会話】") == 1,
+              "会話が人数ぶん重なった: {}".format(prompt.count("【新しい会話】")))
+    finally:
+        run.cleanup()
+
+
 def main():
     for test in (test_turn_updates_profile,
                  test_extraction_runs_after_the_reply,
@@ -1561,7 +1629,9 @@ def main():
                  test_settings_match_the_manifest,
                  test_the_quest_mod_reads_the_same_file,
                  test_turn_survives_without_llm,
-                 test_turn_survives_a_failing_extraction):
+                 test_turn_survives_a_failing_extraction,
+                 test_party_talk_defers_auto_extract_and_accepts_external_transcript,
+                 test_group_extract_updates_all_participants):
         scenario(test)
     print("{} passed, {} failed".format(RESULTS["pass"], RESULTS["fail"]))
     return 1 if RESULTS["fail"] else 0

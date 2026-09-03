@@ -232,6 +232,14 @@ CONVERSATION_CHARS = 2000
 # `sys` に置けば世代をまたいで同じ1組を共有できる（`118_` と同じ手）。
 STATE_STORE_ATTR = "__instantale_npc_profile_memory_store__"
 
+# 404_party_talk がプロセスに置く棚。active のあいだは自動抽出を止めて、
+# 会話終了時の一括抽出に任せる（誤帰属を防ぐ）。
+PARTY_TALK_STORE = "__instantale_party_talk__"
+
+# 404 がセッション全文を渡すときの書き起こし上限（通常の1対1より長い）。
+GROUP_CONVERSATION_CHARS = 8000
+GROUP_KIND = "group"
+
 
 def ordered_bucket(bucket):
     """控えを書く前に、1件ずつ `RECORD_KEYS` の並びへ直す。
@@ -397,6 +405,41 @@ def _parse_plain(body):
                                               "存在しません", "見当たりません"))):
         return {}
     return {KEY_PROFILE: body}
+
+
+def normalize_group_result(data, allowed_ids):
+    """一括抽出の応答を (npc_id, update) の列にする。構造化・JSON の共通出口。
+
+    参加していない id は落とす。`changed` が false なら空列。読めなければ None。
+    """
+    if not isinstance(data, dict):
+        return None
+    if not llm.truthy(data.get(KEY_CHANGED, True)):
+        return []
+    rows = data.get("people")
+    if not isinstance(rows, list):
+        return None
+    allowed = {str(x) for x in allowed_ids}
+    out = []
+    seen = set()
+    for row in rows:
+        row = llm.as_dict(row)
+        if not isinstance(row, dict):
+            continue
+        npc_id = str(row.get("npc_id", "")).strip()
+        if npc_id not in allowed or npc_id in seen:
+            continue
+        update = normalize_update({
+            KEY_CHANGED: "true",
+            KEY_PROFILE: row.get(KEY_PROFILE),
+            KEY_ABOUT_PLAYER: row.get(KEY_ABOUT_PLAYER),
+            KEY_NEW_FACTS: row.get(KEY_NEW_FACTS),
+        })
+        if not update:
+            continue
+        out.append((npc_id, update))
+        seen.add(npc_id)
+    return out
 
 
 def apply(ctx):
@@ -842,25 +885,23 @@ def apply(ctx):
                                          frames.short(turn.get("content"), 300)))
         return "\n".join(lines)[-CONVERSATION_CHARS:]
 
-    def snapshot_of(app, npc_id):
-        """ワーカーへ渡す不変データ。ゲームオブジェクトは持ち出さない。"""
+    def party_talk_active():
+        """404 のパーティー会話中か。棚が無ければ False。"""
+        party = getattr(sys, PARTY_TALK_STORE, None)
+        return isinstance(party, dict) and bool(party.get("active"))
+
+    def snapshot_body(app, npc_id, transcript, *, limit=None):
+        """抽出写しの共通部。`transcript` は呼び出し側が組む。"""
         npc = character_of(app, npc_id)
         if npc is None:
             note_extract_skip("NPC {!r} is not in world.characters".format(npc_id))
             return None
-        history = getattr(app, "current_conversation_history", None)
-        if not isinstance(history, list):
-            note_extract_skip("current_conversation_history is {}".format(
-                type(history).__name__))
-            return None
-        if not history:
-            note_extract_skip("current_conversation_history is empty")
-            return None
-        transcript = transcribe(app, npc_id)
-        if not transcript:
+        text = transcript.strip() if isinstance(transcript, str) else ""
+        if not text:
             note_extract_skip("conversation transcript is empty for {!r}".format(
                 npc_id))
             return None
+        cap = CONVERSATION_CHARS if limit is None else max(1, int(limit))
         return {
             "world": world_key(app),
             "npc_id": str(npc_id),
@@ -869,12 +910,24 @@ def apply(ctx):
             "game_profile": frames.short(getattr(npc, "profile", ""), 400),
             "personality": frames.short(getattr(npc, "personality", ""), 300),
             "job": frames.short(getattr(npc, "job", ""), 60),
-            "transcript": transcript,
+            "transcript": text[-cap:],
             # ゲーム内の日付もここで採る。
             # ワーカーは `app` を触らないので、
             # 日を跨ぐ処理に必要な値は全部この写しに乗せておく。
             "day": game_day(app),
         }
+
+    def snapshot_of(app, npc_id):
+        """ワーカーへ渡す不変データ。ゲームオブジェクトは持ち出さない。"""
+        history = getattr(app, "current_conversation_history", None)
+        if not isinstance(history, list):
+            note_extract_skip("current_conversation_history is {}".format(
+                type(history).__name__))
+            return None
+        if not history:
+            note_extract_skip("current_conversation_history is empty")
+            return None
+        return snapshot_body(app, npc_id, transcribe(app, npc_id))
 
     def build_messages(snapshot, record):
         """抽出の頼み文。**返すのは JSON オブジェクト1つだけ**と指示する。
@@ -963,6 +1016,9 @@ def apply(ctx):
         ]
 
     def extract(snapshot):
+        if snapshot.get("kind") == GROUP_KIND:
+            extract_group(snapshot)
+            return
         record = record_for(snapshot["world"], snapshot["npc_id"],
                             snapshot["npc_name"])
         messages = build_messages(snapshot, record)
@@ -981,13 +1037,145 @@ def apply(ctx):
         update_record(snapshot["world"], snapshot["npc_id"],
                       snapshot["npc_name"], update, snapshot.get("day"))
 
+    def build_group_messages(snapshot):
+        """参加者全員を1回の JSON で更新する頼み文。"""
+        people = snapshot.get("people") or []
+        player_name = snapshot.get("player_name") or "プレイヤー"
+        ids = [person["npc_id"] for person in people]
+        about_chars = max(1, INJECT_CHARS // ABOUT_PLAYER_RATIO)
+        fields = [
+            '"{}": 記録に加えるものが有れば "true"、何も無ければ "false"'.format(
+                KEY_CHANGED),
+            '"people": 参加NPCごとに1要素。npc_id は【参加NPC】の id をそのまま使う',
+            '"{}": 更新後のその人物自身の人物像の全文（{}文字以内）'.format(
+                KEY_PROFILE, INJECT_CHARS),
+        ]
+        if RECORD_PLAYER_MEMORY:
+            fields.append(
+                '"{}": 更新後の、その人物から見た{}についての記録の全文（{}文字以内）'
+                .format(KEY_ABOUT_PLAYER, player_name, about_chars))
+        fields.append('"{}": この会話でその人物について新しく判明した事実だけの配列。'
+                      '既知の事実の言い換えは入れない。無ければ []'.format(
+                          KEY_NEW_FACTS))
+        instruction = (
+            "あなたは人物の記録係だ。パーティーでの会話から、参加NPCそれぞれの"
+            "記録を統合し、**JSON オブジェクト1つ**で出力せよ。\n\n"
+            "【出力する項目】\n- {fields}\n\n"
+            "【決まり】\n"
+            "- JSON の前後に説明・見出し・コードフェンスを書いてはならない\n"
+            "- 会話に出ていない事を推測で補ってはならない\n"
+            "- 出来事の経過や会話のあらすじを書いてはならない。"
+            "書くのは会話から分かった、この先も変わらずに残ることだけ\n"
+            "- 記録に加えるものが何も無ければ {changed} を \"false\" にし、"
+            "people は空配列にする\n"
+            "- 各要素の npc_id は参加NPCの id を一字一句そのまま使う\n"
+            "- 固定の分類は使わず、継続的な性格、価値観、嗜好、経歴、関係、"
+            "目標、秘密、約束を自然な人物像として簡潔に統合する\n"
+            "- {about} には、呼び方、抱いている感情、交わした約束、貸し借り、"
+            "頼まれた用件だけを書く。何をどう話したかの経過は書かない\n"
+            "- 既知の事実が人物像から抜け落ちていたら書き戻すこと\n"
+            "- 重複はまとめ、既存の記録と新しい会話が矛盾するときは新しい会話を優先する\n"
+            "- 書き足すのではなく要約して統合し、各項目を指定の文字数以内に収める\n"
+            "出力: {{\"changed\":\"true または false\",\"people\":[{{\"npc_id\":\"id\","
+            "\"profile\":\"更新後全文\",\"about_player\":\"更新後全文\",\"new_facts\":[]}}]}}"
+        ).format(fields="\n- ".join(fields), changed=KEY_CHANGED,
+                 about=KEY_ABOUT_PLAYER)
+        sections = []
+        for person in people:
+            record = record_for(person["world"], person["npc_id"],
+                                person["npc_name"])
+            blocks = [
+                "【{}の素性（ゲームの記録）】\n- プロフィール: {}\n- 人格: {}\n- 役割: {}"
+                .format(person["npc_name"], person["game_profile"],
+                        person["personality"], person["job"]),
+                "【現在の人物像】\n{}".format(
+                    _field(record, "profile") or "（まだ記録が無い）"),
+            ]
+            if RECORD_PLAYER_MEMORY:
+                blocks.append("【現在の、{}から見た{}についての記録】\n{}".format(
+                    person["npc_name"], player_name,
+                    _field(record, "about_player") or "（まだ記録が無い）"))
+            recalled = recent_facts(record)
+            if recalled:
+                blocks.append("{}\n{}".format(
+                    FACTS_HEADING, "\n".join("- " + fact for fact in recalled)))
+            gap = elapsed_days(record, person.get("day"))
+            if gap:
+                blocks.append("【前回の会話からの経過】\n{}日が経っている。".format(gap))
+            sections.append("\n".join(blocks))
+        index = "\n".join(
+            "- id={} / 名前={}".format(person["npc_id"], person["npc_name"])
+            for person in people)
+        content = (instruction
+                   + "\n\n【参加NPC】\n" + index
+                   + "\n\n" + "\n\n".join(sections)
+                   + "\n\n【新しい会話】\n" + snapshot["transcript"])
+        return [
+            {"role": "user", "content": content},
+            {"role": "user", "content": "<行動: 記録を更新する>"},
+        ], ids
+
+    def ask_structured_group(messages, count):
+        import typing
+
+        person = llm.create_structure(
+            ctx, "NpcProfileGroupPerson",
+            {"npc_id": (str, ...),
+             KEY_PROFILE: (str, ...),
+             KEY_ABOUT_PLAYER: (str, ...),
+             KEY_NEW_FACTS: (typing.List[str], ...)},
+            label="npc profile group")
+        if person is None:
+            return None
+        structure = llm.create_structure(
+            ctx, "NpcProfileGroupUpdate",
+            {KEY_CHANGED: (str, ...),
+             "people": (typing.List[person], ...)},
+            label="npc profile group")
+        if structure is None:
+            return None
+        return llm.ask(ctx, MANAGER_EXTRACT, messages, timeout=EXTRACT_TIMEOUT,
+                       structure=structure,
+                       max_tokens=max(INJECT_CHARS * 3, INJECT_CHARS * max(1, count)),
+                       label="npc profile group", write=write)
+
+    def extract_group(snapshot):
+        people = snapshot.get("people") or []
+        if not people:
+            write("extract: group had no people")
+            return
+        messages, ids = build_group_messages(snapshot)
+        for person in people:
+            stamp_day(person["world"], person["npc_id"], person.get("day"))
+        rows = normalize_group_result(ask_structured_group(messages, len(ids)), ids)
+        if rows is None:
+            raw = ask(MANAGER_EXTRACT, messages)
+            parsed = llm.parse_json(llm.strip_fence(raw) if isinstance(raw, str) else "")
+            rows = normalize_group_result(parsed, ids)
+        if not rows:
+            write("extract: nothing to change for group {}".format(ids))
+            return
+        by_id = {person["npc_id"]: person for person in people}
+        for npc_id, update in rows:
+            person = by_id.get(npc_id)
+            if person is None:
+                continue
+            update_record(person["world"], npc_id, person["npc_name"],
+                          update, person.get("day"))
+
     def note_finished(snapshot):
+        if snapshot.get("kind") == GROUP_KIND:
+            write("extract: finished group {}".format(
+                [p.get("npc_name") for p in snapshot.get("people") or []]))
+            return
         write("extract: finished {!r} ({})".format(
             snapshot["npc_name"], snapshot["npc_id"]))
 
     def note_dropped(snapshot):
-        # ワーカーが（返らない推論などで）止まっている間に会話を続けても際限なく溜めない。
-        # 溢れたぶんは古い方から捨てる（捨てる判断は `jobs.Worker`）。
+        if snapshot.get("kind") == GROUP_KIND:
+            write("extract: dropped the oldest group job - {} already waiting".format(
+                MAX_PENDING))
+            return
         write("extract: dropped the oldest job for {!r} ({}) "
               "- {} already waiting".format(
                   snapshot["npc_name"], snapshot["npc_id"], MAX_PENDING))
@@ -1012,16 +1200,77 @@ def apply(ctx):
                 snapshot["npc_name"], snapshot["npc_id"],
                 len(snapshot["transcript"])))
 
+    def enqueue_transcript(app, npc_id, transcript):
+        """他 MOD から、既に組んだ台本で1人ぶんの抽出を積む。
+
+        本体履歴に無い台詞を話者名付きで渡すための口。
+        メインスレッドから呼ぶこと（`snapshot_body` が app を読む）。
+        """
+        snapshot = snapshot_body(app, npc_id, transcript)
+        if snapshot is None:
+            return False
+        if not worker.enqueue(snapshot):
+            return False
+        state["last_extract_skip"] = None
+        write("extract queued (external): {!r} ({}) {} transcript chars".format(
+            snapshot["npc_name"], snapshot["npc_id"],
+            len(snapshot["transcript"])))
+        return True
+
+    def snapshot_group(app, ids, transcript):
+        """404 のセッション全文から、参加者全員ぶんの写しを1ジョブにまとめる。"""
+        text = transcript.strip() if isinstance(transcript, str) else ""
+        if not text:
+            note_extract_skip("group transcript is empty")
+            return None
+        people = []
+        for npc_id in ids:
+            person = snapshot_body(app, npc_id, text, limit=GROUP_CONVERSATION_CHARS)
+            if person is not None:
+                people.append(person)
+        if not people:
+            return None
+        return {
+            "kind": GROUP_KIND,
+            "world": people[0]["world"],
+            "player_name": people[0]["player_name"],
+            "people": people,
+            "transcript": text[-GROUP_CONVERSATION_CHARS:],
+        }
+
+    def enqueue_group_transcript(app, ids, transcript):
+        """他 MOD（404）から、参加者全員を1回の抽出で更新する。"""
+        snapshot = snapshot_group(app, ids, transcript)
+        if snapshot is None:
+            return False
+        if not worker.enqueue(snapshot):
+            return False
+        state["last_extract_skip"] = None
+        write("extract queued (group): {} {} transcript chars".format(
+            [p["npc_name"] for p in snapshot["people"]],
+            len(snapshot["transcript"])))
+        return True
+
+    # 404 などが `sys` の棚から呼ぶ公開口。apply し直しでも同じ関数を差し替える。
+    store["api"] = {
+        "enqueue_transcript": enqueue_transcript,
+        "enqueue_group_transcript": enqueue_group_transcript,
+    }
+
     def schedule_extract(app):
         """返答が描画された次のフレームで抽出をキューへ渡す。
 
         Clock が行うのは会話データのコピーと enqueue だけ。
         LLM 待ちは専用ワーカーなので、メインスレッドも会話画面も止めない。
+        パーティー会話中は 404 が終了時に一括で積むので、ここでは積まない。
         """
         if app is None:
             app = ui.find_app()
         if app is None:
             note_extract_skip("no running app")
+            return
+        if party_talk_active():
+            note_extract_skip("party talk active; defer to 404")
             return
         npc_id = getattr(app, "in_conversation", None)
         if not isinstance(npc_id, str) or not npc_id:
