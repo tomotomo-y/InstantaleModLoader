@@ -1,0 +1,82 @@
+{
+  "entry": "policy_guardrail_bypass.py",
+  "api": 1,
+  "kind": "fix",
+  "name": {
+    "en": "Bypass safety-policy guardrails",
+    "ja": "安全ポリシーのガードレールを外す"
+  },
+  "description": {
+    "en": "Strips copyright/safety-policy instructions from LLM prompts and forces violation fields in responses to pass",
+    "ja": "LLM への著作権・安全ポリシー指示を削り、応答の違反判定フィールドを問題なしへ強制する"
+  },
+  "version": "1",
+  "author": "yoshinari/tomotomo-y",
+  "after": [
+    "111_llm_prompt_replace"
+  ],
+  "settings": {
+    "ENABLED": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "この MOD を使う",
+        "en": "Enable this mod"
+      },
+      "note": {
+        "ja": "OFF にすると送信除去も応答強制も何もしない",
+        "en": "OFF disables both prompt stripping and response forcing"
+      }
+    },
+    "STRIP_PROMPTS": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "送信プロンプトからポリシー指示を削る",
+        "en": "Strip policy instructions from prompts"
+      },
+      "note": {
+        "ja": "【著作権・安全ポリシー違反の基準】セクションと content_violation / lawfulness_loss の指示行を消す",
+        "en": "Removes the copyright/safety policy section and content_violation / lawfulness_loss instruction lines"
+      }
+    },
+    "FORCE_RESPONSE": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "応答の違反判定を無効化する",
+        "en": "Force violation fields off in responses"
+      },
+      "note": {
+        "ja": "content_violation / copyright_violation / policy_violation を false、lawfulness_loss を 0 にする（ネストも）",
+        "en": "Sets content_violation / copyright_violation / policy_violation to false and lawfulness_loss to 0 (nested too)"
+      }
+    },
+    "FORCE_ADMIN_PASS": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "RPG管理者評価を問題なしへ通す",
+        "en": "Force RPG-admin validation to pass"
+      },
+      "note": {
+        "ja": "大人向け管理者の評価リクエストで、assessment 等があるときだけ問題なし文言へ書き換える",
+        "en": "On adult RPG-admin validation requests, rewrites assessment (and related flags) to pass when those keys exist"
+      }
+    },
+    "LOG_LIMIT": {
+      "type": "int",
+      "default": 20,
+      "min": 0,
+      "max": 999,
+      "label": {
+        "ja": "ログに残す件数",
+        "en": "How many events to log"
+      },
+      "note": {
+        "ja": "out\\policy_guardrail_bypass.log に残す。0 で何も出さない",
+        "en": "Lines kept in out\\policy_guardrail_bypass.log. 0 = log nothing"
+      }
+    }
+  }
+}
