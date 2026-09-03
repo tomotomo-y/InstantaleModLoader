@@ -1,0 +1,98 @@
+{
+  "entry": "generation_limits.py",
+  "api": 1,
+  "kind": "fix",
+  "name": {
+    "en": "Cap quest enemies and widen large-generation output",
+    "ja": "クエスト敵の水増しを抑え、大規模生成の出力枠を広げる"
+  },
+  "description": {
+    "en": "Rewrites quest-generator enemy-count instructions, adds stop rules, and raises max tokens for world-map / quest / summary generation",
+    "ja": "クエストジェネレータの敵数指示を上書きして終了規則を足し、ワールドマップ／クエスト／要約の出力トークン上限を広げる"
+  },
+  "version": "1",
+  "author": "yoshinari/tomotomo-y",
+  "after": [
+    "111_llm_prompt_replace"
+  ],
+  "settings": {
+    "ENABLED": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "この MOD を使う",
+        "en": "Enable this mod"
+      },
+      "note": {
+        "ja": "OFF にすると敵抑制も出力枠も何もしない",
+        "en": "OFF disables both enemy caps and output widening"
+      }
+    },
+    "ENEMY_CAPS": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "クエスト敵の水増しを抑える",
+        "en": "Cap quest enemy inflation"
+      },
+      "note": {
+        "ja": "敵数指示の上書きと終了規則の追記。structure が dict のときは enemies.maxItems も付ける",
+        "en": "Rewrites enemy-count instructions and adds stop rules. Also sets enemies.maxItems when structure is a dict schema"
+      }
+    },
+    "WIDEN_OUTPUT": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "大規模生成の出力枠を広げる",
+        "en": "Widen large-generation output"
+      },
+      "note": {
+        "ja": "ワールドマップ／クエストジェネレータ／TRPG要約で max_tokens 等を引き上げる",
+        "en": "Raises max_tokens (and local n_predict) for world-map / quest-generator / TRPG summarizer"
+      }
+    },
+    "MAX_OUTPUT_TOKENS": {
+      "type": "int",
+      "default": 32768,
+      "min": 1024,
+      "max": 131072,
+      "label": {
+        "ja": "大規模生成の出力トークン上限",
+        "en": "Large-generation output token cap"
+      },
+      "note": {
+        "ja": "プロキシの areaDetailNumPredict と同じ既定。VRAM や窓が足りないと遅くなる",
+        "en": "Same default as the proxy's areaDetailNumPredict. Too high for your VRAM/window makes generation slow"
+      }
+    },
+    "QUEST_ENEMIES_MAX_ITEMS": {
+      "type": "int",
+      "default": 6,
+      "min": 2,
+      "max": 20,
+      "label": {
+        "ja": "enemies 配列の maxItems",
+        "en": "enemies array maxItems"
+      },
+      "note": {
+        "ja": "schema に載せる件数上限。指示文の「合計2〜6件」と揃える",
+        "en": "Schema cap for enemies. Keep aligned with the 2–6 instruction text"
+      }
+    },
+    "LOG_LIMIT": {
+      "type": "int",
+      "default": 20,
+      "min": 0,
+      "max": 999,
+      "label": {
+        "ja": "ログに残す件数",
+        "en": "How many events to log"
+      },
+      "note": {
+        "ja": "out\\generation_limits.log に残す。0 で何も出さない",
+        "en": "Lines kept in out\\generation_limits.log. 0 = log nothing"
+      }
+    }
+  }
+}
