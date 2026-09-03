@@ -8,8 +8,8 @@
 手で書き換えても次の生成で消える。
 直す先は各 MOD の `mod.json` か MODS.md の見出し。
 
-同梱 84 本（基盤 2 / 修正 32 / 追加 26 / 計測 24）。
-うち 11 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
+同梱 88 本（基盤 2 / 修正 36 / 追加 26 / 計測 24）。
+うち 15 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
 
 並びはフォルダ名順。
 適用順はこれとは別で、GUI の `順` 列（`load_order.json`）が持つ。
@@ -36,7 +36,7 @@
 
 ---
 
-## 修正（32本）
+## 修正（36本）
 
 ゲームのバグ・不便を直す。
 
@@ -56,6 +56,10 @@
 | [`1114_message_viewport_height`](MODS.md#1114_message_viewport_height-本文の表示領域を常時広げる) | 本文の表示領域を広げる | 本文の表示領域を常時広げる | 1 |  |
 | [`111_llm_prompt_replace`](MODS.md#111_llm_prompt_replace-llm-への指示文を置換ルールで書き換える) | LLM への指示文を置換 | LLM への指示文を置換ルールで書き換える | 2 |  |
 | [`112_ui_text_spacing`](MODS.md#112_ui_text_spacing-広すぎる本文の行間を詰める) | 本文の行間を詰める | 広すぎる本文の行間を詰める | 2 |  |
+| [`1131_ollama_disable_thinking`](MODS.md#1131_ollama_disable_thinking-ollamaopenai互換の思考モードを切る) | Ollama（OpenAI互換）の思考モードを切る | Ollama（OpenAI互換）の思考モードを切る | 2 |  |
+| [`1132_policy_guardrail_bypass`](MODS.md#1132_policy_guardrail_bypass-安全ポリシーのガードレールを外す) | 安全ポリシーのガードレールを外す | 安全ポリシーのガードレールを外す | 5 |  |
+| [`1133_generation_limits`](MODS.md#1133_generation_limits-クエスト敵の水増しを抑え大規模生成の出力枠を広げる) | クエスト敵の水増しを抑え、大規模生成の出力枠を広げる | クエスト敵の水増しを抑え、大規模生成の出力枠を広げる | 6 |  |
+| [`1134_quest_split_generation`](MODS.md#1134_quest_split_generation-討伐クエスト3件を1件ずつ生成する) | 討伐クエスト3件を1件ずつ生成する | 討伐クエスト3件を1件ずつ生成する | 3 |  |
 | [`113_ui_text_expand`](MODS.md#113_ui_text_expand-本文の表示域をボタンで広げる) | 本文の表示域を広げる | 本文の表示域をボタンで広げる | 10 |  |
 | [`114_ui_input_focus`](MODS.md#114_ui_input_focus-自由入力のあと入力欄にフォーカスを戻す) | 入力欄のフォーカスを保つ | 自由入力のあと入力欄にフォーカスを戻す | 3 |  |
 | [`115_ui_item_list_fit`](MODS.md#115_ui_item_list_fit-はみ出すアイテム一覧を画面内に収める) | アイテム一覧を収める | はみ出すアイテム一覧を画面内に収める | 3 |  |
@@ -147,7 +151,7 @@
 
 ## 提供を受けた MOD
 
-外部の MOD 作者から提供を受けて同梱している 11 本。
+外部の MOD 作者から提供を受けて同梱している 15 本。
 
 **番号の帯では数えられない。**
 いま提供を取り込む先は出どころの帯（`4xx`）だが、
@@ -161,6 +165,10 @@
 | フォルダ | 提供 | 取り込み |
 |---|---|---|
 | [`1114_message_viewport_height`](MODS.md#1114_message_viewport_height-本文の表示領域を常時広げる) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`1131_ollama_disable_thinking`](MODS.md#1131_ollama_disable_thinking-ollamaopenai互換の思考モードを切る) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`1132_policy_guardrail_bypass`](MODS.md#1132_policy_guardrail_bypass-安全ポリシーのガードレールを外す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`1133_generation_limits`](MODS.md#1133_generation_limits-クエスト敵の水増しを抑え大規模生成の出力枠を広げる) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`1134_quest_split_generation`](MODS.md#1134_quest_split_generation-討伐クエスト3件を1件ずつ生成する) | yoshinari/tomotomo-y 様 | そのまま取り込み |
 | [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い応答が途中で切れるのを直す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
 | [`118_batch_message_render`](MODS.md#118_batch_message_render-本文の出し方逐次一括と既読の色を選ぶ) | yoshinari/tomotomo-y 様 | 提供者と共同 |
 | [`119_fix_crime_attribution`](MODS.md#119_fix_crime_attribution-他人の犯罪が主人公のものになるのを直す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
