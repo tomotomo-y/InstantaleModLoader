@@ -39,6 +39,7 @@ Nuitka が1つの関数の中で解決してしまった呼び出しは、外か
 from __future__ import annotations
 
 import functools
+import os
 import sys
 from typing import Any, Callable
 
@@ -518,22 +519,39 @@ def patch(target: str, *, alias_scan: Any = True, required: bool = True,
 def _guard(func: Callable, old: Callable, target: str) -> Callable:
     """`safe=True` の中身。フックの例外をゲームへ流さず、素の動作に落とす。
 
-    「落とす」の意味が2つに分かれるので、元の関数が**もう走ったかどうか**で決める。
+    「落とす」の意味が3つに分かれるので、元の関数が**どこまで走ったか**で決める。
 
-        まだ走っていない  → 元の関数を呼んでその結果を返す（素のゲームと同じ挙動）
-        もう走った        → その結果をそのまま返す（後処理だけが失敗した）
+        まだ走っていない      → 元の関数を呼んでその結果を返す（素のゲームと同じ挙動）
+        走って答えを返した    → その答えをそのまま返す（後処理だけが失敗した）
+        走って自分から投げた  → その例外をそのまま通す（フックの失敗ではない）
 
-    2つ目が要点で、単純に「失敗したら元を呼び直す」と書くと、
+    2つ目と3つ目が要点で、単純に「失敗したら元を呼び直す」と書くと、
     元の関数が持つ副作用（テキストの追加・セーブ・状態の更新）が2回起きる。
     フックが `orig` を呼んだ後に壊れるのはよくある形（返り値を加工していて型を間違えた等）なので、ここを間違えると
     `safe=True` が事故の原因になる。
+
+    3つ目を呼び直すと、同じ対象に `safe=True` の層が重なったとき N 層で 2^N 回走る
+    （各層が素の例外を「フックの失敗」と読む。VERIFICATION.md §3.46）。
+    `safe=True` が守るのはフックの失敗であって、ゲーム自身の失敗ではない。
+    フックが `orig` の例外を握って別の例外を投げた場合も呼び直さず、
+    素の例外のほうを投げ直す（フック側の失敗はログに残す）。
+    投げ直しは except 節の**外**で行う。中で投げると素の例外の `__context__` に
+    フックの例外が上書きされ、連鎖がフックの例外を引き金として読める。
+
+    通過の `WARN` は例外1つにつき1行。層ごとに出すと層の数だけ同じ行が並ぶので、
+    最初に見た層が例外に印を付けて、外側の層は黙って通す。
+    行には投げた場所（ファイル・行・関数）を添える。`old` は「1つ内側」であって
+    ゲーム本体とは限らず、内側に載った別 MOD の素の（safe でない）フックのこともある。
+    その場合ここにはトレースバックが残らないので、場所で見分ける。
 
     `wrap` では第1引数として渡す `orig` がこの記録を兼ねる。
     `patch` では元の関数を呼ぶかどうかが差し替え側の自由なので、
     記録は取らず「まだ走っていない」扱いにする。
 
-    **記録は `orig` を呼ぶたび上書きされる。**
-    覚えているのは「最後に呼んだ答え」であって「本番の答え」ではない。
+    **記録は `orig` を呼ぶたび上書きされる（答えも例外も1つの記録）。**
+    覚えているのは「最後に呼んだ結果」であって「本番の結果」ではない。
+    答えと例外を別々に持つと、答えの後に投げた回で答えのほうが勝ち、
+    素の例外を成功として返してしまう。
     普通のフックは `orig` を1回しか呼ばないので差は出ないが、
     本番の呼び出しの後に**捨て玉の呼び出し**（合成引数でゲーム側の振る舞いを
     探る等）を挟むフックでは、記録がその探りの答えに化ける。
@@ -550,27 +568,87 @@ def _guard(func: Callable, old: Callable, target: str) -> Callable:
 
     @functools.wraps(old)
     def guarded(*args, **kwargs):
+        # 最後に呼んだ `orig` の結果。("result", 答え) か ("raised", 例外) の1つだけ。
         box: dict = {}
 
         def orig(*a, **kw):
-            box["result"] = old(*a, **kw)
-            return box["result"]
+            try:
+                result = old(*a, **kw)
+            except BaseException as exc:
+                # 素の関数が投げた。フックの失敗ではないので、外側で呼び直さない。
+                box["last"] = ("raised", exc)
+                raise
+            box["last"] = ("result", result)
+            return result
 
         try:
             return func(orig, *args, **kwargs) if is_wrap else func(*args, **kwargs)
-        except BaseException:
-            log_exc("safe hook failed on {}; falling back to the original".format(target))
-            if "result" in box:
-                return box["result"]
-            if old is None:
-                # `required=False` で**属性を新設**した patch。
-                # 元の実装が無いので落とす先も無い。ここで `None(...)` を呼ぶと
-                # TypeError がゲームへ抜けて、
-                # safe の約束（例外を流さない）が破れる。
-                return None
-            return old(*args, **kwargs)
+        except BaseException as exc:
+            kind, value = box.get("last") or (None, None)
+            if kind == "result":
+                log_exc("safe hook failed on {} after the original returned; "
+                        "returning the original's result".format(target))
+                return value
+            if kind == "raised" and exc is value:
+                # 素の関数の例外がそのまま上がってきた。
+                # 呼び直すと素の関数の副作用が重なるので、そのまま通す。
+                # 落ちた記録は crash_recorder が取る。ここは1行だけ残す。
+                _note_pass_through(target, value)
+                raise
+            if kind == "raised":
+                # フックが素の例外を握って別の例外を投げた（`raise ... from e` も含む）。
+                # 素の関数の副作用はもう起きているかもしれないので呼び直さず、
+                # ゲームが素で受け取るはずだった例外のほうを投げ直す。
+                # フック側の失敗はここでトレースバック付きで残す。
+                log_exc("safe hook failed on {} after the original raised; "
+                        "re-raising the original's exception".format(target))
+                game_exc = value
+            else:
+                log_exc("safe hook failed on {}; falling back to the original".format(target))
+                if old is None:
+                    # `required=False` で**属性を新設**した patch。
+                    # 元の実装が無いので落とす先も無い。ここで `None(...)` を呼ぶと
+                    # TypeError がゲームへ抜けて、
+                    # safe の約束（例外を流さない）が破れる。
+                    return None
+                return old(*args, **kwargs)
+        # except 節の外で投げる。中で投げると `__context__` にフックの例外が入る。
+        _note_pass_through(target, game_exc)
+        raise game_exc
 
     return guarded
+
+
+_PASSED_MARK = "__instantale_passed_through__"
+
+
+def _note_pass_through(target: str, exc: BaseException) -> None:
+    """素の例外を通した印を1行残す。同じ例外は層が重なっても1行。"""
+    if getattr(exc, _PASSED_MARK, False):
+        return
+    try:
+        setattr(exc, _PASSED_MARK, True)
+    except Exception:
+        pass  # 属性を持てない例外。層の数だけ行が並ぶだけなので続ける。
+    log("safe hook on {}: the original raised {} at {}; passing it through"
+        .format(target, _short_exc(exc), _raise_site(exc)), level="WARN")
+
+
+def _raise_site(exc: BaseException) -> str:
+    """例外を投げた一番内側の場所。`old` はゲーム本体とは限らないので、ファイルで見分ける。"""
+    tb = exc.__traceback__
+    if tb is None:
+        return "?"
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code
+    return "{}:{} in {}".format(os.path.basename(code.co_filename), tb.tb_lineno, code.co_name)
+
+
+def _short_exc(exc: BaseException, limit: int = 160) -> str:
+    # 改行を潰さないと、1行1エントリのログが崩れる（recon.safe_repr と同じ扱い）。
+    text = "{}: {}".format(type(exc).__name__, exc).replace("\n", "\\n")
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def wrap(target: str, *, alias_scan: Any = True, required: bool = True,

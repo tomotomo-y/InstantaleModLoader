@@ -18,8 +18,11 @@
     "123_fix_new_character_level",
     "125_balance_charisma_impression",
     "128_item_image_variety",
+    "405_regional_economy",
     "129_balance_item_price",
     "130_currency_unit",
+    "131_sharp_portrait",
+    "132_npc_variety",
     "111_llm_prompt_replace",
     "117_message_text_integrity",
     "127_llm_response_speed",
@@ -76,6 +79,8 @@
     "320_guild_adventurer_recruit",
     "321_area_chronicle",
     "322_battle_bgm",
+    "324_place_bgm",
+    "323_npc_carryover",
     "401_battle_character_context",
     "215_probe_event_roll",
     "213_probe_npc_memory",
@@ -87,7 +92,8 @@
     "220_probe_bounty_hunter",
     "221_probe_item_level",
     "222_probe_battle_mechanics",
-    "223_probe_party_equipment"
+    "223_probe_party_equipment",
+    "224_probe_npc_carryover"
   ],
   "disabled": []
 }

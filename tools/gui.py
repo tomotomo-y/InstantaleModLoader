@@ -132,10 +132,18 @@ PALETTE = {
     "check_edge": "#9aa2ad",   # 入っていないチェックの枠
     "danger":     "#b3261e",   # 前回の注入で入らなかった mod
     "warn":       "#9a5b00",   # 警告の行
-    # デバッグモードでだけ一覧に出る行（計測・取込済）の地。
+    # 普段の遊びの一覧に**並ばない**行の地。
     # 文字色は無効=灰・失敗=赤で使い切っているので、こちらは背景で分ける。
-    # 選択色（#dce7fb）とも見分けが付くように、青ではなく暖色に振る。
-    "dev_bg":     "#fdf3df",
+    # 伏せる理由ごとに色を変えてある ―
+    # デバッグモードを入れると3種類が同時に並ぶので、
+    # 1色だと「なぜ出ているのか」が混ざる。
+    "dev_bg":     "#fdf3df",   # 計測。選択色（#dce7fb）と離すため暖色に振る
+    "wip_bg":     "#e0f2dc",   # 開発中（9xx）。作りかけ＝これから育つ、で緑
+    "taken_bg":   "#e7e9ec",   # 取込済。降ろしたものなので色味を抜く
+    # `local/` から読んだ行の地（配る予定が無い MOD。TECH.md §2.6.2）。
+    # 選択色も薄い青なので、そちらを青寄り・こちらをシアン寄りに離してある
+    # （同じ青みだと、選んでいるのか `local/` なのかが読めない）。
+    "local_bg":   "#dbf1f6",
 }
 
 # 日本語と英語が同じ列に並ぶので、両方が同じ太さで出る書体を選ぶ。
@@ -474,18 +482,26 @@ KIND_LABELS = {
 }
 
 
-def mod_kind(name: str, manifest: dict) -> str:
+def mod_kind(name: str, manifest: dict, local: bool = False) -> str:
     """一覧の「種別」列に出す文字。
 
     種別そのもの（`kind`）より、**状態を表す印を先に**見る。取込済と開発中は
     「本来の種別が何であれ、いまは普段の遊びから外れている」ことのほうが
     一覧では大事なため。`kind` はローダが語彙を検めた値（`_manifest`）。
 
+    「ローカル」は `local/` に在る mod（配る予定が無い。TECH.md §2.6）。
+    開発中と分けるのは、伏せ方が違うから ―
+    あちらはデバッグモードのときだけ動くが、こちらは普段の遊びで動く。
+
     どれも名乗っていない mod は空 ― 無理に当てはめるより、
     規約の外に居ることがそのまま見える方が良い。
     """
     if manifest.get("superseded"):
         return "取込済"
+    # 在り処が番号に勝つ。`local/` へ移した mod は 9xx の番号を残したままなので
+    # （`is_wip` が真になる）、先に見ないと全部「開発中」になる。
+    if local:
+        return "ローカル"
     if ml.is_wip(name):
         return "開発中"
     label = KIND_LABELS.get(manifest.get("kind") or "")
@@ -514,12 +530,18 @@ def read_mods() -> dict:
     found = ml.discover(MODS_DIR)
     disabled = set(found["disabled"])
 
+    local = found.get("local") or set()
+    dirs = found.get("dirs") or {}
+
     mods = []
     for name in found["listed"]:
         manifest = found["manifests"].get(name) or {}
         mods.append({
             "dir": name,
-            "kind": mod_kind(name, manifest),
+            # フォルダを開くのも道具を起動するのも、この実在パスから引く。
+            # `MODS_DIR` を決め打つと `local/` の mod だけ見つからない。
+            "path": os.path.join(dirs.get(name) or MODS_DIR, name),
+            "kind": mod_kind(name, manifest, name in local),
             "name_ja": (manifest.get("name") or {}).get("ja") or name,
             "name_en": (manifest.get("name") or {}).get("en") or name,
             "desc_ja": (manifest.get("description") or {}).get("ja") or "",
@@ -541,8 +563,15 @@ def read_mods() -> dict:
             # 読み込みの扱いは debug と同じ（デバッグモードのみ）。
             # 判定はローダの語彙（`is_wip`）を借りる ― 番号帯の規則をここに写すと、
             # 片方だけ直したとき読み込みと表示がずれる。
-            "wip": ml.is_wip(name),
-            # MOD 同梱の道具（`908_` §4）。GUI はボタンを出して別プロセスで開くだけ。
+            # `local/` に居るものは開発中に数えない。
+            # 移した MOD は 9xx の番号を残したままなので（TECH.md §2.6.2）、
+            # 番号だけで見ると `_hidden()` がデバッグモードを要求してしまい、
+            # 普段の遊びの一覧から消える。`discover()` の `wip` と同じ扱いに揃える。
+            "wip": ml.is_wip(name) and name not in local,
+            # `local/` に在る（配る予定が無い）。読み込みの条件は順序ファイルの
+            # 記載だけで、デバッグモードは要らない。
+            "local": name in local,
+            # MOD 同梱の道具（`323_` §4）。GUI はボタンを出して別プロセスで開くだけ。
             "tool": manifest.get("tool"),
         })
     return {"mods": mods, "disabled": disabled, "problems": found["problems"],
@@ -1181,15 +1210,24 @@ class App(ttk.Frame):
         # 本体が取り込んだので降ろした mod。
         # デバッグモードのときだけ並ぶので、**計測 MOD と一緒に見えることになる**。
         # 同じ見た目だと「なぜ出ているのか」が混ざるため、
-        # こちらだけ色を変える（無効な行の灰色とも別にする ― 切ってあるのではなく、
-        # 要らなくなったので降ろした、という違いがある）。
+        # こちらは文字色も変える（無効な行の灰色とも別にする ― 切ってあるのではなく、
+        # 要らなくなったので降ろした、という違いがある）。地は下の `taken`。
         self.tree.tag_configure("superseded", foreground=PALETTE["text_sub"])
-        # デバッグモードでだけ出てくる行（計測・取込済）は背景でまとめて示す。
-        # 文字色の3色（無効・失敗・取込済）とは**別の軸**なので、
-        # 同じ行に重なる（無効にした計測 MOD は灰字＋この背景）。
+        # 背景は文字色とは**別の軸**で、同じ行に重なる
+        # （無効にした計測 MOD は灰字＋計測の地）。
         # 選択中は style.map の選択色が勝つ ― off /
         # bad の文字色が選択で消えるのと同じ振る舞いに揃う。
+        #
+        # 伏せる理由ごとに地の色を分ける。
+        # デバッグモードを入れると計測・開発中・取込済が同時に並ぶので、
+        # 1色でまとめると「なぜ出ているのか」が読めない。
         self.tree.tag_configure("dev", background=PALETTE["dev_bg"])
+        self.tree.tag_configure("wip", background=PALETTE["wip_bg"])
+        self.tree.tag_configure("taken", background=PALETTE["taken_bg"])
+        # `local/` から読んだ行（配る予定が無い MOD。TECH.md §2.6.2）。
+        # `dev` と同じ「背景の軸」だが、こちらは**デバッグモードに関係なく常に並ぶ**。
+        # 普段の遊びの一覧に混ざるので、配布物に入るものと地の色で分かれている必要がある。
+        self.tree.tag_configure("local", background=PALETTE["local_bg"])
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_detail())
         self.tree.bind("<Button-1>", self._on_press)
         self.tree.bind("<B1-Motion>", self._on_drag)
@@ -1440,6 +1478,10 @@ class App(ttk.Frame):
           debug       計測用。開発者以外には意味が無い
           superseded  ゲーム本体が同じ修正を取り込んだので降ろした
           wip         開発中（9xx）。まだ配る形が決まっていない
+
+        `local/` の mod はここに**入らない**（TECH.md §2.6.2）。
+        配る予定が無いだけで作りかけではなく、普段の遊びで動かすために置いてある。
+        番号が 9xx のままのものが在るので、`wip` の側で先に除いてある（`read_mods`）。
 
         どれもデバッグモードを入れれば出てくる。
         **表示だけは分ける**ので、
@@ -1770,7 +1812,18 @@ class App(ttk.Frame):
             # 背景は文字色と独立に付ける。
             # デバッグモードが切なら `_matches` が既に落としているので、
             # ここで改めてモードを見る必要は無い。
-            if mod["debug"] or mod.get("superseded") or mod["wip"]:
+            # 1行に付く背景は1つ。
+            # 2つ付けても片方しか出ず、どちらが勝つかは Tk の tag の並び次第で
+            # 読んで分かる形にならないので、ここで順に振り分ける。
+            # 並びは「その行が並んでいる理由」の強い順 ―
+            # 取込済は降ろした事実が最優先、次に開発中、計測が最後。
+            if mod.get("local"):
+                tags.append("local")
+            elif mod.get("superseded"):
+                tags.append("taken")
+            elif mod["wip"]:
+                tags.append("wip")
+            elif mod["debug"]:
                 tags.append("dev")
             # 設定を持つ mod だけ印を出す。
             # 持たない mod で「設定…」を押しても何も無いことが、
@@ -2130,7 +2183,7 @@ class App(ttk.Frame):
 
     # -- MOD 同梱の道具 ----------------------------------------------------
     def _open_tool(self) -> None:
-        """`mod.json` の "tool" を別プロセスで開く（`908_` §4 の契約）。
+        """`mod.json` の "tool" を別プロセスで開く（`323_` §4 の契約）。
 
         MOD のコードをこのプロセスに import しない、という原則を守るため
         サブプロセスにする。場所は引数ではなく環境変数で渡す
@@ -2140,7 +2193,8 @@ class App(ttk.Frame):
         if not mod or not mod.get("tool"):
             return
         tool = mod["tool"]
-        mod_dir = os.path.join(MODS_DIR, mod["dir"])
+        # 在り処は一覧の行が持っている（`local/` の mod も同じ形で開ける）。
+        mod_dir = mod.get("path") or os.path.join(MODS_DIR, mod["dir"])
         entry = os.path.join(mod_dir, tool["entry"])
         if not os.path.isfile(entry):
             messagebox.showerror("道具が見つかりません",
@@ -2166,7 +2220,7 @@ class App(ttk.Frame):
             return
         # 同梱の設定画面を持つ mod は、そちらを開く。
         # 宣言の設定（"settings"）もその画面が引き受ける約束
-        # （`908_` §4。設定の入口が2つあると、どちらに何があるか覚えることになる）。
+        # （`323_` §4。設定の入口が2つあると、どちらに何があるか覚えることになる）。
         if mod.get("tool"):
             self._open_tool()
             return
@@ -2234,7 +2288,7 @@ class App(ttk.Frame):
         if not mod:
             self._set_status("一覧から MOD を選択してください")
             return
-        self._open(os.path.join(MODS_DIR, mod["dir"]))
+        self._open(mod.get("path") or os.path.join(MODS_DIR, mod["dir"]))
 
     def open_mods_dir(self) -> None:
         self._open(MODS_DIR)

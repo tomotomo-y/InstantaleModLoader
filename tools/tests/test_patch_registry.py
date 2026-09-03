@@ -1030,6 +1030,130 @@ def main():
     except BaseException as exc:
         check(False, "新設＋safe の例外がゲームへ抜けた: {!r}".format(exc))
 
+    # 素の関数**自身**が投げた場合。フックの失敗ではないので、呼び直さずそのまま通す。
+    # 呼び直すと素の関数の副作用が重なる。層が重なると倍々になる（VERIFICATION.md §3.46）。
+    P.set_generation("gen_safe_game_raises")
+    calls.clear()
+
+    class GameFailure(KeyError):
+        pass
+
+    def game_side(x):
+        calls.append(("orig", x))
+        raise GameFailure("21")
+
+    victim.risky = game_side
+
+    @P.wrap("fakegame:risky", safe=True)
+    def pass_through(orig, x):
+        return orig(x)
+
+    try:
+        victim.risky(6)
+        check(False, "素の関数の例外が握り潰された")
+    except GameFailure:
+        check(True, "素の関数が投げた例外はそのまま外へ出る")
+    check(len(calls) == 1,
+          "素の関数が投げても**呼び直さない**: {}".format(calls))
+
+    # 同じ対象に safe=True の層を重ねても1回。以前は層の数だけ倍々になった。
+    # 世代を変えると前の層が剥がれて1層に戻るので、ゲームの起動と同じく**同じ世代**で重ねる。
+    @P.wrap("fakegame:risky", safe=True)
+    def pass_through_2(orig, x):
+        return orig(x)
+
+    @P.wrap("fakegame:risky", safe=True)
+    def pass_through_3(orig, x):
+        return orig(x)
+
+    check(P.unwrap(victim.risky)[1] == 3,
+          "3層が生きている: depth={}".format(P.unwrap(victim.risky)[1]))
+    calls.clear()
+    try:
+        victim.risky(7)
+        check(False, "素の関数の例外が握り潰された（3層）")
+    except GameFailure as e:
+        check(getattr(e, P._PASSED_MARK, False) is True,
+              "通した印が例外に付く（WARN は層ごとではなく例外1つに1行）")
+    check(len(calls) == 1,
+          "safe=True を3層重ねても素の関数は1回: {}".format(calls))
+
+    # フックが orig の例外を握って別の例外を投げた場合も呼び直さない。
+    # 素の関数の副作用はもう起きているかもしれない。素の例外のほうを投げ直す。
+    P.set_generation("gen_safe_game_raises_4")
+
+    @P.wrap("fakegame:risky", safe=True)
+    def swallow_and_raise(orig, x):
+        try:
+            return orig(x)
+        except GameFailure:
+            raise RuntimeError("フック側の後始末が壊れた")
+
+    calls.clear()
+    try:
+        victim.risky(8)
+        check(False, "素の関数の例外が握り潰された（フックが握った後）")
+    except GameFailure as e:
+        check(e.__context__ is None,
+              "投げ直しで連鎖が逆さにならない（フックの例外が __context__ に入らない）: {!r}"
+              .format(e.__context__))
+    except RuntimeError:
+        check(False, "フック側の例外がゲームへ抜けた")
+    check(len(calls) == 1,
+          "フックが握った後でも呼び直さない: {}".format(calls))
+
+    # `raise ... from e` で包んだ場合は連鎖として扱う（素の例外の続き）。
+    P.set_generation("gen_safe_game_raises_5")
+
+    @P.wrap("fakegame:risky", safe=True)
+    def wrap_and_raise(orig, x):
+        try:
+            return orig(x)
+        except GameFailure as e:
+            raise ValueError("包み直した") from e
+
+    calls.clear()
+    try:
+        victim.risky(9)
+        check(False, "素の関数の例外が握り潰された（包み直し）")
+    except GameFailure as e:
+        check(e.__context__ is None and e.__cause__ is None,
+              "包み直しでも素の例外の連鎖は素のまま: {!r}".format(e.__context__))
+    except ValueError:
+        check(False, "包み直した例外がゲームへ抜けた")
+    check(len(calls) == 1,
+          "包み直しでも呼び直さない: {}".format(calls))
+
+    # 答えを返した後の2回目の orig が投げた場合。記録は「最後の結果」なので素の例外が通る。
+    # 答えと例外を別々に持つと、答えのほうが勝って素の例外を成功として返してしまった。
+    P.set_generation("gen_safe_game_raises_6")
+
+    def game_side_branch(x):
+        calls.append(("orig", x))
+        if x == "bad":
+            raise GameFailure("bad")
+        return ("orig", x)
+
+    victim.risky = game_side_branch
+
+    @P.wrap("fakegame:risky", safe=True)
+    def return_then_raise(orig, x):
+        first = orig(x)
+        orig("bad")
+        return first
+
+    calls.clear()
+    try:
+        result = victim.risky("good")
+        check(False, "答えの後に投げた素の例外が成功に化けた: {!r}".format(result))
+    except GameFailure:
+        check(True, "答えの後に投げた素の例外もそのまま外へ出る")
+    check(len(calls) == 2,
+          "答えの後に投げても呼び直さない（本番2回のみ）: {}".format(calls))
+
+    # 元に戻す（後の節が risky を使う場合に備えて、投げない実装へ）。
+    victim.risky = lambda x: calls.append(("orig", x)) or ("orig", x)
+
     print("=== revert（注入をまたいで剥がせる）===")
     # 前の節に触られていない対象を使う。
     # target_a には gen1 の層が乗っている。
@@ -1101,6 +1225,14 @@ def main():
     # `listed` は一覧に出す順で、宣言に無い開発中の mod（9xx）はそこから外れている。GUI の保存で
     # `load_order.json` に混ざらないようにするため（§2.6）。
     installed = survey_result["installed"]
+    # 配る予定の無い mod は `local/` に居る（TECH.md §2.6）。
+    # `discover()` はそこも読むが、突き合わせる相手は `runtime/mods` の中身なので、
+    # ここでは外して数える。
+    local = set(survey_result.get("local") or ())
+    if local:
+        print("  note local/ から読んだため同梱の検査から外す: {}"
+              .format(", ".join(sorted(local))))
+    installed = [n for n in installed if n not in local]
     check(sorted(installed) == on_disk,
           "mod.json を持つフォルダが全て見つかる（{} 個）".format(len(on_disk)))
     check(all(os.path.isdir(os.path.join(mods_dir, f)) for f in installed),
@@ -1111,10 +1243,10 @@ def main():
     # 書きかけの一本でリリースする側の検査が止まらないようにするため。
     # **外した名前は必ず出す。**
     # 黙って減らすと、宣言の抜けを見逃す検査になる。
-    wip = [f for f in found if ml.is_wip(f)]
+    wip = [f for f in found if ml.is_wip(f) and f not in local]
     if wip:
         print("  note 開発中のため同梱の検査から外す: {}".format(", ".join(wip)))
-    found = [f for f in found if f not in wip]
+    found = [f for f in found if f not in wip and f not in local]
 
     # 名乗りは mod.json から読む＝**mod のコードを1行も走らせずに**一覧が作れる。
     # GUI が他人の mod を並べるときに import せずに済む、という性質の確認。
@@ -1155,8 +1287,9 @@ def main():
     # 宣言の側からも開発中の mod を抜く。
     # 手元の `load_order.local.json` は 9xx を名指ししている（そうしないと動かない）ので、
     # 片側だけ抜くと今度は手元でだけ赤くなる。
-    check(found == [n for n in declared if not ml.is_wip(n)],
-          "並びが {} の宣言どおり（開発中を除く）"
+    check(found == [n for n in declared
+                    if not ml.is_wip(n) and n not in local],
+          "並びが {} の宣言どおり（開発中と local/ を除く）"
           .format(os.path.basename(order_file)))
 
     # 適用順は「宣言の並びから、切られているものを抜いたもの」。

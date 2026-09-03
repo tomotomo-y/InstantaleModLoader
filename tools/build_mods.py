@@ -42,6 +42,10 @@ PREAMBLE = r"""# MODS: 同梱している MOD
 1行ずつ見渡したいときは [MODLIST.md](MODLIST.md)。
 ローダと GUI の使い方は [README.md](README.md)。
 
+**この文書は `tools/build_mods.py` が各 MOD の `DOC.md` を綴じたもの。**
+手で書き換えても次の生成で消える。
+直す先はその MOD のフォルダの `DOC.md`。
+
 フォルダ名の先頭の番号が種類と適用順を表す。
 
 | 番号帯 | 種類 | 中身 |
@@ -73,7 +77,7 @@ CONTRIB_HEAD = "## 提供（4xx）"
 CONTRIB_INTRO = r"""ユーザから提供を受けて取り込んだ MOD。
 `4xx` の番号は出どころを表すもので、中身の種別は他の帯と同じく
 `mod.json` の `"kind"` が名乗る（提供された計測 MOD は 2xx に入る。`223_` がそれ）。
-取り込みの際にこちらの環境へ合わせた調整を行っており、経緯は各 MOD の説明にある。"""
+取り込みの際にこちらの環境へ合わせて調整しており、経緯は各 MOD の説明にある。"""
 
 #: 計測の帯だけは節を持たないので、導入をここに置く。
 PROBE_INTRO = r"""いずれもゲームは変更しない。
@@ -110,6 +114,8 @@ BANDS = (
         "128_item_image_variety",
         "129_balance_item_price",
         "130_currency_unit",
+        "131_sharp_portrait",
+        "132_npc_variety",
         "111_llm_prompt_replace",
         "117_message_text_integrity",
         "127_llm_response_speed",
@@ -153,12 +159,15 @@ BANDS = (
         "320_guild_adventurer_recruit",
         "321_area_chronicle",
         "322_battle_bgm",
+        "323_npc_carryover",
+        "324_place_bgm",
     )),
     ("feature", CONTRIB_HEAD, (
         "401_battle_character_context",
         "402_party_inventory_transfer",
         "403_npc_social_memory",
         "404_party_talk",
+        "405_regional_economy",
     )),
 )
 

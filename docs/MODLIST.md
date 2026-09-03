@@ -8,8 +8,8 @@
 手で書き換えても次の生成で消える。
 直す先は各 MOD の `mod.json` か MODS.md の見出し。
 
-同梱 88 本（基盤 2 / 修正 36 / 追加 26 / 計測 24）。
-うち 15 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
+同梱 94 本（基盤 2 / 修正 38 / 追加 29 / 計測 25）。
+うち 16 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
 
 並びはフォルダ名順。
 適用順はこれとは別で、GUI の `順` 列（`load_order.json`）が持つ。
@@ -36,7 +36,7 @@
 
 ---
 
-## 修正（36本）
+## 修正（38本）
 
 ゲームのバグ・不便を直す。
 
@@ -74,14 +74,16 @@
 | [`124_ui_craft_window_fit`](MODS.md#124_ui_craft_window_fit-クラフト画面の枠の重なりを直す) | クラフト画面の枠の重なりを直す | クラフト画面の枠の重なりを直す | 3 |  |
 | [`125_balance_charisma_impression`](MODS.md#125_balance_charisma_impression-魅力が高いと初対面から全員に好かれるのを直す) | 魅力が高いと初対面から全員に好かれるのを直す | 魅力が高いと初対面から全員に好かれるのを直す | 3 |  |
 | [`126_ui_title_version`](MODS.md#126_ui_title_version-タイトル画面にローダの版を出す) | タイトル画面にローダの版を出す | タイトル画面にローダの版を出す | 4 |  |
-| [`127_llm_response_speed`](MODS.md#127_llm_response_speed-ローカル-llm-の応答を速くする) | ローカルLLMの応答を速くする | ローカル LLM の応答を速くする | 4 |  |
-| [`128_item_image_variety`](MODS.md#128_item_image_variety-アイテム画像の偏りを均す) | アイテム画像の均し | アイテム画像の偏りを均す | 4 |  |
+| [`127_llm_response_speed`](MODS.md#127_llm_response_speed-ローカル-llm-の応答を速くする) | ローカルLLMの応答を速くする | ローカル LLM の応答を速くする | 3 |  |
+| [`128_item_image_variety`](MODS.md#128_item_image_variety-アイテム画像の偏りを均す) | アイテム画像の均し | アイテム画像の偏りを均す | 3 |  |
 | [`129_balance_item_price`](MODS.md#129_balance_item_price-アイテムの値段を付け直す) | アイテムの値付けの調整 | アイテムの値段を付け直す | 19 |  |
-| [`130_currency_unit`](MODS.md#130_currency_unit-通貨の呼び名と所持金の表示を変える) | 通貨の表記を変更する | 通貨の呼び名と所持金の表示を変える | 5 |  |
+| [`130_currency_unit`](MODS.md#130_currency_unit-通貨の呼び名と所持金の表示を変える) | 通貨の表記を変更する | 通貨の呼び名と所持金の表示を変える | 4 |  |
+| [`131_sharp_portrait`](MODS.md#131_sharp_portrait-立ち絵の縮小減色を通さず顔の検出をやり直す) | 立ち絵の高画質化と顔認識精度の向上 | 立ち絵の縮小・減色を通さず、顔の検出をやり直す | 2 |  |
+| [`132_npc_variety`](MODS.md#132_npc_variety-npc-の外見性格経歴に種を渡す) | NPC の外見・性格・経歴の多様化 | NPC の外見・性格・経歴に種を渡す | 7 |  |
 
 ---
 
-## 追加（26本）
+## 追加（29本）
 
 ゲームに無かった遊びを足す。
 
@@ -109,14 +111,17 @@
 | [`320_guild_adventurer_recruit`](MODS.md#320_guild_adventurer_recruit-ギルドの冒険者の補充) | ギルドの冒険者の補充 | ギルドの冒険者の補充 | 2 |  |
 | [`321_area_chronicle`](MODS.md#321_area_chronicle-エリアの状況を更新依頼クリアで案内文が変わる) | エリアの状況を更新 | エリアの状況を更新（依頼クリアで案内文が変わる） | 4 |  |
 | [`322_battle_bgm`](MODS.md#322_battle_bgm-戦闘bgmを置いた曲から選んで鳴らす) | 戦闘BGMの選曲 | 戦闘BGMを置いた曲から選んで鳴らす | 2 |  |
+| [`323_npc_carryover`](MODS.md#323_npc_carryover-別の世界のnpcを連れてくる) | 別の世界のNPCを連れてくる | 別の世界のNPCを連れてくる | 4 |  |
+| [`324_place_bgm`](MODS.md#324_place_bgm-施設と土地のbgmを置いた曲から選んで鳴らす) | 街・施設BGMの選曲 | 施設と土地のBGMを置いた曲から選んで鳴らす | 4 |  |
 | [`401_battle_character_context`](MODS.md#401_battle_character_context-戦闘の審判へ同行者の人物と装備を見せる) | 戦闘キャラクター情報補完 | 戦闘の審判へ同行者の人物と装備を見せる | - |  |
 | [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | パーティーメンバー：アイテム受け渡し | 仲間とアイテムを受け渡しできる | - |  |
 | [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | NPC同士の認知と関係記憶 | NPC同士がお互いを認知し、関係を覚える | 5 |  |
 | [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | パーティーメンバーと話す | パーティーメンバー全員と話す | 7 |  |
+| [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給で売買の値段が変わる) | 地域毎に物価が変動する | 街ごとの需給で売買の値段が変わる | 5 |  |
 
 ---
 
-## 計測（24本）
+## 計測（25本）
 
 ゲームは変えない。`out\` にログを残すだけ。デバッグモードのときだけ読み込まれる。
 
@@ -135,7 +140,7 @@
 | `210_probe_character_state` | NPC の死亡の印を特定し、誰がその NPC を参照しているかを数えて、印だけで安全に退場させられるかを測る |
 | `211_probe_text_speed` | 本文の1文字ごとの間隔・`app.text_speed`・フレームレート・ラベルのテクスチャ作り直しの重さを測る |
 | `212_probe_character_sheet` | プレイヤーの人物欄の実寸と組み立てを写し取り、載せられる値（手配度・スキル・特性）の在り処を確かめる |
-| `213_probe_npc_memory` | ゲーム自身が NPC ごとに覚えるもの（`memory`・`life_log`・`relationship`・`knowledge`）の実体と、それが会話プロンプトへどう載るか、プロンプト内の重複量（`311_` の注入分も含む）を測る |
+| `213_probe_npc_memory` | ゲーム自身が NPC ごとに覚えるもの（`memory`・`life_log`・`relationship`・`knowledge`）の実体を測る |
 | `214_probe_new_character` | 新規作成したキャラクタが経験値0のままレベル60で始まる経路を写す |
 | `215_probe_event_roll` | クエスト中のミニイベントの成否判定を写す |
 | `216_probe_llm_overlap` | LLM リクエストの多重送信をプロセス内で数える（`127_` の `--parallel 1` によるキュー待ちが実プレイでどれだけ起こるか） |
@@ -145,13 +150,14 @@
 | `220_probe_bounty_hunter` | 手配度に応じて追手を出す MOD（`316_`）を書くための下調べ |
 | `221_probe_item_level` | 品物のレベルを誰が決めているかを録る |
 | `222_probe_battle_mechanics` | 戦闘の数の作られ方を録る |
-| `223_probe_party_equipment` | 本体のアイテム popup と `ItemEquipManager` / `ItemUnequipManager` の入口を観測し、素のゲームが実際に誰の `equipments` を書き換えるかを測る（`402_party_inventory_transfer` が NPC の装備を直書きし続けるかを決める材料） |
+| `223_probe_party_equipment` | 本体のアイテム popup と `ItemEquipManager` / `ItemUnequipManager` の入口を観測し、素のゲームが実際に誰の `equipments` を書き換えるかを測る |
+| `224_probe_npc_carryover` | ロードのどの地点から世界へ NPC を入れられるかを測る |
 
 ---
 
 ## 提供を受けた MOD
 
-外部の MOD 作者から提供を受けて同梱している 15 本。
+外部の MOD 作者から提供を受けて同梱している 16 本。
 
 **番号の帯では数えられない。**
 いま提供を取り込む先は出どころの帯（`4xx`）だが、
@@ -179,3 +185,4 @@
 | [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | MoririnJP 様 | そのまま取り込み |
 | [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | MoririnJP 様 | そのまま取り込み |
 | [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | MoririnJP 様 | 提供者と共同 |
+| [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給で売買の値段が変わる) | MoririnJP 様 | 提供者と共同 |
