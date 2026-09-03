@@ -1,0 +1,60 @@
+{
+  "entry": "quest_split_generation.py",
+  "api": 1,
+  "kind": "fix",
+  "name": {
+    "en": "Generate the three quests one at a time",
+    "ja": "討伐クエスト3件を1件ずつ生成する"
+  },
+  "description": {
+    "en": "When the game asks for quest_1..3 in one shot, splits the call into three single-quest generations and merges the results",
+    "ja": "ゲームが quest_1〜3 を一括で求めるとき、1件ずつの生成に分けてから結合して返す"
+  },
+  "version": "1",
+  "author": "yoshinari/tomotomo-y",
+  "after": [
+    "1133_generation_limits"
+  ],
+  "settings": {
+    "ENABLED": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "この MOD を使う",
+        "en": "Enable this mod"
+      },
+      "note": {
+        "ja": "OFF にすると一括生成のまま通す",
+        "en": "OFF leaves the original one-shot generation alone"
+      }
+    },
+    "MAX_ATTEMPTS": {
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 10,
+      "label": {
+        "ja": "1スロットあたりの再試行回数",
+        "en": "Retries per quest slot"
+      },
+      "note": {
+        "ja": "スロットが取れなかった／例外のときに同じスロットをやり直す上限",
+        "en": "How many times to retry a slot when the value is missing or the call raises"
+      }
+    },
+    "LOG_LIMIT": {
+      "type": "int",
+      "default": 30,
+      "min": 0,
+      "max": 999,
+      "label": {
+        "ja": "ログに残す分割の件数",
+        "en": "How many splits to log"
+      },
+      "note": {
+        "ja": "out\\quest_split_generation.log に残す。0 で何も出さない",
+        "en": "Lines kept in out\\quest_split_generation.log. 0 = log nothing"
+      }
+    }
+  }
+}
