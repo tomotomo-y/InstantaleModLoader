@@ -91,6 +91,8 @@ EXTRACT_TIMEOUT = 120
 
 # 抽出に載せる書き起こしの長さ（長すぎると要点が薄まる）。
 CONVERSATION_CHARS = 2600
+# 404 がセッション全文を渡すときの上限。
+GROUP_CONVERSATION_CHARS = 8000
 
 # 待ち行列へ積んだままにする仕事の上限。
 # 溢れたら古い方を捨てる（新しい会話ほど関係に効くため）。
@@ -101,6 +103,9 @@ MAX_PENDING = 8
 # `apply()` は再注入と遅延当て直しで何度も走り、そのたびに worker が None に戻る。
 # `sys` に置けば世代をまたいで同じ1組を共有できる。
 STORE_ATTR = "__instantale_npc_social_memory_store__"
+
+# 404_party_talk の棚。active 中は自動抽出を止め、終了時の一括抽出に任せる。
+PARTY_TALK_STORE = "__instantale_party_talk__"
 
 #: 会話相手の profile の末尾へ足す塊の見出し。
 HEADING = "【現在この場に同行している人物】"
@@ -637,15 +642,21 @@ def apply(ctx):
         参加 NPC が2人未満（会話相手だけ）なら関係は生まれないので見送る。
         """
         ids = participant_ids(app, conversation_id)
-        people = people_of(app, ids)
+        return snapshot_from(app, ids, transcribe(app, conversation_id))
+
+    def snapshot_from(app, ids, transcript, *, limit=None):
+        """参加者 id と台本を渡して写しを組む（404 の外部口からも使う）。"""
+        people = people_of(app, [str(i) for i in ids if i])
         if len(people) < 2:
             note_skip("fewer than two NPC participants: {}".format(ids))
             return None
 
-        transcript = transcribe(app, conversation_id)
-        if not transcript:
+        text = transcript.strip() if isinstance(transcript, str) else ""
+        if not text:
             note_skip("conversation transcript is empty")
             return None
+        cap = CONVERSATION_CHARS if limit is None else max(1, int(limit))
+        text = text[-cap:]
 
         key = world_key(app)
         existing = {}
@@ -657,7 +668,7 @@ def apply(ctx):
                 existing[(observer["id"], target["id"])] = (
                     _field(record, "relationship"), recent_facts(record))
         return {"world": key, "people": people,
-                "transcript": transcript, "existing": existing}
+                "transcript": text, "existing": existing}
 
     def build_messages(snap):
         """抽出 LLM へ渡す messages と、許す id の一覧を返す。
@@ -842,15 +853,42 @@ changed=falseならrelations=[]。""".format(player_name=player_name,
                   [len(p["about_player"]) for p in snap["people"]],
                   len(snap["transcript"])))
 
+    def enqueue_transcript(app, participant_ids, transcript):
+        """他 MOD（404 など）から、既に組んだ多人数台本で抽出を積む。
+
+        `participant_ids` は会話相手＋仲間。2人未満なら見送る。
+        メインスレッドから呼ぶこと。
+        """
+        snap = snapshot_from(app, participant_ids, transcript,
+                             limit=GROUP_CONVERSATION_CHARS)
+        if snap is None:
+            return False
+        if not worker.enqueue(snap):
+            return False
+        store["last_skip"] = None
+        write("extract queued (external): participants={} transcript={} chars".format(
+            [p["name"] for p in snap["people"]], len(snap["transcript"])))
+        return True
+
+    store["api"] = {"enqueue_transcript": enqueue_transcript}
+
+    def party_talk_active():
+        party = getattr(sys, PARTY_TALK_STORE, None)
+        return isinstance(party, dict) and bool(party.get("active"))
+
     def schedule_extract(app):
         """会話が1手進んだときの入口。次のフレームに `enqueue` を予約する。
 
         フックの戻り時点ではなく次のフレームで写すのは、本体が同じ手の処理
         （履歴への追記など）を終えてから読むため。
+        パーティー会話中は 404 が終了時に一括で積むので、ここでは積まない。
         """
         app = app or ui.find_app()
         if app is None:
             note_skip("no running app")
+            return
+        if party_talk_active():
+            note_skip("party talk active; defer to 404")
             return
         conversation_id = getattr(app, "in_conversation", None)
         if not isinstance(conversation_id, str) or not conversation_id:

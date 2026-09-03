@@ -418,6 +418,40 @@ check("例外を残さない", ctx.errors == [], ctx.errors)
 shutil.rmtree(out_dir, ignore_errors=True)
 
 
+print("404 経由の外部台本")
+app = InstantaleApp()
+ctx, out_dir = fresh(app)
+fake = FakeLLM(structured=answer(["同行中に言い合った"]))
+# パーティー会話中は自動抽出を積まない
+sys.__dict__[MOD.PARTY_TALK_STORE] = {"active": True}
+FakeClock.scheduled = []
+original_ask, original_create = llm.ask, llm.create_structure
+llm.ask, llm.create_structure = fake.ask, fake.create_structure
+try:
+    ctx.hooks[TURN](lambda self, text: None,
+                    types.SimpleNamespace(app=app), "どう思う？")
+    FakeClock.run_all()
+    check("パーティー会話中は自動抽出を積まない",
+          fake.calls == [] and any("party talk active" in n for n in ctx.notes),
+          (fake.calls, ctx.notes[-3:]))
+    api = getattr(sys, MOD.STORE_ATTR)["api"]["enqueue_transcript"]
+    ok = api(app, ["80", "81"],
+             "主人公: どう思う？\n宿の娘: 信用できない\nガルド: そうか")
+    getattr(sys, MOD.STORE_ATTR)["worker"].jobs.join()
+finally:
+    llm.ask, llm.create_structure = original_ask, original_create
+    if MOD.PARTY_TALK_STORE in sys.__dict__:
+        del sys.__dict__[MOD.PARTY_TALK_STORE]
+check("外部台本で抽出が走る", ok is True and fake.calls, fake.calls)
+prompt = fake.calls[0][1][0]["content"] if fake.calls else ""
+check("外部台本の本文が載る", "宿の娘: 信用できない" in prompt, prompt[-300:])
+saved = json.load(io.open(state_file(ctx, app), encoding="utf-8"))
+check("外部台本の結果が保存される",
+      saved.get("80", {}).get("relations", {}).get("81", {}).get("relationship")
+      == "信用していない。", saved)
+shutil.rmtree(out_dir, ignore_errors=True)
+
+
 print()
 if failures:
     print("FAILED: {}".format(", ".join(failures)))
