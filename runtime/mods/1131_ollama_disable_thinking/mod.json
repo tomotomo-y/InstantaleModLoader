@@ -1,0 +1,43 @@
+{
+  "entry": "ollama_disable_thinking.py",
+  "api": 1,
+  "kind": "fix",
+  "name": {
+    "en": "Disable thinking on Ollama OpenAI API",
+    "ja": "Ollama（OpenAI互換）の思考モードを切る"
+  },
+  "description": {
+    "en": "Adds reasoning_effort=none to OpenAI-compatible chat/completions so Ollama does not run thinking mode",
+    "ja": "OpenAI 互換の chat/completions に reasoning_effort=none を足し、Ollama の思考モードを止める"
+  },
+  "version": "1",
+  "author": "yoshinari/tomotomo-y",
+  "settings": {
+    "ENABLED": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "思考モードを切る",
+        "en": "Disable thinking"
+      },
+      "note": {
+        "ja": "OFF にすると何もしない。任意 OpenAI 互換（Ollama の /v1）向け",
+        "en": "OFF does nothing. For OpenAI-compatible endpoints (Ollama /v1)"
+      }
+    },
+    "LOG_LIMIT": {
+      "type": "int",
+      "default": 5,
+      "min": 0,
+      "max": 999,
+      "label": {
+        "ja": "書き換えをログに出す回数",
+        "en": "How many patches to log"
+      },
+      "note": {
+        "ja": "0 にすると何も出さない。効いているかの確認用",
+        "en": "0 = log nothing. Enough to confirm the hook works"
+      }
+    }
+  }
+}
