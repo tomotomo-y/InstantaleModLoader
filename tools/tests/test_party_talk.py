@@ -9,6 +9,7 @@
   分配   … アンカーの台詞は本体の返答に、残りは表示待ちへ。参加者以外と重複は落とす
   表示   … 仲間の台詞は本体の履歴に積まず、立ち絵の切り替えは Clock に載る
   合流   … 自分のプロンプトには仲間の台詞が出た位置に並ぶ
+  記憶   … ラウンドで1ファイルへ追記し、終了時に 311/403 へ分配
   横取り … アンカー以外の facilitator と、会話の外では素通し
 """
 import importlib.util
@@ -87,6 +88,28 @@ check("素の JSON", MOD.parse_unstructured(json.dumps(plain, ensure_ascii=False
 check("フェンス付き", MOD.parse_unstructured("```json\n" + json.dumps(plain) + "\n```") == plain)
 check("説明混じり", MOD.parse_unstructured("結果:\n" + json.dumps(plain) + "\n以上") == plain)
 check("読めなければ None", MOD.parse_unstructured("いいえ") is None)
+print("整形と名前")
+check("末尾の書式残骸を落とす",
+      MOD.clean_statement("……できてます……っ！】 ,{") == "……できてます……っ！")
+check("本文の括弧は残す", MOD.clean_statement("（笑う）") == "（笑う）")
+check("記号だけは空", MOD.clean_statement("】 , {") == "")
+check("JSON 断片の残骸も落とす",
+      MOD.clean_statement('よし】 , {"speaker"') == "よし")
+# 実機 round6: statement 値の途中で JSON が閉じ、その先にメタ説明が付いた。
+check("JSON 閉じ以降のメタ説明を落とす",
+      MOD.clean_statement(
+          "行け、ガルド様！ もっと深く貫いてあげて！」}]}view more说明: 这是关于RPG"
+      ) == "行け、ガルド様！ もっと深く貫いてあげて！")
+check("閉じだけ混入しても落とす",
+      MOD.clean_statement("覚悟はいいか。}]}") == "覚悟はいいか。")
+check("名前の揺れを潰す",
+      MOD.normalize_name("ガルド_ストーン") == MOD.normalize_name("ガルド・ストーン"))
+check("プレースホルダは一致しない",
+      MOD.normalize_name("アンカーNPC名") != MOD.normalize_name("アリス"))
+check("人数が少なくとも下限トークン",
+      MOD.round_max_tokens(1) == MOD.TOKEN_MIN
+      and MOD.round_max_tokens(2) == MOD.TOKEN_MIN
+      and MOD.round_max_tokens(6) == MOD.TOKEN_PER_PARTICIPANT * 6)
 # `content_violation` は判らない語を False へ倒す（`llm.truthy(unknown=False)`）。
 check("真偽は true 系の文字列だけ",
       MOD.llm.truthy("true", unknown=False) and MOD.llm.truthy("1", unknown=False)
@@ -282,6 +305,9 @@ class Ctx(object):
     def log_exc(self, message):
         self.errors.append(message)
 
+    def write_json(self, path, data, *, indent=1):
+        return ml.write_json(path, data, indent=indent, report=self.log_exc)
+
     def read_json(self, path, default=None):
         return ml.read_json(path, default, report=self.log_exc)
 
@@ -316,11 +342,13 @@ def fresh():
 
 answers = []
 asked = []
+asked_tokens = []
 
 
 def fake_ask(ctx, manager_name, message, *, timeout, structure=None,
              max_tokens=None, label="llm", write=None):
     asked.append(message[0]["content"])
+    asked_tokens.append(max_tokens)
     return answers.pop(0) if answers else None
 
 
@@ -380,11 +408,18 @@ check("落とした理由がログに残る",
       any("duplicate:ハナ" in n and "nonparty:誰か" in n for n in ctx.notes))
 check("プロンプトに参加者と 311/403 の見出しが載る",
       "【参加NPC】" in asked[-1] and "【403:" in asked[-1] and "【アンカーNPC】" in asked[-1])
+check("末尾の出力例にアンカーの実名があり、プレースホルダは無い",
+      '"speaker":"アリス"' in asked[-1] and '"speaker":"アンカーNPC名"' not in asked[-1])
+check("2人なら max_tokens は下限", asked_tokens[-1] == MOD.round_max_tokens(2))
 
+answers.append({"content_violation": "false", "responses": [
+    {"speaker": "ハナ", "statement": "アンカーが黙っている"}]})
 answers.append({"content_violation": "false", "responses": [
     {"speaker": "ハナ", "statement": "アンカーが黙っている"}]})
 result, _ = facilitate(ctx, APP.world.characters["8"])
 check("アンカーの台詞が無ければ黙って聞く", result.action.statement == "（黙って話を聞いている）")
+check("アンカー欠落は1回呼び直す",
+      any("retry 1: reason=anchor-empty" in n for n in ctx.notes))
 
 answers.append({"content_violation": "true", "responses": []})
 result, _ = facilitate(ctx, APP.world.characters["8"])
@@ -394,6 +429,49 @@ answers.append(None)
 answers.append('```json\n{"content_violation":"false","responses":[{"speaker":"アリス","statement":"代替経路"}]}\n```')
 result, _ = facilitate(ctx, APP.world.characters["8"])
 check("構造化が読めなければ no-structure に降りる", result.action.statement == "代替経路")
+
+answers.append({"content_violation": "false", "responses": [
+    {"speaker": "アリス", "statement": "できてます……っ！】 ,{"}]})
+result, _ = facilitate(ctx, APP.world.characters["8"])
+check("末尾の書式残骸は表示前に落とす", result.action.statement == "できてます……っ！")
+check("削ったらログに残る", any("sanitized:" in n for n in ctx.notes))
+
+APP.world.characters["15"].name = "ガルド・ストーン"
+answers.append({"content_violation": "false", "responses": [
+    {"speaker": "アリス", "statement": "本体"},
+    {"speaker": "ガルド_ストーン", "statement": "揺れ"},
+]})
+result, _ = facilitate(ctx, APP.world.characters["8"])
+check("・と_の揺れは参加者の正規表記へ引き当てる",
+      [x["speaker"] for x in store["pending"]] == ["ガルド・ストーン"], store["pending"])
+check("引き当てたらログに残る",
+      any("matched:'ガルド_ストーン'->'ガルド・ストーン'" in n for n in ctx.notes))
+APP.world.characters["15"].name = "ハナ"
+
+answers.append({"content_violation": "false", "responses": [
+    {"speaker": "アリス", "statement": "本体"},
+    {"speaker": "アンカーNPC名", "statement": "偽物"},
+]})
+result, _ = facilitate(ctx, APP.world.characters["8"])
+check("プレースホルダの speaker は落とす",
+      store["pending"] == [] and any("nonparty:アンカーNPC名" in n for n in ctx.notes),
+      store["pending"])
+
+answers.append({"content_violation": "false", "responses": []})
+answers.append({"content_violation": "false", "responses": [
+    {"speaker": "アリス", "statement": "修復"}]})
+result, _ = facilitate(ctx, APP.world.characters["8"])
+check("壊れた応答は1回呼び直して採る", result.action.statement == "修復")
+check("再試行の理由がログに残る",
+      any("retry 1: reason=responses-empty" in n for n in ctx.notes))
+
+answers.append({"content_violation": "false", "responses": []})
+answers.append({"content_violation": "false", "responses": []})
+result, passed = facilitate(ctx, APP.world.characters["8"])
+check("2回とも壊れても本体へ返す（横取りを捨てない）",
+      passed == [] and result is not None
+      and getattr(getattr(result, "action", None), "statement", None) == "（黙って話を聞いている）")
+
 
 
 # ---------------------------------------------------------------- 表示と合流（切り替え方式）
@@ -440,7 +518,8 @@ MOD.PROMPT_CHARS, saved_chars = limit, MOD.PROMPT_CHARS
 answers.append({"content_violation": "false", "responses": [{"speaker": "アリス", "statement": "x"}]})
 facilitate(ctx, APP.world.characters["8"])
 check("上限を超えたら人物ブロックから削り、直近の対話ログは残る",
-      len(asked[-1]) <= limit and asked[-1].endswith(log) and any("prompt trimmed" in n for n in ctx.notes),
+      len(asked[-1]) <= limit and "発言5" in asked[-1] and "【出力形式】" in asked[-1]
+      and any("prompt trimmed" in n for n in ctx.notes),
       (len(asked[-1]), limit, asked[-1][-80:]))
 MOD.PROMPT_CHARS = saved_chars
 
@@ -449,6 +528,117 @@ check("会話を終えると控えを全部捨てる",
       store["active"] is False and store["extras"] == [] and store["anchor"] is None)
 result, passed = facilitate(ctx, APP.world.characters["8"])
 check("終えた後は素通しに戻る", result == "ORIG")
+
+
+# ---------------------------------------------------------------- パーティ会話記憶
+print("パーティ会話記憶")
+ctx = fresh()
+store = getattr(sys, MOD.STORE)
+store.update({"active": True, "anchor": "8", "participants": ["8", "15"],
+              "extras": [{"at": 2, "text": "ハナ: 効率は別問題です"}],
+              "pending": [], "round": 1, "session_slot": None})
+APP.current_conversation_history = [
+    {"role": "user", "content": "二人ともどう思う？"},
+    {"role": "assistant", "content": "悪くないね"},
+]
+seen_311 = []
+seen_403 = []
+
+
+def fake_311_group(app, ids, transcript):
+    seen_311.append((list(ids), transcript))
+    return True
+
+
+def fake_403(app, ids, transcript):
+    seen_403.append((list(ids), transcript))
+    return True
+
+
+sys.__dict__[MOD.PROFILE_STORE] = {"api": {"enqueue_group_transcript": fake_311_group}}
+sys.__dict__[MOD.SOCIAL_STORE] = {"api": {"enqueue_transcript": fake_403}}
+check("ターン後にセッションを追記する",
+      ctx.hooks[TURN](lambda self, text: "TURN", Phase(APP), "x") == "TURN")
+check("ラウンドでは 311/403 へ分配しない",
+      seen_311 == [] and seen_403 == [], (seen_311, seen_403))
+check("ログに session saved が残る",
+      any("memory session saved" in n for n in ctx.notes), ctx.notes[-5:])
+saved = store["worlds"].of(APP)[1]
+check("セッションが1件残る",
+      isinstance(saved, dict) and len(saved.get("sessions") or []) == 1, saved)
+check("ラウンド追記では summary をまだ確定しない",
+      not (saved.get("summary") or "").strip(), saved.get("summary"))
+check("終了時に 311 一括と 403 へ分配する",
+      ctx.hooks[END](lambda self: None, object()) is None)
+check("311 は参加者列を1回渡す",
+      len(seen_311) == 1 and seen_311[0][0] == ["8", "15"], seen_311)
+check("403 は参加者列と台本を1回渡す",
+      len(seen_403) == 1 and seen_403[0][0] == ["8", "15"], seen_403)
+transcript = seen_311[0][1] if seen_311 else ""
+check("台本は話者名付きで仲間の台詞も載る",
+      "主人公: 二人ともどう思う？" in transcript
+      and "アリス: 悪くないね" in transcript
+      and "ハナ: 効率は別問題です" in transcript
+      and "user:" not in transcript and "assistant:" not in transcript,
+      transcript)
+check("ログに memory split が残る",
+      any("memory split:" in n for n in ctx.notes), ctx.notes[-8:])
+saved = store["worlds"].of(APP)[1]
+check("終了時に summary が残る",
+      bool((saved.get("summary") or "").strip()), saved.get("summary"))
+
+result, passed = facilitate(ctx, APP.world.characters["8"])
+check("終えた後は素通しに戻る", result == "ORIG")
+injected = passed[0][3].profile if passed else ""
+check("1対1の会話へ要約を注入する",
+      MOD.MEMORY_HEADING in injected, injected)
+
+print("終了時に本体履歴が空でもファイルの台本で分配する")
+ctx = fresh()
+store = getattr(sys, MOD.STORE)
+store.update({"active": True, "anchor": "8", "participants": ["8", "15"],
+              "extras": [{"at": 2, "text": "ハナ: 効率は別問題です"}],
+              "pending": [], "round": 1, "session_slot": None,
+              "split_ids": None, "split_transcript": None})
+APP.current_conversation_history = [
+    {"role": "user", "content": "二人ともどう思う？"},
+    {"role": "assistant", "content": "悪くないね"},
+]
+seen_311 = []
+seen_403 = []
+sys.__dict__[MOD.PROFILE_STORE] = {"api": {"enqueue_group_transcript": fake_311_group}}
+sys.__dict__[MOD.SOCIAL_STORE] = {"api": {"enqueue_transcript": fake_403}}
+check("ターン後にセッションを追記する",
+      ctx.hooks[TURN](lambda self, text: "TURN", Phase(APP), "x") == "TURN")
+APP.current_conversation_history = []
+store["extras"] = []
+check("本体が履歴を消しても分配する",
+      ctx.hooks[END](lambda self: None, object()) is None)
+check("空履歴でも 311 へ台本が渡る",
+      len(seen_311) == 1 and "主人公: 二人ともどう思う？" in seen_311[0][1]
+      and "ハナ: 効率は別問題です" in seen_311[0][1],
+      seen_311[0][1] if seen_311 else "")
+check("空履歴でも 403 へ同じ台本が渡る",
+      len(seen_403) == 1 and seen_403[0][1] == seen_311[0][1], seen_403)
+check("空履歴でも memory split が残る",
+      any("memory split:" in n for n in ctx.notes)
+      and not any("empty transcript" in n for n in ctx.notes), ctx.notes[-8:])
+
+MASTER = "scripts.llm.llm_manager:master_ai_facilitator"
+seen_world = []
+
+
+def orig_master(player, log, worldview, *rest):
+    seen_world.append(worldview)
+    return "AI"
+
+
+check("master_ai の worldview へも要約を足す",
+      ctx.hooks[MASTER](orig_master, APP.player, "log", "世界観本文") == "AI"
+      and seen_world and MOD.MEMORY_HEADING in seen_world[0], seen_world)
+for key in (MOD.PROFILE_STORE, MOD.SOCIAL_STORE):
+    if key in sys.__dict__:
+        del sys.__dict__[key]
 
 
 # ---------------------------------------------------------------- 立ち絵を並べる

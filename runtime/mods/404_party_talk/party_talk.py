@@ -8,9 +8,12 @@
 押すと「パーティーメンバーと話す」と「やめる」だけの一覧を開く。
 
 その会話の間だけ `llm_manager:conversation_facilitator` / `_after_retrieval` を横取りし、
-参加者全員ぶんの人物情報（ゲームの設定に `311_` / `403_` の state を読むだけで添える）を載せた
-MOD 専用プロンプトで LLM を1回だけ呼ぶ。返答のうちアンカーの台詞は本体の通常返答として返し、
+参加者全員ぶんの人物情報（ゲームの設定に `311_` / `403_` の state を添える）と
+パーティ会話記憶の短い要約を載せた MOD 専用プロンプトで LLM を呼ぶ
+（形式が壊れていれば1回だけ呼び直す）。返答のうちアンカーの台詞は本体の通常返答として返し、
 残りの仲間の台詞は `ConversationPhaseManager.conversation_continued` が返った直後に順に表示する。
+表示後に話者名付きの台本を `state/party_talk_memory/` へ追記する（LLM は呼ばない）。
+会話が終わったときに 311 一括抽出と 403 関係抽出を1回ずつ積む。
 
     プレイヤーの入力
       └─ ConversationPhaseManager.execute（ワーカースレッド）
@@ -18,15 +21,19 @@ MOD 専用プロンプトで LLM を1回だけ呼ぶ。返答のうちアンカ�
                 └─ アンカーの台詞 → 本体が表示
            └─ conversation_continued 復帰 ── flush_extras()
                 └─ 仲間ごとに add_text → wait_for_add_text
+                └─ party_talk_memory へ台本を追記
+           └─ 終了 ── 台本を写してから 311 一括 + 403 へ分配
+                （本体の finish_conversation は要約前に履歴を空にする）
 
 会話の境界は本体の「話し合いを終了する」（`ConversationEndManager`）。
 1ラウンド（プレイヤーの1発言）につき各 NPC は最大1回しか反応しない。
 
 設計の決まり（理由は DOC.md と VERIFICATION_LOG.md §2.78）:
 
-- 仲間の台詞は本体の `current_conversation_history` へ積まない。積むと `311_` の抽出が
+- 仲間の台詞は本体の `current_conversation_history` へ積まない。積むと `311_` の自動抽出が
   アンカーの発言として読む（本体の `conversation_history_to_text` は assistant を相手の名で描く）。
-  この MOD の側で「本体履歴の何件目の後か」を添えて控え、自分のプロンプトにだけ合流させる。
+  この MOD の側で「本体履歴の何件目の後か」を添えて控え、自分のプロンプトと終了時の分配に使う。
+  パーティー会話中は 311/403 の自動抽出は止まる。
 - UI は Clock（メインスレッド）からしか触らない（GAME.md §2.1）。`add_text` だけは本体が
   Clock に載せるのでワーカースレッドから呼べる。
 - 立ち絵は既定で参加者全員を横に並べる（`SIDE_BY_SIDE`）。本体の相手枠（`hud.character_image`）は
@@ -46,9 +53,13 @@ MOD 専用プロンプトで LLM を1回だけ呼ぶ。返答のうちアンカ�
 
 もとは MoririnJP 氏の `404_party_talk` v6（提供元の README.txt は work フォルダ）。
 """
+import copy
+import datetime
 import random
+import re
 import sys
 import typing
+import unicodedata
 
 from instantale_modloader import frames, llm, ui
 from instantale_modloader.state import WorldStore, world_key
@@ -107,6 +118,13 @@ BUSY_FLAGS = tuple(flag for flag in ui.BUSY_FLAGS if flag != "in_shopping")
 BATTLE_FLAGS = ("in_battle", "in_boss_battle", "in_colosseum_battle")
 # 会話の状態を置く `sys` の属性名（TECH.md §3.4。apply() が走り直しても続きが分かる）。
 STORE = "__instantale_party_talk__"
+PROFILE_STORE = "__instantale_npc_profile_memory_store__"
+SOCIAL_STORE = "__instantale_npc_social_memory_store__"
+MEMORY_DIRNAME = "party_talk_memory"
+MEMORY_HEADING = "【パーティ会話の記憶】"
+SUMMARY_CHARS = 800
+SESSION_LIMIT = 8
+SPLIT_TRANSCRIPT_CHARS = 8000
 # プロンプトの上限。全体 → 人物1人ぶん・対話ログ → 属性1項目の順に細かい。
 PROMPT_CHARS = 30000
 SECTION_CHARS = 7000
@@ -127,6 +145,28 @@ OTHER_SCREEN_SPECS = ("ConversationEndManager", "MovePhaseManager", "DisplayTalk
 #   402_party_inventory_transfer     「＜アイテムの受け渡し＞」（mod_party_inventory_transfer_equipment）
 # どちらも「会話相手が仲間なら」で差してくるので、全員と話している場面では相手が1人に定まらず筋が合わない。
 HIDDEN_MARK_KEYS = ("mod_party_action", "mod_party_inventory_transfer_equipment")
+# 壊れた応答を同じプロンプトで呼び直す回数（本体を止めないための上限）。
+ROUND_RETRIES = 1
+# 応答の上限トークン。人数 × 単価、最低 TOKEN_MIN（`403_` の max_tokens_for と同じ流儀）。
+TOKEN_PER_PARTICIPANT = 800
+TOKEN_MIN = 2400
+# statement 末尾に残る書式の残骸だけを落とす（本文の（）「」は触らない）。
+TRAIL_JUNK = "】【{}[]\"':,"
+# 名前の揺れ（・ と _ など）を潰すときに落とす文字。
+NAME_SEPARATORS = re.compile(r"[・･_＿.\-\s　]+")
+# statement 値の途中から JSON の続き・閉じ・メタ説明が混入したとき、そこから末尾まで落とす。
+# 例: ...あげて！」}]}view more说明: ... / ...っ！】 , {"speaker"
+JSON_LEAK = re.compile(
+    r'(?:'
+    r'\{\s*"(?:speaker|statement)'
+    r'|[」』"]\s*\}\s*(?:,\s*\{|\]\s*\}?)'
+    r'|\}\s*\]\s*\}'
+    r').*$',
+    re.DOTALL,
+)
+RETRY_HINT = ("前回の返答は形式が壊れていた。"
+              "JSONオブジェクト1つだけを返し、"
+              "statementにJSONの記号や【】を書かないこと。")
 
 RULES = """【全体の指示】
 あなたはRPGの会話イベントにおいて、現在この場にいるパーティーメンバーであるNPCたちの振る舞いを再現します。対話ログはuser/assistantの入出力として記録されています。user roleがプレイヤーキャラの発言で、assistant roleがNPCたちの発言です。現在の文脈に合わせ、相応しい次の反応を生成して下さい。
@@ -141,6 +181,7 @@ RULES = """【全体の指示】
 ・要約や前置きを避け、仕草や周囲の気配を一言添えるなど、その人物が実際にそこで生きているような生身の言葉で応じて下さい。プレイヤーのセリフの反芻は禁止。「……」を先頭に多用しないこと。
 ・statement内に発言者名は不要です。行動描写は（）の中に記述してください。（例: こんにちは、今日はいい天気ですね！（そう言って、彼女は元気に近づいてくる））
 ・喋らない人物でも（小さく頷く）のように行動描写だけで反応して構いません。それも1回の反応です。
+・【直近の対話ログ】は user がプレイヤー、assistant のうち「名前: 台詞」が仲間、名前なしがアンカーの台詞。statement を書くときは名前を付けない。
 
 【出力要素】
 - content_violation: プレイヤーの行動入力文が著作権侵害、安全ポリシー違反に該当するか否か。該当する場合は文字列"true"、該当しない場合は文字列"false"を指定する。"none"等の別表現を使わない。trueの場合はresponsesを空にする。falseの場合はこの判定に言及しない。
@@ -156,7 +197,8 @@ RULES = """【全体の指示】
 - このモードは会話だけを行う。移動、戦闘、売買、金銭移動、アイテム操作、状態変更、NPC生成、時間経過その他のゲーム状態変更は一切行わない。
 - 上位GMへ処理を委譲しない。会話だけでは実行できない要求も、参加NPCとして返答・拒否・同意・態度を示すだけに留める。
 - プレイヤーキャラクターの台詞や行動を生成しない。
-- responsesのspeakerは【参加NPC】の名前からのみ選ぶ。同じspeakerを複数回出力しない。
+- responsesのspeakerは【参加NPC】の名前を一字一句そのまま使う。・を_等に置き換えない。同じspeakerを複数回出力しない。
+- statementにJSONの記号（{ } [ ] " :）と【】を書かない。
 
 【基本情報】
 プレイヤーの入力ルール（括弧の種類）
@@ -167,8 +209,7 @@ RULES = """【全体の指示】
 パーティー会話では＜＞もゲーム状態を変更する命令として実行せず、参加NPCが会話・態度・行動描写として反応できる範囲だけで扱って下さい。
 
 【出力形式】
-JSONオブジェクト1つだけ。説明・コードフェンス禁止。
-{"content_violation":"false","responses":[{"speaker":"アンカーNPC名","statement":"発言または（行動描写）"},{"speaker":"必要なら他の参加NPC名","statement":"発言または（行動描写）"}]}
+JSONオブジェクト1つだけ。説明・コードフェンス禁止。具体的な形と実名の例は末尾の【出力形式】に従う。
 """
 
 
@@ -186,6 +227,38 @@ def parse_unstructured(raw):
     return llm.parse_json(raw)
 
 
+def clean_statement(text):
+    """statement 末尾の書式残骸だけを落とす。空なら空文字。
+
+    モデルが JSON の続き（`】 , {` や `{"speaker`）や閉じ（`」}]}`）を
+    値の中へ書き足し、その先にメタ説明を連ねることがある。
+    本文中の（）「」は触らない（閉じ括弧の直前で切る）。
+    """
+    if not isinstance(text, str):
+        return ""
+    body = JSON_LEAK.sub("", text.strip()).rstrip()
+    while True:
+        trimmed = body.rstrip()
+        cut = trimmed.rstrip(TRAIL_JUNK)
+        if cut == trimmed:
+            return cut.strip()
+        body = cut
+
+
+def normalize_name(name):
+    """話者名の揺れを潰す。NFKC のあと区切り（・ _ 空白など）を落として casefold。"""
+    if not isinstance(name, str):
+        return ""
+    folded = unicodedata.normalize("NFKC", name).casefold()
+    return NAME_SEPARATORS.sub("", folded)
+
+
+def round_max_tokens(count):
+    """応答の上限トークン。人数 × TOKEN_PER_PARTICIPANT、最低 TOKEN_MIN。"""
+    n = max(1, int(count or 1))
+    return max(TOKEN_MIN, TOKEN_PER_PARTICIPANT * n)
+
+
 def apply(ctx):
     write = ctx.logger("party_talk.log")
     screen = ui.Screen(ctx, write, tag="party talk", mark=MARK_KEY)
@@ -193,16 +266,27 @@ def apply(ctx):
     # 会話の状態。注入し直しても続きが分かるようにプロセスに置く。
     #   active  : パーティー会話の最中か
     #   anchor  : 本体の会話相手（この人物の facilitator だけ横取りする）
+    #   participants : 開始時の仲間 id 列（311/403 抽出の対象）
     #   round   : プレイヤーの発言回数
     #   pending : 今ラウンドの仲間の台詞（表示待ち）
     #   extras  : 表示済みの仲間の台詞。本体履歴の何件目の後に出たかを添える
     #   frames  : 自前の立ち絵の枠（仲間 id -> ウィジェット）
     st = getattr(sys, STORE, None)
     if not isinstance(st, dict):
-        st = {"active": False, "anchor": None, "round": 0, "pending": [], "extras": []}
+        st = {"active": False, "anchor": None, "participants": [],
+              "round": 0, "pending": [], "extras": [], "session_slot": None,
+              "split_ids": None, "split_transcript": None,
+              "worlds": WorldStore(ctx, MEMORY_DIRNAME)}
         setattr(sys, STORE, st)
     st.setdefault("frames", {})
+    st.setdefault("participants", [])
+    st.setdefault("session_slot", None)
+    st.setdefault("split_ids", None)
+    st.setdefault("split_transcript", None)
     st.setdefault("talk_list", False)   # 「会話する」の相手一覧を開いている（DisplayTalkChoice の旗）
+    if not isinstance(st.get("worlds"), WorldStore):
+        st["worlds"] = WorldStore(ctx, MEMORY_DIRNAME)
+    worlds = st["worlds"].rebind(ctx, write)
 
     # ------------------------------------------------------------ 構造化応答
     # create_model は llm_manager が読み込まれてからでないと作れないので、要る時に作って控える。
@@ -391,12 +475,196 @@ def apply(ctx):
             lines = lines[starts[-keep]:]
         return "\n".join(lines)[-SECTION_CHARS:]
 
+    def memory_transcript(app, *, windowed=True):
+        """話者名付き台本。windowed=True なら HISTORY_TURNS、False ならセッション全文。"""
+        hist = getattr(app, "current_conversation_history", None)
+        if not isinstance(hist, list):
+            return ""
+        pn = player_name(app)
+        anchor_id = st.get("anchor")
+        anchor_name = ui.character_name(app, anchor_id, fallback="") if anchor_id else ""
+        if not anchor_name:
+            anchor_name = "アンカー"
+        extras = {}
+        for item in st.get("extras") or []:
+            extras.setdefault(int(item.get("at", -1)), []).append(str(item.get("text") or ""))
+        lines = []
+        for index, turn in enumerate(hist):
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "?"))
+            content = turn.get("content")
+            text = content.strip() if isinstance(content, str) else ""
+            if role == "assistant" and text in ("", '"', "'"):
+                continue
+            if text and role == "user":
+                lines.append("{}: {}".format(pn, text))
+            elif text and role == "assistant":
+                lines.append("{}: {}".format(anchor_name, text))
+            elif text:
+                lines.append("{}: {}".format(role, text))
+            for extra in extras.get(index + 1, []):
+                if extra.strip():
+                    lines.append(extra.strip())
+        if windowed:
+            keep = max(2, int(HISTORY_TURNS))
+            starts = [i for i, line in enumerate(lines) if line.startswith(pn + ": ")]
+            if len(starts) > keep:
+                lines = lines[starts[-keep]:]
+            return "\n".join(lines)[-SECTION_CHARS:]
+        return "\n".join(lines)[-SPLIT_TRANSCRIPT_CHARS:]
+
+    def memory_bucket(app):
+        """世界1つぶんのパーティ会話記憶。"""
+        key = world_key(app)
+        bucket = worlds.load(key)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        if not isinstance(bucket.get("sessions"), list):
+            bucket["sessions"] = []
+        if not isinstance(bucket.get("summary"), str):
+            bucket["summary"] = ""
+        return key, bucket
+
+    def memory_summary(app):
+        """注入用の短いグループ要約。無ければ空。"""
+        if app is None:
+            return ""
+        _key, bucket = memory_bucket(app)
+        text = (bucket.get("summary") or "").strip()
+        if not text:
+            return ""
+        return MEMORY_HEADING + "\n" + frames.short(text, SUMMARY_CHARS)
+
+    def upsert_session(app, transcript, *, finalize=False):
+        """今セッションの台本をファイルへ書く。LLM は呼ばない。"""
+        if app is None or not transcript:
+            return
+        ids = [str(i) for i in (st.get("participants") or []) if i]
+        names = {i: ui.character_name(app, i, fallback=i) for i in ids}
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        entry = {
+            "at": stamp,
+            "participants": [{"id": i, "name": names.get(i, i)} for i in ids],
+            "transcript": transcript[-SPLIT_TRANSCRIPT_CHARS:],
+        }
+        key, bucket = memory_bucket(app)
+        sessions = list(bucket.get("sessions") or [])
+        slot = st.get("session_slot")
+        if isinstance(slot, int) and 0 <= slot < len(sessions):
+            entry["at"] = sessions[slot].get("at") or stamp
+            sessions[slot] = entry
+        else:
+            sessions.append(entry)
+            st["session_slot"] = len(sessions) - 1
+            if len(sessions) > SESSION_LIMIT:
+                sessions = sessions[-SESSION_LIMIT:]
+                st["session_slot"] = len(sessions) - 1
+        bucket["sessions"] = sessions
+        bucket["updated"] = stamp
+        if finalize:
+            bucket["summary"] = frames.short(transcript, SUMMARY_CHARS)
+        worlds.save(key, bucket)
+
+    def split_to_311_403(app, ids, transcript):
+        """終了時に 311 一括と 403 を1回ずつ積む。"""
+        if app is None or not transcript or not ids:
+            write("memory split skipped: transcript={} ids={}".format(
+                len(transcript or ""), ids))
+            return
+        profile = getattr(sys, PROFILE_STORE, None)
+        api311 = profile.get("api") if isinstance(profile, dict) else None
+        enqueue311 = (api311.get("enqueue_group_transcript")
+                      if isinstance(api311, dict) else None)
+        queued_311 = False
+        if callable(enqueue311):
+            try:
+                queued_311 = bool(enqueue311(app, ids, transcript))
+            except Exception:
+                ctx.log_exc("party talk: 311 group enqueue failed")
+        elif api311 is None:
+            write("memory: 311 store absent; profile split skipped")
+
+        social = getattr(sys, SOCIAL_STORE, None)
+        api403 = social.get("api") if isinstance(social, dict) else None
+        enqueue403 = (api403.get("enqueue_transcript")
+                      if isinstance(api403, dict) else None)
+        queued_403 = False
+        if callable(enqueue403):
+            try:
+                queued_403 = bool(enqueue403(app, ids, transcript))
+            except Exception:
+                ctx.log_exc("party talk: 403 enqueue failed")
+        elif api403 is None:
+            write("memory: 403 store absent; social split skipped")
+
+        write("memory split: participants={} transcript={} chars 311={} 403={}".format(
+            ids, len(transcript), queued_311, queued_403))
+
+    def session_entry(app):
+        """今セッションとして追記しているファイル上の1件。無ければ末尾。"""
+        if app is None:
+            return None
+        slot = st.get("session_slot")
+        _key, bucket = memory_bucket(app)
+        sessions = bucket.get("sessions") or []
+        if isinstance(slot, int) and 0 <= slot < len(sessions) and isinstance(sessions[slot], dict):
+            return sessions[slot]
+        if sessions and isinstance(sessions[-1], dict):
+            return sessions[-1]
+        return None
+
+    def session_ids_and_text(app):
+        """ファイルに残した参加者 id と台本。ライブ履歴が空のときの落ち先。"""
+        entry = session_entry(app)
+        if not isinstance(entry, dict):
+            return [], ""
+        people = entry.get("participants") or []
+        ids = [str(p.get("id")) for p in people if isinstance(p, dict) and p.get("id")]
+        text = entry.get("transcript") if isinstance(entry.get("transcript"), str) else ""
+        return ids, text
+
+    def capture_split_payload(app):
+        """分配用の台本を、本体が履歴を消す前に写す。既にあれば触らない。"""
+        if st.get("split_transcript"):
+            return
+        ids = [str(i) for i in (st.get("participants") or []) if i]
+        text = memory_transcript(app, windowed=False)
+        if not text:
+            stored_ids, text = session_ids_and_text(app)
+            if not ids:
+                ids = stored_ids
+        if text:
+            st["split_ids"] = ids
+            st["split_transcript"] = text
+
+    def finish_memory(app):
+        """会話を畳む前に台本を確定し、311/403 へ分配する。
+
+        本体の `finish_conversation` は要約 LLM の前に `current_conversation_history`
+        を空にする（実機 2026-09-01。`memory split skipped: empty transcript`）。
+        ライブ履歴が空なら、終了ボタン時点の写し → ラウンド追記済みのファイルの順に落とす。
+        """
+        capture_split_payload(app)
+        ids = [str(i) for i in (st.get("split_ids") or st.get("participants") or []) if i]
+        transcript = st.get("split_transcript") or ""
+        if not transcript:
+            stored_ids, transcript = session_ids_and_text(app)
+            if not ids:
+                ids = stored_ids
+        if transcript:
+            upsert_session(app, transcript, finalize=True)
+            split_to_311_403(app, ids, transcript)
+        else:
+            write("memory split skipped: empty transcript")
+
     def prompt(app, worldview, anchor_id):
         """LLM へ渡す本文を1本にする。
 
         並びは RULES → 世界観（本体が facilitator に渡すもの）→ プレイヤー名 →
-        参加NPCの一覧とアンカー → 人物の塊 → 直近の対話ログ。
+        参加NPCの一覧とアンカー → 人物の塊 → 直近の対話ログ → 出力形式（実名の例）。
         `worldview` は本体の facilitator の引数をそのまま流用する。
+        出力形式を末尾に置くのは、先頭だけだと 2万字の対話ログのあとに形式が消えるため。
         """
         ids, names, blocks = sections(app)
         anchor_name = names.get(anchor_id, "")
@@ -406,14 +674,115 @@ def apply(ctx):
         head = (RULES + world
                 + "\n\n【プレイヤーキャラ】\n- 名前: " + player_name(app)
                 + "\n\n【参加NPC】\n" + index + anchor + "\n\n")
-        tail = "\n\n【直近の対話ログ】\n" + (history(app) or "（会話開始直後）")
+        hist_block = (
+            "\n\n【直近の対話ログ】\n"
+            "（user はプレイヤー。assistant のうち「名前: 台詞」は仲間、名前なしはアンカー）\n"
+            + (history(app) or "（会話開始直後）"))
+        example_name = anchor_name or "参加NPCの名前"
+        format_tail = (
+            "\n\n【出力形式】\n"
+            "JSONオブジェクト1つだけ。説明・コードフェンス禁止。\n"
+            "speakerは【参加NPC】の表記を一字一句そのまま使う（・を_等に置き換えない）。\n"
+            "statementにJSONの記号（{ } [ ] \" :）と【】を書かない。statement内に発言者名を書かない。\n"
+            '{"content_violation":"false","responses":[{"speaker":"'
+            + example_name
+            + '","statement":"発言または（行動描写）"},'
+            '{"speaker":"必要なら他の参加NPC名","statement":"発言または（行動描写）"}]}')
         people = "\n\n".join(blocks)
-        # 上限を超えたら人物ブロックから削る。末尾から切ると直近の対話ログが先に消える。
-        budget = PROMPT_CHARS - len(head) - len(tail)
+        mem_block = ""
+        summary = memory_summary(app)
+        if summary:
+            mem_block = "\n\n" + summary
+        # 上限を超えたら人物ブロックから削る。末尾から切ると対話ログと出力形式が先に消える。
+        budget = PROMPT_CHARS - len(head) - len(mem_block) - len(hist_block) - len(format_tail)
         if len(people) > budget:
             people = people[:max(0, budget)]
             write("prompt trimmed: people {} -> {} chars".format(len("\n\n".join(blocks)), len(people)))
-        return head + people + tail, ids, names, anchor_name
+        return head + people + mem_block + hist_block + format_tail, ids, names, anchor_name
+
+    def accept_responses(data, names, ids):
+        """responses を検分する。戻りは (accepted, dropped, rows)。
+
+        accepted は (正規表記の名前, 整形した台詞) の列。
+        名前は正規化して参加者へ引き当て、表示は参加者側の表記に揃える。
+        """
+        allowed_norm = {}
+        name_to_id = {}
+        for i in ids:
+            name = names[i]
+            allowed_norm[normalize_name(name)] = name
+            name_to_id[name] = i
+        accepted = []
+        dropped = []
+        seen = set()
+        rows = data.get("responses") if isinstance(data, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            row = row if isinstance(row, dict) else llm.as_dict(row)
+            if not isinstance(row, dict):
+                continue
+            speaker = row.get("speaker")
+            statement = row.get("statement")
+            if not isinstance(speaker, str) or not isinstance(statement, str):
+                continue
+            speaker = speaker.strip()
+            raw_statement = statement.strip()
+            if not speaker or not raw_statement:
+                continue
+            statement = clean_statement(raw_statement)
+            if len(statement) != len(raw_statement):
+                write("sanitized: {} -{} chars".format(speaker, len(raw_statement) - len(statement)))
+            if not statement:
+                dropped.append("empty-statement:" + speaker)
+                continue
+            canonical = allowed_norm.get(normalize_name(speaker))
+            if canonical is None:
+                dropped.append("nonparty:" + speaker)
+                continue
+            if canonical != speaker:
+                write("matched:{!r}->{!r}".format(speaker, canonical))
+            if canonical in seen:
+                dropped.append("duplicate:" + canonical)
+                continue
+            seen.add(canonical)
+            accepted.append((canonical, statement, str(name_to_id.get(canonical, ""))))
+        return accepted, dropped, rows
+
+    def breakage_of(accepted, dropped, rows, anchor_name):
+        """呼び直す理由。壊れていなければ None。"""
+        if not isinstance(rows, list) or not rows:
+            return "responses-empty"
+        if not accepted and dropped:
+            return "all-dropped"
+        if not any(name == anchor_name for name, _statement, _cid in accepted):
+            return "anchor-empty"
+        return None
+
+    def ask_round(messages, token_limit, label):
+        """構造化 → 素の JSON。どちらも読めなければ空の responses。"""
+        data = None
+        response_cls = llm_response_structure()
+        if response_cls is None:
+            write("structured unavailable -> fallback no-structure")
+        else:
+            data = llm.ask(ctx, "mod_party_talk", messages, timeout=120,
+                           structure=response_cls, max_tokens=token_limit,
+                           label=label, write=write)
+            if isinstance(data, dict):
+                write("structured accepted")
+            else:
+                write("structured -> {!r}; fallback no-structure".format(data))
+                data = None
+        if data is None:
+            raw = llm.ask(ctx, "mod_party_talk", messages, timeout=120,
+                          max_tokens=token_limit,
+                          label=label + " fallback", write=write)
+            data = parse_unstructured(raw)
+            if isinstance(data, dict):
+                write("fallback accepted keys={}".format(sorted(data.keys())))
+            else:
+                write("WARN fallback unreadable; using silent anchor reaction")
+                data = {"content_violation": "false", "responses": []}
+        return data
 
     # ------------------------------------------------------------ 1ラウンド
     def party_round(app, worldview, anchor_id):
@@ -424,42 +793,20 @@ def apply(ctx):
 
         流れ:
           1. プロンプトを組み、構造化出力で1回呼ぶ。使えなければ素の JSON で呼び直す。
+             形式が壊れていれば同じプロンプトで1回だけ呼び直す。
              それも読めなければ「誰も反応しない」として先へ進む（本体を止めない）
           2. content_violation なら本体と同じく空の返答を返す
-          3. responses を検分する。参加者に居ない名前と同じ人物の2回目は落とす（ログの dropped）
+          3. responses を検分する。名前の揺れは正規化して引き当て、
+             参加者に居ない名前と同じ人物の2回目は落とす（ログの dropped）
           4. アンカーの台詞を本体へ返す形に載せ、残りを pending に積む。
              アンカーが黙っていたら行動描写1つを補う（本体は空の台詞を表示できない）
         戻り値 None は「横取りをやめて本体に任せる」の意味（`intercept` が見る）。
         """
         text, ids, names, anchor_name = prompt(app, worldview, anchor_id)
         allowed = {names[i] for i in ids}
-        name_to_id = {names[i]: i for i in ids}
-        write("round {} LLM participants={} anchor={!r} prompt={} chars".format(
-            int(st.get("round", 0)) + 1, sorted(allowed), anchor_name, len(text)))
-        messages = [{"role": "user", "content": text}]
-
-        data = None
-        response_cls = llm_response_structure()
-        if response_cls is None:
-            write("structured unavailable -> fallback no-structure")
-        else:
-            data = llm.ask(ctx, "mod_party_talk", messages, timeout=120,
-                           structure=response_cls, max_tokens=1800,
-                           label="party talk", write=write)
-            if isinstance(data, dict):
-                write("structured accepted")
-            else:
-                write("structured -> {!r}; fallback no-structure".format(data))
-                data = None
-        if data is None:
-            raw = llm.ask(ctx, "mod_party_talk", messages, timeout=120, max_tokens=1800,
-                          label="party talk fallback", write=write)
-            data = parse_unstructured(raw)
-            if isinstance(data, dict):
-                write("fallback accepted keys={}".format(sorted(data.keys())))
-            else:
-                write("WARN fallback unreadable; using silent anchor reaction")
-                data = {"content_violation": "false", "responses": []}
+        token_limit = round_max_tokens(len(ids))
+        write("round {} LLM participants={} anchor={!r} prompt={} chars tokens={}".format(
+            int(st.get("round", 0)) + 1, sorted(allowed), anchor_name, len(text), token_limit))
 
         action_cls = action_structure()
         conv_cls = conversation_structure()
@@ -467,49 +814,48 @@ def apply(ctx):
             write("WARN normal conversation response structure unavailable")
             return None
 
-        # `content_violation` は共通 API の規約どおり str で受ける
-        # （`llm.create_structure`）。読めない返答を「違反あり」に倒すと
-        # 普通の台詞が消えるので、判らない語は False へ（`unknown=False`）。
-        if llm.truthy(data.get("content_violation"), unknown=False):
-            st["pending"] = []
-            write("party-talk response marked content_violation")
-            return conv_cls(content_violation=True,
-                            action=action_cls(type="casual_response", accepted=None,
-                                              statement="", call_free_action=False))
-
-        seen = set()
-        accepted = []
-        dropped = []
-        rows = data.get("responses")
-        for row in rows if isinstance(rows, list) else []:
-            row = row if isinstance(row, dict) else llm.as_dict(row)
-            if not isinstance(row, dict):
-                continue
-            speaker = row.get("speaker")
-            statement = row.get("statement")
-            if not isinstance(speaker, str) or not isinstance(statement, str):
-                continue
-            speaker, statement = speaker.strip(), statement.strip()
-            if not speaker or not statement:
-                continue
-            if speaker not in allowed:
-                dropped.append("nonparty:" + speaker)
-                continue
-            if speaker in seen:
-                dropped.append("duplicate:" + speaker)
-                continue
-            seen.add(speaker)
-            accepted.append((speaker, statement))
+        data = None
+        accepted, dropped, rows = [], [], None
+        reason = None
+        for attempt in range(1 + ROUND_RETRIES):
+            if attempt == 0:
+                messages = [{"role": "user", "content": text}]
+                label = "party talk"
+            else:
+                write("retry {}: reason={}".format(attempt, reason))
+                messages = [{"role": "user", "content": text},
+                            {"role": "user", "content": RETRY_HINT}]
+                label = "party talk retry"
+            data = ask_round(messages, token_limit, label)
+            statement_chars = 0
+            for row in (data.get("responses") if isinstance(data, dict) else None) or []:
+                row = row if isinstance(row, dict) else llm.as_dict(row)
+                if isinstance(row, dict):
+                    statement_chars += len(str(row.get("statement") or ""))
+            write("round {} tokens_limit={} statement_chars={}".format(
+                int(st.get("round", 0)) + 1, token_limit, statement_chars))
+            # `content_violation` は共通 API の規約どおり str で受ける
+            # （`llm.create_structure`）。読めない返答を「違反あり」に倒すと
+            # 普通の台詞が消えるので、判らない語は False へ（`unknown=False`）。
+            if llm.truthy(data.get("content_violation"), unknown=False):
+                st["pending"] = []
+                write("party-talk response marked content_violation")
+                return conv_cls(content_violation=True,
+                                action=action_cls(type="casual_response", accepted=None,
+                                                  statement="", call_free_action=False))
+            accepted, dropped, rows = accept_responses(data, names, ids)
+            reason = breakage_of(accepted, dropped, rows, anchor_name)
+            if reason is None:
+                break
 
         # 本体は会話相手1人の statement を表示するので、アンカーの分だけそこへ載せる。
         anchor_statement = ""
         pending = []
-        for speaker, statement in accepted:
+        for speaker, statement, cid in accepted:
             if speaker == anchor_name and not anchor_statement:
                 anchor_statement = statement
             else:
-                pending.append({"id": str(name_to_id.get(speaker, "")),
-                                "speaker": speaker, "statement": statement})
+                pending.append({"id": cid, "speaker": speaker, "statement": statement})
         if not anchor_statement:
             anchor_statement = "（黙って話を聞いている）"
             dropped.append("anchor-missing:fallback-silent")
@@ -540,26 +886,99 @@ def apply(ctx):
         cid = facilitator_anchor(args, kwargs)
         return bool(cid and cid == str(st.get("anchor") or ""))
 
+    def inject_profile(label, args, kwargs):
+        """1対1の会話相手の浅い複製の profile 末尾へ要約を足す。"""
+        if st.get("active"):
+            return args, kwargs
+        npc = kwargs.get("character_instance")
+        if npc is None and len(args) >= 4:
+            npc = args[3]
+        if npc is None:
+            return args, kwargs
+        app = ui.find_app()
+        summary = memory_summary(app)
+        if not summary:
+            return args, kwargs
+        try:
+            clone = copy.copy(npc)
+        except Exception:
+            ctx.log_exc("party talk: cannot copy NPC for memory inject")
+            return args, kwargs
+        base = getattr(npc, "profile", "")
+        if base is None:
+            base = ""
+        if not isinstance(base, str):
+            return args, kwargs
+        clone.profile = (base.rstrip() + "\n\n" + summary) if base.strip() else summary
+        write("{}: +{} chars party memory into profile".format(label, len(summary)))
+        if "character_instance" in kwargs:
+            merged = dict(kwargs)
+            merged["character_instance"] = clone
+            return args, merged
+        merged = list(args)
+        merged[3] = clone
+        return tuple(merged), kwargs
+
+    def inject_worldview(label, args, kwargs, index=2):
+        """master_ai の worldview 文字列の末尾へ要約を足す。"""
+        if st.get("active"):
+            return args, kwargs
+        app = ui.find_app()
+        summary = memory_summary(app)
+        if not summary:
+            return args, kwargs
+        if isinstance(kwargs.get("worldview"), str):
+            merged = dict(kwargs)
+            merged["worldview"] = kwargs["worldview"].rstrip() + "\n\n" + summary
+            write("{}: +{} chars party memory into worldview".format(label, len(summary)))
+            return args, merged
+        if len(args) > index and isinstance(args[index], str):
+            merged = list(args)
+            merged[index] = args[index].rstrip() + "\n\n" + summary
+            write("{}: +{} chars party memory into worldview".format(label, len(summary)))
+            return tuple(merged), kwargs
+        return args, kwargs
+
     def intercept(orig, label, args, kwargs):
         """facilitator の包みの共通部。
 
         パーティー会話の最中で、相手がアンカーのときだけ `party_round` に置き換える。
         それ以外（普通の会話、403 が差し替えた複製で相手が違って見える場合など）は本体へ。
+        本体へ流すときはパーティ記憶の要約を profile へ足す。
         `party_round` が None を返すか例外を投げたら本体を呼ぶ（会話を止めない）。
         """
-        if not st["active"] or not same_anchor(args, kwargs):
-            return orig(*args, **kwargs)
-        app = ui.find_app()
-        if app is None:
-            return orig(*args, **kwargs)
-        write("party {} intercepted (normal conversation lifecycle)".format(label))
+        if st["active"] and same_anchor(args, kwargs):
+            app = ui.find_app()
+            if app is None:
+                return orig(*args, **kwargs)
+            write("party {} intercepted (normal conversation lifecycle)".format(label))
+            try:
+                result = party_round(app, facilitator_worldview(args, kwargs),
+                                     facilitator_anchor(args, kwargs))
+            except Exception:
+                ctx.log_exc("party talk: {} round failed".format(label))
+                result = None
+            return result if result is not None else orig(*args, **kwargs)
         try:
-            result = party_round(app, facilitator_worldview(args, kwargs),
-                                 facilitator_anchor(args, kwargs))
+            args, kwargs = inject_profile(label, args, kwargs)
         except Exception:
-            ctx.log_exc("party talk: {} round failed".format(label))
-            result = None
-        return result if result is not None else orig(*args, **kwargs)
+            ctx.log_exc("party talk: memory inject failed")
+        return orig(*args, **kwargs)
+
+    def pass_conversation(orig, label, args, kwargs):
+        """横取りしない会話経路。要約だけ足して本体へ。"""
+        try:
+            args, kwargs = inject_profile(label, args, kwargs)
+        except Exception:
+            ctx.log_exc("party talk: memory inject failed")
+        return orig(*args, **kwargs)
+
+    def pass_master_ai(orig, label, args, kwargs):
+        try:
+            args, kwargs = inject_worldview(label, args, kwargs)
+        except Exception:
+            ctx.log_exc("party talk: master_ai memory inject failed")
+        return orig(*args, **kwargs)
 
     # ------------------------------------------------------------ 仲間の台詞の表示
     def flush_extras(app):
@@ -854,12 +1273,20 @@ def apply(ctx):
             screen.schedule(lambda: layout_portraits(app), 0)
 
     # ------------------------------------------------------------ 開始と終了
-    def clear(reason):
+    def clear(reason, app=None):
         """パーティー会話の状態を畳む。枠の片付けも予約する。何度呼んでも害は無い。"""
         if st["active"]:
+            try:
+                finish_memory(app or ui.find_app())
+            except Exception:
+                ctx.log_exc("party talk: cannot split memory at end")
             write("party talk end: " + reason)
         st["active"] = False
         st["anchor"] = None
+        st["participants"] = []
+        st["session_slot"] = None
+        st["split_ids"] = None
+        st["split_transcript"] = None
         st["round"] = 0
         st["pending"] = []
         st["extras"] = []
@@ -951,6 +1378,10 @@ def apply(ctx):
             return
         st["active"] = True
         st["anchor"] = anchor
+        st["participants"] = list(ids)
+        st["session_slot"] = None
+        st["split_ids"] = None
+        st["split_transcript"] = None
         st["round"] = 0
         st["pending"] = []
         st["extras"] = []
@@ -1081,6 +1512,27 @@ def apply(ctx):
     def facilitator_after_retrieval(orig, *args, **kwargs):
         return intercept(orig, "retrieval facilitator", args, kwargs)
 
+    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_in_quest", required=False)
+    def facilitator_in_quest(orig, *args, **kwargs):
+        return pass_conversation(orig, "facilitator[quest]", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_starter", required=False)
+    def starter(orig, *args, **kwargs):
+        return pass_conversation(orig, "starter", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:conversation_starter_in_quest", required=False)
+    def starter_in_quest(orig, *args, **kwargs):
+        return pass_conversation(orig, "starter[quest]", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:master_ai_facilitator", required=False)
+    def master_ai(orig, *args, **kwargs):
+        return pass_master_ai(orig, "master_ai", args, kwargs)
+
+    @ctx.wrap("scripts.llm.llm_manager:master_ai_facilitator_from_conversation",
+              required=False)
+    def master_ai_from_conversation(orig, *args, **kwargs):
+        return pass_master_ai(orig, "master_ai[conversation]", args, kwargs)
+
     @ctx.wrap("__main__:ConversationPhaseManager.conversation_continued", required=False, safe=True)
     def continued(orig, self, choice_text, *args, **kwargs):
         """プレイヤーの1手の処理（ワーカースレッド）。本体がアンカーの返答を表示した後に仲間の台詞を出す。
@@ -1096,13 +1548,21 @@ def apply(ctx):
                 flush_extras(getattr(self, "app", None))
             except Exception:
                 ctx.log_exc("party talk: cannot flush extra responses")
+            try:
+                app = getattr(self, "app", None)
+                text = memory_transcript(app, windowed=False)
+                if text:
+                    upsert_session(app, text, finalize=False)
+                    write("memory session saved {} chars".format(len(text)))
+            except Exception:
+                ctx.log_exc("party talk: cannot save session memory")
             schedule_layout(getattr(self, "app", None))
         return result
 
     @ctx.wrap("__main__:InstantaleApp.start_battle_with_in_conversation", required=False, safe=True)
     def battle(orig, self, *args, **kwargs):
         """会話中に戦闘へ入る本体の入口。パーティー会話はここで終わり（戦闘の LLM には触らない）。"""
-        clear("start_battle_with_in_conversation")
+        clear("start_battle_with_in_conversation", self)
         return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:ConversationEndManager.execute", required=False, safe=True)
@@ -1112,9 +1572,14 @@ def apply(ctx):
         枠の片付けはここで先に予約する。`finish_conversation` の中で要約の LLM が回り
         （GAME.md §2.5。最大120秒）、その後に片付けると仲間の絵だけ残る（実機 2026-08-28）。
         会話の状態そのものは `finish_conversation` が返ってから畳む。
+        台本の写しはここ（履歴が残っている間）で取る。
         """
         if st["active"]:
             app = getattr(self, "app", None) or ui.find_app()
+            try:
+                capture_split_payload(app)
+            except Exception:
+                ctx.log_exc("party talk: cannot snapshot memory at end")
             screen.schedule(lambda: remove_portraits(app), 0)
         return orig(self, *args, **kwargs)
 
@@ -1123,16 +1588,22 @@ def apply(ctx):
         """会話の終了処理（要約・ライフログ）が終わったら状態を畳む。"""
         # 要約の LLM が例外を投げても畳む。畳み損ねると次の会話も横取りし続ける。
         was = st["active"]
+        app = getattr(self, "app", None) or ui.find_app()
+        if was:
+            try:
+                capture_split_payload(app)
+            except Exception:
+                ctx.log_exc("party talk: cannot snapshot memory before finish")
         try:
             return orig(self, *args, **kwargs)
         finally:
             if was:
-                clear("ConversationEndManager")
+                clear("ConversationEndManager", app)
 
     @ctx.wrap("__main__:InstantaleApp.return_to_title", required=False)
     def title(orig, self, *args, **kwargs):
         """タイトルへ戻るとき。会話の途中でも畳む。"""
-        clear("return_to_title")
+        clear("return_to_title", self)
         return orig(self, *args, **kwargs)
 
     ctx.log("party talk: installed (side_by_side={} start={!r} end={!r}); log -> {}".format(

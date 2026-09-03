@@ -2,14 +2,14 @@
   "entry": "party_talk.py",
   "api": 1,
   "kind": "feature",
-  "version": "8",
+  "version": "13",
   "name": {
     "ja": "パーティーメンバーと話す",
     "en": "Party Talk"
   },
   "description": {
-    "ja": "平時の選択肢に「パーティーメンバーと話す」を足す。仲間から1人を選んで本体の会話に入り、その間だけ会話のLLMを差し替えて仲間全員が順に反応する。プレイヤーの1発言につき各NPCは最大1回。311/403 の記録は読むだけ",
-    "en": "Adds a 'talk with the party' choice outside battle. Enters the game's own conversation with one random member and, for that conversation only, swaps the conversation LLM so every member can react in turn (at most once per player line). Reads 311/403 state without writing it"
+    "ja": "平時の選択肢に「パーティーメンバーと話す」を足す。仲間から1人を選んで本体の会話に入り、その間だけ会話のLLMを差し替えて仲間全員が順に反応する。パーティ会話の記憶は1ファイルに蓄積して会話・物語LLMへ短く注入し、終了時に311/403へ分配する",
+    "en": "Adds a 'talk with the party' choice. During the talk, group memory is stored in one file and injected briefly into conversation/story LLMs; when the talk ends it is split into 311/403"
   },
   "author": "MoririnJP, R01/Flossian",
   "after": [
