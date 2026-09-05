@@ -242,6 +242,7 @@ app.refresh_choice_buttons(reset_page=True)
 押されると `getattr(__main__, cls_name)(app, *args)` が組み立てられ
 `app.process_choice(それ, 文字列)` に渡る。
 押された添字は `display_button_map` で引き直される（`ui.pressed_entry` が同じことをする）。
+選択肢が1ページ（8枠）に収まらないときは最後の枠が `次` になり、`display_button_map` のその枠には添字ではなく文字列 `'next'` が入る（`206_` の記録、2026-08-17: `['<int>'×7, 'next']`。`choice_button_page` は 0）。整数でない枠はボタンではないので `ui.pressed_entry` は None を返し、`次` の押下はどの MOD のログにも出ない（素通し。添字そのままに落ちて `buttons[7]` を引き、自前の一覧を出す MOD がページ送りを横取りしていた不具合は 2026-09-03 に直した。VERIFICATION.md §3.50）。2ページ目以降の枠の文字列（戻る側）は未実測。
 
 > `app.function_correspond_to_input` は名前に反して対応表ではなく `PhaseSpec` 1個。
 > 「いま自由入力を送ったら何を呼ぶか」を保持している。
@@ -474,10 +475,10 @@ app.world.characters     -> {id: Character}    Facility.owner はこの id（str
   `location` / `dungeon_location`。
   うち `ward` / `location` / `entrance` / `exit` は主のいない通路
   （実セーブ3世界には `training_facility` も1件ずつある。`free` は §2.21）
-- 施設 id は**土地の中でしか一意でない**（実セーブ3世界とも、世界の中では別の土地に同じ id がある。
-  世界単位で施設を指すなら `土地id/施設id` の組で持つ。`324_` の `worlds\<世界>.json` がその形）
-- 実行時の `Area.size` は読めない（`207_` の記録と `324_` の実機 38/38 がともに取れず。
-  土地の種類は `save_data_dict["areas"][id]["size"]` から取る。`324_` の `size_of`）
+- 施設 id は**土地の中でしか一意でない**（実セーブ3世界とも別の土地に同じ id がある）。
+  世界単位で施設を指すなら `土地id/施設id` の組で持つ（`324_` の `worlds\<世界>.json` がその形）
+- 実行時の `Area.size` は読めない（`207_` と `324_` の実機 38/38 がともに取れず。VERIFICATION_LOG.md §2.83）。
+  土地の種類は `save_data_dict["areas"][id]["size"]` から取る（`324_` の `size_of`）
 
 #### セーブの形＝実行時の形ではない
 
@@ -673,6 +674,31 @@ MOD からの書き方はこうなる。
 - 元からある依頼の `client_name` は**実在 NPC と結び付いていない**（世界生成時に付いた名前）
 - **クエスト辞書に独自キーを足さない**（セーブに焼かれるうえ、
   再読み込み後に `Quest` インスタンスがそのキーを持つ保証が無い）。控えは `state/` に別ファイルで持つ
+
+#### 街の中身と初期依頼は初訪問で作られる（2026-09-03、`225_` で実測）
+
+世界生成が作るのは 9 街の名前・概要・接続だけ（`level_of_detail=0`、`nodes` と `quests` は空）。
+施設・NPC・初期依頼3件・BGM は、その街へ初めて移動したときに
+`AreaMoveManager.method_1` → `save_area_json:write_area_data_to_world_dict(world_dict, area_id)` が
+`create_settlement_detail` → `settlement_quest_generator` → `generate_quest_area` の順で作る（`level_of_detail` は 1 になる）。
+ロード時に全エリアで走る `Area.update` / `generate_nodes` は中身を作らない（0.0s）。
+
+初期依頼3件の難易度は LLM ではなくゲームが先に決め、頼み文に `quest_1:難易度は26/70` と書く:
+
+```
+random.sample(range(lo, hi), k=3)          save_area_json.py:329
+```
+
+`lo` / `hi` は街の枠（id）で固定。プレイヤーのレベル・物語の段階・その街の物語の依頼には依らない。
+序盤 0・1・4 → 中盤 2・5・7 → 終盤 3・6・8 の順に窓が隣り合う
+（id 2・3・8 は `sample` の実引数、残りは5世界の初期依頼の観測。VERIFICATION_LOG.md §2.84）:
+
+| id | 0 | 1 | 4 | 2 | 5 | 7 | 3 | 6 | 8 |
+|---|---|---|---|---|---|---|---|---|---|
+| `range(lo, hi)` | (1, 6) | (3, 11) | (11, 19) | (19, 28) | (28, 37) | (37, 47) | (47, 57) | (57, 67) | (67, 77) |
+
+エディタで後から足した街（id 9 以降）は枠が無く、全域 `range(1, 77)` から引かれる（id 33 で `[6, 34, 3]`、id 21 で `[13, 30, 40]`）。
+`133_ui_area_difficulty` はこの表で未訪問の街の帯を見積もる。
 
 #### 進行ループ（2026-07-28、1クエストを頭から終わりまで実測）
 
@@ -960,7 +986,7 @@ apply_music_volume(app)         main_023 で追加
   どれが何回発火しても結果が変わらない書き方にして全部に仕掛ける
   （実測では `save_world_json:write_obfuscated_json_file` だけが発火した。VERIFICATION.md §3.4）
 
-土地の曲が `play_music_from_src` へ来る経路（2026-08-21〜09-01 の実測 357 回。`207_` の `out\battle_bgm.log` 2世代）:
+土地の曲が `play_music_from_src` へ来る経路（`207_` の `out\battle_bgm.log` 2世代、2026-08-21〜09-01 の 357 回）:
 
 | 呼び出し元（`instantale.py` の lambda） | 場面 | 回数 |
 |---|---|---|
@@ -971,9 +997,8 @@ apply_music_volume(app)         main_023 で追加
 | `:6168` | 依頼の始まり（`QuestStartManager`。ダンジョンの曲） | 19 |
 | `:1027` / `:8038` / `:8102` | 場面は特定していない | 4 / 3 / 3 |
 
-この範囲では渡してくる物は全部 app だった（本節冒頭の「app でない物」はこの2世代のログには現れていない）。
-`MovePhaseManager` からは 0 件 ＝ **施設の出入りではゲームは曲を鳴らし直さない**
-（`324_` はそのために `move_phase` の復帰後に自分で鳴らし直す）。
+357 回とも渡してくる物は app（本節冒頭の「app でない物」はこの2世代には無い）。
+`MovePhaseManager` からは 0 件。**施設の出入りではゲームは曲を鳴らし直さない**（`324_` は `move_phase` の復帰後に自分で鳴らし直す）。
 
 **乱数は MOD 専用の `random.Random` を使う**（グローバルから引くとゲーム自身の乱数列がずれる）。
 
@@ -1218,19 +1243,19 @@ InstantaleApp.normalize_shop_inventory_prices(shop_obtainer, player_obtainer)
 
 | 世界 / 土地 | その土地の依頼の難易度 | 施設（tier） | 在庫の `value` |
 | --- | --- | --- | --- |
-| ペルディション 2 | 27 / 30 / 31（3件とも完了済み） | general_store（standard） | 5,5,27,27,30,30,31,31,31 |
+| 世界A・土地2 | 27 / 30 / 31（3件とも完了済み） | general_store（standard） | 5,5,27,27,30,30,31,31,31 |
 | 〃 | 〃 | medical_facility（basic） | 27,27,27,27,27,30,30,31 |
 | 〃 | 〃 | specialty_shop（basic） | 27,27,27,27,30,30,30,30,31 |
-| ペルディション 3 | 48 / 54 / 55（3件とも完了済み） | specialty_shop（advanced） | 48,48,48,54,54,54,54,54,55,55 |
-| 暮影裂界 1 | 5 / 10 / 12（10 だけ完了済み） | general_store（basic） | 5,5,5,10,10,10,10,12 |
-| 暮影裂界 4 | 17 / 18 / 21 | medical_facility（advanced） | 17,17,17,17,18,18,21 |
-| Astergrave 7 | 42 / 44 / 45 | general_store（advanced） | 42,44,44,44,44,44,45,45 |
+| 世界A・土地3 | 48 / 54 / 55（3件とも完了済み） | specialty_shop（advanced） | 48,48,48,54,54,54,54,54,55,55 |
+| 世界B・土地1 | 5 / 10 / 12（10 だけ完了済み） | general_store（basic） | 5,5,5,10,10,10,10,12 |
+| 世界B・土地4 | 17 / 18 / 21 | medical_facility（advanced） | 17,17,17,17,18,18,21 |
+| 世界C・土地7 | 42 / 44 / 45 | general_store（advanced） | 42,44,44,44,44,44,45,45 |
 
 - 品物 190個のうち 186個が、その土地の3つの難易度の**いずれか**そのもの。
   外れた4個は2軒に集まっていて（上表の 5,5 を含む）、
   どれもその土地には無い難易度。プレイヤーが売った品が主の持ち物へ積まれる経路
   （上の売買の項）で入ったものと読める
-- **完了済みの依頼も母数に入る**。ペルディションのエリア 2 / 3 / 8 は
+- **完了済みの依頼も母数に入る**。世界A のエリア 2 / 3 / 8 は
   3件とも `config['status'] == 'completed'` だが、在庫はその難易度で並んでいる
   （`get_quest_difficulties` の `include_completed=True` が既定）
 - **施設の `tier` は在庫の段を1つに絞らない**。`basic` の店にもその土地の最高難度の品が並ぶ。
@@ -1269,6 +1294,38 @@ generate_item_in_shopping(item_data, shop_owner_instance, item_stock_tier=2)
 > つまり**その土地の物価と品揃えを動かす道は、依頼の難易度1つ**。
 > `318_area_difficulty_growth` はこれを使って、在庫にもクラフトにも触らずに街を育てる。
 > 効き始めるのは品揃えが入れ替わってからなので、`312_shop_restock` と組で意味を持つ。
+
+#### 2.13.1.3 店を開くたびに、売れた品が作り直される（実測。VERIFICATION.md §3.52）
+
+施設は品揃えの雛形を `Facility.config['goods']` に持つ
+（`stock_tier` と `stock_update_date` も同じ `config`。セーブ側にしか無い項目がある）。
+店を開くと、**雛形にあって主が持っていない品が1つ作り直されて棚へ入る**:
+
+```
+品の誕生: id=59 'ハルマンの予備のランプ' 主=ハルマン(118) {'item_detail': 'tool', '買価': 368}
+  呼び出し元: ShoppingStartManagerRemake.shopping_start_method_1 (instantale.py:3159)
+           <- ShoppingStartManagerRemake.execute (instantale.py:3281)
+```
+
+- 作るのも採番もゲーム自身（`index['item']` が進む）。鍵は `item_` の付かない裸の数字
+- 走るのは開いたとき。買う操作は `InventoryItem.change_inventory` が売り手から買い手へ移すだけで、品は生まれない。
+  雛形は買っても減らず、`stock_update_date` も動かない
+- 装備は作り直されない。実測7品:
+
+| `item_type` / `item_detail` | 作り直し |
+| --- | --- |
+| `weapon` / `small_weapon` | されない |
+| `wearable` / `body_armor` | されない |
+| `wearable` / `accessory` | されない（4回の来店を跨いで欠けたまま） |
+| `healing_item` / `food`・`drink`・`potion`・`medicine` | される |
+| `utility` / `tool` | される |
+
+  `material` と `utility` / `document` は未測定。
+- 作り直された品は素の値のまま並ぶ。`129_` / `134_` / `405_` は生成の入口の**戻り値しか見ていない**ので、
+  持ち物へ直に入れるこの経路は素通り（次に開いたときの on-sight で付け直される）
+
+> 回復アイテムだけは同じ品を何度でも買えて、在庫が尽きない。
+> `312_shop_restock` の「買った品を作り直させない」（既定 ON）が、その来店で増えたぶんを窓が組み上がる前に外す。
 
 #### 店の主は `job` が施設の種類と一致している
 
@@ -1332,9 +1389,42 @@ gold に直すのは `get_item_base_price` と `get_randomized_item_price`。
 能力値は種別ごとに違う（`weapon`＝`攻撃力` / `wearable`＝`防御力` /
 `healing_item`＝`回復` と `疲労負荷` / それ以外は無し）。
 
+#### 回復アイテムの数値は `value` だけで決まる
+
+`回復` は `get_heal_spec(value)`（`221_` の対応表。2026-08-26〜09-02）:
+
+| `value` | 3 | 6 | 18 | 26 | 48 | 49 | 50 | 52 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `回復` | 9 | 13 | 59 | 115 | 204 | 211 | 237 | 237 |
+
+`疲労負荷` は `get_heal_physical_integrity_barden(value)` と読めるが未計測。
+実物では `value` 3〜52 の全域で **9〜11** しか観測していない（`208_` のログ 20 件）。
+スタミナの上限はレベル1で 10（§2.19）なので、序盤は回復アイテム1つでスタミナが尽きる（回復 9 のために 11 を払う）。
+`healing_item` の細分は `food` / `drink` / `herb` / `medicine` / `potion` の5つ
+（店の品揃え生成のスキーマ。`consumable` はこれに `scroll` が足される。品の `item_detail` では `herb` が `plant`）。
+
+#### 使うと何が起きるか（2026-09-04 に `226_` で実測。使用5回）
+
+```
+ItemPopupMenu.on_consume_item          右クリックの「消費」
+  Item.consume                         品の側の入口
+    (本体が usable を決める)            physical_integrity >= 疲労負荷
+    ItemConsumeManager.consume_item(item_instance, usable)   別スレッドで走る
+```
+
+- `usable` が真: `physical_integrity` が `疲労負荷` ぶん減る → HP に `回復` を足す →
+  持ち物から1つ減る → `add_text("…を消費した。HPを N だけ回復した。")`。
+  N は使う時に `attributes["回復"]` を読んだ値（生成時に固めていない）
+- `usable` が偽: `add_text("駄目だ...体がもたない。")` だけ。品は減らない
+- 文は `consume_item` のワーカースレッドの先頭で出て、1 秒ほど後に品を外す。
+  メインスレッドの `ItemConsumeManager.execute` はその間まだ戻っていない（スレッドを分けずに数えると `execute` の側の文に見える）
+- `max_hp` / `update_max_hp` / `update_max_physical_integrity` はこの間に走らない（最大 HP が動くのは別の地点）
+- `on_use_item` / `ItemUseManager` は回復アイテムでは通らない（別の種別の入口）
+- `usable` は popup の項目には無い（`ItemPopupMenu` が持つのは `item` とボタン2つと `canvas`）
+
 #### レア度が値段に効いていない
 
-実セーブ（`ヴェスティア`、Lv31 / 3651日）から拾った実額:
+実セーブ（Lv31 / 3651日）から拾った実額:
 
 | 品 | `value` | 能力値 | 買価 | 売価 |
 | --- | --- | --- | --- | --- |
@@ -1540,8 +1630,8 @@ Character.calculate_current_required_exp_on_display() / _gained_exp_on_display(g
 | キャラ | `point_use` | 合計 | 各値の幅 |
 | --- | --- | --- | --- |
 | テスト女性 / テスト男性 | 16 | 66 | 11 一律 |
-| ヴァルカ・ヴォルガド | 31 | 71 | 9〜15 |
-| アーリ | 300 | 142 | 18〜26 |
+| 才能点を少し積んだキャラ | 31 | 71 | 9〜15 |
+| 才能点を大量に積んだキャラ | 300 | 142 | 18〜26 |
 
 普通に始めると各能力値は 9〜16。
 24 前後という値は才能点を大量に積んだキャラのもので、既定の姿ではない。
@@ -1955,7 +2045,7 @@ app.move_npc_to_facility(npc_id, character, 施設, ノード)
 > ゲームが新しい町を生成するとき、店主・ギルド員の id は `index['npc']` から
 > 連番で振られ、既に同じ id の NPC が居ても構わず上書きする。
 > MOD が `max + 1` だけで採ると台帳が追いつかず、次の町の生成でゲームが
-> 同じ番号を踏む。テストワールドの灰の交易都市（area 2）では店主 50〜57 の
+> 同じ番号を踏む。ある世界の街（area 2）では店主 50〜57 の
 > 素データが `local/` の MOD が作った登場人物に差し替わり、
 > `world_data.json` 側にだけ正しい店主が残った（2026-08-29。
 > VERIFICATION_LOG.md §2.77）。ローダの `ids.claim`（TECH.md §3.2.3）が
@@ -2140,7 +2230,7 @@ retrieval を待たず第一声から載る。
 #### 2.25.1 プレイヤーへの感情の文（`affinity_text`）は2本立て
 
 `relationship["player"]["affinity_text"]` は文字列のことも文の配列のこともある
-（実セーブで両方あった。ヴェスティア 103人で str 57 / list 46。`323_` の `affinity_of`）。
+（実セーブで両方あった。103人の世界で str 57 / list 46。`323_` の `affinity_of`）。
 配列のときの先頭が好感度の段、2つ目以降が魅力の段。
 魅力には文が付かない帯がある（下の表）ので、2つ揃うとは限らない。
 決めているのは1本の関数だけ:
@@ -2319,7 +2409,7 @@ story = {world_situation, story_flow, current_rumor, current_story_phase}
 > 「概要が空なら `create_world_overview`」は分岐が在ることまでが定数から言えることで、
 > 条件そのものは HUD 側の `内容ある` / `内容ない` の分岐から採った推定。
 > 「保存されるのは書き直しの方」は実セーブで見える
-> （`テストワールド` の `world_data["overview"]` は1段落の要約文）。
+> （実セーブの `world_data["overview"]` は1段落の要約文）。
 
 ### 2.28 素データの辞書は2つあり、遊んでいる最中の追加は片方に届かない
 
@@ -2328,7 +2418,7 @@ app.world_dict       worlds\<世界>\world_data.json
 app.save_data_dict   saves\<世界>\savedata.json
 ```
 
-実セーブを復号して突き合わせた（ヴェスティア、2026-08-21）:
+実セーブを復号して突き合わせた（2026-08-21）:
 
 | | world 側 | save 側 |
 | --- | --- | --- |
@@ -2559,7 +2649,7 @@ Epic 版の `instantale.exe` の隣に `saves` も `worlds` も無かった。
 
 `image_src` は**書いた機械の絶対パス**で入っている。
 別の機械で作られた世界を持ってくると、他人のユーザー名を指したまま存在しない
-（ペルディションは 95人中 93人が `C:\Users\Owner\...` だった）。
+（ある世界では 95人中 93人が `C:\Users\<ユーザー名>\...` だった）。
 `worlds` から後ろだけを残して手元のデータの場所へ繋ぎ直せば当たる。
 
 `face_image.png` の大きさは揃っていない。

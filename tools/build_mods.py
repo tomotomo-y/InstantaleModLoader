@@ -113,6 +113,7 @@ BANDS = (
         "125_balance_charisma_impression",
         "128_item_image_variety",
         "129_balance_item_price",
+        "134_balance_item_effects",
         "130_currency_unit",
         "131_sharp_portrait",
         "132_npc_variety",
@@ -133,6 +134,7 @@ BANDS = (
         "121_ui_character_sheet",
         "118_batch_message_render",
         "122_ui_conversation_log",
+        "133_ui_area_difficulty",
         "119_fix_crime_attribution",
     )),
     ("probe", "## 計測（2xx）", None),
@@ -161,13 +163,17 @@ BANDS = (
         "322_battle_bgm",
         "323_npc_carryover",
         "324_place_bgm",
+        "325_road_opening",
+        "326_npc_travel",
     )),
-    ("feature", CONTRIB_HEAD, (
+    #: 提供（4xx）は出どころの帯なので kind を固定しない（TECH.md §3.2.2）。
+    (None, CONTRIB_HEAD, (
         "401_battle_character_context",
         "402_party_inventory_transfer",
         "403_npc_social_memory",
         "404_party_talk",
         "405_regional_economy",
+        "406_gemini_user_role_fix",
     )),
 )
 
@@ -308,7 +314,7 @@ def check_order() -> None:
             listed.append(f)
             if not os.path.isdir(os.path.join(MODS_DIR, f)):
                 raise SystemExit("実体が無い: %s" % f)
-            if kind_of(f) != key:
+            if key is not None and kind_of(f) != key:
                 raise SystemExit("%s は %s の帯に居るが kind は %s。"
                                  % (f, key, kind_of(f)))
     dup = [f for f in set(listed) if listed.count(f) > 1]
