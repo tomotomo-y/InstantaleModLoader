@@ -48,7 +48,7 @@
 1本の MOD は**フォルダ1つ**。
 中身は `mod.json`（名乗り）と入口の `.py` の2つが最低限。
 
-```
+```text
 my_mod/
     mod.json
     my_mod.py       # apply(ctx) を持つ
@@ -145,6 +145,11 @@ GitHub の Issue か Pull Request で受ける。
    `mod.json` の `"author"` にお名前、[NOTICE](../NOTICE) に著作者として記載。
    `docs/MODLIST.md` の「提供を受けた MOD」にも出る。
    ここは `tools/check_mods.py` が検算するので、載せ忘れると CI が止まる
+
+MOD そのものではなく、既にある MOD への機能の提案（PR）を頂いたときも同じで、
+`"author"` の**末尾**にお名前を足す（先頭は出どころなので動かさない）。
+こちらは「提供を受けた MOD」ではなく `docs/MODLIST.md` の
+「提案を取り込んだ MOD」に出る（`130_currency_unit` / `314_area_move_custom` がこれ）。
 
 2 で手を入れた内容は `docs/MODS.md` のその MOD の説明に残す。
 何をどう変えたかが後から読める状態にしてから同梱する。

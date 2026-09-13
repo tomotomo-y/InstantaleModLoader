@@ -42,7 +42,7 @@ GAME.md と分けているのは、**ゲームが更新されて食い違うの�
 | 台帳／設定／API 番号／剥がし方／`out/` と `state/` | §3.7 〜 §3.11 |
 | MOD 同梱の設定画面（`"tool"`。設定ダイアログに収まらない設定） | §3.12 |
 | Nuitka で効くもの・効かないもの | §4 |
-| 画面・選択肢・会話・LLM・世界ごとの控え・背景ワーカーの既製部品 | §5 |
+| 画面・選択肢・会話・LLM・世界ごとの控え・背景ワーカー・MOD が持つ NPC と施設の既製部品 | §5 |
 | **踏んだ罠の一覧（守るべきルール）** | §6 |
 | 近い手口の既存 MOD を探す | §7 |
 | このローダでできないこと | §8 |
@@ -77,7 +77,7 @@ C コンパイラと管理者権限は要らない。ゲームフォルダは読
 > モジュール階層に `import` や代入を書くと、
 > 本体がその名前に束縛していたものを黙って上書きする。
 >
-> 実際に踏んだ（2026-08-21）。`import sys, os, datetime, traceback` の1行が、
+> 実際に踏んだ。`import sys, os, datetime, traceback` の1行が、
 > 本体の `from datetime import datetime`（クラス束縛）をモジュールで上書きしていた。
 > そのせいで本体の `make_crash_log` が
 > `AttributeError: module 'datetime' has no attribute 'now'` で落ち、
@@ -91,19 +91,23 @@ C コンパイラと管理者権限は要らない。ゲームフォルダは読
 
 ### 1.2 ファイル構成
 
-```
+```text
 InstantaleModLoader.bat   GUI を開く（配布物で唯一の入口）
+make_dist.bat             配布物を dist\ に組む（loader / mods / full の3つの zip）
 tools/gui.py              MOD 一覧・適用順・有効/無効・設定・追加・起動と注入・結果表示
 tools/watch.bat, watcher.py  ゲームの起動を監視して自動注入（GUI 無し）
 tools/injector.py         PE解析 → x64スタブ → CreateRemoteThread（--unload で剥がす）
 tools/logrotate.py        out/*.log の世代管理（注入 = 1世代の境目）
 tools/check_mods.py       静的検査（デコレータ・宣言と実体のずれ）
+tools/check_tool_screens.py  同梱の設定画面を実際に開いて撮る（§3.12）。配布物には入らない
+tools/modtool.py          MOD 同梱の設定画面が共有する土台（§3.12）。配布物に入る
 tools/build_mods.py       docs/MODS.md を各 MOD の DOC.md から綴じる（--check で照合）
 tools/list_mods.py        docs/MODLIST.md を mod.json から組む（--check で照合）
-tools/llm_ctx_probe.py    ローカル LLM の窓を実測して最適値を出す（127_ 用）
+tools/llm_ctx_probe.bat, llm_ctx_probe.py  ローカル LLM の窓を実測して最適値を出す（127_ 用）
 tools/epithet_probe.py    ローカル LLM で二つ名を引いて偏りを測る（317_ 用）
 tools/npc_variety_probe.py  ローカル LLM で NPC を生成させ、外見・性格・経歴の偏りを測る（頼み文の写しは npc_variety_prompts.json）
 tools/rebalance_saved_bgm.py  既存セーブの BGM を後からまとめて均す（104_ 用）
+tools/mods_meta.py        mod.json の author の読み方。build_mods / list_mods / check_mods が共用
 tools/tests/test_*.py     ゲーム抜きで走る検査。開発用で配布物には入らない
 runtime/instantale_modloader/
     __init__.py   boot() / discover() / ログ / 世代発行 / 遅延設置の監視 / on_ready
@@ -117,7 +121,10 @@ runtime/instantale_modloader/
     jobs.py       重い処理を背景で直列にこなすワーカー（§5.5）
     llm.py        LLM へ出ていく文章の捕まえ方・1問だけ聞く口・返答の読み方（§5.3）
     npcs.py       NPC の作り方（素データの置き場所・ひな型・配置。GAME.md §2.23）
+    modnpc.py     MOD だけが持つ NPC と、正規 NPC への層（§5.7）
+    modfacility.py  MOD だけが持つ施設（街に建てて MOD が管理する。§5.8）
     ids.py        ゲームの採番台帳（`index`）を通した id の採り方（§3.2.3）
+    saves.py      ディスクのセーブの読み方（置き場・難読化・世界の一覧。§3.2.3）
     recon.py      実行時リコン（モジュール構造ダンプ）
 runtime/mods/     MOD 本体（1バグ・1機能 = 1フォルダ。入口は mod.json が名指し）
     <フォルダ>/DOC.md      遊ぶ側から見た説明（§2.7）。docs/MODS.md へ綴じられる
@@ -153,6 +160,9 @@ found["local"]      # local/ から読んだもの（配る予定が無い。§2
 found["dirs"]       # {MOD 名: 在り処}。runtime/mods か local/。入口はここから組む
 found["problems"]   # 宣言と実体のずれ。人が読む行
 found["notes"]      # 直すべきずれではない知らせ（手元用の順序ファイルを使っている等）
+found["installed"]  # 在るもの全部（フォルダ名順。伏せたものも切ったものも含む）
+found["disabled"]   # 順序ファイルの "disabled"。GUI のチェックの実体
+found["mods_dir"]   # runtime/mods の在り処
 ```
 
 `problems` と `notes` を分けているのは、
@@ -199,7 +209,7 @@ GUI は保存のたびに順序ファイルを書き戻すので消しても戻�
 > ```
 >
 > Python 側では `PermissionError` として上がるので権限や多重起動を疑いたくなるが、
-> MSDN が「成功するまで再試行せよ」と書いている類の失敗で、待てば通る（2026-08-21）。
+> MSDN が「成功するまで再試行せよ」と書いている類の失敗で、待てば通る。
 > `injector._snapshot()` が `ERROR_BAD_LENGTH` のときだけ 0.1 秒おきに 20 回まで粘る。
 > 権限やプロセス不在は待っても変わらないので、1回目でそのまま投げる。
 > `tools/tests/test_injector_snapshot.py` が両方の振る舞いを見ている。
@@ -419,7 +429,7 @@ GUI は一覧に「ローカル」と出し、入切・設定・同梱の道具�
 遊ぶ側から見た1本ぶんの説明は、その MOD のフォルダの `DOC.md` に置く。
 `docs/MODS.md` はそれを綴じ直したもので、`tools/build_mods.py` が組む。
 
-```
+```text
 runtime/mods/316_bounty_hunter/
     mod.json
     bounty_hunter.py
@@ -494,7 +504,7 @@ InstantaleModLoader.bat        # GUI からゲームを起動して注入する
 
 | ファイル | 使いどころ |
 |---|---|
-| `out/recon/targets.txt` | これが本命。`module:qualname(signature)` 形式で 1,635件（main_025 時点） |
+| `out/recon/targets.txt` | これが本命。`module:qualname(signature)` 形式で約1,600件（main_025） |
 | `out/recon/game_modules.txt` | ゲーム自身のモジュールの全属性ダンプ。擬似ソースとして読む |
 | `out/recon/modules.json` | 機械可読のインベントリ |
 | `out/recon/build.json` | このダンプがどのビルドを見たものか |
@@ -532,7 +542,7 @@ findstr /i "employ_price" out\recon\targets.txt
 
 見つけた行をそのまま `@ctx.wrap` に貼る（`(signature)` の部分は貼らない）:
 
-```
+```text
 scripts.functions:get_npc_employ_price(npc_difficulty_level)
         ↓
 @ctx.wrap("scripts.functions:get_npc_employ_price")
@@ -593,7 +603,7 @@ type out\modloader.log         # applied / wrapped の行、失敗のトレー�
 
 1つの MOD = 1つのフォルダで、`mod.json` を持つものが MOD:
 
-```
+```text
 runtime/mods/
     load_order.json
     area_move_dungeon/
@@ -643,6 +653,11 @@ runtime/mods/
 > `llm_replacements.default.txt`（配布物の既定。更新で上書きされる）と
 > `llm_replacements.txt`（手元のファイル。あればこちらを読む）。
 > MOD の更新は上書きマージなので、配布物が同じ名前で持たなければ更新を生き残る。
+> `120_` の `npc.default.json` / `npc.json`、`132_` の `seeds.default.json` / `seeds.json` も同じ分け方。
+> default の方を書き換えて使っていた場合は、GUI の更新が上書きの前に
+> 手元の名前へ改名して残す（`tools/gui.py` の `keep_edited_default`。
+> `*.default.*` ごとに配った版の中身を空白抜きの sha1 で持ち、どれとも違えば書き換えられたと見る。
+> default を変えて配るときは `SHIPPED_DEFAULTS` に足す。忘れると `test_update.py` が落ちる）。
 > `make_dist.bat` は手元側の名前を `/XF` で除外している。
 
 入口は `mod.json` が名指しする:
@@ -690,6 +705,7 @@ def apply(ctx):
 | `ctx.mod_dir` | いま apply() 中の MOD のフォルダ。**`apply()` の外では `None`** |
 | `ctx.out_dir` / `ctx.state_dir` | `out/` と `state/` の場所（`out_path` / `state_path` の親。§3.11）。`state/` は `runtime/` の1つ上＝配布フォルダ直下 |
 | `ctx.game_dir` | ゲームの exe（`sys.executable`）の在るフォルダ |
+| `ctx.runtime_dir` | `runtime/` の場所（ローダと MOD の親） |
 | `ctx.on_ready(fn)` | プロセスにつき1回だけメインスレッドで実行（§3.6） |
 | `ctx.superseded()` | 自分より新しい注入が来たか。自前のスレッド・`Clock` の繰り返しはこれで降りる（§3.6.1） |
 | `ctx.refresh_status()` | `out/status.json` を書き直す。`apply()` を抜けた後に設置したときだけ（§3.7.3） |
@@ -697,6 +713,7 @@ def apply(ctx):
 | `ctx.config` / `ctx.setting(名前)` | この MOD に効いている設定値（§3.8） |
 | `ctx.api` / `ctx.version` | ローダの API 番号と版（§3.9） |
 | `ctx.generation` | この注入の世代。`on_ready` のキーに混ぜる用（§3.6.1） |
+| `ctx.describe()` | 環境の要約（Python・exe・モジュール数・書き込み先）を1つの文字列で。ログの先頭に出す用 |
 
 `target` は `module:qualname` 形式
 （`llm_manager:quest_referee_event_resolve` / `llama_cpp_runtime_completion:LlamaCppClient.chat`）。
@@ -733,7 +750,7 @@ def apply(ctx):
 
 通した `WARN` は例外1つにつき1行（層が重なっても増えない）:
 
-```
+```text
 safe hook on __main__:AreaMoveManager.execute: the original raised KeyError: '37' at <ファイル>:<行> in <関数>; passing it through
 ```
 
@@ -814,7 +831,7 @@ GUI は MOD の一覧を作るのにコードを1行も走らせずに済む
 
 **順序が効くのは同じ対象を2つの MOD が包むときだけ**で、その関係は帯順で決まる:
 
-```
+```text
 204_ が 103_ を包む / 206_ が 104_ を包む / 300_ が 205_ を包む
 304_ が 303_ を包む / 215_ が 313_ を包む（計測は 313_ が動かした後の値を控える）
 111_ が 102_ / 103_ / 105_ を包む（置換は圧縮前の本文を見る）
@@ -831,6 +848,11 @@ GUI は MOD の一覧を作るのにコードを1行も走らせずに済む
 > 数える先は `mod.json` の `author` で、
 > 一覧は MODLIST.md の「提供を受けた MOD」が `author` から組む。
 > 権利の所在は NOTICE が持ち、`tools/check_mods.py` が両者の食い違いで止まる。
+>
+> **MOD そのものの提供と、こちらの MOD への提案（PR）は別に数える。**
+> 見分けるのは `author` の先頭の名前（＝出どころ）で、
+> 先頭がこちらなら自作、続く名前が提案を出した人（`tools/mods_meta.py` の冒頭）。
+> 提案は MODLIST.md の「提案を取り込んだ MOD」に出る。
 だから**種別そのものは各 MOD が `mod.json` の `"kind"` で名乗る**
 （`core` / `fix` / `probe` / `feature` の4語）。
 GUI はこの宣言を表示するだけで、フォルダ名の番号帯からは導かない。
@@ -849,6 +871,21 @@ MOD どうしが繋がるのは同じファイルを読むことによってで�
 |---|---|
 | ローダ（共有する） | ゲームの読み方（`ui` / `frames`）、保存先の決め方（`state`）、壊れない書き込み（`ctx.write_json`） |
 | MOD（共有しない） | その MOD 固有の判断: どの画面に何を出すか、プロンプトをどう書き換えるか |
+
+##### ゲームの外で走るものの共有先は `tools\modtool.py`
+
+MOD 同梱の設定画面（`tool.py`。§3.12）は**ゲームの中では走らない**。
+ローダの設定画面が別プロセスで開く tkinter スクリプトで、共有したいものも
+場所の決め方・窓の記憶・配色といった GUI 側のものになる。
+
+| 走る場所 | 共有先 | なぜ |
+|---|---|---|
+| ゲームの中（フックの側） | `instantale_modloader.*` | 注入したモジュールから引ける唯一の場所 |
+| ゲームの外（`tool.py` / GUI） | `tools\modtool.py` | ローダ package はゲームが boot で読む。**tkinter 依存をそこへ足さない** |
+| 両方で要るもの | `instantale_modloader.*`（例: `saves`） | ゲームの中からも外からも引ける |
+
+裏返しの決まりが1つ増える: **ゲームの中のコードは `tools\` を import しない。**
+配布物ではローダ側のパッケージにしか入っておらず、注入時の `sys.path` にも無い。
 
 **写して回るものが出たら、それはローダの語彙**だと考えること。
 写した時点でドリフトは予告されていて、実際に起きた:
@@ -877,6 +914,8 @@ MOD どうしが繋がるのは同じファイルを読むことによってで�
 | 包む前の素の関数まで剥がす | `patch.unwrap` / `original_of` | 4本（うち2本は1段しか剥がしていなかった） |
 | 壊れない書き込み・読み込み | `ctx.write_json` / `read_json`（§3.11.1） | 3本 |
 | NPC の作り方（素データ・ひな型・配置） | `npcs.make_npc` ほか（GAME.md §2.23） | 2本（`320_` と `local/` の MOD） |
+| MOD だけが持つ NPC と正規 NPC への被せ | `modnpc`（§5.7） | **1本**（`914_` の `make_holder`）。2本目を書く前に置いた唯一のもので、理由は §5.7 の末尾 |
+| MOD だけが持つ施設（建てる・控える・建て直す・道と選択肢と出口） | `modfacility`（§5.8） | **1本**（`914_` の `estate`）。同じ理由で2本目（出資 MOD）を書く前に置いた。関所を MOD ごとに持つと、写した本数だけ漏れる口が増える |
 | ゲームの採番台帳を通した id の採り方 | `ids.claim` / `next_id` / `advance` / `audit` | 2本（`npcs` と `402_`）。`npcs` は `max + 1` で台帳を進めず、次の町の生成でゲームに踏まれた（VERIFICATION_LOG.md §2.77） |
 | HUD への置き場所 | `ui.overlay_host`（§5.1.3） | 2本 |
 | 表示・ログ用の切り詰め | `frames.short` | 6本 |
@@ -888,6 +927,13 @@ MOD どうしが繋がるのは同じファイルを読むことによってで�
 | モデルの返答から JSON を拾う | `llm.parse_json` / `strip_fence`（§5.3） | 5本。囲みの剥がし方が3通りに枝分かれしていた |
 | モデルの返した真偽の読み方 | `llm.truthy`（§5.3） | 3本。判らない語をどちらへ倒すかが項目ごとに違うのに、関数の側で決め打ちしていた |
 | ゲーム内の日付 | `ui.game_day`（§5.6） | 5本。ロード中の受け皿を持っていたのは `312_` だけだった |
+| 1件1行の JSON（後から数える表） | `ctx.jsonl`（§3.11.2） | 8本。probe を1本書くたびに写しが1つ増える形になっていた |
+| 直前と同じ内容なら書かない記録 | `ctx.logger(dedup=True)`（§3.11.2） | 6本。`cap` と `warner` と同じ族の欠けた1人で、docstring が互いを参照していた |
+| 窓の大きさの変化を見る（注入し直しても手が積もらない） | `ui.window_watcher` | 3本。コメントごと同じものが在った |
+| 冒険者名簿への登録（実行時とセーブの両方） | `npcs.enroll` | 2本。`323_` の docstring が「`320_` の `enroll`」と写しを自認していた |
+| ディスクのセーブの読み方（置き場・難読化・世界の一覧） | `saves.data_dir` / `decode` / `read_save` / `list_worlds` / `world_names` | 5本。鍵（`SAVE_KEY`）が `130_` / `314_` / `324_` の `tool.py`・`323_` の `carryover.py`・`tools\rebalance_saved_bgm.py` に散っていた |
+| 同梱の設定画面のインフラ（場所・設定・窓の記憶・書き込み・配色） | `tools\modtool.py`（§3.12） | 6本。`save_window` が4変種に枝分かれし、**1本は最大化した窓の寸法を壊していた** |
+| 宣言駆動のワールド別設定画面 | `modtool.world_settings_main`（§3.12.1） | 2本が **501行バイト同一**の写しだった |
 
 ```python
 from instantale_modloader import state
@@ -945,7 +991,7 @@ item_key = claim(app, "item", write=write)     # "item_<n>" の書式で返る
 `ids.audit(app)` は台帳が実在に追いついていない種類を並べる（`make_npc` が
 採番の前に呼び、ログに `ids: index behind existing ids:` を残す）。
 セーブエディタで足した施設も台帳を進めていない（実セーブで facility が
-台帳 230 に対し実在 234。2026-08-29）。
+台帳 230 に対し実在 234）。
 
 > `import state` ではなく関数を直に import する。
 > `301_` は `apply()` の中に `state = {...}` というローカル変数を持っている。
@@ -998,8 +1044,8 @@ MOD から import された時点で、ここは `API = 1` と同格の約束に
 どちらを外すべきかローダには決められないから。
 
 > `load_order.json` を機械的な番号順に並べ直さないこと。
-> 番号順は `after`/`before` を8箇所で破る（`117`→`112` / `213`→`311` / `215`→`313` /
-> `217`←`314`/`307` / `218`←`315` / `223`←`402` / `314`→`307`）。
+> 番号順は `after`/`before` を10箇所で破る（`117`→`112` / `213`→`311` / `215`→`313` /
+> `217`←`314`/`307` / `218`←`315` / `223`←`402` / `314`→`307` / `323`←`403` / `405`→`129`）。
 > 壊れはしない（ローダが並べ替えて動かす）が宣言と適用がずれ、
 > `check_mods.py` が問題として出す。判定は `python tools/check_mods.py` が問題0になるか。
 
@@ -1107,7 +1153,7 @@ import は先に `sys.modules` へ登録してから本体を走らせるので�
 3行目が別に要るのは、**`__main__` は `__spec__` を持たない**ため（起動スクリプトなので）。
 `__main__`（約1万行）は最初の1行から載っていて、そこからクラスを組み立てていく。
 インタプリタ初期化の時点で注入すると `World` も `InstantaleApp` もまだ無い。
-これは打ち間違いではなく順番の問題（2026-08-15〜19 に、初回ブートで5本が
+これは打ち間違いではなく順番の問題（初回ブートで5本が
 `AttributeError: module '__main__' has no attribute 'World'` で `apply()` ごと落ちていた）。
 
 > `__main__` の側では持ち主だけを見る。
@@ -1261,7 +1307,7 @@ def apply(ctx):
 
 #### 3.7.1 `boot()` の最後に出る報告
 
-```
+```text
 patches: 61 applied on 54 target(s) by 26 mod(s)
 overlapping targets (5):
   llama_cpp_runtime_completion:LlamaCppClient.chat <- 105_fix_schema_compact/, 111_llm_prompt_replace/
@@ -1326,7 +1372,7 @@ GUI から見えないことと、MOD を更新すると設定が消えること
 
 MOD のコードは何も変えなくてよい。
 
-```
+```text
 mods/300_event/mod.json    "settings" に何が変えられるかを宣言する
 mods/300_event/event.py    EVENT_MODE = "conversation"   ← 既定値。そのまま残す
 settings/mod_settings.json 選んだ値だけ
@@ -1524,6 +1570,10 @@ write = ctx.logger("item_detail.log", stamp=False)   # 本文だけ
 | `stamp` | 時刻を付けるか（既定 True） |
 | `label` | 書けなかったときに `modloader.log` へ出す名前。既定は MOD のフォルダ名 |
 | `cap` | この関数からの書き込みをこの行数で打ち切る。毎フレーム呼ばれる場所からの記録用。**数える器は関数の中なので、注入し直すと上限は戻る**。世代を跨いで数え続けたいものはこれに寄せない |
+| `dedup` | **直前と同じ本文なら書かない。** 結末が変わったときだけ1行出る。会話の LLM は1ターンに何度も回るので、注入の結末をそのまま書くとログが会話で埋まる。`cap` が「N 行で打ち切る」なのに対し、こちらは「変わるまで黙る」 |
+
+`cap` と `dedup` を両方渡したときは **`dedup` が先**。
+書かなかった行が枠を食わないので、`cap=10, dedup=True` は「変わった行を 10 行」になる。
 
 一度しか出さない警告は `ctx.warner()` で作る
 （行き先は `modloader.log`。起きているのは MOD の異常ではなくゲーム側の形が想定と違うことなので、
@@ -1535,6 +1585,20 @@ warn_once("no_hud", "HUD が見つからない")   # 同じ鍵の2回目から�
 ```
 
 書けなくても例外にしない。錠は中に持っているので、別スレッドから書く MOD も自分で掛けなくてよい。
+
+後から**数える**ための記録は `ctx.jsonl()`。1行1件の JSON を `out/` へ足す:
+
+```python
+record = ctx.jsonl("event_roll.jsonl")
+record({"at": "...", "roll": 12, "target": 15})
+```
+
+`logger()` が**読む文**、`jsonl()` が**数える表**。
+測った結果を機械で読み直すので体裁（時刻・印）は付けない。
+`default=str` を通すので、JSON にできない値が来ても行ごと失われない
+（probe が拾うのはゲームの生の値で、何が来るか決まらない）。
+
+> `jsonl` の5行は**9本の probe に写されていた**。probe を1本書くたびに写しが1つ増える形になっていた。
 
 MOD のログはローダのログ（`ctx.log`）と分ける
 （`modloader.log` は全 MOD の共用なので、混ぜると1本を追うのに他の全部を読むことになる）。
@@ -1567,14 +1631,116 @@ MOD が自分の画面を持つほうが分かりやすい。
 
 別プロセスにするのは、GUI が「MOD のコードを一切 import しない」（`gui.py` 冒頭）を守るため。
 引数ではなく環境変数で渡すのは、道具側の引数の書式を縛らないため。
-道具は普通の tkinter スクリプトでよく、`IML_ROOT/runtime` を `sys.path` に足せばローダの語彙
-（`write_json` / `config`）をそのまま使える。配色と書体は `tools/gui.py` の `setup_theme()` を借りる。
+道具は普通の tkinter スクリプトでよい。
 
 直接起動（`python runtime/mods/322_battle_bgm/tool.py`）もできるようにしておく。
-環境変数が無いときは自分の位置と `settings/gui.json` から場所を組む（`322_` の `locate()`）。
+環境変数が無いときは自分の位置と `settings/gui.json` から場所を組む。
+
+##### インフラは `tools\modtool.py` にある。道具は `MOD_DIR` を渡すだけ
+
+どの道具も最初に同じことをする。場所を決め、設定を読み、窓の大きさを思い出し、
+配色を借り、保存のときに壊れない書き込みをする。
+6本に写していたら実際にずれた（§3.2.3 の表）。
+
+| 要ること | 呼ぶもの |
+|---|---|
+| 場所 | `modtool.locate(MOD_DIR)` → `(root, state_dir, game_dir)` |
+| 設定の名前と既定値 | `modtool.defaults(MOD_DIR)` / `decls(MOD_DIR)`（`mod.json` の `"settings"` が唯一の出所） |
+| 設定の読み書き | `modtool.load_settings(root, MOD_DIR)` / `save_settings(root, MOD_DIR, values)` |
+| 窓の記憶 | `modtool.restore_window(root, MOD_DIR, win)` / `save_window(root, MOD_DIR, win)` |
+| 壊れない書き込み | `modtool.write_json(root, path, data)` |
+| 配色と書体 | `modtool.setup_theme(win, root)`（戻り値は `gui` モジュール。他も借りられる） |
+| ディスクのセーブ | `modtool.saves_module(mod_dir=MOD_DIR)`（＝`instantale_modloader.saves`） |
+
+`modtool` は**状態を持たない**（`MOD_DIR` は毎回引数）。
+オフラインの検査が1プロセスで複数の `tool.py` を読み込むので、持つと2本目が1本目の場所を掴む。
+
+道具の先頭に書く仕掛けはこれだけ:
+
+```python
+MOD_DIR = os.path.dirname(os.path.abspath(__file__))
+_IML_ROOT = os.environ.get("IML_ROOT") or ""
+for _tools in ([os.path.join(_IML_ROOT, "tools")] if _IML_ROOT else []) + [
+        os.path.normpath(os.path.join(MOD_DIR, os.pardir, os.pardir, os.pardir, "tools"))]:
+    if os.path.isfile(os.path.join(_tools, "modtool.py")) and _tools not in sys.path:
+        sys.path.insert(0, _tools)
+
+import modtool  # noqa: E402
+```
+
+3つ上のフォールバックは**省略できない**。
+`IML_ROOT` が指す先に `tools\` が無い場合（オフラインの検査は `runtime\` だけの仮フォルダを渡す）と、
+環境変数の無い直接起動の両方がここを通る。
+`_IML_ROOT` が空のとき候補に入れないのは、`os.path.join("", "tools")` が相対 `"tools"` になり、
+`cwd` が MOD フォルダなので MOD 自身が `tools\` を持つと誤爆するため。
+
+`modtool.py` は `make_dist.bat` の**名指しの白名簿**で配布物に入る。
+`tools\` に新しいファイルを足すときはそこへ1語足すこと。
+忘れると手元と CI は緑のまま、**配布 zip でだけ「設定…」が何も開かない**。
+
+##### 土台を触ったら `tools\check_tool_screens.py` で開いてみる
+
+```
+python tools/check_tool_screens.py              開いて撮る（python と pythonw の両方）
+python tools/check_tool_screens.py --window     窓の記憶の往復（最大化して閉じて開き直す）
+python tools/check_tool_screens.py --only 322   名前に 322 を含む MOD だけ
+```
+
+`modtool.py` か `instantale_modloader.saves` を触ると6画面すべてに効くのに、
+**`tools\tests\` の検査はこの経路を通らない**:
+
+- 起動は別プロセスで、渡すのは環境変数だけ。`import` では通らない
+- 配布物のローダは `pythonw` で走る。`sys.stderr` が `None` なので、
+  そこへ書く道が在ると**無反応で死ぬ**（traceback がどこにも出ない）。だから両方で試す
+- 窓が組めても中身が空、という壊れ方がある
+
+対象は `discover()` が `"tool"` を宣言していると言った MOD（§1.3）。
+道具が増えても書き足すところは無い。
+撮ったものは `out\tool_screens\`（消してよい）。
+
+機械が決めるのは「出たか・落ちなかったか・寸法が壊れないか」までで、
+**中身が入っているか・崩れていないかは撮ったものを目で見る**。
+`tools\tests\test_*.py` に置いていないのは、あちらが
+「ゲーム不要・短時間・CI が全部走らせる」名前空間で、こちらは画面が要り、
+数分かかり、`--window` が本物の `settings\gui.json` を書く（退避して戻す）ため。
 
 > 元は `323_npc_carryover` の設計。先に `322_battle_bgm` で実装した。
 > `131_sharp_portrait` も同じ契約で、既存 NPC の顔の一括切り直しをこの画面に持つ（設定もそこで引き受ける）。
+
+#### 3.12.1 設定を2段にする（一括とワールド個別）
+
+世界ごとに違う値を持たせたい設定は、`mod.json` の宣言（§3.8）を残したまま
+同梱の画面（`tool.py`）にもう1段足す。
+宣言した値が全ワールド共通の一括設定で、画面の「ワールド個別設定」タブがその世界だけの上書きになる。
+
+| 段 | 効く範囲 | 置き場 |
+|---|---|---|
+| 一括設定 | 全ワールド | `settings\mod_settings.json`（他の MOD と同じ） |
+| ワールド個別設定 | その世界だけ | `state\<MOD 専用の名前>\<世界名>.json`（`state.WorldStore`。§3.11） |
+
+決まりは4つ。
+
+- **個別の控えには一括設定と違う項目だけ書く。** 全部同じならファイルを消す。
+  一括設定を後から変えたとき、触っていない項目が古い値に固定されない
+- **世界の見分けは `state.world_key(app)`。** フォルダ名でもセーブのファイル名でもない（§3.11 と GAME.md §2.7）
+- **一括設定をモジュールの外（`sys` など）に固定しない。**
+  ローダは注入のたびにモジュールを作り直す（`module_from_spec` → 設定の注入 → `apply`）ので、
+  素の宣言の値はそのモジュールのグローバルにだけ在る
+- **重ねるのは MOD が自分の出口で行う。** 世界が変わったかを見て、変わったときだけ控えを読み直す
+  （`130_` は `tr` から呼ばれるので、変わっていない道は辞書引き1回で抜ける）
+
+この形は `324_place_bgm`（曲）・`130_currency_unit`（通貨の表記）・`314_area_move_custom`（日数・料金・文言）の3本が同じ。
+
+`130_` と `314_` の画面は**宣言駆動で MOD 固有のコードが1行も無かった**
+（`mod.json` の `name` / `description` / `settings` しか読まない）ので、
+501行の写しごと `tools\modtool.py` の `world_settings_main(MOD_DIR)` へ移した。
+2本の `tool.py` はそれを呼ぶだけのシムで、`__file__` 以外に何も書かない。
+だから今も同じファイルで、`tools\tests\test_world_settings_tool.py` が
+`filecmp` で同一性を、`test_modtool.py` が中身を検査している。
+
+4本目が要るときは `tool.py` を写さず、シムを1枚置いて `world_settings_main` を呼ぶこと。
+`state\` の控えのフォルダ名は `modtool.state_dirname(MOD_DIR)`（番号を落としたもの）が決めるので、
+MOD 側に書くことは何も無い。
 
 ---
 
@@ -1660,8 +1826,9 @@ screen.mark_of(entry)        # 'offer'（自分のボタンでなければ None�
 ```
 
 キーを他の MOD と共有すると、相手の `on_button_press` が自分のボタンを握り潰す。
-同梱 MOD が使用中のキーは4つ（`mod_action` / `mod_party_action` /
-`mod_road_action` / `mod_pardon_action`）。
+同梱 MOD が使っているキーの一覧はここには置かない（増えるたびに古くなる）。
+同じ名前を2本が使えば `tools/check_mods.py` が止め、
+わざと共有するなら `mod.json` の `"shares"` で断る（§3.2.3）。
 
 印のキーは必ず `ui.MARK_PREFIX`（`mod_`）で始めること。
 残骸の掃除（`prune_stale`）は「他の MOD が今その場に出しているボタン」を見分けるのに
@@ -2072,6 +2239,254 @@ day = ui.game_day(app)      # 読めなければ None
 実行時の世界がまだ無いとき（ロードの途中）は `world_dict["world_data"]` から拾う。
 5本が各自でこれを読んでいて、**その受け皿を持っていたのは `312_` だけ**だった。
 
+### 5.7 `instantale_modloader.modnpc`
+
+**MOD だけが持つ NPC**と、**正規 NPC への層（頼み文とフック）**。
+`npcs.make_npc`（§3.2.3。セーブに残る本物）の裏返しで、**ゲームが id で引く場所には現れない**。
+
+> 残さないのは機械的な参照（`npcs` の項目・`party`・ボタンの引数・敵の辞書）で、
+> ロードのときに名簿を引いて落ちるもの。
+> 遊んだ記憶（ほかの住人の `current_log` / `life_log`、プレイヤーの記憶）には
+> 名前が残り、消さない。ゲームが書いた文章で、居なくなった住人と同じ扱い
+> （下の「残る足跡」）。「セーブに一切残さない」ではない。
+
+```python
+from instantale_modloader import modnpc
+
+def apply(ctx):
+    modnpc.install(ctx, write=write)          # 関所。何本の MOD が呼んでも1つ
+
+    npc_id = modnpc.register("330_my_mod", key="innkeeper",   # mod:330_my_mod:innkeeper
+                             fields={"name": "宿の主", "profile": "..."},   # 組むときの初期値
+                             on={"world": on_world}, notes=add_rumor)
+    modnpc.spawn(app, npc_id)                 # 組んで world.characters に載せる
+    modnpc.place(app, npc_id, area_id, facility_id, owner=True)
+
+    modnpc.register("330_my_mod", npc_id="42", notes=lambda info: "…")   # 正規 NPC の頼み文に足す
+```
+
+| 何を | どうなるか |
+|---|---|
+| id | `mod:<持ち主>:<鍵>` の文字列。整数の連番とは名前空間が分かれる |
+| `fields` | セーブの項目名（`npcs.NEW_NPC_TEMPLATE` の33項目）で受ける、組むときの**初期値**。控えの写しが在ればそちらが勝つ（ゲームの「新規作成時の値」と同じ扱い） |
+| 素データ | `spawn` が33項目の写し（`plain_data`）を `save_data_dict['npcs']` / `world_dict['npcs']` に同じ辞書として置く。ゲームの詳細生成（`generate_npc_detail`）はそこへ書く |
+| 保存 | 関所が実体を控えへ写し（`snapshot_all`）、施設と主から外し、名簿と素データの辞書を `_RosterView`（反復では隠し、id では引ける）に差し替え、**id が載る他の器**（選択肢・自由入力・パーティ・戦闘中の敵。`scrub_saved_refs`）からも落として、保存の後に戻す |
+| ロード | 実体は捨てられ、層に `on["world"]` が来て、控えから組み直して置く（`restore_world`。その持ち主の層が登録されているものだけ） |
+| 控え | ローダが `state\modnpc\<世界>.json` に持つ（持ち主ごとに `{id: {snapshot, spawned, place}}`）。MOD 固有の続き（出資の帳簿など）は `state.WorldStore`（§5.4） |
+
+**真実は実体1つ。** ローダは値の変換も戻しもしない。
+MOD の NPC は実体に直接書き、保存のたびにローダが実体を控えへ写す（正規 NPC でゲームがやっている保存を、
+場所を変えてやる）。正規 NPC の項目を書けばそれは本物の変更で、ゲームがセーブに書く（戻すのは書いた MOD の責任）。
+「正規 NPC の項目をセーブに残さず画面上だけ変える」機構は持たない ― 実行時に差し替えて保存の直前に戻す往復は、
+その間にゲームが書いた値を消す・世界をまたいで残る・保存の窓に漏れる、という同期の穴を作るので外した（2026-09-13）。
+要るのは「変装」と「行事の絵」くらいで、どちらも本物を書き換えて MOD が戻す形で成り立つ。
+
+**層は持ち主ごとに1つ**で、同じ `(持ち主, id)` の登録は差し替わる。
+`apply()` は注入のたびに走る（§3.5）ので、ここが重なる作りだと世代のぶんだけ積み上がる。
+
+`register` の引数:
+
+| | 効く場所 |
+|---|---|
+| `fields` | MOD の NPC を組むときの初期値 |
+| `prompt` | `llm_manager:conversation_*` の引数。名前で開いて渡すので、`messages` も `retrieved_knowledge` も触れる（GAME.md §2.24） |
+| `notes` | 相手の素性に足す文章を返す関数（`fn(info) -> str / None`）。関所が1回だけ複製を作って `profile` の末尾に繋ぎ、引数を差し替える。本物には触らない |
+| `on` | `world` / `conversation_start` / `conversation_end` / `detail` / `detail_done` / `image` / `save` |
+| `place` | 施設の名簿と主、実体の `.location` / `current_node` / `current_area`（外すと元へ戻す） |
+
+**取っ手**（`modnpc.get(app, id)` → `Npc`）。ModNPC でも正規 NPC でも同じ形。読み書きとも実体へ素通し。
+
+```python
+npc = modnpc.get(app, "mod:330_my_mod:innkeeper")   # 居なければ None
+npc.is_dead                                         # config['is_dead']（読み書き）
+npc.profile / npc.skills / npc.image_src            # セーブの33項目が同名のプロパティ
+npc.physical_integrity                              # ローダが知らない属性も実体へそのまま素通し
+npc.profile = npc.profile + "\n今日は休み"           # 実体へ書く（ModNPC は写しにも同じ値）
+npc.character / npc.config / npc.data / npc.snapshot()   # 実体／その config／ModNPC の写し／いまの写し
+npc.in_world / npc.exists / npc.is_mod
+npc.place(area, facility) / npc.despawn() / npc.unregister(owner)
+```
+
+**素データ（セーブに焼かれる側）を触る口は取っ手に無い。** `data` は ModNPC の写しだけを返し、正規 NPC では None。
+正規 NPC の素データを触るなら `npcs.make_npc` や `save_data_dict['npcs']` を直に使う（セーブの改変。片付けは MOD の責任）。
+HP は `current_hp` / `max_hp` / `original_max_hp` の3つ組（GAME.md §2.22。1つだけ動かすと本体の不変条件を破る）。
+写しに入るのは JSON に落ちる項目だけで、`location` などの実行時のオブジェクトは `place` の控えが持つ。
+
+##### 隠す先は名簿だけではない（2026-09-13 に実セーブで確認）
+
+`game_variables.buttons_backup` には
+`{"spec": {"cls_name": "ConversationStartManager", "args": ["35"]}}` が焼かれている。
+「会話する」の一覧を出したまま保存すると、そこへ `mod:` の id が残り、
+**MOD を外した後にその選択肢を押すと `KeyError` で落ちる**。
+パーティ（`party` / `original_party`）と戦闘中の敵（`current_enemy_dict`）も同じ形で id が並ぶ。
+`hide` はこの4種類も保存の窓の間だけ落とす（`SAVED_CHOICE_ATTRS` / `SAVED_SPEC_ATTRS` /
+`SAVED_PARTY_ATTRS` / `SAVED_ENEMY_ATTRS`）。
+id を載せる器を新しく見つけたら、ここへ足す。
+
+##### 仲間にはできない（関所が断る）
+
+**仲間は `save_data_dict['npcs']` に素データが在ることが前提。**
+実セーブで確認した（2026-09-13。`game_variables.party` の id が `npcs` の鍵を指し、
+その人物は `areas/<id>/adventurer_npcs` にも載っていた）。
+MOD の NPC の素データは保存の直前に隠すので、加入したまま保存すると
+ロードのときに組み立てられない。
+保存の窓で `party` から外す手もあるが、それは**仲間だったことが黙って消える**形になる。
+だから `InstantaleApp.add_party_member` を包んで断り、記録を残す（`on["party_refused"]`）。
+`SAVED_PARTY_ATTRS` の掃除は、`add_party_member` を通らない経路のための保険。
+
+仲間にしたい人物は `npcs.make_npc` で本物として作る
+（セーブに残るので、片付けはその MOD の責任。GAME.md §2.23）。
+
+##### 残る足跡と、他の MOD との関わり
+
+- **住人の記憶には名前が残る**（実セーブで確認。`npcs/<id>/current_log` に
+  「…測定用の来訪者に対し…」）。これはゲームが書いた文章で、id ではないので壊れないが、
+  MOD を外すと居ない人物の話が残る。
+  **消さない**。ほかの住人の要約は LLM が混ぜ書きした文で、名前だけ抜くと文が壊れ、
+  1件ごと消せば本物の記憶を削ることになる。倒れた住人や `326_` で旅立った住人と同じで、
+  居たことは記憶に残る。方針は「機械的な参照は残さず、記憶は残す」の2本（2026-09-13）。
+  名前を本物と重複させると痕跡が別人に付くので、名前は作る側が決める
+- **名簿を舐める MOD は MOD の NPC も拾う**（`120_` の改名・`301_` のクエスト・`327_` の社交など）。
+  `modnpc.is_mod_npc(id)` で飛ばせるが、既存の MOD は知らない。
+  名前を本物と重複させない（`120_` が改名の対象にする）、
+  ゲームに残る器へ id を渡す MOD と併用しない、で避ける
+- **`unload` は剥がす前に MOD の NPC を降ろす**（§3.10）。関所だけ消えると次の保存で焼かれる
+`npc_id` に `modnpc.ANY`（`"*"`）を渡すと**誰と話していても効く層**になる。
+`311_` / `317_` / `321_` / `403_` は「相手を複製して `profile` に足し、引数を差し替える」手順を
+4本とも自前で持っている（2026-09-12 に確認。外側の層から複製の複製ができ、繋ぐ順は
+`load_order.json` の並びでしか決まらない）。`notes` はその手順を関所に寄せるための口で、
+順は `priority`（小さいほど先。同じなら id 指定 → `ANY` → 積んだ順）、同じ文章が2本から来たら1つに畳み、
+足すのは会話の5関数（`NOTES_SITES`。要約や雇用の頼み文には足さない。層ごとに `sites=` で変えられる）。
+4本の移行は別作業で、**`notes` の口はオフラインでしか通していない**（2026-09-12 時点）。
+
+フックは `fn(info)` の1つ形で、`info` は `{"site", "app", "npc_id", "character", "args", "owner"}`。
+戻り値に意味があるのは2つだけで、`detail` は `True` で本体へ通し、`image` は `False` で本体を止める。
+フックの例外は飲む（1本の MOD の失敗で関所を止めない）。飲んだことはログに残る。
+
+> 実機で通っているのは、保存に漏れないこと・会話の一巡（開始→第一声→終了→要約、記憶の蓄積）・
+> 被せが頼み文まで届くこと（2026-09-12。VERIFICATION.md §3.59）。
+> 「会話する」の一覧にも並ぶ（`place()` が `.location` に実行時の `Facility` を据える。
+> 一覧はそこを見て組まれる。GAME.md §2.23）。置かずに話しかけさせるなら
+> `process_choice(ConversationStartManager(app, id), 名前)` を MOD が出す。
+> 名簿を外すのではなく差し替えるのは、保存が別スレッドで名簿を舐める間に
+> ゲーム自身の id 引きが落ちたため（同日、`KeyError` 2件）。
+> 戦闘はここでは何も引き受けていない（パーティ加入は関所が断る）。
+> 素の住人は会話の直前の詳細生成（`generate_npc_detail`）で HP・スキル・立ち絵が埋まるので
+> 会話から挑んでも落ちない。実測で落ちたのは `make_npc` で作った詳細生成前の NPC
+> （`902_` の容疑者。VERIFICATION_LOG.md §2.40 / §2.42）で、素の住人が落ちた記録は無い。
+> MOD の NPC も既定で同じ道を通す（`level_of_detail` を 1 で組み、素データの写しを置く。
+> 会話の直前の入口は `ensure_npc_detail_generated` ではなく `generate_npc_detail` で、
+> LLM の答えを `save_data_dict['npcs'][id]` へ書く。写しが無いと `KeyError` で会話のスレッドが死ぬ。
+> 実機 2026-09-12。写しを置いた後は `skills` / HP / 立ち絵が埋まり、`level_of_detail` が 2 に上がって
+> 会話も保存も通った）。埋まった後に何が入るかは `on["detail_done"]` で受け取れる。
+> 層が `on["detail"]` で False を返せば止まる（そのときは挑まれると落ちる）。
+> 詳細生成を経た人物は戦闘にも入れる（実機 2026-09-12。倒れると `config['is_dead']` が立って
+> 一覧から外れる。素の住人と同じ。生死を残すかは MOD の控えで決め、控えなければ組み直しで生き返る）。
+
+> この節は§3.2.3 の表（写しが2本出たら寄せる）の例外で、**写しはまだ1本**
+> （`914_real_estate` の `storage.make_holder`）。
+> 2本目（出資して建てた施設の主人）を書く前に置いたのは、
+> 「セーブに残さない」を守っているのが保存の直前の関所1箇所だけだからで、
+> そこを MOD ごとに持つと、**写した本数だけ漏れる口が増える**。
+> 寄せる順が逆になるぶん、`make_holder` 側は実機で線が引けるまで触らない。
+
+### 5.8 `instantale_modloader.modfacility`
+
+**MOD だけが持つ施設。** `modnpc`（§5.7）の施設版で、考え方は同じ。
+街に建てて、控えはローダが `state\modfacility\<世界>.json` に持ち、世界を読み直すたびに建て直す。
+MOD を外せば街は素のまま（建物も、そこへ繋がる道も残らない）。
+
+```python
+from instantale_modloader import modfacility
+
+def apply(ctx):
+    modfacility.install(ctx, write=write)       # 関所。何本の MOD が呼んでも1つ
+
+    fid = modfacility.register("915_my_mod", key="inn1",   # mod:915_my_mod:inn1
+                               fields={"name": "灯火亭", "facility_type": "inn",
+                                       "tier": "basic"},
+                               choices=[{"key": "stay", "label": "滞在する",
+                                         "on": start_stay}],
+                               on={"background": paint, "world": on_world})
+    modfacility.spawn(app, fid, area_id)        # その土地の入口に建てる
+```
+
+**NPC と施設では、隠す側と肩代わりする側が逆になる。**
+
+| | `modnpc` | `modfacility` |
+|---|---|---|
+| 保存が舐める器 | `world.characters` と `npcs` の素データ | **舐めない**。保存は `save_data_dict['areas']` から書き、実行時の `node.facilities` を見ない |
+| だから保存で | 名簿を `_RosterView` に差し替える | 実体は隠さなくてよい |
+| ゲームが実行時の追加を見るか | 見る（会話の一覧に並ぶ） | **見ない**（移動の一覧にも、建物の中にも出ない） |
+| だから MOD が出すもの | 入口だけ | 道・中の選択肢・出口・背景の全部 |
+
+ゲームは移動の一覧を素データから組み直すので、実行時に足した `connections` を読まない
+（`914_real_estate` が実機で確認。GAME.md §2.7）。
+**肩代わりはこのモジュールが持つ。** 宣言するのは中の選択肢だけで、出口・道・残骸の掃除・
+本文が流れている間の見送りとやり直しは関所の側にある。
+
+| 何を | どうなるか |
+|---|---|
+| id | `mod:<持ち主>:<鍵>` の文字列。`ids.claim` を通さないので `index['facility']` が進まない |
+| `fields` | 素データの8項目（`FACILITY_FIELDS`。実セーブの `location` と同じ並び）で受ける初期値。控えの写しが在ればそちらが勝つ |
+| 保存 | 関所が素データを控えへ写し（`snapshot_all`）、**id が載る器**（選択肢・自由入力。`scrub_saved_refs`）から落とし、立ち位置が MOD の施設なら入口へ移して**その場の選択肢も一緒に置く**（ロードは選択肢を組み直さない。GAME.md §2.3）。保存の後に戻す |
+| ロード | 実体は捨てられ、層に `on["world"]` が来て、控えから建て直す（`restore_world`）。**その後で立ち位置を検める**（`repair_player_location`） |
+| 押下 | 自前のボタンの spec は無害な既存クラス（`ui.SAFE_CLS`）で、印（`mod_facility`）で横取りして層のハンドラを呼ぶ |
+
+**立ち位置に残った id は、その世界を二度と開けなくする。**
+ゲームのロードは、引けなかった施設に `'facilityが見つからない'` という**文字列**を入れてから
+`.name` を読む（`instantale.py:1493`）。建て直されない建物の中で保存されるとそうなる。
+既定（`LIFT_LOCATION`）は**常に入口へ移して保存する**。
+建て直しがゲームの立ち位置の引き当てより先に走るなら中のまま保存してよいが、
+その順序は実機で当てていないので、確かめるまで安全側に倒してある。
+
+`register` の引数:
+
+| | 効く場所 |
+|---|---|
+| `fields` | 素データの初期値（`name` / `description` / `facility_type` / `tier` / `owner` / `config`） |
+| `choices` | 建物の中の選択肢。`[{"key", "label", "on"}, ...]` か、その時点で組む `fn(info)` |
+| `exit_label` | 出口の文言（省くと `出る`） |
+| `keep_inside` | 中に立ったまま保存してよいか。`True` か `fn(info) -> bool`（省くと入口へ移す） |
+| `on` | `world` / `save` / `enter` / `leave` / `choices` / `background` |
+
+`keep_inside` を真にしてよいのは、**その建物がロードで必ず建て直る**ときだけ。
+壊す予定が立っている間だけ偽を返す関数にすると、
+「中に居るあいだは壊さず、外に出てから壊す」という作りとも噛み合う。
+
+背景は2つの入口がある。ゲームが決めようとしている場面（`change_background_image_*` の包み）は
+**必ず描く**（そこで降りると街の景色のままになる）。
+「立っているのにまだ描いていない」ほうは `ensure_background` が Clock へ1回だけ予約し、
+予約から実行までの間にゲームの経路が描いていれば降りる
+（画像の読み込みが2回走って見えた。`914_` が実機で踏んだ）。
+
+**取っ手**（`modfacility.get(app, id)` → `Fac`）。読み書きとも実体へ素通しで、
+建っていなければ層の `fields` と控えの写しを読む。
+
+```python
+place = modfacility.get(app, fid)
+place.name = "灯火亭（改装）"        # 次の保存で控えへ写る
+place.tier                          # 素データの8項目が同名のプロパティ
+place.config_set("stock_tier", 2)   # config の中の1鍵だけ
+```
+
+> **`modnpc` とは別の関所になる。** フレームワークどうしは順序を約束しないので、
+> 建てた施設に ModNPC を置くなら **MOD の側が `on["world"]` で置く**こと
+> （`modnpc` の自動の置き直しは、施設が先に建っている保証を持たない）。
+
+> 実機では何も確かめていない（測るのは `230_probe_mod_facility`）。
+> 文字列の施設 id が `MovePhaseManager` と背景の引きで通るか、
+> 保存後のセーブにその土地の施設が増えていないかは、どれもまだ見込み。
+> 整数で建てる形は `914_real_estate` が版19 まで実機で通していたので、落ちたときの逃げ場はそちら。
+> オフラインは `tools\tests\test_modfacility.py` 58件。
+>
+> **最初の使い手は `914_real_estate`（版20）。** 2本目は `915_facility_investment`（版1）で、
+> `modnpc` と組で使う最初の MOD（建てた施設に主人を置く。置くのは MOD の側）。
+> 版19 まで自前で持っていた建物をここへ寄せて、682行ぶん減った。
+> 実機で踏んだ知識（入口へ繋ぐ・立ち位置に残った id で世界が開けなくなる・
+> 本文が流れている間は足せない・背景の二重描き・取り残されたときの出口）は、
+> どれもあちらが払った代償なので、この節はその写しでもある。
+
 ---
 
 ## 6. 落とし穴（ルール一覧）
@@ -2166,7 +2581,7 @@ day = ui.game_day(app)      # 読めなければ None
 | ゲームの文言を持たずに、ゲームの分類を書き換える | `125_`（段の並びを注入後の最初の呼び出しで総当たりして覚え、以後は位置で扱う。文字列を1つも持たないので言語設定にも版差にも巻き込まれない） |
 | 引数に居ない相手を、場面のマネージャを包んで拾う | `125_`。直そうとしている関数が相手を受け取っていないとき、**フレームを遡る手はこのゲームでは使えない**（生きたフレームの `f_locals` は空。§6.3）。相手が引数として届く場所（その場面の入口と出口のマネージャ）を包み、**通っている間だけ**相手をスレッドごとに控える。id は世界の名簿で引けたものだけ採る（会話の通し番号のような「相手ではない id」を鍵にすると、値が場面ごとに変わって「気まぐれ」に化ける）。**入口と出口の両方を包むこと**。片方だけだと、付けた差がもう片方の再計算で上書きされる |
 | 失敗を握り潰す前に、必ず引数と型を記録する | `100_`（値と型を残し、自前のプロトタイプで直接呼び直す。それも駄目なら諦めて `None`。再送出はしない） |
-| どのフックが効くか分からないので全部に仕掛ける | `104_`（BGM）/ `105_`（`chat` と `payload`） |
+| どのフックが効くか分からないので全部に仕掛ける。**効いた側が分かったら残りは外す** | `104_`（BGM）/ `105_`（`chat` と `payload` の両方に仕掛け、実機で chat しか発火しないと分かった時点で payload を外した） |
 
 ### 7.2 プロンプトと LLM
 

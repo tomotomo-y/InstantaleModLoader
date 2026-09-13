@@ -70,7 +70,7 @@
 import sys
 
 from instantale_modloader import ui
-from instantale_modloader.state import WorldStore, world_key
+from instantale_modloader.state import UNKNOWN_WORLD, WorldStore, world_key
 
 LOG_BASENAME = "area_move_custom.log"
 
@@ -83,7 +83,9 @@ MARK = "mod_area_move_custom"
 
 # ---------------------------------------------------------------- 設定（mod.json）
 # ここの定数だけが GUI から変えられる（ローダは入口モジュールのグローバルへ書き込む。TECH.md
-# §3.8）。
+# §3.8）。これが全ワールド共通の一括設定。
+# ワールド個別の値は同梱の tool.py が `state/area_move_custom/<世界>.json` に書き、
+# `apply()` がその世界を見ているあいだだけここへ上書きする（`refresh_world`）。
 # 他のファイルへ移さないこと。
 # 既定値はすべて素のゲームの値。
 # 素の値のままなら、この
@@ -186,6 +188,17 @@ GAME_COACH_PRICE = 1000
 # ファイルが無いだけで、挟む街の数は常に 0 ＝ 補正なしに落ちる）。
 ROADS_DIRNAME = "road_opening"
 
+# ワールド個別の設定の控え。
+# 書くのは同梱の tool.py だけ。ゲーム中はこの MOD が読む。
+SETTINGS_DIRNAME = "area_move_custom"
+SETTINGS_STORE_ATTR = "__instantale_area_move_custom_settings_store__"
+SETTING_NAMES = (
+    "WALK_DAYS", "COACH_DAYS", "COACH_PRICE", "WALK_NAME", "COACH_NAME",
+    "WALK_BUTTON", "COACH_BUTTON", "WALK_DEPART_TEXT", "COACH_DEPART_TEXT",
+    "ARRIVE_TEXT", "HOP_SCALING", "HOP_FACTOR", "HOP_ADD_DAYS",
+    "HOP_ADD_FARE", "WALK_DAYS_MAX", "COACH_DAYS_MAX",
+)
+
 # 手持ちが設定した運賃に足りないときの一言。
 REFUSE_TEXT = "（{name}代{price}Gに足りない ― 手持ち{gold}G）"
 
@@ -280,6 +293,58 @@ def apply(ctx):
     # 書くのは 325_ だけなので `fresh=True` で読めば足りる（更新時刻が変われば
     # 読み直る）。読み取り専用なので、apply のたびに作り直しても安全。
     roads = WorldStore(ctx, ROADS_DIRNAME, own=False, write=write)
+
+    # ワールド個別の設定。控えがあればその世界を見ているあいだだけ上書きし、
+    # 無い世界では一括設定（ローダが注入した値）へ戻す。
+    settings_store = getattr(sys, SETTINGS_STORE_ATTR, None)
+    if not isinstance(settings_store, WorldStore):
+        settings_store = WorldStore(ctx, SETTINGS_DIRNAME, default=dict,
+                                    write=write)
+        setattr(sys, SETTINGS_STORE_ATTR, settings_store)
+    elif settings_store is not None and hasattr(settings_store, "rebind"):
+        settings_store.rebind(ctx, write)
+    # 注入のたびにモジュールは作り直され、一括設定を注入してからここへ来る（TECH.md §3.8）。
+    # だからここで控えた値がそのまま一括設定（`sys` に固定してはいけない。
+    # 一括設定を変えて注入し直しても古い値が残る）。
+    base_settings = {name: globals()[name] for name in SETTING_NAMES}
+    active_settings = [None]    # 直前に反映した (世界, 値) の署名
+
+    def refresh_world(app=None):
+        """現在のワールドの控えを読み直す。変わっていれば True。"""
+        current_world = UNKNOWN_WORLD
+        if app is None:
+            try:
+                app = ui.find_app()
+            except Exception:
+                app = None
+        try:
+            if app is not None:
+                current_world = world_key(app)
+        except Exception:
+            pass
+        record = {}
+        if isinstance(current_world, str) and current_world != UNKNOWN_WORLD:
+            try:
+                loaded = settings_store.load(current_world, fresh=True)
+                if isinstance(loaded, dict):
+                    record = loaded
+            except Exception:
+                ctx.log_exc("area move custom: cannot read world settings")
+        values = {}
+        for name in SETTING_NAMES:
+            default = base_settings[name]
+            value = record.get(name, default)
+            values[name] = value if type(value) is type(default) else default
+        signature = (current_world,
+                     tuple((name, values[name]) for name in SETTING_NAMES))
+        changed = signature != active_settings[0]
+        if changed:
+            globals().update(values)
+            active_settings[0] = signature
+        return changed
+
+    # 起動時に現在ワールドが分かっていれば即時に反映する。
+    refresh_world()
 
     def scaled(base, hops, add_per_hop, mode=None, factor=None):
         """距離補正後の値。挟む街が 0 なら素通し。
@@ -426,6 +491,7 @@ def apply(ctx):
             app = getattr(self, "app", None) or ui.find_app()
             if app is None:
                 return result
+            refresh_world(app)
             options = move_options(getattr(app, "buttons", None))
             if not options:
                 return result
@@ -473,6 +539,7 @@ def apply(ctx):
         `307_` の体力の断り方と同じ）。
         """
         try:
+            refresh_world(self)
             entry = ui.pressed_entry(self, button_index)
             if isinstance(entry, dict) \
                     and ui.spec_cls_name(entry) == "AreaMoveManager":
@@ -576,6 +643,7 @@ def apply(ctx):
         ずらした直後に描画は走らないので、増えた瞬間が画面に見えることもない。
         """
         app = getattr(self, "app", None) or ui.find_app()
+        refresh_world(app)
         window = None
         try:
             info = getattr(self, "_mod_area_move_custom", None) or {}
@@ -685,6 +753,7 @@ def apply(ctx):
     @ctx.wrap("__main__:InstantaleApp.add_text", required=False)
     def add_text(orig, self, context=None, *args, **kwargs):
         try:
+            refresh_world(self)
             window = state["window"]
             if window is not None and isinstance(context, str):
                 replaced = reword(window, context)

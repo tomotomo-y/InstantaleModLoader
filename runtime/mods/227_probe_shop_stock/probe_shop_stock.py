@@ -91,7 +91,6 @@ def now():
 
 def apply(ctx):
     write = ctx.logger(LOG_BASENAME)
-    record_path = ctx.out_path(RECORD_BASENAME)
     seen = {"items": 0, "boundaries": 0}
     state = {"in_shop": 0}
 
@@ -102,14 +101,11 @@ def apply(ctx):
                     if not str(key).startswith("_")}
         return value
 
+    _record = ctx.jsonl(RECORD_BASENAME)
+
     def record(row):
         """1件1行の JSON。読む用のログとは別に、後から数えるために残す。"""
-        row = plain(row)
-        try:
-            with open(record_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-        except Exception:
-            ctx.log_exc("shop stock probe: cannot write the record")
+        _record(plain(row))
 
     def take(bucket, limit):
         if limit <= 0 or seen[bucket] >= limit:
@@ -423,6 +419,29 @@ def apply(ctx):
             frames.short(name_of(item), 24),
             who(frames.attr(new_inventory, "obtainer", None))),
             ui.find_app(), lambda: orig(self, new_inventory, *args, **kwargs))
+
+    def watch_generator(name):
+        """ゲームの LLM 生成が呼ばれた瞬間の、ゲーム側の呼び出し元と引数の形を録る。"""
+        @ctx.wrap("scripts.llm.llm_manager:" + name, required=False, safe=True)
+        def hook(orig, *args, **kwargs):
+            try:
+                write("LLM生成 {}: args=({}) kwargs={} 呼び出し元: {}".format(
+                    name, ", ".join(type(a).__name__ for a in args),
+                    sorted(kwargs) or "-", frames.caller(CALLER_DEPTH)))
+            except Exception:
+                ctx.log_exc("shop stock probe: cannot record the generator call")
+            result = orig(*args, **kwargs)
+            try:
+                write("LLM生成 {} -> {} {}".format(
+                    name, type(result).__name__, frames.repr_value(result)[:300]))
+            except Exception:
+                ctx.log_exc("shop stock probe: cannot record the generator result")
+            return result
+        return hook
+
+    for name in ("shop_item_generator_ordinary",
+                 "shop_additional_item_generator_ordinary"):
+        watch_generator(name)
 
     ctx.log("shop stock probe: watching the shop path; "
             "records go to out/{} and out/{}".format(

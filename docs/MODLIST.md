@@ -8,8 +8,9 @@
 手で書き換えても次の生成で消える。
 直す先は各 MOD の `mod.json` か MODS.md の見出し。
 
-同梱 102 本（基盤 2 / 修正 41 / 追加 31 / 計測 28）。
+同梱 107 本（基盤 2 / 修正 41 / 追加 34 / 計測 30）。
 うち 17 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
+ほかに 2 本は自作だが、外部からの提案を取り込んでいる（下の「提案を取り込んだ MOD」）。
 
 並びはフォルダ名順。
 適用順はこれとは別で、GUI の `順` 列（`load_order.json`）が持つ。
@@ -86,7 +87,7 @@
 
 ---
 
-## 追加（31本）
+## 追加（34本）
 
 ゲームに無かった遊びを足す。
 
@@ -100,10 +101,10 @@
 | [`304_quest_end_keep_party`](MODS.md#304_quest_end_keep_party-クエストをクリアしても解散しない) | クエスト後も解散しない | クエストをクリアしても解散しない | 2 |  |
 | [`306_party_train_exp`](MODS.md#306_party_train_exp-宿屋の訓練で仲間も育つ) | 仲間も訓練で育つ | 宿屋の訓練で仲間も育つ | 6 |  |
 | [`307_area_move_dungeon`](MODS.md#307_area_move_dungeon-第3の移動手段危険な道を行くを足す) | 危険な道を行く | 第3の移動手段「危険な道を行く」を足す | 8 |  |
-| [`308_battle_damage_display`](MODS.md#308_battle_damage_display-戦闘のダメージ表示) | 戦闘のダメージ表示 | 戦闘のダメージ表示 | 7 |  |
+| [`308_battle_damage_display`](MODS.md#308_battle_damage_display-戦闘のダメージ表示) | 戦闘のダメージ表示 | 戦闘のダメージ表示 | 8 |  |
 | [`309_office_pardon`](MODS.md#309_office_pardon-役場で罰金を納めて手配を解く) | 役場で手配を解く | 役場で罰金を納めて手配を解く | 4 |  |
 | [`311_npc_profile_memory`](MODS.md#311_npc_profile_memory-npcが会話の内容を覚える) | NPCが会話を覚える | NPCが会話の内容を覚える | 5 |  |
-| [`312_shop_restock`](MODS.md#312_shop_restock-日数経過で店の在庫を更新) | 店の品揃えの入れ替え | 日数経過で店の在庫を更新 | 3 |  |
+| [`312_shop_restock`](MODS.md#312_shop_restock-日数経過で店の在庫を更新) | 店の品揃えの入れ替え | 日数経過で店の在庫を更新 | 4 |  |
 | [`313_event_ability_check`](MODS.md#313_event_ability_check-行動の成否判定に能力値を効かせる) | 行動判定に能力値を効かせる | 行動の成否判定に能力値を効かせる | 9 |  |
 | [`314_area_move_custom`](MODS.md#314_area_move_custom-エリア移動の日数料金文言を変える) | 街移動のカスタマイズ | エリア移動の日数・料金・文言を変える | 16 |  |
 | [`315_vacation_custom`](MODS.md#315_vacation_custom-宿の宿泊期間部屋宿代を変える) | 宿泊のカスタマイズ | 宿の宿泊期間・部屋・宿代を変える | 14 |  |
@@ -117,7 +118,10 @@
 | [`323_npc_carryover`](MODS.md#323_npc_carryover-別の世界のnpcを連れてくる) | 別の世界のNPCを連れてくる | 別の世界のNPCを連れてくる | 4 |  |
 | [`324_place_bgm`](MODS.md#324_place_bgm-施設と土地のbgmを置いた曲から選んで鳴らす) | 街・施設BGMの選曲 | 施設と土地のBGMを置いた曲から選んで鳴らす | 4 |  |
 | [`325_road_opening`](MODS.md#325_road_opening-街と街を結ぶ新しい道を切り開く) | 新たな道を探す | 街と街を結ぶ新しい道を切り開く | 18 |  |
-| [`326_npc_travel`](MODS.md#326_npc_travel-npcの街移動) | NPCの街移動 | NPCの街移動 | 14 |  |
+| [`326_npc_travel`](MODS.md#326_npc_travel-npcの街移動) | NPCの街移動 | NPCの街移動 | 15 |  |
+| [`327_inn_quality`](MODS.md#327_inn_quality-高級宿のメリット追加改善) | 高級宿のメリット追加・改善 | 高級宿のメリット追加・改善 | 13 |  |
+| [`328_quest_from_world`](MODS.md#328_quest_from_world-世界概要から依頼を生成する) | 世界概要から依頼を生成する | 世界概要から依頼を生成する | 2 |  |
+| [`329_area_move_with_party`](MODS.md#329_area_move_with_party-雇った仲間がエリア移動を拒まなくなる) | 雇った仲間がエリア移動を拒まなくなる | 雇った仲間がエリア移動を拒まなくなる | - |  |
 | [`401_battle_character_context`](MODS.md#401_battle_character_context-戦闘の審判へ同行者の人物と装備を見せる) | 戦闘キャラクター情報補完 | 戦闘の審判へ同行者の人物と装備を見せる | - |  |
 | [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | パーティーメンバー：アイテム受け渡し | 仲間とアイテムを受け渡しできる | - |  |
 | [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | NPC同士の認知と関係記憶 | NPC同士がお互いを認知し、関係を覚える | 5 |  |
@@ -126,7 +130,7 @@
 
 ---
 
-## 計測（28本）
+## 計測（30本）
 
 ゲームは変えない。`out\` にログを残すだけ。デバッグモードのときだけ読み込まれる。
 
@@ -160,6 +164,8 @@
 | `225_probe_area_quest_difficulty` | 街を初めて訪ねたとき、依頼の難易度を誰がどう決めるかを録る |
 | `226_probe_item_consume` | 回復アイテムを使ったとき何が起きるかを録る |
 | `227_probe_shop_stock` | 買った品が店の棚へ戻るのはどこかを録る |
+| `228_probe_area_move_reject` | エリア移動の拒否（`AreaMoveManager.execute` → `area_move_rejector`）が同行者の何を読んで決めているかを録る |
+| `229_probe_mod_npc` | ローダの `instantale_modloader.modnpc`（MOD だけが持つ NPC と、正規 NPC への被せ）を実機に通し、どこまで通るかを録る |
 
 ---
 
@@ -195,3 +201,17 @@
 | [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | MoririnJP 様 | 提供者と共同 |
 | [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給で売買の値段が変わる) | MoririnJP 様 | 提供者と共同 |
 | [`406_gemini_user_role_fix`](MODS.md#406_gemini_user_role_fix-クラウド-api-の-gemini-で-user-role-の無い依頼を補う) | MoririnJP 様 | そのまま取り込み |
+
+---
+
+## 提案を取り込んだ MOD
+
+MOD 自体はこちらの著作物で、機能の一部を外部からの提案（PR）で取り込んだ 2 本。
+上の「提供を受けた MOD」とは分けてある（出どころが違う）。
+
+権利の所在は [NOTICE](../NOTICE) が持つ。
+
+| フォルダ | 提案 |
+|---|---|
+| [`130_currency_unit`](MODS.md#130_currency_unit-通貨の呼び名と所持金の表示を変える) | MoririnJP 様 |
+| [`314_area_move_custom`](MODS.md#314_area_move_custom-エリア移動の日数料金文言を変える) | MoririnJP 様 |

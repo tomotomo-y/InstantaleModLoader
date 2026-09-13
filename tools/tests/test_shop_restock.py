@@ -66,11 +66,14 @@ def check(name, cond, detail=""):
 
 # ---------------------------------------------------------------- 偽ゲーム
 class Facility:
-    def __init__(self, facility_id, facility_type, owner):
+    def __init__(self, facility_id, facility_type, owner, goods=None):
         self.id = facility_id
         self.name = "テスト" + facility_type
         self.facility_type = facility_type
         self.owner = owner
+        # 品揃えの雛形。作り直しかどうかの目印はここの品名だけ。
+        self.config = {"goods": [{"name": name} for name in (goods or [])],
+                       "stock_tier": 1, "stock_update_date": 0}
 
 
 class Node:
@@ -110,9 +113,47 @@ class Player:
 
 
 class InstantaleApp:
+    counter = [0]
+
     def __init__(self, world, player):
         self.world = world
         self.player = player
+        self.windows = []       # 売買画面に並んだ鍵（開いた回ごと）
+        self.generated_from_dict = []
+
+    def generate_item_from_item_data(self, item_name, description, item_type,
+                                     item_sub_type, value, item_appearance,
+                                     rarity, obtainer):
+        """ゲームの生成（LLM の1行から品1つ）。主の棚へ入れる。"""
+        self.counter[0] += 1
+        item_id = "item_{}".format(3000 + self.counter[0])
+        obtainer.inventory[item_id] = {"name": item_name, "value": value,
+                                       "item_type": item_type, "rarity": rarity}
+        return obtainer.inventory[item_id]
+
+    def generate_item_from_dict(self, item_dict, item_id, obtainer):
+        """ゲームの生成。辞書から品を作って持ち主の棚へ入れる。"""
+        self.generated_from_dict.append((item_id, item_dict.get("name")))
+        item = dict(item_dict)
+        item["id"] = item_id
+        obtainer.inventory[item_id] = item
+        return item
+
+    def toggle_twin_inventory_window(self, left, right, left_label_text=None,
+                                     situation=None, *args):
+        """売買画面。素のゲームはここで主の持ち物の辞書を回す
+        （`normalize_shop_inventory_prices`）。回している最中に鍵が消えると落ちる。"""
+        shown = []
+        for key in left.inventory:
+            shown.append(key)
+        self.windows.append(shown)
+
+
+class BareApp(InstantaleApp):
+    """生成の入口を持たない版（古い本体を演じる）。"""
+
+    generate_item_from_dict = property(
+        lambda self: (_ for _ in ()).throw(AttributeError("no generator")))
 
 
 class ShoppingStartManagerRemake:
@@ -124,12 +165,17 @@ class ShoppingStartManagerRemake:
 
     counter = [0]
 
-    def __init__(self, app, refills=True, defer=False, tier=2, tops_up=False):
+    def __init__(self, app, refills=True, defer=False, tier=2, tops_up=False,
+                 new_name=None, rebuilds=None):
         self.app = app
         self.refills = refills
         self.defer = defer
         self.tier = tier
         self.tops_up = tops_up
+        # 雛形に無い品（売買のたびに LLM が作る新しい品）を1つ足す名前。
+        self.new_name = new_name
+        # 空にした後に作り直す品名。None なら雛形から3件（従来の演じ方）。
+        self.rebuilds = rebuilds
         self.generated = []
         self.topped_up = []
 
@@ -151,16 +197,53 @@ class ShoppingStartManagerRemake:
             key = str(50 + self.counter[0])
             owner.inventory[key] = {"name": "作り直された薬"}
             self.topped_up.append(key)
+            if self.new_name:
+                self.counter[0] += 1
+                owner.inventory[str(50 + self.counter[0])] = {
+                    "name": self.new_name}
+        # 画面を開くのは Clock 経由でメインスレッド（`instantale.py:3208`）。
+        # `execute` は別スレッドなので、メインスレッドは `execute` が戻る前に
+        # 画面を組み始めうる（2026-09-07 の実機はこの順で落ちた）。
+        # その順を再現する: 予約してから、戻る前に走らせる。
+        if owner is not None:
+            CLOCK.schedule_once(
+                lambda dt: self.app.toggle_twin_inventory_window(
+                    owner, self.app.player, "店", "shop"), 0)
+            CLOCK.run_onces()
         return "shopping"
+
+    def generate_item_in_shopping(self, item_data, shop_owner_instance,
+                                  item_stock_tier):
+        """ゲームの生成（品1つ）。LLM が返した1件を主の棚へ入れる。"""
+        self.counter[0] += 1
+        shop_owner_instance.inventory["item_{}".format(2000 + self.counter[0])] = {
+            "name": item_data["name"], "value": item_data.get("value"),
+            "tier": item_stock_tier}
+        return None
 
     def set_item_from_world_data(self, shop_owner_instance, next_tier):
         """ゲーム自身の生成。呼ばれた回数だけ新しい品物を入れる。"""
         self.generated.append((getattr(shop_owner_instance, "id", None), next_tier))
-        for _ in range(3):
+        # 素のゲームは雛形（`config['goods']`）の品を作る。
+        # 名前が雛形と揃っていないと「作り直し」の見分けを検査できない。
+        location = self.app.player.location
+        if isinstance(location, str):
+            location = self.app.world.areas["0"].nodes["0"].facilities.get(location)
+        config = getattr(location, "config", None) or {}
+        goods = [g["name"] for g in (config.get("goods") or [])]
+        if self.rebuilds is not None:
+            # 素のゲームは雛形のうち装備を作らない（GAME.md §2.13.1.3）。
+            for name in self.rebuilds:
+                self.counter[0] += 1
+                shop_owner_instance.inventory[
+                    "item_{}".format(1000 + self.counter[0])] = {"name": name}
+            return None
+        for index in range(3):
             self.counter[0] += 1
             item_id = "item_{}".format(1000 + self.counter[0])
-            shop_owner_instance.inventory[item_id] = {
-                "name": "生成品" + str(self.counter[0]), "value": 3}
+            name = (goods[index % len(goods)] if goods
+                    else "生成品" + str(self.counter[0]))
+            shop_owner_instance.inventory[item_id] = {"name": name, "value": 3}
         return None
 
 
@@ -170,6 +253,10 @@ class FakeClock:
 
     def schedule_once(self, callback, timeout=0):
         self.onces.append(callback)
+
+    def schedule_interval(self, callback, timeout=0):
+        """待機表示の点のアニメーション。検査では1コマだけ回す。"""
+        callback(0.0)
 
     def run_onces(self):
         for _ in range(8):
@@ -181,6 +268,41 @@ class FakeClock:
 
 
 CLOCK = FakeClock()
+
+
+class FakeLLM:
+    """ローダの LLM 経路（`llm.ask` / `llm.create_structure`）を演じる。頼み文を控える。"""
+
+    def __init__(self):
+        self.asked = []
+        self.reply = {"items": [
+            {"item_name": "新作の短剣", "description": "短い剣。", "item_type": "weapon",
+             "item_sub_type": "small_weapon", "value": 36,
+             "item_appearance": "短い剣", "rarity": "common"},
+            {"item_name": "新作の胸当て", "description": "革の胸当て。",
+             "item_type": "wearable", "item_sub_type": "body_armor", "value": 36,
+             "item_appearance": "革の胸当て", "rarity": "rare"},
+            {"item_name": "新作の薬", "description": "薬。", "item_type": "healing_item",
+             "item_sub_type": "medicine", "value": 36,
+             "item_appearance": "小瓶", "rarity": "common"},
+        ]}
+
+    def create_structure(self, ctx, name, fields, label="llm"):
+        return name                      # 何かが返ればよい（None は「作れない」）
+
+    def ask(self, ctx, manager_name, message, *, timeout, structure=None,
+            max_tokens=None, label="llm", write=None):
+        self.asked.append((manager_name, message, timeout))
+        return self.reply
+
+
+LLM = FakeLLM()
+
+
+def install_fake_llm():
+    from instantale_modloader import llm
+    llm.create_structure = LLM.create_structure
+    llm.ask = LLM.ask
 
 
 def install_fake_kivy():
@@ -210,10 +332,9 @@ class FakeCtx:
     # 検査だけが別のログ処理を通ることになる（`write_json` と同じ理由）。
     _mod = None
 
-    def logger(self, name, *, tag=None, stamp=True, label=None):
+    def logger(self, name, **kw):
         import instantale_modloader as _ml
-        return _ml.ModContext.logger(self, name, tag=tag, stamp=stamp,
-                                     label=label)
+        return _ml.ModContext.logger(self, name, **kw)
 
     def state_path(self, *parts):
         path = os.path.join(self.state_dir, *parts)
@@ -264,18 +385,19 @@ SHOP_ID = "30"
 OWNER_ID = "16"
 
 
-def make_world(days, stock, world_name="テスト世界", location_as_id=False):
-    facility = Facility(SHOP_ID, "general_store", OWNER_ID)
+def make_world(days, stock, world_name="テスト世界", location_as_id=False,
+               goods=("薬", "作り直された薬"), can_generate=True):
+    facility = Facility(SHOP_ID, "general_store", OWNER_ID, goods)
     owner = Character(OWNER_ID, "欲深きバルト", stock)
     area = Area("0", [facility])
     world = World(world_name, {"0": area}, {OWNER_ID: owner}, days)
     player = Player("0", SHOP_ID if location_as_id else facility)
-    app = InstantaleApp(world, player)
+    app = (InstantaleApp if can_generate else BareApp)(world, player)
     return app, owner, facility
 
 
 def fresh_mod(restock_days=30, first_visit=False, keep_state=False,
-              keep_sold_out=True):
+              keep_sold_out=True, new_stock=False):
     """mod を読み直して当て直す。**世代をまたぐ控えは毎回捨てる。**
 
     ログも捨てる（`ctx.logger` は追記なので、
@@ -290,6 +412,7 @@ def fresh_mod(restock_days=30, first_visit=False, keep_state=False,
     module.RESTOCK_DAYS = restock_days
     module.RESTOCK_ON_FIRST_SHOP = first_visit
     module.KEEP_SOLD_OUT = keep_sold_out
+    module.NEW_STOCK = new_stock
     log_path = os.path.join(OUT_DIR, module.LOG_BASENAME)
     if os.path.exists(log_path):
         os.remove(log_path)
@@ -320,11 +443,26 @@ def shop(ctx, manager, choice_text="商品を見せてもらう"):
 
         manager.set_item_from_world_data = wrapped
         manager._tier_hooked = True
+    window_hook = ctx.hooks.get("__main__:InstantaleApp.toggle_twin_inventory_window")
+    app = manager.app
+    if window_hook is not None and not getattr(app, "_window_hooked", False):
+        original_window = app.toggle_twin_inventory_window
+
+        def wrapped_window(left, *args, **kwargs):
+            return window_hook(lambda _self, l, *a, **k: original_window(l, *a, **k),
+                               app, left, *args, **kwargs)
+
+        app.toggle_twin_inventory_window = wrapped_window
+        app._window_hooked = True
     result = hook(lambda _self, text: ShoppingStartManagerRemake.execute(manager, text),
                   manager, choice_text)
     CLOCK.run_onces()      # 生成を Clock へ回す版のため
     CLOCK.run_onces()      # 補充の確認（VERIFY_DELAY のコールバック）
     return result
+
+
+def module_store(module):
+    return getattr(sys, module.STORE_ATTR, {})
 
 
 def state_file(world_name="テスト世界"):
@@ -342,6 +480,7 @@ def reset_state():
 # ---------------------------------------------------------------- 検査
 def main():
     install_fake_kivy()
+    install_fake_llm()
     sys.modules["__main__"].InstantaleApp = InstantaleApp
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -455,6 +594,14 @@ def main():
     shop(ctx, manager)
     check("補充止め: 何度開いても増えない",
           list(owner.inventory) == ["item_1"], owner.inventory)
+    # 外すのは画面を開く側（メインスレッド）。`execute` の戻り際に外すと、
+    # 先に走り出した画面に作り直された品が並び、辞書を回す最中に消えて落ちる。
+    check("補充止め: 作り直された品は画面に一度も出ない",
+          app.windows and all(key not in shown for shown in app.windows
+                              for key in manager.topped_up),
+          (app.windows, manager.topped_up))
+    check("補充止め: 控えは画面を開いた時点で消えている",
+          module_store(module).get("held") is None, module_store(module))
 
     # 切れば素のゲームのまま。
     module, ctx = fresh_mod(keep_sold_out=False)
@@ -463,6 +610,122 @@ def main():
           len(owner.inventory) == 2, owner.inventory)
     check("補充止め: 切ったときは記録も出ない",
           "kept sold out" not in read_log(module), read_log(module))
+
+    # -- 作り直されなかった雛形の品は控えから戻す ------------------------
+    reset_state()
+    module, ctx = fresh_mod()
+    app, owner, facility = make_world(
+        days=100, goods=("剣", "薬"),
+        stock={"item_1": {"name": "剣"}, "item_2": {"name": "薬"},
+               "item_3": {"name": "売った品"}})
+    # 素のゲームと同じく、埋め直すのは装備以外（ここでは「薬」）だけ。
+    manager = ShoppingStartManagerRemake(app, rebuilds=("薬",))
+    shop(ctx, manager)                      # 初回（基準）
+    app.world.days_elapsed = 200
+    shop(ctx, manager)
+    names = sorted(v.get("name") for v in owner.inventory.values())
+    check("入替: 作り直された品が並ぶ", "薬" in names, names)
+    check("入替: 作らない雛形の品はこちらで生成する", "剣" in names, names)
+    check("入替: 生成はゲームの入口を通る",
+          [name for _key, name in app.generated_from_dict] == ["剣"],
+          app.generated_from_dict)
+    check("入替: 売った品は流れる", "売った品" not in names, names)
+    check("入替: 生成の記録が残る", "built missing" in read_log(module),
+          read_log(module))
+
+    # 生成の入口が無い版では、控えの現物を戻す。
+    reset_state()
+    module, ctx = fresh_mod()
+    app, owner, facility = make_world(
+        days=100, goods=("剣", "薬"), can_generate=False,
+        stock={"item_1": {"name": "剣"}, "item_2": {"name": "薬"}})
+    manager = ShoppingStartManagerRemake(app, rebuilds=("薬",))
+    shop(ctx, manager)
+    app.world.days_elapsed = 200
+    shop(ctx, manager)
+    names = sorted(v.get("name") for v in owner.inventory.values())
+    check("入替: 生成できなければ控えを戻す", "剣" in names, names)
+    check("入替: 戻した記録が残る", "kept in stock" in read_log(module),
+          read_log(module))
+
+    # -- 入れ替えで品揃え一式を新しく作る（NEW_STOCK）--------------------
+    reset_state()
+    module, ctx = fresh_mod(new_stock=True)
+    app, owner, facility = make_world(
+        days=100, goods=("剣", "薬", "作り直された薬"),
+        stock={"item_1": {"name": "剣"}, "item_2": {"name": "薬"},
+               "item_3": {"name": "売った品"}})
+    for entry, value in zip(facility.config["goods"], (30, 31, 32)):
+        entry["value"] = value
+    manager = ShoppingStartManagerRemake(app, rebuilds=("薬",), tops_up=True)
+    shop(ctx, manager)                              # 初回（基準）
+    LLM.asked.clear()
+    app.world.days_elapsed = 200
+    shop(ctx, manager)
+    names = sorted(v.get("name") for v in owner.inventory.values())
+    check("新規生成: 入れ替えの日に LLM を1回呼ぶ", len(LLM.asked) == 1, LLM.asked)
+    check("新規生成: 品揃えが新しい品名になる",
+          names == sorted(["新作の短剣", "新作の胸当て", "新作の薬"]), names)
+    check("新規生成: 雛形の作り直しも売った品も残らない",
+          "作り直された薬" not in names and "売った品" not in names
+          and "剣" not in names, names)
+    prompt = LLM.asked[0][1][0]["content"] if LLM.asked else ""
+    check("新規生成: 頼み文に店と土地と前の品名が入る",
+          "テストgeneral_store" in prompt and "剣" in prompt and "30, 31, 32" in prompt,
+          prompt)
+    check("新規生成: 記録に残る", "new stock:" in read_log(module), read_log(module))
+    check("新規生成: 控えの日が進む",
+          (state_file() or {}).get(OWNER_ID, {}).get("day") == 200, state_file())
+    check("新規生成: 例外を出していない", not ctx.errors, ctx.errors)
+    log = read_log(module)
+    check("新規生成: LLM の間は待機表示を出す", "busy on" in log, log)
+    check("新規生成: 終わったら解く", "busy off" in log, log)
+    check("新規生成: 解いた後は操作を受け付ける",
+          getattr(app, "is_button_enabled", True) is True, app.__dict__)
+
+    # LLM が返さなければ雛形から作り直す側に落ちる。
+    reset_state()
+    module, ctx = fresh_mod(new_stock=True)
+    app, owner, facility = make_world(
+        days=100, goods=("剣", "薬"),
+        stock={"item_1": {"name": "剣"}, "item_2": {"name": "薬"}})
+    for entry, value in zip(facility.config["goods"], (30, 31)):
+        entry["value"] = value
+    manager = ShoppingStartManagerRemake(app, rebuilds=("薬",))
+    shop(ctx, manager)
+    saved_reply, LLM.reply = LLM.reply, None
+    app.world.days_elapsed = 200
+    try:
+        shop(ctx, manager)
+    finally:
+        LLM.reply = saved_reply
+    names = sorted(v.get("name") for v in owner.inventory.values())
+    check("新規生成: LLM が返さなければ雛形の品名で作り直す",
+          names == ["剣", "薬"], names)
+    check("新規生成: 落ちた記録が残る", "WARN new stock" in read_log(module),
+          read_log(module))
+
+    # -- 雛形に無い新しい品は残す ----------------------------------------
+    reset_state()
+    module, ctx = fresh_mod()
+    app, owner, facility = make_world(days=100, stock={"item_1": {"name": "薬"}})
+    manager = ShoppingStartManagerRemake(app, tops_up=True, new_name="新作の短剣")
+    shop(ctx, manager)
+    names = [v.get("name") for v in owner.inventory.values()]
+    check("新しい品: 雛形に無い品は棚に残る", "新作の短剣" in names, names)
+    check("新しい品: 雛形の作り直しは外す", "作り直された薬" not in names, names)
+    check("新しい品: 記録に残る", "new stock kept" in read_log(module),
+          read_log(module))
+
+    # 雛形が読めなければ、増えたぶんを全部外す（売り切れを守る側）。
+    reset_state()
+    module, ctx = fresh_mod()
+    app, owner, facility = make_world(days=100, stock={"item_1": {"name": "薬"}})
+    facility.config = None
+    manager = ShoppingStartManagerRemake(app, tops_up=True, new_name="新作の短剣")
+    shop(ctx, manager)
+    check("雛形が読めない: 増えたぶんは全部外す",
+          list(owner.inventory) == ["item_1"], owner.inventory)
 
     # -- 止めても初回の品揃えは作らせる ----------------------------------
     reset_state()

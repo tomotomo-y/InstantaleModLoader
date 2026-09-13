@@ -25,7 +25,25 @@
   4. `move_npc_to_facility` で施設に置く（`302_` が実証済みの経路）
 
 生成した NPC は HP・スキル・装備・立ち絵のいずれも空でよい
-（ゲームが会話や戦闘の直前に `ensure_npc_detail_generated` で埋める）。
+（ゲームが会話の直前に `ensure_npc_detail_generated` で埋める）。
+
+##### 戦闘はそこを通らない
+
+以前ここには「会話や戦闘の直前に埋める」と書いてあったが、**戦闘では埋まらない**。
+スキルが空のまま敵ターンを迎えると、ゲームが空の `Literal[]` を組んで落ちる
+（VERIFICATION_LOG.md §2.40）。
+立ち絵も `image_src` が `None` のままだと `StringProperty` への代入で落ちる（同 §2.42）。
+
+本体が空を守っていないのは事実だが、**実測で落ちた相手はここを通して作った
+詳細生成前の NPC**（`902_` の容疑者、2026-08-08 の1件。`902_` の DOC.md §3）で、
+素の住人が落ちた記録は無い。素の住人は会話の直前に `ensure_npc_detail_generated` で
+HP・スキル・立ち絵が埋まるので、会話から挑んでも落ちない。
+「ゲーム自身が作った街の住人が落ちた」と書いていた時期があるが、それは §2.40 の
+「HP 100 の街の住人」という**状態の描写**を出どころと読み違えたもの（2026-09-12 に訂正）。
+
+ここを通して NPC を作る MOD は、その NPC が戦闘に入りうるなら
+先に会話を1度通させるか、`skills` と `image_src` を自分で持たせること。
+本体側を塞ぐ（VERIFICATION.md §3.6 の1位と2位）かどうかとは別の話。
 
 ##### セーブに残る
 
@@ -38,13 +56,17 @@ README の「MOD を消せば完全に元通り」からは外れる性質なの
 import copy
 import sys
 
-from . import ids, ui
+from . import frames, ids, ui
 
 #: 生成直後の NPC の素データのひな型。
 #:
 #: HP・スキル・装備・立ち絵は空でよい。
-#: ゲームが会話や戦闘の直前に `ensure_npc_detail_generated` で埋める。
+#: ゲームが会話の直前に `ensure_npc_detail_generated` で埋める。
 #: だから MOD は軽く作れる。
+#:
+#: 戦闘はそこを通らない（この文書の冒頭の「戦闘はそこを通らない」）。
+#: スキルと立ち絵が空のまま戦闘に入ると落ちるが、
+#: それはゲーム本体のバグで、ここで埋めて隠す話ではない。
 #:
 #: ##### 並び順は「合っていればよい」ではなく、この順でなければならない
 #:
@@ -447,3 +469,50 @@ def _place(app, npc_id, character, area, facility, write=None):
             write("    move_npc_to_facility failed: {}: {}".format(
                 type(exc).__name__, exc))
         return False
+
+
+def enroll(app, area, area_id, npc_id) -> list:
+    """NPC を土地の冒険者名簿（`adventurer_npcs`）に載せる。書けた場所の名前を返す。
+
+        wrote = npcs.enroll(app, area, area_id, npc_id)
+        write("enroll: {} -> adventurer_npcs of area {} via {}".format(
+            npc_id, area_id, wrote or "nothing (roster not found)"))
+
+    戻りは `["area", "world_dict", "save_data_dict"]` の並び（書けたものだけ）。
+    **ログの文言は呼び側が決める** ― 既にあるログの見た目を変えないため
+    （`320_` と `323_` で字下げが違い、どちらも VERIFICATION_LOG.md に引用がある）。
+
+    ##### なぜ1箇所ではなく心当たりを全部見るのか
+
+    **セーブの形＝実行時の形ではない**（GAME.md §2.7）。
+    実行中の `Area` オブジェクトに足しただけでは、次のセーブで消える。
+    素データ側にも同じ名前のリストがあり、そちらは
+    `world_dict` と `save_data_dict` の2本、さらにその中の `world_data` の下にも居る。
+    どれがその世界で生きているかは決めつけられないので、
+    **在るものには全部書く**（`raw is not roster` で同じ実体への二重書きだけ避ける）。
+
+    書けた場所が1つも無ければ空のリスト。
+    呼び側はそれを「名簿が見つからなかった」として記録する
+    （例外にしない ― NPC は作れているので、一覧に出ないだけ）。
+    """
+    wrote = []
+    roster = frames.attr(area, "adventurer_npcs", None)
+    if isinstance(roster, list) and npc_id not in roster:
+        roster.append(npc_id)
+        wrote.append("area")
+    for label, root in (("world_dict", getattr(app, "world_dict", None)),
+                        ("save_data_dict", getattr(app, "save_data_dict", None))):
+        if not isinstance(root, dict):
+            continue
+        holders = [root]
+        inner = root.get("world_data")
+        if isinstance(inner, dict):
+            holders.append(inner)
+        for holder in holders:
+            areas = holder.get("areas")
+            entry = areas.get(area_id) if isinstance(areas, dict) else None
+            raw = entry.get("adventurer_npcs") if isinstance(entry, dict) else None
+            if isinstance(raw, list) and raw is not roster and npc_id not in raw:
+                raw.append(npc_id)
+                wrote.append(label)
+    return wrote

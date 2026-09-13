@@ -10,8 +10,8 @@
     "en": "Change how long walking and the coach take, the coach fare, and the travel wording. Defaults are the game's own values (behavior is untouched until you edit them); the coach button always shows the travel days, which the game itself never displays",
     "ja": "徒歩・馬車の日数と馬車の料金、移動中の文言を変えられる。既定は素のゲームの値のままで挙動は変わらないが、素のゲームでは分からない馬車の所要日数を既定でもボタンに表示する"
   },
-  "version": "1",
-  "author": "R01/Flossian",
+  "version": "2",
+  "author": "R01/Flossian,MoririnJP",
   "shares": [
     "road_opening"
   ],
@@ -231,6 +231,17 @@
         "ja": "距離補正で増えた日数をここで頭打ちにする。既定30",
         "en": "Caps the coach days after distance scaling. Default 30"
       }
+    }
+  },
+  "tool": {
+    "entry": "tool.py",
+    "label": {
+      "ja": "ワールド別のエリア移動設定",
+      "en": "Area travel settings by world"
+    },
+    "note": {
+      "ja": "ワールドごとに日数・料金・文言を変える。ここの設定は全ワールド共通の値",
+      "en": "Per-world days, fare and wording. The settings here are the shared defaults"
     }
   }
 }

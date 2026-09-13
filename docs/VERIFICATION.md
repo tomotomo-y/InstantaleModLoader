@@ -1,6 +1,6 @@
 # VERIFICATION: 現在地
 
-最終更新: 2026-09-04
+最終更新: 2026-09-12
 
 何がどこまで確かめられているかの一覧と、まだ確かめていないものの確認手順。
 
@@ -30,7 +30,7 @@
 | `102_fix_prompt_dedup` | DEDUP | 実経路での発火は確認済みだが、発生源が本体で直って仕事が無くなった。**〔main_023 で本体が取込〕** | §2.3 |
 | `103_fix_eventlog_trim` | EVENTLOG | 実経路で検証済。**〔main_024 で本体が取込〕** | §2.3 |
 | `104_balance_area_bgm` | エリアBGMの偏り是正 | 決着。差し替え3件を実機確認。既存3世界の是正は未実行（§3.4） | §2.4 / §2.39 / §3.4 |
-| `105_fix_schema_compact` | COMPACT | 実機で検証済（33件 73.5%減） | §2.3 |
+| `105_fix_schema_compact` | COMPACT | 決着。実機 2,803 件で 73.3% 減（2026-09-09 時点。ゲームはまだ本文にスキーマを埋めている）。発火しなかった payload 側の仕掛けは同日に外した | §2.3 |
 | `106_fix_battle_bgm_restore` | 戦闘後にBGMが戻らない | 決着。3つの起点すべてが実機で発火。**〔main_024 で本体が取込〕** | §2.5 / §3.1 |
 | `107_fix_battle_flag_stuck` | 戦闘後も `in_battle` が残る | 決着。注入時・戦闘終了時・ロード時の全経路が発火。**〔main_024 で本体が取込〕** | §2.5 / §2.12 / §2.39 |
 | `108_fix_shop_inventory_overflow` | 売買画面の `IndexError` | 原因確定・修正済だが**救済経路が一度も発火せず、能動的に起こせない**。2026-08-09 に `superseded: main_024` で降ろした | §2.16 / §3.8 / §3.8.1 |
@@ -57,7 +57,7 @@
 | `127_llm_response_speed` | ローカルLLMの応答速度 | 実機・別セッションとも再現確認済み。書き換えは通算15回の起動すべてで成立。残るは4点（他の GPU・モデル、短縮形の別名、SLOTS>=2 の窓縮小、欄剥がしが `-c` にも効くか。§3.25） | §2.48 / §3.25 |
 | `128_item_image_variety` | アイテム画像が同じ絵に集中する | 選定と同一品種2個目からの散りは実機で成立。追加辞書の合成も実機初。履歴の永続化（版3）は実機で動作。「同じ品の再入手は同じ絵」は版4（名前ベース）が実機でドロップ全滅、版5（世界走査）はレビューで冗長と棄却、版6（2026-08-20）で「外見文→絵」の対応表1つに作り直し（同じドロップは同じ外見文で来るので名前の解決自体が不要）。版6は実機未確認 | §3.26 / §2.49 |
 | `129_balance_item_price` | レア度が値段に反映されない | **決着**（2026-08-19）。値付け367行に加えて決済も売り買い1回ずつ通り、`reconcile` は0行 ＝ ゲームの決済はこの MOD の値段をそのまま読む | §3.19 / §2.50 |
-| `130_currency_unit` | 通貨の呼び名と所持金の表示を変えられない | **実機で成立**（2026-08-26）。画面上部の欄・宿の部屋選び4つ・`315_` との噛み合い（額もずれない）まで確認。`tr` が画面の1点であることも同じ回で通った。残るのは古いセーブの文を送る経路 | §3.37 / §2.64 |
+| `130_currency_unit` | 通貨の呼び名と所持金の表示を変えられない | **実機で成立**（2026-08-26）。画面上部の欄・宿の部屋選び4つ・`315_` との噛み合い（額もずれない）まで確認。`tr` が画面の1点であることも同じ回で通った。残るのは古いセーブの文を送る経路。ワールド個別設定（版4、PR #11）は未実機（§3.57） | §3.37 / §2.64 |
 | `131_sharp_portrait` | NPC の絵が保存前に 165x330 まで縮められ、顔の検出も 16% 外れる | **実機で決着**（2026-08-30〜31）。素通し・2倍の戻し・顔の切り直し・設定の両側・やり直しが拾う回まで通した。残るのはやり直しの誤検出率の実機値、旗がスレッドを跨がないこと、敵・モンスターの除外（版14）の実機確認 | §3.43 / §2.80 |
 | `132_npc_variety` | NPC を生成する頼み文に、表から引いた具体の特徴（髪・瞳・肌・体格・年齢・目立つ特徴・服、性格の軸、来歴）を足す。役職の型で埋まるのを止める | **決着**（2026-09-02、実機2回。役職の型の語 59% → 10%、書式の写り 0。§3.47） | §3.47 / §2.82 |
 | `133_ui_area_difficulty` | 「他の土地へ行く」の一覧の各土地に、その土地の依頼の難易度帯（適正Lv）を添える。確認画面にも同じ帯 | **決着**（2026-09-03。未訪問の街の見積もりが推定 29〜37 → 実値 30〜37 で収まった。§3.49）。未確認は残っていない | §3.49 / §2.84 |
@@ -83,9 +83,9 @@
 | `308_battle_damage_display` | 戦闘で動いた HP を数字で出す | 実機で成立（通常攻撃・スキル・とどめ・味方の被弾）。版2で出どころ付きの行を追加（`319_` の状態異常。`ui.take_damage_notes`）。出どころ行は実機で確認済み。残るのはコロシアムと、味方が倒れた／逃げた場合（§3.14） |
 | `309_office_pardon` | 役場で罰金を納めて手配を帳消しに | 実機で成立（設置・支払い・永続まで通しで確認）。残るのは投獄・市民権の系統との関係（§3.15） |
 | `311_npc_profile_memory` | 会話から NPC の人物像を作る | 実機で発火（3世界ぶん）。版2・版4の機構も動作。**受け答えが実際に変わったかは未評価**（§2.38） |
-| `312_shop_restock` | 一定日数で店の品揃えを入れ替える。版2 で「買った品がその場で作り直されて棚に戻る」のも止める（`KEEP_SOLD_OUT` 既定 ON） | 前提が実機で成立。4店舗・入れ替え6回で `WARN not refilled` は0件。版2 は実機1回目で #1 が通った（2026-09-04。§3.52）。残るのは偏りと**品数が痩せないか**（§3.16）、版2 の #2〜#5（§3.52） |
+| `312_shop_restock` | 一定日数で店の品揃えを入れ替える。版2 で「買った品がその場で作り直されて棚に戻る」のも止める（`KEEP_SOLD_OUT` 既定 ON） | 前提が実機で成立。4店舗・入れ替え6回で `WARN not refilled` は0件。版2 は実機1回目で #1 が通った（2026-09-04）が、2回目で外す順が裏返ってゲームごと落ちた。版3（2026-09-08、外す場所をメインスレッドへ）は実機未確認（§3.52）。残るのは偏りと**品数が痩せないか**（§3.16）、版2 の #2〜#5（§3.52） |
 | `313_event_ability_check` | 2系統の成否判定に能力値の加点 | 自由入力側は実機で加点まで確認（§3.18）。**フィールドイベント側も23件発火していた**（端数も通る。§2.49 / §3.17） |
-| `314_area_move_custom` | 移動の日数・料金・文言を設定で変える。`325_` が開いた道には距離補正（挟む街の数で日数と馬車代を加算/倍加、オフ可） | 実機で成立（往復4移動＋前払い調整3回＋所持金0の局面）。注入し直しをまたぐ側も成立。距離補正も実機で成立（2026-09-03、挟む街1と4の道でラベル2倍/5倍・馬車代2000を1回で引き落とし）。残るのは「設定額以上・1000G未満」の帯と、開いた道を徒歩で行く（日数を増やす置き換え）の1回（§3.27 / §2.50） |
+| `314_area_move_custom` | 移動の日数・料金・文言を設定で変える。`325_` が開いた道には距離補正（挟む街の数で日数と馬車代を加算/倍加、オフ可） | 実機で成立（往復4移動＋前払い調整3回＋所持金0の局面）。注入し直しをまたぐ側も成立。距離補正も実機で成立（2026-09-03、挟む街1と4の道でラベル2倍/5倍・馬車代2000を1回で引き落とし）。残るのは「設定額以上・1000G未満」の帯と、開いた道を徒歩で行く（日数を増やす置き換え）の1回（§3.27 / §2.50）。ワールド個別設定（版2、PR #11）は未実機（§3.57） |
 | `315_vacation_custom` | 宿の宿泊期間・部屋・宿代を設定で変える | 実機3回で成立（週単位・犬小屋・LLM 描写の追随まで）。残るのは年齢加算ONと犬小屋の宿代変更（§3.28） |
 | `316_bounty_hunter` | 手配されていると土地を跨いで追手が来る | **実機で成立**（版5。§2.58 / §2.60）。4つの契機・持ち越し・改名・難易度・手配度の戻し・画面の重なりまで確認。残るのは既定の設定での出方（#8）と、塗り直しの時機を直した側の実機（#9）。分かっていて直していないものは別に挙げてある（§3.35） |
 | `317_reputation` | 土地ごとの評判と世界に1つの二つ名を会話に注入する | オフライン全経路と二つ名の偏り 240回は済（§2.63）。人物欄の表示は実機3周で決着。**残るのは編纂の質と据え置きの実機確認**（§3.36） |
@@ -98,6 +98,9 @@
 | `324_place_bgm` | 施設の種類（宿屋・ギルドなど13種）と土地の種類（町・村・都市・ダンジョン）ごとの重みで、戦闘以外の BGM を置いた曲から選んで鳴らす。世界ごとの個別指定（その町・その宿）が先に効く。施設の出入りで鳴らし直し、土地の曲は覚える。設定画面（`tool.py`）は一括設定とワールド個別設定の2タブ | 実機で一部成立（2026-09-02、決定38回・ERROR 0。§2.83）。**施設の段の切り替え・見張り・覚えた曲の再訪・戦闘後は未確認**（§3.48） |
 | `325_road_opening` | 「他の土地へ行く」に「新たな道を探す」を足す。まだ繋がっていない街（`size` が village / town / city）を選び、お金を払って開削を委託する（既定 14 日後に開通）か道中のダンジョンを踏破すると、両側の `Area.connections` に対称に道が開く。金額と難易度は BFS で数えた「間に挟む街の数」で上がる。記録は `state\road_opening\<世界名>.json`、ロード時に当て直す | **実機で成立**（2026-09-03、版2。3経路とも通り WARN / ERROR 0件。§3.50）。**連打の門だけ未発火**（§3.50） |
 | `326_npc_travel` | 友好度 20 以上のギルドの冒険者が旅に出る。別の街（施設が生成済み）のギルドか宿に 30〜90 日、または同じ街のギルド以外の施設に 7 日。各街に 2 人は残す。旅先のギルドでは雇える。旅先で話すと会話の文脈に「〜から来ている」を 1 文足す。台帳は `state\npc_travel\<世界名>.json`、ロード時に突き合わせ | **実機で出発・旅先・帰還まで成立**（2026-09-04、版1、1回目。`return:` 13 件が元の施設へ、WARN / ERROR 0。§3.53）。残るは延期・セーブとロード・片付け（#6 #7 #9） |
+| `327_inn_quality` | 部屋の等級で1回の宿泊でできる活動の数が変わる（既定 1/1/2/3）。宿の主が常連を覚え、宿泊のたびに好感度が等級ぶん上がり（累計 +20 で止まる）、宿の主との会話に宿泊の履歴を1行足す。社交の相手を部屋を問わず 同行者 → 好感度の高い相手 → ランダム の順で選ぶ（宿の名簿を窓の間だけ差し替える）。記録は `state\inn_regular\<世界名>.json` | **実機3回で活動の数・常連・社交の相手が成立**（2026-09-08。3回目で同行者シルヴァンが【参加NPC】に。オフライン `test_inn_quality.py` 30 件）。残るは感情の反映・簡易寝台の素の挙動（#4 #13）と #6〜#9。§3.54 |
+| `328_quest_from_world` | `random_quest_generator` を包み、`CHANCE_PERCENT` で当たった回だけ `settlement_overview` / `settlement_structure_description` / `area_description` を `NOTE_WORLD_ONLY` に差し替える。`world_overview` / 街の名前 / 難易度は素通し | **実機1回で #1・#2・#4 が通った**（2026-09-06、版1。§3.55）。残るは `301_` の会話から作る依頼での並び（#3）。オフラインは `tools\tests\test_quest_from_world.py` |
+| `329_area_move_with_party` | 雇用 NPC を連れてエリア移動できる。判定の間だけ同行者の `relationship["player"]["relationship"]` を `['家族']` に置き、移動の前後で配列が元に戻り、セーブにも残らない | **版3 実機1回で成立**（2026-09-10。版1・2は外れ。§3.56）。残るは所持金不足と `326_` との併用（#3 #4）。オフラインは `tools\tests\test_area_move_with_party.py` |
 
 ### 提供（400番台）
 
@@ -138,11 +141,12 @@
 | `214_probe_new_character` | 新規キャラのレベル60の経路 | 決着。`instantale.py:876`。本体が main_025 で直したことの確認にも同じログを使った。§2.36 |
 | `215_probe_event_roll` | 確率に付く負の差（-2〜-40）の正体 | 計測は実施済み（4イベント）。問い2「判定の窓で `calculate_attribute` が呼ばれるか」は **YES**。**負の差の正体だけ未決**で、4件とも `313_` を有効のまま測っているので素の分布が無い。§2.49 / 手順は §3.17 |
 | `221_probe_item_level` | 品物のレベルを誰が決めているか（在庫の段とクラフトの式） | 1回目で鎖が端まで繋がった（§2.67）。`tier` は整数、品揃えは `generate_item_in_shopping` が作る、`calculate_modification` は float の倍率で 成果物の値段 = 素材の合計値段 × 倍率。残るのは `tier` と倍率の式を出すための通り数 |
-| `222_probe_battle_mechanics` | 戦闘の語彙（power・バフ・デバフ）が数になるところ。ダメージ式の形／attack と defense の出どころ／`AttributeEffect`・`TextStatusEffect` がキャラのどこへ書かれ、次の手の数を動かすか | **主要部は1回目（戦闘6回）で決着**（§2.68・GAME.md §2.10.2）。基礎値 = 2×幾何平均(能力側, 武器)、防御は引き算で乱数ゼロ、`text_status` は文章だけ、自由入力の防御は数に落ちない。残るのは (1) `AttributeEffect` の実効（敵のデバフが1手目で死んで撃てない）(2) 味方防御の 500 が防具の値かの切り分け（装備替えで1戦）(3) power→倍率の表の通り数 |
+| `222_probe_battle_mechanics` | 戦闘の語彙（power・バフ・デバフ）が数になるところ。ダメージ式の形／attack と defense の出どころ／`AttributeEffect`・`TextStatusEffect` がキャラのどこへ書かれ、次の手の数を動かすか | **主要部は1回目（戦闘6回）で決着**（§2.68・GAME.md §2.10.2）。基礎値 = 2×幾何平均(能力側, 武器)、防御は引き算で乱数ゼロ、`text_status` は文章だけ、自由入力の防御は数に落ちない。残るのは (1) `AttributeEffect` の実効（敵のデバフが1手目で死んで撃てない）(2) 味方防御の 500 が防具の値かの切り分け（装備替えで1戦）(3) power→倍率の表の通り数 (4) 自由入力の `command` は審判の記録に残らないので、どう書けば強く判定されるかを数えるには `referee_player_any_input_new_new` を包む必要がある（GAME.md §2.10.3 / §2.85） |
 | `224_probe_npc_carryover` | ロードのどの地点から `make_npc` を呼べるか（世界の鍵・素データ・採番台帳・置ける施設が揃う最初の瞬間） | **1回目で決着**（2026-08-30。ロード6回）。注入時と `load_game_new` の前は NOT READY（世界の鍵も素データの辞書も無い）。`load_game_new` から戻った直後が最初の READY で、世界の鍵・`index['npc']`・エリア21件・ギルド4件・宿4件が揃う。ロード直後の `world.characters` は1件しか無く、実行時の名簿との突き合わせでは素データを見つけられないことも同じ行に出た（`npcs.npc_stores` の直し。`out\npc_carryover_probe.log`） |
 | `225_probe_area_quest_difficulty` | 街を初めて訪ねたとき、依頼の難易度を誰がどう決めているか（`133_` が訪問前の街にも帯を出すための材料。§3.49 #5） | **決着**（2026-09-03、5回。§2.84 / GAME.md §2.9.1）。街の初期依頼3件は `random.sample(range(lo, hi), k=3)`（`save_area_json.py:329`）で、`lo` / `hi` は街の枠（id）で決まる。`133_` 版2の `SLOT_RANGES` がその表 |
 | `226_probe_item_consume` | 回復アイテムを使ったとき何が誰にどれだけ効くか（`usable` を誰が決めるか・動く項目と量・使えなかったときの挙動・足される文）。効き方を種別ごとに作り直す MOD が「本体を呼んだ後に戻す」か「本体を呼ばずに全部書く」かを決める材料 | **1回目で決着**（2026-09-04、使用5回。GAME.md §2.13.2）。`usable` は本体が `ItemConsumeManager.consume_item` の間に決め（スタミナ 15 ≥ `疲労負荷` 11 で真）、真なら `physical_integrity` が `疲労負荷` ぶん減って HP が `回復` ぶん戻る。`134_` はこれを受けた形（§3.51） |
 | `227_probe_shop_stock` | 買った品が店の棚へ戻るのはどこか（手持ちの複製か、雛形からの作り直しか）。`312_` が止めるべき地点を決める材料 | **1回目で決着**（2026-09-04。GAME.md §2.13.1.3）。棚に並ぶのはゲーム自身（`shopping_start_method_1`）が店を**開いたとき**に雛形から作り直した別の現物（`index['item']` が 58 → 59）。`312_` 版2 はこれを受けた形（§3.52） |
+| `228_probe_area_move_reject` | エリア移動の拒否が同行者の何を読んで決めているか（`329_` の版1・版2が外れた後の材料） | **1回目で決着**（2026-09-10。GAME.md §2.18）。読むのは `relationship["player"]["relationship"]` の配列だけで、友好度も `state` も読まない。`329_` 版3 はこれを受けた形（§3.56） |
 
 どれも読み取り専用で、答えが出た後は無効にしてよい。
 
@@ -1281,7 +1285,7 @@ module docstring だけを読むと `label.text = 通知 + value[-N:]` の2行�
 
 `out/npc_name.log` に、**別人どうしを重複と判定して改名していた行が3件**あった。
 
-```
+```text
 'バルガス・グラトル' -> 'トリスタン'  (clashed with id='7' '“黒蜥蜴”アルカス')
 '“黒蜥蜴”アルカス'  -> 'カゲロウ'    (clashed with id='__player__' 'ヴァルガス・ヴォルフレイン')
 '“黒蜥蜴”アルカス'  -> '影を纏うシキ' (clashed with id='__player__' 'ヴァルガス・グレイヴ')
@@ -1338,7 +1342,7 @@ module docstring だけを読むと `label.text = 通知 + value[-N:]` の2行�
 
 本体のクラッシュ記録が、記録を書く前に自分で落ちていた。
 
-```
+```text
 File "instantale.py", line 288, in report_crash
 File "instantale.py", line 200, in make_crash_log
 AttributeError: module 'datetime' has no attribute 'now'
@@ -1371,7 +1375,7 @@ import sys, os, datetime, traceback
 本体は `from datetime import datetime`（クラス束縛）で持っているので、
 この行がモジュールを被せていた。`datetime.now()` はクラスにしか無い。
 
-```
+```text
 素の __main__.datetime = <class 'datetime.datetime'>
 流し込んだ後           = <module 'datetime' ...>
 ```
@@ -1401,7 +1405,7 @@ import sys, os, datetime, traceback
 
 **直った後の実機（2026-08-21 10:46:38、同じ店で1回）**
 
-```
+```text
 datetime = <class 'datetime.datetime'>
 datetime is sys.modules['datetime'] = False | has now = True
 OK       3495 chars
@@ -1987,8 +1991,11 @@ VERIFICATION_LOG.md §2.77、GAME.md §2.23）。
 
 分かっていて残していることが2つ。
 
-- セーブの復号（XOR）が `323_npc_carryover\carryover.py` と `324_place_bgm\tool.py` の2箇所にある。
-  ローダの語彙（`instantale_modloader.saves`: `data_dir` / `list_worlds` / `read_save`）へ寄せ、両方をそちらに向ける（TECH.md §3.2.3 の理由。写した先はいつかずれる）
+- ~~セーブの復号（XOR）が `323_npc_carryover\carryover.py` と `324_place_bgm\tool.py` の2箇所にある。
+  ローダの語彙（`instantale_modloader.saves`: `data_dir` / `list_worlds` / `read_save`）へ寄せ、両方をそちらに向ける~~
+  → **2026-09-10 に片付けた**（§3.58）。数えたら鍵は2箇所ではなく5箇所にあった
+  （`130_` / `314_` / `324_` の `tool.py`・`carryover.py`・`tools\rebalance_saved_bgm.py`）。
+  全部 `instantale_modloader.saves` に向けてある
 - `104_balance_area_bgm` を終えるかの判断。条件は3つ:
   上の #1〜#4 が通ること・
   選び方の差（`104_` は使用回数の最少優先、`324_` は重みの抽選。埋めるなら `AREA_PICK = "least_used"` を足す）をどうするか決めること・
@@ -2097,24 +2104,42 @@ HANDOVER §6 の1と3も決着: **一覧は `Area.connections` を読む**（`WA
 **同梱 MOD は関与していない。** 持ち物の辞書を書き換えるのは `312_`（入れ替え日に空にする）と `402_`（受け渡しの2人の間だけ）の2本きりで、どちらもこの場面のログが空。`config['goods']` を触る MOD は0件。
 
 **対処**（`312_shop_restock` 版2、`KEEP_SOLD_OUT` 既定 ON。仕組みは `312_` の DOC.md）:
-その来店で増えたぶんを、窓が組み上がる前（`execute` が戻るより先）に外す。雛形には触らない。
+その来店で増えたぶんを、売買画面が組み上がる手前（`toggle_twin_inventory_window` の前。メインスレッド）で外す。雛形には触らない。
 空にした回（この MOD 自身の入れ替え）と、控えがまだ無い空の店（初回の品揃え）は素通しする。
 採番台帳（`index['item']`）は外しても戻らない。
-オフラインは `tools\tests\test_shop_restock.py` 36件。
+オフラインは `tools\tests\test_shop_restock.py` 38件。
 
 実機で見るもの:
 
 | # | 何を | どう見るか |
 | --- | --- | --- |
-| 1 | 回復アイテムを1つ買って開き直す | 済（2026-09-04）。棚に戻らず、`out\shop_restock.log` に `kept sold out: … dropped 1 refilled item(s)` |
+| 1 | 回復アイテムを1つ買って開き直す | 版2 は済（2026-09-04）。棚に戻らず、`out\shop_restock.log` に `kept sold out: … dropped 1 refilled item(s)`。版3（外す場所を移した）は実機で見直す |
 | 2 | 装備を1つ買って開き直す | もともと戻らない。`kept sold out` の行も出ない |
 | 3 | 買い占める | 空のまま。入れ替えの日（既定30日）を跨ぐと `cleared` → `restocked` で戻る |
 | 4 | 初めての店 | 品揃えが普通に並ぶ（`first visit:` のみで `kept sold out` は出ない） |
 | 5 | 設定を切る | 素のゲームどおり作り直される（`kept sold out` が出なくなる） |
 
+**2026-09-07 の実機（2回目）でゲームごと落ちた。**
+版2 は外す場所を `execute` の戻り際（`finally`）に置いていた。
+`execute` はワーカースレッドで、画面を開く処理は Clock でメインスレッドへ回る（`instantale.py:3208` の lambda）。
+メインスレッドが先に `normalize_shop_inventory_prices`（`instantale.py:2660`。主の持ち物の辞書を直に回す）を走らせ、その最中に `finally` が鍵を消して `RuntimeError: dictionary changed size during iteration`。
+`227_` の境目の記録が順を示している（`toggle_twin_inventory_window('shop')` の境目で `店 -501`。画面を開いている間に消えた）:
+
+```text
+23:55:10.176 品の誕生: id=501 '再生の蒸気ポーション' 主=ハーラン(66)  ← shopping_start_method_1
+23:55:10.347 WARN safe hook on normalize_shop_inventory_prices: RuntimeError: dictionary changed size during iteration
+23:55:10.348 境目 toggle_twin_inventory_window('shop'): 店 -501
+             kept sold out: ハーラン(66) @ 156 dropped 1 refilled item(s): 501=再生の蒸気ポーション
+```
+
+1回目（09-04）は `finally` が先に走って通っただけで、順は保証されていなかった。
+対処（2026-09-08、版3）: 外す場所を `toggle_twin_inventory_window` の手前（メインスレッド、辞書を回す前）へ移した。
+`execute` 側は控えを `store["held"]` に置くだけで持ち物に触らない。
+オフラインの検査に「画面を開く処理が `execute` の戻る前に走る」順を足した（旧コードでは落ちる）。
+
 **2026-09-04 の実機（1回目）で #1 は通った。** `227_` と `312_` の記録が同じ購入（16:25、id=61 '乾いた砂の糧食'）で噛み合っている:
 
-```
+```text
 16:25:17 境目 shopping_start_method_1: 店 +61          ← 内側では生まれている
 16:25:17 境目 ShoppingStartManagerRemake.execute: index のみ  ← 外側では消えている
          kept sold out: ハルマン(118) @ 287 dropped 1 refilled item(s): 61=乾いた砂の糧食
@@ -2134,7 +2159,7 @@ HANDOVER §6 の1と3も決着: **一覧は `Area.connections` を読む**（`WA
 プレイヤーが居る施設では出発も帰還も待ち、施設を移った後に果たす。
 同じ街の中に出ている人は `adventurer_npcs` から外さず、一覧が居場所で絞られていた場合に備えて漏れている人のボタンを spec の引数で突き合わせて足す（`320_` と同じ差し込み方）。
 ロード直後は `world.characters` が空なので、最初の `refresh_choice_buttons` で突き合わせる。
-オフラインは `tools\tests\test_npc_travel.py` 133件。
+オフラインは `tools\tests\test_npc_travel.py` 138件。
 
 実機で見るもの（済は 2026-09-04 の1回目）:
 
@@ -2156,7 +2181,7 @@ HANDOVER §6 の1と3も決着: **一覧は `Area.connections` を読む**（`WA
 
 **2026-09-04 の実機（1回目、友好度の下限を 0 にして）で #1 #2 #4 #5 #8 が通った。** `out\npc_travel.log`:
 
-```
+```text
 20:50:31 roll: area 6 present=3 eligible=3 chosen=['40'] (chance 0.131 over 14 day(s))
 20:50:31 depart: 鉄錆のカイ (40) away 6/82 -> 2/262 [inn] day 411 .. 473
 20:57:31 context[starter]: 鉄錆のカイ +48 chars
@@ -2184,7 +2209,302 @@ HANDOVER §6 の1と3も決着: **一覧は `Area.connections` を読む**（`WA
 生成が `current_area` / `current_location` を `initial_location`（元の街）で上書きするなら次のロードで食い違う。`reconcile:` が台帳を正として旅先へ置き直すので壊れないが、#10 はここを見る。
 `generate_npc_detail` は既知の不具合現場（`KeyError: '52'` ＝ *文字列*キー。`200_probe_bug_sites` が張ってある）。旅と関係があるかは不明なので、#10 は `200_` を入れたまま見る。
 
+### 3.54 高級宿のメリット追加・改善（`327_`）: 実機3回で活動の数・常連・社交の相手が成立（2026-09-08）
+
+決まりと設定は `327_` の DOC.md。
+土台は「1泊＝活動1回」（GAME.md §2.17。`out/vacation.jsonl` の 54 回全件）。
+活動の一覧はゲームが最初に出す画面から `cls` / `args` を写し、活動の後の「まだ宿泊する／宿泊を終える」の画面に残りのぶんだけ並べ直す（`refresh_choice_buttons` の直前。文言も語彙も持たない）。
+数えるのは活動マネージャの `execute` の入口（出口で数えると最後の活動の後にもう1回並ぶ。オフラインで踏んだ）。
+宿泊の成立は窓の中の `elapse_days` で見る。
+宿の主は `app.player.location.owner`、会話相手は `app.in_conversation`。
+好感度は本体の `relationship["player"]["affinity"]` に足し、文は本体に任せる。`"player"` の欄が無い主には足さず記録だけ残す。
+オフラインは `tools\tests\test_inn_quality.py` 30 件。
+
+実機で見るもの:
+
+| # | 何を | どう見るか |
+| --- | --- | --- |
+| 1 | 活動の一覧が写せるか | 高級個室で泊まり、`out\inn_quality.log` に `menu: N activities again (left=2)`。活動の後の画面に活動が並ぶ |
+| 2 | 活動の後の画面の経路 | 並ばないなら、活動の後の画面が `refresh_choice_buttons` を通っていないか、`VacationEndManager` のボタンが無い。`218_` に活動後の choice 画面を1行足して見る |
+| 3 | 3回目の後 | 高級個室で3つ目の活動の後は「まだ宿泊する／宿泊を終える」だけ |
+| 4 | 簡易寝台 | 素のまま（活動の後に活動が並ばない） |
+| 5 | 常連 | `regular: 名前 affinity 0 -> 4 (granted 4/20)`。`state\inn_regular\` に宿の主の記録。5泊で `granted 20/20` |
+| 6 | 初対面の主 | 一度も話していない宿の主で `has no relationship['player']`。話してから泊まると上がる |
+| 7 | 会話の1行 | 泊まった後に宿の主と話し、`prompt at chat:` に1行。返答が宿泊の履歴を踏まえる。`311_` が次の会話で `about_player` に取り込む |
+| 8 | 社交 | 社交（Manager と ResolveManager の対）で残りが 1 だけ減る |
+| 9 | 仲間の訓練 | `306_` と同じ `VacationTrainManager.execute` を包む。2回目の訓練でも仲間に入る |
+| 10 | 社交の相手（差し替えが届くか） | 仲間を連れて社交。`social: -> 名前 (id) by party` の後に `social: scene npc_list ['宿の主'] -> [仲間]` と `social: npc_id_list ['id'] -> ['id']`、応答の後に `social: resolve npc_list ...`。`output_data/.../vacation_scene_generator` の最新の【参加NPC】がその仲間で、schema の `const` も仲間の名前 |
+| 11 | 社交の相手（段） | 仲間なしで好感度 10 以上の相手（`by friends`）、誰も居ない街で `by random`。部屋を問わない（1回目の後に「部屋で段を変える」をやめた） |
+| 12 | 人生ログ | 済。`output_data/unknown/unknown/vacation_scene_generator/56.json` の【参加NPC】シルヴァンに `'70日前-35日前'` / `'35日前'` の人生ログと「プレイヤーとの関係性: ['同行中']」が載り、schema の `const` も `'シルヴァン'`。応答は同行者との対話で `emotion_changes: [{'npc': 'シルヴァン', 'amount': 3}]` |
+| 13 | 感情の反映 | 差し替えた相手への `emotion_changes` がその相手の好感度に入る（`npc_id_list` を同じ1人にしてあるので、名前→id の対応がそこから組まれているなら入る）。社交の前後で仲間の `affinity` を控える |
+
+社交の相手の土台: 【イベントの場所】は宿ともギルドとも出て（`output_data` と `out/vacation.jsonl` の `location_name`）、【参加NPC】はその施設の主。
+1回目の版は宿の名簿 `Facility.characters` を窓の間だけ差し替えたが、2回目の実機で選ばれる相手が変わらず（`WARN swap ineffective`）、施設の主を直接引いていると分かった。
+そこで LLM へ渡る直前の3か所（`vacation_scene_generator` / `vacation_scene_resolver` の `npc_list`、`VacationSocializeResolveManager.__init__` の `npc_id_list`）を同じ1人にそろえる形に改めた。
+`npc_list` の要素は `{'instance': Character, 'life_log_dict': {...}}`（実測）で、`life_log_dict` はゲーム自身の `scripts.llm.context_manager.get_life_log_text(app, character)` で組む。
+共有倉庫は別 MOD（宿ごとには持たない）。
+
+**2026-09-08 の実機（1回目）で #1 #3 #5 が通った。** `out\inn_quality.log`:
+
+```
+23:00:08 stay: quality='luxury_suite' actions=3
+23:00:08 regular: ヘンリエッタ affinity 0 -> 4 (granted 4/20)
+23:00:10 activity: VacationTrainManager left=2
+23:00:18 menu: 3 activities again (left=2)
+23:00:25 activity: VacationSocializeManager left=1
+23:01:03 menu: 3 activities again (left=1)
+```
+
+高級個室で訓練の後に活動が並び直し、社交の後も並び直した（活動後の画面は `refresh_choice_buttons` を通る。#2 も決着）。
+社交は `KeyError: 'rng'` で相手を選べず素のまま走った（`sys` に残っていた前の版の控えに `rng` が無かった。乱数はモジュール直下へ移し、控えの欠けは `setdefault` で埋める）。
+同じ回で `vacation_scene_generator` の `npc_list` の型が読めた: 要素は `{'instance': Character, 'life_log_dict': {...}}`。
+同行者が居るのに選ばれなかったのは上の例外のため。
+合わせて「部屋で段を変える」をやめ、部屋を問わず 同行者 → 好感度 → ランダム にした（決めた仕様）。
+
+**2回目（同日）**: `social: luxury_suite -> ザーラ (91) by party` は出たが `scene npc_list=['ヘンリエッタ'] -> WARN swap ineffective`。
+宿の名簿を差し替えても相手は宿の主のままで、ゲームは名簿を見ていない。
+差し替えを LLM の直前の3か所へ移した（上の土台）。
+
+**3回目（同日）で #10 が通った。** `out\inn_quality.log`:
+
+```
+23:13:29 social: -> シルヴァン (58) by party
+23:13:32 social: scene npc_list ['ヘンリエッタ'] -> [シルヴァン]
+23:13:57 social: npc_id_list ['61'] -> [58]
+23:13:57 social: resolve npc_list ['シルヴァン'] -> [シルヴァン]
+```
+
+ゲームが選んだのは宿の主（61）だったが、描写の相手は同行者シルヴァンになった。
+`resolve` に渡る `npc_list` は最初から差し替え後の相手で、ゲームは `generator` に渡した要素をそのまま持ち回っている（`resolver` の差し替えは保険として残す）。
+WARN / ERROR 0（1回目の `KeyError` のみ）。
+`output_data` の同じ回のプロンプトで #12 も済（【参加NPC】が同行者で、人生ログと「同行中」の関係が載った。応答の `emotion_changes` も同行者宛て）。
+同じ回の `306_` は2人の同行者に訓練の経験値を渡し（`shared 1 gain(s) with 2 companion`）、他 MOD のログに ERROR / WARN は無い。
+残るのは感情の反映（#13。`amount: 3` が同行者の `affinity` に入ったかは前後を控えていないので未確定）・簡易寝台の素の挙動（#4）と #6〜#9。
+
 ---
+
+
+### 3.55 世界概要から依頼を生成する（`328_`）: 実機1回で #1・#2・#4 が通った（2026-09-06）
+
+決まりと設定は `328_` の DOC.md。開発中は `911_quest_from_world` の名前で動かした。
+
+| # | 確かめること | 手順 |
+| --- | --- | --- |
+| 1 | 当たった回の依頼が街の描写から離れる | 確率 100 にして「クエストを探す」を3回。`out\quest_flow.log` の `random_quest_generator(...)` の `area_description` が指示文になっていること、生成された `request_summary` が街の湿地・砂漠などを繰り返していないこと |
+| 2 | 外れた回が素のまま | 確率 0 にして1回。`quest_flow.log` の `area_description` が街の描写のまま |
+| 3 | `301_` の会話から作る依頼で発端が残る | 確率 100 で会話から依頼を作る。`area_description` が指示文＋`【この依頼の発端` の並びになっていること |
+| 4 | 指示文を LLM が守るか | #1 の3件で依頼人が街の人物になっているか。守らないモデルなら `NOTE_WORLD_ONLY` を書き直す |
+
+実機1回目（2026-09-06、版1）。同じ街（`オールド・フォージ`、難易度 76）で「クエストを探す」を3回。`out\quest_from_world.log` と `out\quest_flow.log` の突き合わせ。
+
+| 回 | 判定 | `area_description` | 生成された依頼 | 所要 |
+| --- | --- | --- | --- | --- |
+| 1（15:14） | `as-is` | 街の描写 | 完走せず。106 秒で返った後に同じ要求を再送し、その最中に GPU が脱落（llama-server 異常終了）。この MOD とは無関係の回 | 106s+ |
+| 2（15:29） | `as-is` | 街の描写 | 「暴走する神代の熱源：蒸気迷宮の鎮圧」依頼人は工房の長老。街の熱源炉・蒸気回廊そのもの | 25s |
+| 3（15:32） | `world-only` | `NOTE_WORLD_ONLY` の1文 | 「神代の残響、静寂の回廊」依頼人は工房の調査員。舞台は街の外の旧遺構。題材は世界の概要（神代・古代文明）から | 26s |
+
+- #1 当たった回の `area_description` が指示文になり、依頼が街の炉・蒸気の描写を繰り返していない: ○（3回目）
+- #2 外れた回は素通し: ○（2回目。`area_description` が街の描写のまま）
+- #3 `301_` の会話から作る依頼での並び: 未確認（今回は掲示板からのみ）
+- #4 依頼人が街の人物になる: ○（3回目。「工房の調査員」）
+
+当たった回でも世界の概要が「神代の遺物」を軸にしているので、題名には同じ語が残る。
+崩れたのは舞台と依頼の中身で、これは狙いどおり。世界の概要そのものが狭ければ差は小さくなる。
+
+### 3.56 雇った仲間がエリア移動を拒まなくなる（`329_`）: 版3 実機1回で成立（2026-09-10）
+
+決まりは `329_` の DOC.md。開発中は `913_area_move_with_party` の名前で動かした。
+ゲーム側の事実は GAME.md §2.18。
+
+版1（2026-09-10）: 友好度（`relationship.player.affinity`）を 999 にする形。**実機1回で外れ**。
+友好度 68（仲間だと感じている）の同行者を 999 にしても拒まれた（`out\area_move_party.log` 14:41:52 `lift: 103 ... 68 -> 999` → `rejector:` → `WARN rejected:`）。
+分岐は友好度を見ていない。
+同じ回で、拒否の途中に本体が保存し、`savedata.json` の相手の `affinity` に 999 が残った（実行時の値は戻していたのに）。
+本体は保存のときに Character の値を `save_data_dict["npcs"]` へ写してから書くので、戻す前に写されると残る。
+版2は `save_game` の直前にも戻し、`save_data_dict` 側に写った値も戻す。
+
+版2（2026-09-10）: `Character.state` を `家族` にする形。**実機2回で外れ**（16:21・16:22、`state='家族'` のまま `rejector`）。
+`save_game` の前で戻す口は効いた（`restore (save_game)` が `WARN rejected:` より前）。
+
+`228_probe_area_move_reject` の実機記録（16:25、`out\area_move_reject.log`）で分岐の材料が決まった。
+`execute` → `method_1` が `app.party.items()` を回し、同行者の `relationship["player"]["relationship"]`（`['同行中']`）を2回読んで `area_move_rejector` へ行く（#33〜#40）。
+友好度・`state`・`initial_location`・`original_party` は読んでいない。
+
+```text
+#32  manager   .method_1()
+#33  app       .party = {...}
+#34  app.party .items()
+#35  npc103    .relationship = {'player': {'affinity': 68, ..., 'relationship': ['同行中'], ...}}
+#36  npc103.rel        ['player']
+#37  npc103.rel.player ['relationship']
+#38〜#40  同じ3行がもう一度
+#41  app       .display_button_load()
+#42  npc103    .life_log
+#46  npc103    .current_log
+>> area_move_rejector called
+```
+
+48 読みで `rejector` へ。#1〜#31 は `execute` 側で、`gold`・`current_area`・`world_dict`・ボタンの表示。拒否の分岐は `method_1` の中。
+2回読むのは2条件（`家族` と別の値）の可能性で、値そのものは分岐からは分からない。
+
+版3（2026-09-10）: この配列を判定の間だけ `['家族']` に置き換える形。
+**実機1回で成立**（16:43、残響のエリオス 103 を連れてラスト・リフレクション → 陽光の港、馬車）。
+`lift: 103 relationship ['同行中'] -> ['家族']` → `228_` の `>> elapse_days(14) (the branch passed)` → `restore (elapse_days(0))`。
+`WARN` は無し。戻した後の 16:25 の保存で 103 の `affinity` は 68、配列は `['同行中']`（版1の 999 は後の保存で消えた）。
+`restore` の行が `elapse_days(0)` なのは、窓の中で最初に通る `elapse_days` が別の MOD か本体の 0 日で、`217_` が見る 14 日より前に戻っているということ。
+`家族` の値は exe の定数表の並び（`家族` → `パーティに入れる` → `FamilyPartyJoinManager`、`二人は家族になった。`）から。
+
+**素のゲームの条件は実データで確定した**（16:38、`228_` の記録）。
+配列が `['同行中', '同行中', '家族']` の同行者（テラ 45、実データで家族にした相手）を連れた移動は通った（`>> elapse_days(14) (the branch passed)`）。
+`['同行中']` の同行者（残響のエリオス 103、16:21・16:22）は拒否。
+`同行中` が残っていても `家族` が入れば通るので、判定は「配列に `家族` を含むか」。
+版3が置く `['家族']` はこの条件を満たす。
+
+| # | 確かめること | どう分かるか |
+|---|---|---|
+| 1 | 本体の分岐が配列の `家族` で通る | 済（16:43）。雇用 NPC を連れて移動する。`out\area_move_party.log` に `lift:` → `restore (elapse_days(14))` が出て、`217_` の `out\area_move.log` が `days=[14]` で `辿り着いた。`。**`WARN rejected:` が出たら外れ**。そのときは `228_` を入れて `out\area_move_reject.log` の `>> area_move_rejector` の直前の行を見る（配列の何と比べているかは値からは分からないので、`['家族', '同行中']` など置く値を変えて試す） |
+| 2 | 配列が戻っている | 済（16:25 の保存で `同行中`。16:43 の後の保存は未確認）。移動の後に会話で「パーティに入れる」ではなく「ここで別れる」系が出る。セーブエディタで `relationship.player.relationship` が `同行中` のまま。`WARN restore` と `save_data_dict copied` が無い |
+| 3 | 所持金不足のとき | `金が足りない...` で止まり、`restore (execute done)` が出る |
+| 4 | `326_` との併用 | 移動で日数が進んだときの旅立ちの判定に `['家族']` が見えていない（`restore (elapse_days(...))` が `326_` の行より前） |
+| 5 | 版1の残り | 済。16:25 の保存で 68 に戻っていた |
+
+判定に使ったログ: `out\area_move.log`（`217_`）の 2026-08-19T20:10:29 と 2026-09-02T03:16:18 と 2026-09-10T14:41:56 の3件が素の拒否。
+どれも `gold` 不変・`days=[]`・`texts=1`（AI の一言のみ）で、`send_request_with_no_structure('area_move_rejector')` の直後に出ている。
+
+
+### 3.57 ワールド個別設定（`130_` / `314_`）: 未実機（2026-09-10、PR #11）
+
+MoririnJP 氏の提案（PR #11）を取り込み、設定を2段（一括とワールド個別）にした。
+MOD 自体はこちらの著作物で、提供を受けた MOD とは分けて数える（`tools/mods_meta.py` の冒頭）。
+決まりは TECH.md §3.12.1、遊び方は各 MOD の DOC.md。
+`130_` は通貨の表記、`314_` は移動の日数・料金・文言を世界ごとに変えられる。
+
+オフラインは `tools\tests\test_world_settings_tool.py`（画面。同一性・宣言の読み取り・世界の見分け・差分だけ書く・上下限）と、
+`test_currency_unit.py` / `test_area_move_custom.py` に足した重ねの検査で通っている。
+残るのは実機の1回で、見るのは3点。
+
+| # | 確かめること | どう分かるか |
+|---|---|---|
+| 1 | 世界を切り替えると表記が追随する | 2つの世界に別々の通貨を入れ、題名から順に両方をロードする。画面上部の欄と宿の部屋選びが世界ごとの表記になる |
+| 2 | 世界を切り替えると日数と料金が追随する | 同じ2世界に別々の馬車代を入れて確認画面を開く。ラベルの金額と引き落としが世界ごとの値になる（`out\area_move.log` の `fare:`） |
+| 3 | 個別設定を消すと一括設定へ戻る | 画面で個別設定を一括と同じ値に戻すと `state\currency_unit\<世界名>.json` が消え、その世界が一括設定に従う |
+
+`314_` の通貨追従は PR の `{long}` / `{short}` と自前の読み取りを使わず、
+共有部品（`ui.rewrite_coins` / `ui.parse_coin`）のままにしてある。
+表記は `130_` が共有部品へ渡すので、`314_` は `130_` の控えを読まない（DOC.md の「通貨の表記（`130_` と組む）」）。
+
+
+### 3.58 各 MOD の `tool.py` の共通化: オフラインで決着・実機は6画面（2026-09-10）
+
+MOD 同梱の設定画面が6本あり、画面の中身ではなくインフラが写して回っていた。
+関数単位で数えた写しと、寄せた先:
+
+| 写していたもの | 本数 | 寄せた先 |
+|---|---|---|
+| `_gui_config_path` / `load_window` / `save_window` | 5本・4変種 | `modtool.load_window` / `save_window` |
+| `load_settings` / `save_settings` / `_config_module` | 4本・4変種 | `modtool.load_settings` / `save_settings` |
+| `locate()` | 6本・3変種 | `modtool.locate` |
+| `_add_loader_path` | 4本・4変種 | `modtool.add_loader_path` |
+| `write_json`（ローダ呼び＋自前の受け） | 2本 | `modtool.write_json` |
+| テーマ拝借の try ブロック | 6本 | `modtool.setup_theme` |
+| セーブの置き場・復号・世界の一覧 | 5本 | `instantale_modloader.saves` |
+| 宣言駆動のワールド別設定画面 | 2本が501行同一 | `modtool.world_settings_main` |
+
+**写しは既にずれていて、3つは実害だった**（どれも `323_npc_carryover`）:
+
+1. `save_window` が最大化を `normal` に戻さずに `geometry()` を取っていた。
+   最大化して閉じると、次に開いて「元に戻す」を押したときの寸法が画面いっぱいの値になる。
+   手元で測ると最大化中の `geometry()` は `2560x1387`、正しくは `800x600`
+2. 同じ `save_window` がローダの `write_json`（tmp → fsync → replace）ではなく
+   自前の `.writing`（fsync 無し）で書いていた
+3. `locate()` だけ `settings\gui.json` の `game_path` から `game_dir` を組んでいなかった
+
+行数は 4974 → 3601（6本の `tool.py`）。
+`tools\modtool.py` 889行 と `saves.py` 199行 が新しく1本ずつ。
+効き目は行数より**写しの箇所が 6 → 1 になったこと**。
+
+`130_` / `314_` の `tool.py` は 501行 → 38行のシムになった。
+`__file__` 以外に何も書かないので2本は今も同一で、`filecmp` の検査を残せている。
+
+オフラインは全て通っている（`tools\tests\test_*.py` 79本。9xx の `test_wip_*` は対象外）。
+新しく置いた検査は3本:
+
+| 検査 | 見るもの |
+|---|---|
+| `test_saves.py`（26項目） | 置き場・素 JSON と XOR の両方・壊れたセーブ・フォルダ名フォールバック |
+| `test_modtool.py`（31項目） | 場所・宣言・設定・入力欄の整え・書き込み・窓の記憶。**最大化の道を名指しで見る**（上の実害1の再発防止） |
+| `test_world_settings_tool.py`（書き換え） | 検査対象を `modtool` に当て直し、シムは「2本同一で、確かに `world_settings_main` を呼ぶ」ことだけ見る |
+
+`tools\check_mods.py` に `"tool.entry"` が実在するかの検査を足した。
+今までは「設定…」を押した瞬間まで欠落に気付けなかった。
+
+`make_dist.bat` の `tools\` は**名指しの白名簿**だったので `modtool.py` を足してある。
+忘れると手元と CI は緑のまま、配布 zip でだけ6画面が全部開かない。
+
+窓は6本すべて組めることをコード側で確かめた（`build_window` を呼んで `destroy`）。
+`130_` / `314_` は題名が `mod.json` から出て、タブが「一括設定 / ワールド個別設定」の2枚になる。
+
+##### 別プロセス起動と窓の記憶は `tools\check_tool_screens.py` で決着した
+
+`gui.py` は道具を `pythonw` で別プロセス起動するので traceback がどこにも出ない。
+`tools\tests\` の検査もこの経路を通らないので、道具を開く harness を足した
+（TECH.md §3.12）。対象は `discover()` が `"tool"` と言った MOD なので、道具が増えても書き足さない。
+
+    python tools/check_tool_screens.py              6本 × python / pythonw で開いて撮る
+    python tools/check_tool_screens.py --window     最大化して閉じて開き直す
+
+結果:
+
+- **12/12 で窓が出た**（6本 × `python` / `pythonw`）。無反応で死ぬものは無く、
+  撮った絵は両者で同一。`pythonw` は配布物のローダが使う側なので、ここが本番の経路
+- 画面に出る値を `settings\mod_settings.json` と突き合わせて**全6本一致**。
+  `322_` / `324_` の「前回と同じ曲を続けて選ばない」が外れて出るのも、
+  `131_` の `SHARP_PORTRAIT` が入っているのも保存どおり（`config.resolve` への
+  切り替えで値がずれていない、ということ）
+- 最大化の往復（実害1・2）:
+
+|  | 寸法 |
+|---|---|
+| 開いたとき | 1196x799 |
+| 最大化 | 2576x1426 |
+| `gui.json` に残った | `1180x760+104+104` / `maximized: true` ← **最大化前の寸法** |
+| 開き直し | 2576x1426（最大化で出る） |
+| 元に戻す | 1196x799 ← ここが壊れていた |
+
+  旧コードなら `geometry` に `2576x1426` が入り、「元に戻す」で画面いっぱいのままになる。
+  `game_path` などの他の覚えごとも落ちていない。
+
+移した画面（`130_` / `314_`）は題名が `mod.json` から出て、控えの行が
+`state\currency_unit\<世界名>.json` / `state\area_move_custom\<世界名>.json` と
+MOD ごとに変わり、注記が一括設定タブでは「既定: ゴールド」、個別タブでは
+「一括設定: ゴールド」に切り替わる。`314_` は 16 項目でスクロールが効くので、
+`_scrollable` の移設も生きている。
+
+##### 目で見るしかない残り
+
+harness が決めるのは「出たか・落ちなかったか・寸法が壊れないか」まで。
+中身が入っているか・崩れていないかは撮ったものを見る（`out\tool_screens\`）。
+2026-09-10 に6画面ぶん見て、一覧・絞り込み・設定欄がすべて埋まっていることを確認した
+（`323_` は NPC 87人、`324_` は 115曲、`131_` は 404体中 20体、`130_` / `324_` は世界6つ）。
+
+人の手が要るのは2点だけ。
+
+| # | 確かめること | どう分かるか |
+|---|---|---|
+| 1 | 設定の保存が効く | 各画面で1つ変えて保存。既定と違う項だけ `mod_settings.json` に入り、他の MOD の項は無傷、既定に戻すと項が消える |
+| 2 | **NPC の引き継ぎがゲーム内でも通る**（`carryover.py` の鍵を `saves` に向けた分） | 別の世界から NPC を引き継いで新しい世界を始める。`323_` の DOC.md の手順どおりに人物が現れる |
+
+§3.57（`130_` / `314_` のワールド個別設定）も未実機のままなので、同じ回で一緒に見る。
+画面が同じものになったので、確認を増やさずに済む。
+
+`131_sharp_portrait` だけ窓の大きさを覚えない（`tool_window` に項が作られない）。
+この作業の前からで、`modtool` に入ったので付けるなら2行。
+
+`tools\rebalance_saved_bgm.py` は `104_` がフォルダ化した時点から
+`find_mod` が `*_balance_area_bgm.py` を見つけられず落ちる（この作業の前から）。
+鍵は `saves` に向けたが、`find_mod` は直していない。
+このスクリプトの置き場所そのものが §3.48 の宿題に入っているため。
+
 
 ## 4. 運用上の取り決め
 
@@ -2227,6 +2547,111 @@ CI が赤くなったが手元では再現しない
 時間切れのときは待った秒数と件数を残すようにした
 （`background extraction timed out: 15.0s 待って finished 0/1` の形）。
 「本当に不発」なのか「間に合わなかっただけ」なのかが1行で分かる。
+
+### 3.59 MOD だけが持つ NPC と正規 NPC への被せ（ローダの `modnpc`）: 実機で #1〜#9 が通った（2026-09-12）
+
+`instantale_modloader/modnpc.py` を置いた（TECH.md §5.7）。
+`npcs.make_npc`（セーブに残る本物）の隣に並ぶ二本目で、置き換えではない。
+id を `mod:` 接頭辞の文字列にして、セーブの採番台帳にも実在の番号にも触らない。
+
+**オフラインは通っている**（`tools\tests\test_modnpc.py` 全項目）。
+偽の `Character` と世界で、層の積み方・6鍵の受け渡し・保存の間の引き上げ・
+被せの往復・世界が変わったときの捨て方・フックの例外の飲み方を見ている。
+ただしオフラインで通るのは「こちらが書いたとおりに動く」ことだけで、
+**ゲームが実際にどこを読むかは1つも確かめていない**。
+
+**確かめること**（`229_probe_mod_npc` を有効にし、デバッグモードで起動する。
+TECH.md §3.2.5）。
+
+| # | 見るもの | 記録（`out\mod_npc.jsonl`） | 通った印 |
+| --- | --- | --- | --- |
+| 1 | セーブに漏れないか | `at=disk` | `leaked` が `npcs` / `characters` とも空 |
+| 2 | 施設で話しかけられるか | `at=place` と選択肢 | `placed=true` で、その施設の会話の相手に「測定用の来訪者」が出る |
+| 3 | 会話が始まって終わるか | `at=conversation_start` → `at=prompt` → `at=conversation_end` | 3つとも出る |
+| 4 | 記憶がインスタンスに溜まるか | `at=conversation_end` | `current_log` が 1 以上、`relationship` に `player` |
+| 5 | 詳細生成が要るか | `at=detail` | 既定（通さない）で会話が成立する。`TRY_DETAIL` を立てた回で何が起きるかも1度見る |
+| 6 | 被せが頼み文に届くか | `at=prompt` の `mark` | 正規 NPC 相手の行で `true` |
+| 7 | 立ち絵 | `at=image` | 呼ばれるか。呼ばれた後に何が起きるか |
+
+**外れうるところ**（どれも見込みで、測る前に直さない）。
+
+- `Facility.characters` に足すだけでは会話の相手に出ない見込みがある。
+  主は `Facility.owner` から引かれ、話し相手を組む経路が別にある（GAME.md §2.7）
+- `ensure_npc_detail_generated` が素データを id で引けば、`mod:` の id は引けない。
+  既定では本体へ通していないので、通さずに会話が成立するかが #5 の答えになる
+- 保存の経路が `InstantaleApp.save_game` の1箇所とは限らない。
+  そこが答えを出すのが #1 で、`leaked` が空でなければ関所が足りていない
+- 頼み文の関数は `inspect.signature` で引数を名前に開いている。
+  Nuitka の関数で署名が読めなければ `at=prompt` が1件も出ない（素通しする作り）
+
+**戦闘とパーティ加入は測らない。**
+ただし「素の住人と同じ状態だから会話だけの人物にスキルは要らない」は誤りだった（同日、指摘で訂正）。
+素の住人は会話の直前に `ensure_npc_detail_generated` で HP・スキル・立ち絵が埋まる
+（実セーブで「話した」NPC は `通常攻撃`/`逃げる`・`current_hp 96`・立ち絵2枚）ので、会話から挑んでも落ちない。
+§2.40 / §2.42 で落ちたのは `make_npc` で作った詳細生成前の NPC（`902_` の容疑者、2026-08-08 の1件）で、
+素の住人が落ちた記録は無い。「ゲーム自身が作った街の住人」は 2026-09-11 の読み違い（同日訂正。
+`npcs.py` / GAME.md §2.23 / `902_` の DOC.md / メモリも直した）。
+MOD の NPC は既定で詳細生成を本体へ通していないので、**話しかけてから挑むと素では起きない落ち方をする**。
+だから #5（`TRY_DETAIL`）は後回しの項目ではなく既定を決める測定。
+`detail_done` の記録（スキル・HP・立ち絵・`save_data_dict['npcs']` / `world_dict['npcs']` への漏れ）を足した。
+本体の空 `Literal` と `image_portrait` の穴そのものを塞ぐなら別の修正 MOD（§3.6 の1位と2位）。
+
+`914_real_estate` の `storage.make_holder`（保管庫の窓の間だけ生きる `Character`）は
+この土台の1本目の写しにあたるが、**まだ寄せていない**。
+
+**実機の結果**（2026-09-12、注入し直し11回・ゲームの再起動2回。画面は押せない環境だったので
+`229_` の自動操作（`AUTO_LOAD_WORLD` / `AUTO_TALK`）で会話を起こした）。
+
+| # | 結果 |
+| --- | --- |
+| 1 | **通った**。保存は `world.characters` を舐めている（来訪者を残すと `save_game` が `AttributeError: 'NoneType' object has no attribute 'id'` で落ち、外すと通る）。`_RosterView` で反復から隠した状態で4回書かれ、`leaked` は空 |
+| 2 | **通った**（同日、画面で確認）。一覧は `DisplayTalkChoice.update_button_display` が `world.characters.items()` を舐めて各人物の **`.location`** を今の施設と突き合わせて組む（読まれる側に印を付けて実測。`Facility.characters` は主を引くのに読むだけ）。`place()` が `.location` / `current_node` / `current_area` に実行時の実体を据えるようにしたら一覧に並び、一覧経由で話しかけて要約まで通った |
+| 3 | **通った**。`ConversationStartManager(app, "mod:…")` → 第一声 → 「会話を終了する」 → 要約まで、来訪者・主とも一巡。落ちたのは初版の `build` が `life_log` 等を None で渡していたときだけ（`get_life_log_text` で `TypeError`） |
+| 4 | **通った**。`current_log` が 1、`relationship` に `player` |
+| 5 | **通った**（22:53、再起動後）。詳細生成は `level_of_detail` が 1 のときだけ、`generate_npc_detail`（`ensure_…` ではない）で走る。2 で組んでいたので一度も走っていなかった。1 にして通すと答えを `save_data_dict['npcs'][id]` へ書く所で `KeyError`（20:47・22:45）。`spawn` が素データの写しを置く形に直したら、ゲームが `skills=['通常攻撃','逃げる']`・`hp 48/48`・立ち絵（`fullbody` / `face`）を埋め、`level_of_detail` を 2 に上げ、会話は要約まで通り、その後の保存4回とも `leaked` 空 |
+| 6 | **通った**。`output_data` の `conversation_starter` 4件すべてに `【229 の被せ】` が載っていた。`messages` 引数は行動の1行（11字）だけで、素性は関数の中で `character_instance` から組まれる |
+| 7 | `update_character_image` は来訪者・主とも呼ばれる。立ち絵（`characters\<名前>\` の5枚）は **19:45、詳細生成がまだ走っていなかった回の会話で作られた**ので、絵の生成は詳細生成とは別の道（無ければ作る）。以後は再利用され、詳細生成が 0.8秒で済むのはそのため（LLM の `npc_detail_generater` の記録は毎回増える: 298 → 299） |
+| 9 | **片付けも通った**（23:05）。`unregister(owner, app=app)` で来訪者が名簿・施設・素データの2辞書から消え、登録簿が空になり、主の `profile` の印が素の文に戻った。その後の一覧は `['35']` だけ、保存5回とも `leaked` 空、主との会話の頼み文（`output_data` 1015）に印は無い。来訪者の名前は主の頼み文に残る（プレイヤーの `current_log` に会話の要約が在るため。ゲームの記憶であって MOD の残骸ではない） |
+| 8 | **戦闘も通った**（22:55、詳細生成の後に挑んだ）。`測定用の来訪者(48) def=13` で戦闘が始まり、1手で倒れて終了、クラッシュ無し。倒れた後は `config['is_dead']` が立ち、「会話する」の一覧から外れる（一覧は `.config` も読む。GAME.md §2.22 の素の住人と同じ振る舞い）。死んだままにするか生き返すかは MOD の控え次第で、`229_` は控えないので注入し直すと組み直されて生き返る |
+
+**直したもの**（すべて実機で踏んでから）。
+
+- `build` はひな型の項目のうち `Character.__init__` が受けるものを全部渡す（受けないのは `original_max_hp` / `max_hp` / `inventory` / `current_location` の4つ）。`relationship` は実セーブ 87/87 の形を既定に持つ
+- 頼み文の包みは署名を対象名から引く（`patch.resolve` → `original_of`）。`orig` は内側 MOD の `(*args, **kwargs)` か、`safe=True` ならローダの閉包で `__original__` すら無い
+- 同じ持ち主が登録し直したら実体を組み直す（登録簿は注入をまたいで生きるので、前の版の実体が使い回されて同じ場所で落ちた）
+- `despawn` は正規 NPC を名簿から消さない
+- 保存の間は名簿から**外さず**、`_RosterView` に差し替える。外していた頃は約0.5秒の窓で `ConversationStartManager.__init__` と `resolve_conversation` が `KeyError`（2件）
+- 登録簿（`sys`）は関所より長生きする。関所を立てる MOD の `apply()` が失敗した世代では、前の世代の実体が名簿に残ったまま関所が無く、次の保存が落ちた（18:58、`AttributeError`）。`spawn` は今の世代の関所が生きていなければ載せない（`gate_is_live`）
+
+**踏んだ罠**（`229_` の側）。
+
+- `process_choice(DisplayTalkChoice(app), "会話する")` で一覧を開かせると、その直後にゲームが別スレッドで走らせる `save_game` が戻らなくなり、以後の保存が全部宙に浮いた（5本。ディスクは 16:42 から書かれず、再起動で解けた）。一覧は受動で包んで読む
+- `load_game_new` を直に呼ぶと LLM の用意を飛ばす。`app.ai_manager` は None のままで、`conversation_starter` が `'NoneType' object is not callable`（llm_manager.py:296）。`AIManager(app, config)` を組んで `set_ai_models()` を呼ぶと、組んでいる間にプロバイダが読み込まれ `send_request*` の別名が生える
+- `ui.Screen` の見張り（`when_idle` / `end_conversation` の `follow_up`）は世代を見ないので、注入し直すと前の世代の自動操作が並走した（`cancel_if=ctx.superseded` で塞いだ。`end_conversation` の `follow_up` は呼ばれた側で見る）
+
+この節の範囲（#1〜#9）はすべて実機で線が引けた（2026-09-12）。
+
+**仲間にはできないことが確定した**（2026-09-13、実セーブの構造から）。
+`game_variables.party` の id は `npcs` の鍵を指し、その人物は `areas/<id>/adventurer_npcs` にも載る。
+MOD の NPC は素データを保存の直前に隠すので、加入したまま保存するとロードで組み立てられない。
+`party` から外す形は「仲間だったことが黙って消える」ので採らず、`add_party_member` を包んで断る形にした。
+仲間にしたい人物は `npcs.make_npc` で本物として作る（§3.6 の「実装が要るもの」ではなく、設計の線）。
+
+**2026-09-13 に見つけた漏れ（実機のセーブで確認、対処済み・再実機は未）。**
+`game_variables.buttons_backup` に `ConversationStartManager(args=[<npc id>])` が焼かれている。
+一覧を出したまま保存すると `mod:` の id がそこへ残り、MOD を外した後に押すと `KeyError` で落ちる
+（名簿と素データを隠すだけでは足りなかった）。パーティ（`party` / `original_party`）と
+戦闘中の敵も同じ形。`hide` がこの4種類も保存の窓の間だけ落とすようにした（`scrub_saved_refs`）。
+`229_` の `leaked` も **セーブ全体の `mod:` の数と出どころの鍵**を数えるように広げた
+（`npcs` と `characters` しか見ていなかった）。
+住人の `current_log` に来訪者の**名前**が残ることも同じセーブで確認した（id ではないので壊れない）。
+
+**2026-09-13 に作りを変えた（実機は未確認）。** 正規 NPC の項目を実行時だけ差し替えて保存の直前に戻す往復（`dress` / `undress`）は、
+その間にゲームが書いた値を消す・世界をまたいで残る・保存の窓に漏れる、という同期の穴を作るので外した。
+いまは「真実は実体1つ」: ModNPC は実体に直接書き、保存のたびにローダが実体を `state\modnpc\<世界>.json` へ写し（`snapshot_all`）、
+読み直しで写しから組み直す（`restore_world`）。正規 NPC への層は頼み文（`notes` / `prompt`）とフックだけ。
+229 の被せ（#6）は `notes` に置き換えた。次の実機で確かめるのは、写しが保存のたびに書かれること・世界を読み直して来訪者が
+記憶ごと戻ること・`notes` の印が `output_data` に載ること。残るのは `notes` の窓口の実機（4本の移行のとき）。`notes` の窓口（`register(owner, modnpc.ANY, notes=...)`。311 / 317 / 321 / 403 が4本とも写している差し込みの手順を関所に寄せる口）は同日にローダ側だけ置き、オフラインで通した。実機は4本の移行（321 → 317 → 403 → 311 の順、1本ずつ `output_data` の字数で前後を突き合わせる）のときに測る。
 
 ### 次回起動時の手順（忘れやすい）
 
