@@ -54,8 +54,10 @@ id 0〜8 の決め打ちではなく `size` が village / town / city のエリ�
 新しい list を作って属性ごと差し替える**（`321_` の descriptions と同じ）。
 
 差し替えはセーブに残らないので、ロードすると素の接続へ戻る。それでよい。
-開通の記録は `state\\road_opening\\<世界名>.json` に持ち、
+開通の記録は `state\\road_opening\\<世界名×主人公名>.json` に持ち、
 ロードの1回（`World.__init__`）で当て直す（`318_` / `321_` と同型）。
+鍵に主人公を入れるのは、同じ世界で作り直した主人公に前の主人公の道と委託を渡さないため
+（`world_dict` に書かない理由と同じ。TECH.md §5.4）。
 **MOD を外せば世界は素のまま**になり、後始末が要らない。
 
 ## ダンジョン踏破は `307_` と同じ機構
@@ -72,6 +74,7 @@ TECH.md §3.2.3）。違いは3点:
 3. 完了時に接続を書くこと
 
 到着の移動にかかる日数は `ARRIVAL_DAYS`（既定 14 ＝ 馬車と同じ。`307_` の `TRAVEL_DAYS` と同じ理由）。
+日数はローダの関所へ望みを出して当てる（TECH.md §3.3.3）。
 道中のクエストは日数を進めない（GAME.md §2.18）。
 
 ## 状態はゲーム自身に聞く
@@ -96,18 +99,18 @@ TECH.md §3.2.3）。違いは3点:
 """
 
 import datetime
+import os
 import random
 import sys
 import time
 
-from instantale_modloader import ui
-from instantale_modloader.state import (UNKNOWN_WORLD, WorldStore, world_key,
-                                        world_key_of_dict)
+from instantale_modloader import durations, ui
+from instantale_modloader.state import UNKNOWN_WORLD, WorldStore
 
 
 LOG_BASENAME = "road_opening.log"
 
-#: 世界ごとの控え `state/road_opening/<世界名>.json`。
+#: 周回（世界×主人公）ごとの控え `state/road_opening/<世界名×主人公名>.json`。
 #: 開いた道（`roads`）と、進行中の道中（`pending`）。
 STATE_DIRNAME = "road_opening"
 
@@ -459,6 +462,7 @@ def apply(ctx):
     write = ctx.logger(LOG_BASENAME)
     worlds = store["worlds"].rebind(ctx, write)
     screen = ui.Screen(ctx, write, tag="road opening", mark=MARK)
+    save_soon = ui.saver(ctx, write, "road opening")
 
     # ------------------------------------------------------------ 控え
     def bucket_of(key):
@@ -474,7 +478,7 @@ def apply(ctx):
         """いま有効な道中の控え。段階が合わなければ None。`moving` は期限を見る。"""
         if app is None:
             return None
-        key = world_key(app)
+        key = worlds.playthrough(app)
         bucket = bucket_of(key)
         record = bucket.get("pending")
         if not isinstance(record, dict):
@@ -493,7 +497,7 @@ def apply(ctx):
         return record
 
     def set_pending(app, record):
-        key = world_key(app)
+        key = worlds.playthrough(app)
         bucket_of(key)["pending"] = record
         worlds.save(key)
 
@@ -503,12 +507,12 @@ def apply(ctx):
             return None
         record["stage"] = stage
         record.update(fields)
-        worlds.save(world_key(app))
+        worlds.save(worlds.playthrough(app))
         return record
 
     def drop_pending(app, why, clear_note=True):
         """道中の紐付けを外す。依頼概要に足した一文も消す（`307_` と同じ理由）。"""
-        key = world_key(app)
+        key = worlds.playthrough(app)
         bucket = bucket_of(key)
         record = bucket.get("pending")
         if not isinstance(record, dict):
@@ -708,7 +712,7 @@ def apply(ctx):
         `idle=True` は日数送りの最中（移動・宿泊）に期日が来た委託。
         流れているテキストに割り込まず、手が空いてから1行出す（待ちきれなくても出す）。
         """
-        key = world_key(app)
+        key = worlds.playthrough(app)
         origin_id, target_id = ui.area_id_of(origin), ui.area_id_of(target)
         origin_name = area_name(origin, "この土地")
         target_name = area_name(target, "その土地")
@@ -825,7 +829,7 @@ def apply(ctx):
         offer = offer_of(app, origin, target,
                          hops_between(graph, ui.area_id_of(origin), str(target_id)))
         price = offer["price"]
-        waiting = commission_of(world_key(app), ui.area_id_of(origin), target_id)
+        waiting = commission_of(worlds.playthrough(app), ui.area_id_of(origin), target_id)
         if waiting is not None:
             today = ui.game_day(app)
             left = max(0, int(waiting.get("due_day", 0)) - int(today)) if today is not None else "?"
@@ -869,7 +873,7 @@ def apply(ctx):
                                 target=area_name(target, "その土地")))
             open_road(app, origin, target, "pay", {"price": price, "hops": offer["hops"]})
         else:
-            key = world_key(app)
+            key = worlds.playthrough(app)
             bucket = bucket_of(key)
             bucket.setdefault("commissions", []).append({
                 "from": ui.area_id_of(origin), "to": str(target_id),
@@ -885,6 +889,9 @@ def apply(ctx):
             if COMMISSION_TEXT:
                 screen.say(app, fmt(COMMISSION_TEXT, price=ui.money(price),
                                     target=area_name(target, "その土地"), days=days))
+        # 道と委託の控えはその場でファイルになるが、払った額がセーブに入るのは次の保存のとき。
+        # 保存しないまま落ちると道だけがタダで残るので、ゲーム自身の保存を少し後に1回呼ぶ。
+        save_soon(app, "pay")
         refresh_status(app)
         settle(app, lambda: reopen_move_list(app))
 
@@ -900,7 +907,7 @@ def apply(ctx):
         """期日が来た委託を開く。開いた数を返す。日数が進んだとき・画面が組み直されたときに呼ぶ。"""
         if app is None:
             return 0
-        key = world_key(app)
+        key = worlds.playthrough(app)
         bucket = bucket_of(key)
         items = [c for c in bucket.get("commissions") or [] if isinstance(c, dict)]
         if not items:
@@ -1093,13 +1100,6 @@ def apply(ctx):
               .format(record.get("quest_id"), record.get("target_name")))
         return True
 
-    def current_quest_id(app):
-        quest = getattr(app, "current_quest_data", None) if app is not None else None
-        if quest is None:
-            return None
-        value = quest.get("id") if isinstance(quest, dict) else getattr(quest, "id", None)
-        return str(value) if value is not None else None
-
     def arrived_check(app):
         record = pending_of(app, "moving")
         if record is None:
@@ -1203,7 +1203,7 @@ def apply(ctx):
         app = getattr(self, "app", None) or ui.find_app()
         try:
             if app is not None:
-                apply_roads(getattr(app, "world", None), world_key(app), "list")
+                apply_roads(getattr(app, "world", None), worlds.playthrough(app), "list")
         except Exception:
             ctx.log_exc("road opening: cannot re-apply the roads before the list")
         result = orig(self, *args, **kwargs)
@@ -1227,7 +1227,7 @@ def apply(ctx):
                 if ui.spec_cls_name(item) == ui.SAFE_CLS:
                     at = index
                     break
-            for road in roads_of(world_key(app)):
+            for road in roads_of(worlds.playthrough(app)):
                 ends = {str(road.get("from")), str(road.get("to"))}
                 if origin_id not in ends:
                     continue
@@ -1285,7 +1285,7 @@ def apply(ctx):
         """セーブを読み込んだ直後、開いた道をこの世界へ当て直す（`318_` / `321_` と同型）。"""
         result = orig(self, save_data_dict, app, *args, **kwargs)
         try:
-            key = world_key_of_dict(save_data_dict, None) or world_key(app)
+            key = worlds.playthrough(app, save_data_dict)
             if key and key != UNKNOWN_WORLD:
                 worlds.forget(key)
                 apply_roads(self, key, "load")
@@ -1344,7 +1344,7 @@ def apply(ctx):
         app = getattr(self, "app", None) or ui.find_app()
         ended = None
         try:
-            ended = current_quest_id(app)
+            ended = ui.current_quest_id(app)
         except Exception:
             ctx.log_exc("road opening: cannot read the current quest")
         result = orig(self, *args, **kwargs)
@@ -1382,7 +1382,7 @@ def apply(ctx):
         app = getattr(self, "app", None) or ui.find_app()
         ended = None
         try:
-            ended = current_quest_id(app)
+            ended = ui.current_quest_id(app)
         except Exception:
             ctx.log_exc("road opening: cannot read the current quest")
         result = orig(self, *args, **kwargs)
@@ -1427,29 +1427,47 @@ def apply(ctx):
             ctx.log_exc("road opening: cannot filter the travel text")
         return orig(self, context, *args, **kwargs)
 
+    # 日数そのものはローダの関所が渡す（TECH.md §3.3.3）。
+    # こちらは「到着の移動は何日か」を答える側に回る。
+    def days_wish(app, days):
+        """到着の移動にかかる日数（`ARRIVAL_DAYS`）を望む。段階 `moving` の最初の1回だけ。
+
+        道を行っていないときは何も望まない（None）。
+        `since` は移動が始まった時刻で、同じ移動に `314_`（街移動の設定）が
+        望みを出していても、**起こしたのはこちら**なので日数はこちらが決める。
+        """
+        observe_quest(app)
+        record = pending_of(app, "moving")
+        if record is None:
+            return None
+        if int(record.get("days_spent") or 0) > 0:
+            write("days: {} left alone (the road to {!r} already took {} day(s))"
+                  .format(days, record.get("target_name"), record.get("days_spent")))
+            return None
+        return {"days": max(0, int(ARRIVAL_DAYS)),
+                "since": record.get("moving_at")}
+
+    def days_note(app, days, granted):
+        """道が実際に取った日数を控える（到着の検算が読む）。"""
+        record = pending_of(app, "moving")
+        if record is None or int(record.get("days_spent") or 0) > 0:
+            return
+        advance(app, "moving", days_spent=max(0, int(granted)))
+        write("road: the road to {!r} takes {} day(s)".format(
+            record.get("target_name"), granted))
+
+    owner = os.path.basename(getattr(ctx, "mod_dir", "") or "") or "road_opening"
+    durations.claim_days(owner, days_wish, note=days_note, write=write)
+    durations.install(ctx, write)
+
     @ctx.wrap("__main__:InstantaleApp.elapse_days", required=False)
     def elapse_days(orig, self, days, *args, **kwargs):
-        """到着の移動にかかる日数を `ARRIVAL_DAYS` にする。段階 `moving` の最初の1回だけ。
+        """日数が進んだ後に、期日が来た委託を開く（`check_commissions`）。
 
-        日数が進んだ後は、期日が来た委託を開く（`check_commissions`）。
+        日数そのものには触らない（それは関所の仕事）。
+        後処理は `orig` の**後**にしか置けないので、この包みだけは残る。
         """
-        granted = days
-        try:
-            observe_quest(self)
-            record = pending_of(self, "moving")
-            if record is not None and _number(days) and days > 0:
-                if int(record.get("days_spent") or 0) > 0:
-                    write("days: {} left alone (the road to {!r} already took {} day(s))"
-                          .format(days, record.get("target_name"), record.get("days_spent")))
-                else:
-                    granted = max(0, int(ARRIVAL_DAYS))
-                    advance(self, "moving", days_spent=granted)
-                    write("days: {} -> {} (the road to {!r} takes {} day(s))".format(
-                        days, granted, record.get("target_name"), granted))
-        except Exception:
-            ctx.log_exc("road opening: cannot set the days")
-            granted = days
-        result = orig(self, granted, *args, **kwargs)
+        result = orig(self, days, *args, **kwargs)
         try:
             check_commissions(self, "days")
         except Exception:
@@ -1490,7 +1508,7 @@ def apply(ctx):
         if world is None:
             return
         try:
-            key = world_key(app)
+            key = worlds.playthrough(app)
             if key and key != UNKNOWN_WORLD:
                 apply_roads(world, key, "ready")
         except Exception:

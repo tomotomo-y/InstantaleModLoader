@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""130_ / 314_ のワールド別設定画面を窓抜きで通す。
+"""130_ / 314_ / 332_ のワールド別設定画面を窓抜きで通す。
 
     python tools/tests/test_world_settings_tool.py
 
-画面そのものは `tools/modtool.py` に1本だけ在り、2本の `tool.py` は
+画面そのものは `tools/modtool.py` に1本だけ在り、3本の `tool.py` は
 `modtool.world_settings_main(MOD_DIR)` を呼ぶシム（TECH.md §3.12.1）。
 だから検査も共有側に当てて、シムは「同じもので、確かに共有側を呼ぶ」ことだけ見る。
 
-  同一    … 2本の tool.py は同じファイル（`__file__` 以外を書いていない）。シムは modtool を呼ぶ
+  同一    … 3本の tool.py は同じファイル（`__file__` 以外を書いていない）。シムは modtool を呼ぶ
   宣言    … 項目は mod.json の "settings" から読む（本体の定数と同じ顔ぶれ）。控えのフォルダ名も本体と同じ
   世界    … セーブを復号して world_data の名前を鍵にする。フォルダ名ではない
   個別    … 一括設定と違う項目だけ書く。全部同じならファイルを消す。型の違う値は読まない
@@ -26,7 +26,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir))
 RUNTIME_DIR = os.path.join(ROOT, "runtime")
-MODS = ("130_currency_unit", "314_area_move_custom")
+MODS = ("130_currency_unit", "314_area_move_custom", "332_training_custom")
 sys.path.insert(0, RUNTIME_DIR)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
@@ -56,7 +56,8 @@ def xor(raw, key):
 
 print("[同一]")
 paths = [os.path.join(RUNTIME_DIR, "mods", m, "tool.py") for m in MODS]
-check("2本の tool.py は同じ", filecmp.cmp(paths[0], paths[1], shallow=False))
+check("{}本の tool.py は同じ".format(len(paths)),
+      all(filecmp.cmp(paths[0], _p, shallow=False) for _p in paths[1:]))
 for _p in paths:
     _src = io.open(_p, encoding="utf-8").read()
     check("{} のシムは modtool を呼ぶ".format(os.path.basename(os.path.dirname(_p))),

@@ -119,6 +119,8 @@ BANDS = (
         "128_item_image_variety",
         "129_balance_item_price",
         "134_balance_item_effects",
+        "135_fix_inn_button_order",
+        "137_fix_npc_skill_uses",
         "130_currency_unit",
         "131_sharp_portrait",
         "132_npc_variety",
@@ -129,6 +131,7 @@ BANDS = (
         "1132_policy_guardrail_bypass",
         "1133_generation_limits",
         "1134_quest_split_generation",
+        "136_cloud_model_override",
         "112_ui_text_spacing",
         "113_ui_text_expand",
         "114_ui_input_focus",
@@ -173,6 +176,11 @@ BANDS = (
         "327_inn_quality",
         "328_quest_from_world",
         "329_area_move_with_party",
+        "330_real_estate",
+        "331_facility_investment",
+        "332_training_custom",
+        "333_equipment_slots",
+        "334_colosseum_custom",
     )),
     #: 提供（4xx）は出どころの帯なので kind を固定しない（TECH.md §3.2.2）。
     (None, CONTRIB_HEAD, (

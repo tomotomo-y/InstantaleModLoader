@@ -104,7 +104,7 @@ Kivy の `y` は下端なので、`y` を据え置いて
 `add_widget` の既定は先頭挿入で、
 Kivy は子を逆順に描くので後から足したものが一番上に出る。
 
-**足す先は HUD ではなく、HUD が持っている `FloatLayout` の中**（`host_of`）。
+**足す先は HUD ではなく、HUD が持っている `FloatLayout` の中**（`ui.overlay_host`）。
 素の HUD の子はその 1枚だけで、
 そこへ直接足すと子が2つになり、**「画面の最初の子」を取る側から見える相手が変わる**（`scripts.hud.new_hud:get_current_screen_root`）。
 実際、この形にする前は **アイテムを持ち物へ移す・装備する操作が効かなくなる**（VERIFICATION_LOG.md
@@ -293,13 +293,6 @@ def apply(ctx):
     warn_once = ctx.warner("text expand")
 
     # -- 本文のラベルを探す --------------------------------------------------
-    def is_label(widget):
-        """本文を描けるウィジェットか。型では見ない（GAME.md §1.3）。"""
-        for name in ("text", "texture_update", "text_size"):
-            if frames.attr(widget, name) is frames.MISSING:
-                return False
-        return isinstance(frames.attr(widget, "text"), str)
-
     def matches(text, value):
         """`value`（ゲームが持っている本文）と同じものを描いているラベルか。
 
@@ -317,7 +310,7 @@ def apply(ctx):
         found = []
 
         def descend(widget, depth):
-            if depth and is_label(widget) and matches(
+            if depth and ui.is_label(widget) and matches(
                     frames.attr(widget, "text", ""), value):
                 found.append(widget)
             if depth >= MAX_DEPTH:
@@ -352,7 +345,7 @@ def apply(ctx):
             return label
 
         named = frames.attr(hud, "text_display")
-        if named is not frames.MISSING and is_label(named):
+        if named is not frames.MISSING and ui.is_label(named):
             label = named
         else:
             value = frames.attr(hud, "display_text", "")
@@ -364,7 +357,7 @@ def apply(ctx):
             except Exception:
                 items = []
             for _name, widget in items:
-                if is_label(widget) and matches(frames.attr(widget, "text", ""), value):
+                if ui.is_label(widget) and matches(frames.attr(widget, "text", ""), value):
                     label = widget
                     break
             if label is None:
@@ -380,12 +373,6 @@ def apply(ctx):
         return label
 
     # -- 本文の枠（広げる相手）を探す ----------------------------------------
-    def is_scroller(widget):
-        for name in ("scroll_y", "do_scroll_y"):
-            if frames.attr(widget, name) is frames.MISSING:
-                return False
-        return True
-
     def container_of(hud, label):
         """本文のラベルを載せている枠。見つからなければ None。
 
@@ -405,7 +392,7 @@ def apply(ctx):
         for _step in range(MAX_UP):
             if widget in (None, frames.MISSING) or widget is hud:
                 break
-            if is_scroller(widget):
+            if ui.is_scroller(widget):
                 return widget   # スクロールできる ＝ 本文の枠。位置は問わない
             if frames.attr(widget, "parent") is hud:
                 break           # HUD の直下の非スクローラ ＝ 画面レイヤ。枠ではない
@@ -415,40 +402,14 @@ def apply(ctx):
         return None
 
     # -- 設計値（こちらが触る前の寸法） --------------------------------------
-    def numbers(value, count):
-        """`size_hint` / `size` などを素の tuple にする（Kivy の可変列を持ち歩かない）。"""
-        try:
-            return tuple(value)[:count]
-        except Exception:
-            return None
-
-    def close_enough(value, wanted):
-        """寸法が「もうその値になっている」か。浮動小数の丸めは差と見ない。"""
-        try:
-            return abs(float(value) - float(wanted)) < 0.5
-        except (TypeError, ValueError):
-            return False
-
-    def rect_of(widget):
-        size = numbers(frames.attr(widget, "size"), 2)
-        pos = numbers(frames.attr(widget, "pos"), 2)
-        if not size or not pos:
-            return None
-        try:
-            return (float(pos[0]), float(pos[1]), float(size[0]), float(size[1]))
-        except (TypeError, ValueError):
-            return None
+    # 寸法の読み方はローダの語彙（`116_` と共有）。
+    numbers = ui.numbers
+    close_enough = ui.close_enough
+    rect_of = ui.rect_of
 
     def same_rect(rect, target):
-        """見た目に同じ矩形か。枠線・背景は数 px ずれて置かれていることがある。"""
-        if rect is None or target is None:
-            return False
-        slack_x = max(RECT_SLACK, target[2] * RECT_RATIO)
-        slack_y = max(RECT_SLACK, target[3] * RECT_RATIO)
-        return (abs(rect[0] - target[0]) <= slack_x
-                and abs(rect[1] - target[1]) <= slack_y
-                and abs(rect[2] - target[2]) <= slack_x * 2
-                and abs(rect[3] - target[3]) <= slack_y * 2)
+        """見た目に同じ矩形か（許容はこの MOD の `RECT_SLACK` / `RECT_RATIO`）。"""
+        return ui.same_rect(rect, target, RECT_SLACK, RECT_RATIO)
 
     def members_of(hud, box):
         """一緒に広げる相手（＝同じ矩形を占めている仲間）。
@@ -618,15 +579,22 @@ def apply(ctx):
         except Exception:
             ctx.log_exc("text expand: could not set the wrap width")
 
-    def settle(hud, label):
-        """枠を変えた後、本文の高さをゲーム自身の計算で決め直させる（GAME.md §2.3）。"""
-        try:
-            label.texture_update()
-            update_height = frames.attr(hud, "update_label_height")
-            if callable(update_height):
-                update_height()
-        except Exception:
-            ctx.log_exc("text expand: could not settle the label height")
+    def settle(hud):
+        """枠を変えた後、本文の高さをゲーム自身の計算で決め直させる（GAME.md §2.3）。
+
+        次のフレームで `update_label_height` を呼ぶだけで、`texture_update()` は呼ばない（TECH.md §6.2）。
+        折り返し幅を変えた時点で Kivy がテクスチャの作り直しを予約しており、
+        それはこの予約より先に走るので、高さを出す時点の `texture_size` は新しい幅のものになっている。
+        """
+        def run():
+            try:
+                update_height = frames.attr(hud, "update_label_height")
+                if callable(update_height):
+                    update_height()
+            except Exception:
+                ctx.log_exc("text expand: could not settle the label height")
+
+        schedule(run)
 
     def clamp(box):
         """`pos_hint` を持たない枠を窓の内側へ。位置はゲームが入れるので次のフレームに。"""
@@ -743,7 +711,7 @@ def apply(ctx):
             warn_once("sizer", "the game's own sizer resets the text frame; "
                                "sizing it here instead")
         schedule(lambda: clamp_all(design))
-        settle(hud, label)
+        settle(hud)
         note("expanded to {}x{:.0f} (design {:.0f}x{:.0f}), {} widget(s)".format(
             "{:.0f}".format(width) if widen else "(unchanged)",
             height, design["size"][0], design["size"][1],
@@ -776,7 +744,7 @@ def apply(ctx):
             setattr(box, EXPANDED_ATTR, False)
         except Exception:
             pass
-        settle(hud, label)
+        settle(hud)
         note("restored to {}".format(design["size"]))
         return True
 
@@ -1108,28 +1076,12 @@ def apply(ctx):
             warn_once("button", "kivy Button unavailable; no toggle will be shown")
         return button
 
-    def host_of(hud):
-        """ボタンを載せる相手。HUD 自身の子の並びは変えない。
-
-        規則は `ui.overlay_host` に集約してある（`116_` も同じものが要るので、
-        同じ発見を2箇所に書かない。TECH.md §6.1）。
-        要点は2つ:
-
-        * 足すのは HUD 直下ではなく、その中の `FloatLayout`。
-          HUD の子を増やすと「画面の最初の子」を取る側から見える相手が変わり、
-          アイテムの移動・装備が効かなくなる（VERIFICATION_LOG.md §2.33）
-        * 選ぶのはいちばん古い子。
-          先頭（＝いちばん新しい子）を採ると、
-          ゲームの一時的な窓や**他の MOD が置いたウィジェット**を掴みうる
-        """
-        return ui.overlay_host(hud)
-
     def ensure_button(hud):
         """ボタンを1枚だけ足す。既にあれば押下先だけ今の注入へ付け替える。"""
         label = label_of(hud)
         if label is None:
             return
-        host = host_of(hud)
+        host = ui.overlay_host(hud)
         button = frames.attr(hud, BUTTON_ATTR)
         if button in (None, frames.MISSING):
             button = make_button(hud, label)

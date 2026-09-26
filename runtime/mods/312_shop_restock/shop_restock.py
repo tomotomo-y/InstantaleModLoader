@@ -53,7 +53,7 @@ obtainer が主の Character）。
 新しい品名はローダの LLM 経路（`llm.ask` + `create_structure`。`405_` と同じ口）で作る。
 ゲーム自身の生成関数（`shop_item_generator_ordinary` など）は使わない。
 引数の形が読めず、店を開いても呼ばれないので、それを待つと入れ替えが止まる
-（版3で一度そうなった。2026-09-10）。
+（版3で一度そうなった）。
 
 頼み文は場所（世界名・土地・施設の名前と説明）と、雛形の各品の `value`
 （世界を作ったときの価値段階）、`item_type` / `item_sub_type` の語彙、前の品名（重複禁止）。
@@ -71,7 +71,7 @@ LLM が返らない・読めないときは `WARN new stock:` を書いて、雛
 `weapon` / `wearable` は作らない（GAME.md §2.13.1.3）。
 空にしたままにすると、入れ替えのたびに店から装備が消え、
 通うほど回復アイテムだけの店になる
-（実測: 雛形8件の店が入れ替え後4件、雛形10件の店が3件。2026-09-10）。
+（実測: 雛形8件の店が入れ替え後4件、雛形10件の店が3件）。
 
 そこで補充の結果を見たあと、**雛形にあるのに戻ってこなかった品**を
 ゲームの生成で作り直す（`InstantaleApp.generate_item_from_dict(item_dict, item_id, obtainer)`。
@@ -92,7 +92,7 @@ id は採番台帳から採る（`ids.claim`）。
 ## 買った品がその場で作り直されるのを止める（`KEEP_SOLD_OUT`）
 
 **ゲームは店を開くたびに、売れた品を作り直して棚へ戻す**
-（2026-09-04 に `227_probe_shop_stock` で実測。GAME.md §2.13.1.3）。
+（`227_probe_shop_stock` で実測。GAME.md §2.13.1.3）。
 
 ```
 15:58:18 買 ハルマンの予備のランプ (utility/tool)
@@ -131,7 +131,7 @@ id は採番台帳から採る（`ids.claim`）。
 `execute` の戻り際に外すと、メインスレッドが `normalize_shop_inventory_prices` で
 主の持ち物の辞書を回している最中に別スレッドから鍵を消すことになり、
 `RuntimeError: dictionary changed size during iteration` でゲームごと落ちる
-（2026-09-07 に実機。VERIFICATION.md §3.52）。
+（実機。VERIFICATION.md §3.52）。
 画面を開く側の手前なら同じスレッドで、しかも辞書を回す前なので、
 作り直された品は画面に一度も出ない。
 
@@ -183,14 +183,22 @@ NEW_STOCK_TIMEOUT = 120      # LLM を待つ秒数（`405_` と同じ。返ら�
 NEW_STOCK_MIN = 4            # 1回の入れ替えで作る品の数の下限・上限（雛形の件数に合わせる）
 NEW_STOCK_MAX = 12
 
-# `item_type` / `item_sub_type` の語彙。実セーブ6世界の品と `129_` の分類から。
+# `item_type` / `item_sub_type` の語彙。ゲーム自身の品揃え生成（`shop_item_generator_ordinary`）の
+# スキーマと同じ組（`output_data` の実記録）。`generate_item_from_item_data` はこの語彙を受けて
+# `item_detail` に直す（武器は `small` -> `small_weapon`、薬草は `herb` -> `plant`）。
+# 品の `item_detail`（`small_weapon`）を渡すと `small_weapon_weapon` になり、
+# 画像の埋め込み `Data/item_embeddings/<item_detail>.json` が見つからずに落ちる（版2まで。武器が1本も入らなかった）。
 # LLM にはこの組から選ばせ、外れたら先頭の細分に寄せる。
 ITEM_TYPES = {
-    "weapon": ("small_weapon", "medium_weapon", "long_weapon", "large_weapon"),
-    "wearable": ("body_armor", "accessory", "clothing"),
-    "healing_item": ("food", "drink", "potion", "medicine", "plant"),
+    "weapon": ("small", "medium", "large", "long", "throwable"),
+    "wearable": ("headgear", "body_armor", "legwear", "gauntlets", "shield",
+                 "accessory", "clothing"),
+    "healing_item": ("food", "drink", "herb", "medicine", "potion"),
+    "consumable": ("food", "drink", "herb", "medicine", "potion", "scroll"),
     "utility": ("tool", "document"),
-    "material": ("ore", "gem", "relic", "magical_material", "creature_part"),
+    "material": ("creature_part", "ore", "gem", "treasure", "metal", "creature",
+                 "plant", "mushroom", "relic", "scrap", "magical_material",
+                 "other_material"),
 }
 RARITIES = ("common", "rare", "magical", "epic", "legendary", "mythic")
 
@@ -540,7 +548,7 @@ def apply(ctx):
         ゲームは空にした店を埋め直すとき、**装備（`weapon` / `wearable`）を作らない**
         （GAME.md §2.13.1.3）。放っておくと入れ替えのたびに店から装備が消え、
         通うほど回復アイテムだけの店になる（実測: 雛形8件の店が入れ替え後4件、
-        雛形10件の店が3件。2026-09-10）。
+        雛形10件の店が3件）。
 
         埋めるのは**雛形にある品**だけ。プレイヤーが売った品は雛形に無いので、
         今までどおり入れ替えで流れる（この MOD の元の目的）。

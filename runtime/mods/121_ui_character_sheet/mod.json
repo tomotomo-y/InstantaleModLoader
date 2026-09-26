@@ -4,13 +4,13 @@
   "kind": "fix",
   "name": {
     "en": "Wider character sheet",
-    "ja": "人物欄を広げて手配度・スキル・特性を出す"
+    "ja": "人物欄に手配度・スキル・特性を足す"
   },
   "description": {
     "en": "Grows the player's character sheet to the left, up and down and adds wanted level (per non-dungeon area), skills and traits. The portrait does not move",
     "ja": "プレイヤーの人物欄を左・上・下へ広げ、手配度（ダンジョン以外の土地ごと）・スキル・特性を足す。立ち絵の位置は変わらない"
   },
-  "version": "1",
+  "version": "3",
   "author": "R01/Flossian",
   "shares": ["reputation"],
   "settings": {
@@ -52,8 +52,8 @@
         "en": "Panel top edge (fraction of the window height, from the top)"
       },
       "note": {
-        "ja": "素の位置は 0.055 相当。上げたぶんは能力値など縦の余裕になる",
-        "en": "The vanilla sheet sits at about 0.055; the extra height goes to the columns"
+        "ja": "素の位置は 0.055 相当。小さくするほど枠が上へ伸び、そのぶんが能力値などの縦の余裕になる",
+        "en": "The vanilla sheet sits at about 0.055. Lower values grow the panel upward, and that height goes to the columns"
       }
     },
     "PANEL_BOTTOM": {

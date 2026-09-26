@@ -4,13 +4,13 @@
   "kind": "feature",
   "name": {
     "en": "City case",
-    "ja": "街の事件"
+    "ja": "街の事件の捜査と告発"
   },
   "description": {
     "en": "A case to investigate around town: gather clues at facilities, then name the culprit",
     "ja": "街を回って調べる事件。施設で聞き込み、手がかりが揃ったら犯人を告発する"
   },
-  "version": "1",
+  "version": "2",
   "author": "R01/Flossian",
   "settings": {
     "START_FACILITY_TYPE": {
@@ -71,7 +71,7 @@
         "en": "Chance of a mistaken testimony (%)"
       },
       "note": {
-        "ja": "混じると、聞いた話を全部信じたときに誰も当てはまらなくなる。0 で従来どおり全部が真",
+        "ja": "混じると、聞いた話を全部信じたときに誰も当てはまらなくなる。0 なら手がかりは全部が真",
         "en": "With one wrong clue, believing every clue leaves nobody; 0 keeps all clues true"
       }
     },

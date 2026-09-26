@@ -36,6 +36,8 @@
 この計測は `315_` より後（外側）に置くので、
 `elapse_days` と所持金は **MOD が差し替える前のゲームの生の値**が録れる（TECH.md
 §3.2.2 の「計測は修正より後」）。
+日数を差し替えるのは `315_` 自身ではなくローダの日数送りの関所（`durations`。TECH.md §3.3.3）だが、
+関所も日数を望む MOD より内側に立つので、ここへ来る数は変わらない。
 一方ボタンのラベルは描かれる直前に `315_` が書き換えるため、
 ここで写る `text` は書き換え後の姿になることがある。
 生のラベルが要るときは `315_` を切って録る（spec の `args` はどちらでも生のまま）。
@@ -206,6 +208,12 @@ def apply(ctx):
                         "texts_dropped": window["overflow"],
                         "loading_dots": window["dots"],
                         "seconds": round(time.monotonic() - started, 1),
+                        # 窓が終わった時点で並んでいるボタン。
+                        # `VacationStartManager` の後なら**活動の選択肢**がここに写る
+                        # （`休養をとる` / `アイテム作成` の spec のクラス名が分かる）。
+                        # 部屋選びと違ってここは `DisplayXxxChoice` を通らないので、
+                        # 上の2つのフックでは録れない。
+                        "buttons_after": buttons_brief(app),
                     }
                     write("{} done: gold {} -> {} (moved {}) days={} bg={} "
                           "texts={} dots={} in {}s".format(
@@ -215,6 +223,9 @@ def apply(ctx):
                               window["dots"], row["seconds"]))
                     for text in window["texts"]:
                         write("    text: {!r}".format(text))
+                    for entry in row["buttons_after"]:
+                        write("    after: {!r} cls={} args={}".format(
+                            entry["text"], entry["cls"], entry["args"]))
                     record(row)
                 except Exception:
                     ctx.log_exc("vacation probe: cannot record the window")

@@ -112,6 +112,17 @@ class Player:
         self.inventory = {}
 
 
+# ゲームの `Data/item_embeddings/` にある埋め込み（実機のフォルダの一覧）。
+EMBEDDINGS = frozenset((
+    "accessory", "body_armor", "clothing", "creature", "creature_part", "document",
+    "drink", "food", "gauntlets", "gem", "headgear", "large_weapon", "leg_armor",
+    "legwear", "liquid_material", "long_weapon", "magical_material", "medicine",
+    "medium_weapon", "metal", "mushroom", "ore", "other_material", "plant", "potion",
+    "relic", "scrap", "scroll", "shield", "small_weapon", "throwable_weapon", "tool",
+    "treasure",
+))
+
+
 class InstantaleApp:
     counter = [0]
 
@@ -124,11 +135,23 @@ class InstantaleApp:
     def generate_item_from_item_data(self, item_name, description, item_type,
                                      item_sub_type, value, item_appearance,
                                      rarity, obtainer):
-        """ゲームの生成（LLM の1行から品1つ）。主の棚へ入れる。"""
+        """ゲームの生成（LLM の1行から品1つ）。主の棚へ入れる。
+
+        ゲームは細分から `item_detail` を組み、画像の埋め込み
+        `Data/item_embeddings/<item_detail>.json` を開く。無ければ落ちる
+        （実機で `small_weapon_weapon.json` が無いと落ちた）。
+        """
+        item_detail = {"herb": "plant"}.get(item_sub_type, item_sub_type)
+        if item_type == "weapon":
+            item_detail = item_sub_type + "_weapon"
+        if item_detail not in EMBEDDINGS:
+            raise FileNotFoundError(
+                "Data/item_embeddings/{}.json".format(item_detail))
         self.counter[0] += 1
         item_id = "item_{}".format(3000 + self.counter[0])
         obtainer.inventory[item_id] = {"name": item_name, "value": value,
-                                       "item_type": item_type, "rarity": rarity}
+                                       "item_type": item_type, "rarity": rarity,
+                                       "item_detail": item_detail}
         return obtainer.inventory[item_id]
 
     def generate_item_from_dict(self, item_dict, item_id, obtainer):
@@ -203,7 +226,7 @@ class ShoppingStartManagerRemake:
                     "name": self.new_name}
         # 画面を開くのは Clock 経由でメインスレッド（`instantale.py:3208`）。
         # `execute` は別スレッドなので、メインスレッドは `execute` が戻る前に
-        # 画面を組み始めうる（2026-09-07 の実機はこの順で落ちた）。
+        # 画面を組み始めうる（実機はこの順で落ちた）。
         # その順を再現する: 予約してから、戻る前に走らせる。
         if owner is not None:
             CLOCK.schedule_once(

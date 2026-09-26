@@ -26,6 +26,8 @@
 払うと手配度は `RESTORE_TO`（既定 10 ＝ 素の平常値）に戻る。
 **下げる方向には決して動かさない**（設定を触って
 `RESTORE_TO` を今の値より低くしても、そのときは今の値のまま）。
+`RESTORE_TO` が `WANTED_THRESHOLD` より低いときは閾値まで戻す
+（そうしないと払っても手配が解けない）。
 
 ## ボタンの出し方
 
@@ -278,7 +280,7 @@ def apply(ctx):
             restore(app, "not wanted")
             return
         area_name, _entry, wanted, price = found
-        gold = record.gold_of(getattr(app, "player", None))
+        gold = ui.gold_of(app)
 
         state["saved"] = [item for item in (getattr(app, "buttons", None) or [])
                           if not screen.mark_of(item)]
@@ -320,8 +322,7 @@ def apply(ctx):
             restore(app, "not wanted")
             return
         area_name, entry, wanted, price = found
-        player = getattr(app, "player", None)
-        gold = record.gold_of(player)
+        gold = ui.gold_of(app)
 
         if gold is None:
             # 所持金が読めないなら払わせない。
@@ -341,13 +342,15 @@ def apply(ctx):
 
         before = record.lawfulness_of(entry)
         # 下げる方向には動かさない（設定を触られても手配を重くしない）。
-        after = max(before, int(RESTORE_TO))
+        # 閾値より下にも戻さない。戻し先が閾値未満の組み合わせ（閾値 20・戻し先 10 など）で
+        # そのまま書くと、払っても手配が解けずにボタンが残り、押すたびに罰金だけ取られる。
+        after = max(before, int(RESTORE_TO), int(WANTED_THRESHOLD))
         if not record.set_lawfulness(entry, after):
             write("WARN pay: cannot write lawfulness; nothing was charged")
             screen.say(app, FAILED_TEXT)
             restore(app, "cannot write lawfulness")
             return
-        if price > 0 and not record.set_gold(player, gold - price):
+        if price > 0 and ui.set_gold(app, gold - price) is None:
             # 金を取れなかったので手配度も戻す。
             # 片方だけ通さない。
             record.set_lawfulness(entry, before)

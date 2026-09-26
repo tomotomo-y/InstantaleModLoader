@@ -27,9 +27,10 @@
 - **同じ街の中の移動は、プレイヤーが居る街でだけ、その街に着いた時に引く**
   （日が進んだときにも引く）。前に引いてからの日数ぶんをまとめて引くので、
   宿に泊まっても、旅から戻っても、着いた街が動いている。
-  街の間は徒歩でも馬車でも 14 日かかる（`314_` の既定）ので、
-  他の街の 7 日の移動は着く前に必ず終わっていて一度も見えない
-  （実プレイ 2026-09-04 の 30 件中 16 件がこれだった）。
+  街の間の移動は素のゲームで最短 14 日（馬車。徒歩は90日。GAME.md §2.18）で、
+  他の街の 7 日の移動より長いので、着く前に必ず終わっていて一度も見えない
+  （実プレイの 30 件中 16 件がこれだった。
+  移動を 7 日より短くする設定を入れているときはこの限りではない）。
   別の街への旅は全部の街で、日が進んだときに引く ― 次にその街へ着いたときの
   「1人欠けている」「知らない冒険者が来ている」を作っているのがそれなので。
   月あたりの出発確率は「同じ街へ向かう割合」で2つに割り当て、
@@ -893,14 +894,6 @@ def apply(ctx):
                 found.add(str(args[0]))
         return found
 
-    def back_button_index(buttons):
-        """ゲーム側の「やめる」の位置。無ければ None（＝一覧ではない）。`320_` と同じ。"""
-        for index, entry in enumerate(buttons):
-            if (ui.spec_cls_name(entry) == ui.SAFE_CLS
-                    and not screen.marked_by_a_mod(entry)):
-                return index
-        return None
-
     def list_label(app, npc_id, trip):
         name = ui.character_name(app, npc_id, fallback=trip.get("name") or npc_id)
         where = where_text(app, trip["dest_area"], trip["dest_facility"])
@@ -930,7 +923,7 @@ def apply(ctx):
         if any(name in OTHER_SCREEN_SPECS for name in names):
             listing["armed"] = False
             return
-        at = back_button_index(buttons)
+        at = screen.back_button_index(buttons)
         if at is None:
             return                      # 「やめる」が無い＝一覧が組み上がっていない
         area = ui.current_area(app)

@@ -5,7 +5,7 @@
 
 偽の app / PhaseSpec / DisplayVacationChoice / VacationStartManager /
 VacationRestManager / VacationEndManager を差し込む。
-**偽ゲームは実機の実測に合わせてある**（2026-08-18、`out/vacation.log`。
+**偽ゲームは実機の実測に合わせてある**（`out/vacation.log`。
 GAME.md §2.17）:
 
   部屋は4つ  犬小屋(0G)=kennel / 簡易寝台(10G)=bunk /
@@ -88,7 +88,7 @@ def check(name, cond, detail=""):
 
 
 # ---------------------------------------------------------------- 偽ゲーム
-#: 実測の部屋（2026-08-18）。
+#: 実測の部屋。
 #: ラベルと quality の対まで実機どおり。
 ROOMS = (("犬小屋(0G)", "kennel", 0),
          ("簡易寝台(10G)", "bunk", 10),
@@ -344,11 +344,18 @@ def install_fake_kivy():
 
 
 class FakeCtx:
+    _seq = 0
+
     def __init__(self, out_dir):
         self.out_dir = out_dir
         self.hooks = {}
         self.errors = []
         self.logs = []
+        # 世代は apply() ごとに違う（本物の `ctx.generation`）。
+        # ローダの日数送りの関所は世代で「もう立てたか」を見るので、
+        # ここが同じ値だと 2本目以降の apply() で関所が立たない（durations.install）。
+        FakeCtx._seq += 1
+        self.generation = FakeCtx._seq
 
     def out_path(self, *parts):
         path = os.path.join(self.out_dir, *parts)
@@ -369,8 +376,23 @@ class FakeCtx:
         self.errors.append(msg)
 
     def wrap(self, target, **kw):
+        """同じ対象に2枚当たったら層にする（本物は後から当てたほうが外側。TECH.md §3.3）。
+
+        `325_` は日数送りに「後処理だけ」の包みを持ち、日数そのものは
+        ローダの関所が渡す。1枚しか覚えないと、後から当てたほうだけが残る。
+        """
         def decorator(func):
-            self.hooks[target] = func
+            previous = self.hooks.get(target)
+            if previous is None:
+                self.hooks[target] = func
+                return func
+
+            def layered(orig, this, *args, _prev=previous, _func=func, **kwargs):
+                def inner(obj, *a, **kw2):
+                    return _prev(orig, obj, *a, **kw2)
+                return _func(inner, this, *args, **kwargs)
+
+            self.hooks[target] = layered
             return func
         return decorator
 
@@ -513,6 +535,12 @@ check("背景の quality もゲームのまま", app.backgrounds == ["private_ro
       app.backgrounds)
 check("日数送りもゲームのまま（90日）", app.elapsed == [90], app.elapsed)
 check("エラーなし", not ctx.errors, ctx.errors)
+
+print("[ラベル] 部屋のボタンの形を変えても自己検証は通る")
+module, ctx, app, choice_cls, start_cls = setup(
+    configure=lambda m: setattr(m, "ROOM_BUTTON", "{name}【{price}G】"))
+check("VERIFY FAILED が出ない",
+      not [msg for level, msg in ctx.logs if level == "ERROR"], ctx.logs)
 
 print("[ラベル] 名前と宿代を変えた部屋だけ表示し直す")
 

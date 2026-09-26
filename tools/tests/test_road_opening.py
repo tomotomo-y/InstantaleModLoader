@@ -108,9 +108,10 @@ class Quest:
         self.__dict__.update(kw)
 
 
-def make_world_dict():
+def make_world_dict(player="旅人"):
     return {
         "world_data": {"world_name": "テスト世界", "days_elapsed": 100},
+        "player_data": {"name": player},
         "areas": {aid: {"id": aid, "name": n, "size": s, "connections": list(c)}
                   for aid, (n, s, c) in STOCK.items()},
         "quests": {},
@@ -132,6 +133,7 @@ class World:
 
 class Player:
     def __init__(self, area):
+        self.name = "旅人"
         self.current_area = area
         self.gold = 10000
         self.physical_integrity = 100
@@ -327,6 +329,7 @@ class InstantaleApp:
         self.ui_updates = 0
         self.pages = 0
         self.hud = HUD_CLS()
+        self.saves = []
 
     def add_text(self, context):
         self.texts.append(context)
@@ -334,6 +337,11 @@ class InstantaleApp:
     def elapse_days(self, days):
         self.elapsed.append(days)
         self.world.days_elapsed += int(days)
+        return None
+
+    def save_game(self):
+        # 保存に焼かれる所持金（払った額が控えと一緒に残るか）
+        self.saves.append(self.player.gold)
         return None
 
     def update_ui(self, *args):
@@ -437,6 +445,8 @@ def install_fake_functions(quests):
 
 
 class FakeCtx:
+    _seq = 0
+
     def __init__(self, out_dir):
         self.out_dir = out_dir
         self.state_dir = os.path.join(out_dir, "state")
@@ -444,6 +454,11 @@ class FakeCtx:
         self.errors = []
         self.logs = []
         self.ready = []
+        # 世代は apply() ごとに違う（本物の `ctx.generation`）。
+        # ローダの日数送りの関所は世代で「もう立てたか」を見るので、
+        # ここが同じ値だと 2本目以降の apply() で関所が立たない（durations.install）。
+        FakeCtx._seq += 1
+        self.generation = FakeCtx._seq
 
     def out_path(self, *parts):
         path = os.path.join(self.out_dir, *parts)
@@ -481,8 +496,23 @@ class FakeCtx:
         return True
 
     def wrap(self, target, **kw):
+        """同じ対象に2枚当たったら層にする（本物は後から当てたほうが外側。TECH.md §3.3）。
+
+        `325_` は日数送りに「後処理だけ」の包みを持ち、日数そのものは
+        ローダの関所が渡す。1枚しか覚えないと、後から当てたほうだけが残る。
+        """
         def decorator(func):
-            self.hooks[target] = func
+            previous = self.hooks.get(target)
+            if previous is None:
+                self.hooks[target] = func
+                return func
+
+            def layered(orig, this, *args, _prev=previous, _func=func, **kwargs):
+                def inner(obj, *a, **kw2):
+                    return _prev(orig, obj, *a, **kw2)
+                return _func(inner, this, *args, **kwargs)
+
+            self.hooks[target] = layered
             return func
         return decorator
 
@@ -733,6 +763,8 @@ app.on_button_press(index)
 app.on_button_press(index)
 CLOCK.settle()
 check("gold deducted once for two presses", app.player.gold == 1000, app.player.gold)
+check("the game saves once after paying (the paid gold and the commission stay together)",
+      app.saves == [1000], app.saves)
 check("second press refused as already commissioned", "already commissioned" in read_log()
       and any("委託済み" in t for t in app.texts), app.texts)
 check("commission line names the days", any("開通まで 14日" in t for t in app.texts), app.texts)
@@ -824,6 +856,36 @@ check("load logged", "load: applied 2 edge(s)" in read_log(), read_log()[-400:])
 plain = BASES["world"](make_world_dict(), None)   # 素の World（`main.World` は差し替え済み）
 check("without the mod the world is stock", plain.areas["0"].connections == ["1", "4", "7"])
 check("no errors so far", not ctx.errors, ctx.errors)
+
+# 控えは周回（世界×主人公）ごと。同じ世界で作り直した主人公には前の主人公の道が無い。
+from instantale_modloader.state import PLAYTHROUGH_SEP, world_filename   # noqa: E402
+OWN_FILE = os.path.join(STATE_DIR, world_filename("テスト世界" + PLAYTHROUGH_SEP + "旅人"))
+OLD_FILE = os.path.join(STATE_DIR, world_filename("テスト世界"))
+check("record lives in the playthrough file", os.path.exists(OWN_FILE)
+      and not os.path.exists(OLD_FILE), sorted(os.listdir(STATE_DIR)))
+app3 = classes["app"](make_world_dict("別の旅人"))
+check("another hero in the same world starts stock", app3.world.areas["0"].connections == ["1", "4", "7"],
+      app3.world.areas["0"].connections)
+
+# 前の版が作った世界名だけの控えは、見つけた時点の主人公のものとして移す。
+print("[世界名だけの控え]")
+os.replace(OWN_FILE, OLD_FILE)
+# 別の主人公の周回が在る世界では移さない（ローダの state.adopt）。`out\test\state` は
+# 他の検査と共有なので、この世界の別の周回（他の検査の残り）を先に片付ける
+_STATE_ROOT = os.path.dirname(STATE_DIR)
+for _folder in os.listdir(_STATE_ROOT):
+    _path = os.path.join(_STATE_ROOT, _folder)
+    if os.path.isdir(_path):
+        for _name in os.listdir(_path):
+            if _name.startswith("テスト世界" + PLAYTHROUGH_SEP):
+                os.remove(os.path.join(_path, _name))
+module, ctx, app, classes = setup(keep_state=True)
+app4 = classes["app"](make_world_dict())
+check("old world file re-applied for the hero found playing", "6" in links(app4, "0"),
+      links(app4, "0"))
+check("moved to the playthrough file and the old one removed", os.path.exists(OWN_FILE)
+      and not os.path.exists(OLD_FILE), sorted(os.listdir(STATE_DIR)))
+check("no errors after the move", not ctx.errors, ctx.errors)
 
 # ================================================================ 踏破
 print("[踏破]")

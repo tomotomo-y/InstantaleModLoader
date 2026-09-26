@@ -194,9 +194,7 @@ def apply(ctx):
         parent = frames.attr(widget, "parent")
         return None if parent in (None, frames.MISSING) else parent
 
-    def children_of(widget):
-        children = frames.attr(widget, "children")
-        return list(children) if isinstance(children, (list, tuple)) else []
+    children_of = ui.children_of
 
     def geom(widget):
         """局所座標（`x`/`y`）と窓座標（`wx`/`wy`）の両方。読めなければ None。
@@ -315,20 +313,10 @@ def apply(ctx):
             walker = parent_of(walker)
         return False
 
-    def walk(widget, depth, seen, out):
-        if id(widget) in seen:
-            return
-        seen.add(id(widget))
-        out.append(widget)
-        if depth >= MAX_DEPTH:
-            return
-        for child in children_of(widget):
-            walk(child, depth + 1, seen, out)
-
     def visible_grids(hud, avoid_for):
         found = []
         try:
-            walk(hud, 0, set(), found)
+            found.extend(ui.walk_widgets(hud, MAX_DEPTH))
         except Exception:
             ctx.log_exc("craft window: walking the HUD failed")
             return []
@@ -673,6 +661,13 @@ def apply(ctx):
             outcome, arrow_outcome,
             " ".join(show(block) for block in blocks)))
 
+    def fit_later(hud):
+        """Clock から呼ぶ `fit`。フックの safe=True は Clock の中まで届かず、ここで投げるとゲームごと落ちる。"""
+        try:
+            fit(hud)
+        except Exception:
+            ctx.log_exc("craft window: the delayed fit failed; leaving the window alone")
+
     def schedule(hud):
         """次のフレームから数回当て直す。`fit` は何度呼んでも同じ結果になる。"""
         try:
@@ -682,7 +677,7 @@ def apply(ctx):
             return
         for delay in PASS_DELAYS:
             try:
-                Clock.schedule_once(lambda _dt, target=hud: fit(target), delay)
+                Clock.schedule_once(lambda _dt, target=hud: fit_later(target), delay)
             except Exception:
                 ctx.log_exc("craft window: could not schedule the fit")
                 return

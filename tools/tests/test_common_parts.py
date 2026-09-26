@@ -20,6 +20,15 @@
 | `ctx.logger(dedup=True)` が変わったときだけ書く | 会話の LLM は1ターンに何度も回る。6本の写しを寄せた先 |
 | `dedup` が `cap` の枠を食わない | 逆だと `cap=10, dedup=True` が「1行書いて終わり」になる |
 | `npcs.enroll` が心当たりを全部見て書く | セーブの形＝実行時の形ではない（GAME.md §2.7）。実行時だけに足すと次のセーブで消える |
+| `frames.arg` / `replace_arg` が位置でもキーワードでも届く | 5本に写っていて、届かなかったときの振る舞いが `327_` と `910_` で違った |
+| `sounds` が曲の置き場と戦闘曲を見分ける | `104_` / `106_` / `322_` / `324_` に同じ本体が写っていた |
+| `ui.walk_widgets` が2通りの順を出し分ける | `330_` / `402_` は「最初の1つ」を採るので、実機で確かめた順（古い子から）を変えられない |
+| 寸法・見分け・テンプレート・クエスト・世界観の小さな部品 | 2〜3本ずつ写されていた（HANDOFF の §2） |
+| `state.SysWorldStore` が上書き鍵を優先する | `modnpc` / `modfacility` の建て直しの間の鍵 |
+| `ui.set_gold` / `add_gold` が所持金の型を保つ | `314_` / `315_` / `332_` の写しが避けていた int への変換を、`add_gold` が行っていた |
+| `ui.scheduler` / `window_watcher` が Clock の中の例外を握る | MOD は素の関数を渡している。漏れるとゲームごと落ちる |
+| `Screen.busy_on` を重ねても戻す値と interval が増えない | 取り直すと自分の `False` を覚えて、選択肢が押せないまま残る |
+| `llm.watch_aliases` が注入し直しで降りるときも1行残す | 黙って降りると、当たらなかった理由を追えない |
 
 ゲームは要らない（偽の `ctx` を渡す）。
 """
@@ -39,7 +48,7 @@ ROOT = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir))
 sys.path.insert(0, os.path.join(ROOT, "runtime"))
 
 import instantale_modloader as ml                                   # noqa: E402
-from instantale_modloader import jobs, llm, npcs, ui                # noqa: E402
+from instantale_modloader import frames, jobs, llm, npcs, sounds, ui  # noqa: E402
 from instantale_modloader import state as state_mod                 # noqa: E402
 from instantale_modloader.state import world_filename               # noqa: E402
 
@@ -218,6 +227,10 @@ def test_worker(root):
                         key=lambda job: job["area"])
     keyed.enqueue({"area": "a"})          # 走り出して hold で止まる
     check("走り出した1件は待ち行列から出ている", keyed.pending() == 0)
+    # 処理中の鍵も積まない。積む側は `run` が書く結果を見て積むかを決めるので、
+    # 受けると同じ入力で LLM を二度呼ぶ（jobs.Worker.enqueue の注記）。
+    check("処理中の鍵は積まない", not keyed.enqueue({"area": "a"}))
+    check("処理中の鍵も waiting が答える", keyed.waiting("a"))
     keyed.enqueue({"area": "b"})
     check("違う鍵は積む", keyed.enqueue({"area": "c"}))
     check("待っている鍵は積まない", not keyed.enqueue({"area": "b"}))
@@ -404,6 +417,471 @@ def test_enroll():
           npcs.enroll(empty, bare, "0", 1) == [])
 
 
+def test_args():
+    print("frames.arg / replace_arg")
+    names = ("quest_data", "player", "log")
+    check("キーワードを先に見る", frames.arg(("a", "b"), {"player": "k"}, "player", 1) == "k")
+    check("位置で読む（添字）", frames.arg(("a", "b"), {}, "player", 1) == "b")
+    check("位置で読む（引数名の並び）", frames.arg(("a", "b"), {}, "player", names) == "b")
+    check("届いていなければ default",
+          frames.arg(("a",), {}, "player", 1, default="d") == "d")
+    check("並びに無い名前はキーワードだけを見る",
+          frames.arg(("a", "b", "c"), {}, "choice_text", names) is None
+          and frames.arg((), {"choice_text": "x"}, "choice_text", names) == "x")
+
+    args, kwargs = ["a", "b"], {"x": 1}
+    new_args, new_kwargs, done = frames.replace_arg(args, kwargs, "player", names, "P")
+    check("位置の差し替え", done and new_args == ("a", "P") and new_kwargs == {"x": 1})
+    check("渡した入れ物は書き換えない", args == ["a", "b"] and kwargs == {"x": 1})
+    new_args, new_kwargs, done = frames.replace_arg(("a",), {"player": 1}, "player", 1, "P")
+    check("キーワードの差し替え", done and new_kwargs == {"player": "P"} and new_args == ("a",))
+    new_args, new_kwargs, done = frames.replace_arg(("a",), {}, "player", 1, "P")
+    check("届いていなければ触らない（既定）", not done and new_kwargs == {} and new_args == ("a",))
+    new_args, new_kwargs, done = frames.replace_arg(("a",), {}, "log", names, "L", insert=True)
+    check("insert=True ならキーワードとして足す", done and new_kwargs == {"log": "L"})
+
+
+def test_sounds(root):
+    print("sounds")
+    check("戦闘曲（区切り・大文字を問わない）",
+          sounds.is_battle_track(r"Assets\Sounds\Musics\Battle\a.mp3")
+          and sounds.is_battle_track("musics/battle/a.ogg"))
+    check("戦闘曲でないもの",
+          not sounds.is_battle_track("Assets/sounds/musics/town/a.mp3")
+          and not sounds.is_battle_track(None) and not sounds.is_battle_track(""))
+    check("重み", sounds.coerce_weight("40") == 40.0 and sounds.coerce_weight(-1) == 0.0
+          and sounds.coerce_weight(float("nan")) == 0.0 and sounds.coerce_weight(True) == 100.0)
+
+    class Playing(object):
+        def get_num_channels(self):
+            return 1
+
+    class Broken(object):
+        def get_num_channels(self):
+            raise RuntimeError("gone")
+    check("鳴っているか", sounds.audible(Playing()) and not sounds.audible(Broken())
+          and not sounds.audible(None))
+
+    game = os.path.join(root, "game")
+    os.makedirs(os.path.join(game, *sounds.MUSIC_SUBDIR))
+    here = os.getcwd()
+    try:
+        os.chdir(game)
+        found = sounds.game_root()
+        check("カレントから曲の置き場を探す",
+              found is not None and os.path.samefile(found, game), found)
+        check("無いサブフォルダなら None",
+              sounds.game_root(("no", "such", "dir")) is None)
+    finally:
+        os.chdir(here)
+
+
+class W(object):
+    """ウィジェットの代わり。`children` は Kivy と同じく新しい順。"""
+
+    def __init__(self, name, *children, **attrs):
+        self.name = name
+        self.children = list(children)
+        self.__dict__.update(attrs)
+
+
+def test_widgets():
+    print("ui.walk_widgets ほか")
+    #      root
+    #     /        #    b      a      （children は新しい順: b が新しい）
+    #    |      |
+    #    b1     a1
+    a1, b1 = W("a1"), W("b1")
+    root = W("root", W("b", b1), W("a", a1))
+    names = lambda seq: [w.name for w in seq]
+    check("前順（children の並び）",
+          names(ui.walk_widgets(root)) == ["root", "b", "b1", "a", "a1"],
+          names(ui.walk_widgets(root)))
+    check("古い子から（330_ / 402_ の順）",
+          names(ui.walk_widgets(root, oldest_first=True)) == ["root", "a", "a1", "b", "b1"],
+          names(ui.walk_widgets(root, oldest_first=True)))
+    check("深さの上限（その深さまで出す）",
+          names(ui.walk_widgets(root, max_depth=1)) == ["root", "b", "a"])
+    seen = set()
+    first = names(ui.walk_widgets(root.children[0], seen=seen))
+    check("seen を共有すれば重なりを二度出さない",
+          first == ["b", "b1"] and names(ui.walk_widgets(root, seen=seen)) == ["root", "a", "a1"])
+    check("None は何も出さない", list(ui.walk_widgets(None)) == [])
+    check("children_of は写しを返す", ui.children_of(root) is not root.children
+          and ui.children_of(root) == root.children and ui.children_of(object()) == [])
+
+    label = W("l", text="本文", texture_update=None, text_size=(0, 0))
+    check("is_label", ui.is_label(label) and not ui.is_label(W("x", text="t")))
+    check("is_label の needs", ui.is_label(W("x", text="t", line_height=1, texture_update=None),
+                                           needs=("text", "line_height", "texture_update")))
+    check("is_scroller", ui.is_scroller(W("s", scroll_y=1, do_scroll_y=True))
+          and not ui.is_scroller(W("s", scroll_y=1)))
+
+    box = W("box", pos=(10, 20), size=(100, 50))
+    check("rect_of", ui.rect_of(box) == (10.0, 20.0, 100.0, 50.0) and ui.rect_of(W("n")) is None)
+    check("same_rect（許容の内と外）",
+          ui.same_rect((15, 25, 110, 55), (10, 20, 100, 50), 12.0, 0.03)
+          and not ui.same_rect((40, 20, 100, 50), (10, 20, 100, 50), 12.0, 0.03))
+    check("close_enough", ui.close_enough(10.4, 10) and not ui.close_enough(10.6, 10)
+          and not ui.close_enough("x", 10))
+
+    safe = {"text": "やめる", "spec": types.SimpleNamespace(cls_name=ui.SAFE_CLS, args=[])}
+    marked = dict(safe, **{ui.MARK_PREFIX + "x": True})
+    other = {"text": "話す", "spec": types.SimpleNamespace(cls_name="Other", args=[])}
+    check("back_button_index は印の無い無害 spec",
+          ui.Screen.back_button_index([other, marked, safe]) == 2
+          and ui.Screen.back_button_index([other, marked]) is None)
+
+    check("fill_template は知らない名前を残す",
+          ui.fill_template("{a}と{typo}", a="砦") == "砦と{typo}"
+          and ui.fill_template("{", a=1) == "{")
+
+    check("current_quest_id（インスタンスでも dict でも）",
+          ui.current_quest_id(types.SimpleNamespace(current_quest_data={"id": 7})) == "7"
+          and ui.current_quest_id(types.SimpleNamespace(
+              current_quest_data=types.SimpleNamespace(id="q"))) == "q"
+          and ui.current_quest_id(types.SimpleNamespace(current_quest_data=None)) is None
+          and ui.current_quest_id(None) is None)
+    app = types.SimpleNamespace(save_data_dict={"world_data": {"overview": "  "}},
+                                world_dict={"world_data": {"overview": " 世界 " + "あ" * 700}})
+    text = ui.world_overview(app)
+    check("world_overview は空を飛ばして次を読み、切り詰める",
+          text.startswith("世界") and len(text) <= 601, len(text))
+    check("world_overview が無ければ空", ui.world_overview(types.SimpleNamespace()) == "")
+
+
+def test_sys_world_store(root):
+    print("state.jsonable / SysWorldStore")
+    check("jsonable", state_mod.jsonable({"a": [1, 2.0, None, "x", True]})
+          and not state_mod.jsonable({"a": object()}) and not state_mod.jsonable({1: 2}))
+    shared = state_mod.SysWorldStore("_instantale_test_sys_store", "sys_store",
+                                     "_instantale_test_sys_store_key")
+    try:
+        check("bind 前は store が None で bucket は空", shared.store() is None
+              and shared.bucket(types.SimpleNamespace()) == (None, None))
+        first = shared.bind(FakeCtx(root))
+        again = shared.bind(FakeCtx(root))
+        check("bind し直しても同じ控え（世代をまたぐ）", first is again and shared.store() is first)
+        setattr(sys, "_instantale_test_sys_store_key", "上書きの鍵")
+        key, bucket = shared.bucket(types.SimpleNamespace())
+        check("上書き鍵を優先する", key == "上書きの鍵" and isinstance(bucket, dict), key)
+    finally:
+        for name in ("_instantale_test_sys_store", "_instantale_test_sys_store_key"):
+            if hasattr(sys, name):
+                delattr(sys, name)
+
+
+def test_gold():
+    print("ui.set_gold / add_gold")
+    def app_with(gold):
+        return types.SimpleNamespace(player=types.SimpleNamespace(gold=gold))
+    errors = []
+
+    app = app_with(100)
+    check("int の所持金へは丸めた int を書く",
+          ui.set_gold(app, 49.6) == 50 and type(app.player.gold) is int, app.player.gold)
+    app = app_with(100.5)
+    check("float の所持金へは float を書く",
+          ui.set_gold(app, 49) == 49.0 and type(app.player.gold) is float, app.player.gold)
+
+    app = app_with(100.5)
+    check("add_gold は float を保つ（素の値に足す）",
+          ui.add_gold(app, -10) == 90.5 and type(app.player.gold) is float, app.player.gold)
+    app = app_with(100)
+    check("add_gold は int を保つ",
+          ui.add_gold(app, 25) == 125 and type(app.player.gold) is int, app.player.gold)
+
+    for bad in (None, True, "100"):
+        app = app_with(bad)
+        check("読めない所持金（{!r}）には書かない".format(bad),
+              ui.set_gold(app, 5) is None and ui.add_gold(app, 5) is None
+              and app.player.gold is bad, app.player.gold)
+    check("player が無ければ None", ui.set_gold(types.SimpleNamespace(), 5) is None)
+
+    class Locked(object):
+        gold = 10
+
+        def __setattr__(self, name, value):
+            raise AttributeError(name)
+    app = types.SimpleNamespace(player=Locked())
+    check("書けなければ None で on_error に渡す",
+          ui.set_gold(app, 5, on_error=errors.append) is None and len(errors) == 1, errors)
+    check("足せない額は書かずに on_error",
+          ui.add_gold(app_with(10), "x", on_error=errors.append) is None
+          and len(errors) == 2, errors)
+
+
+class FakeClock(object):
+    """`kivy.clock.Clock` の代わり。載せた関数を溜めるだけで、呼ぶのは検査の側。"""
+
+    def __init__(self):
+        self.once = []
+        self.intervals = []
+
+    def schedule_once(self, callback, delay=0):
+        self.once.append(callback)
+
+    def schedule_interval(self, callback, poll):
+        self.intervals.append(callback)
+
+    def get_events(self):
+        """予約されている関数（`ui.button_load_pending` が読む）。"""
+        return [types.SimpleNamespace(get_callback=lambda cb=cb: cb)
+                for cb in self.once + self.intervals]
+
+    def unschedule(self, callback):
+        self.once = [cb for cb in self.once if cb != callback]
+
+    def step(self):
+        """次のフレーム。いま載っている `schedule_once` を1回ずつ呼ぶ。"""
+        pending, self.once = self.once, []
+        for callback in pending:
+            callback(0)
+
+
+class FakeHUD(object):
+    """`scripts.hud.new_hud.InstanTaleHUD` の代わり。左の枠が2つ。"""
+
+    def __init__(self):
+        self.buttons = [types.SimpleNamespace(text="") for _ in range(2)]
+
+    def update_button_texts(self, instance, value):
+        for widget, text in zip(self.buttons, list(value)):
+            widget.text = text
+
+
+class WaitingApp(object):
+    """ゲームの点送り（`234_probe_busy_display` の実測。GAME.md §2.4）。
+
+    `is_button_enabled` が False のあいだに `display_button_load` が呼ばれると、
+    **いまの一覧の文字から**次のコマを決めて（`.`→`..`→`...`→`.`、点でなければ `.`）
+    `to_display_buttons` に書いて塗り、0.3秒後の自分を予約し直す。
+    True に戻っていれば、今の一覧を塗って止まる（予約し直さない）。
+    `process_choice` は旗を下ろして、自分で点送りを1本始める。
+    """
+
+    NEXT = {".": "..", "..": "...", "...": "."}
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.is_button_enabled = True
+        self.to_display_buttons = ["a", "b"]
+        self.buttons = []
+        self.painted = []
+        self.hud = FakeHUD()
+        self.hud.update_button_texts(self, self.to_display_buttons)
+
+    def display_button_load(self, dt):
+        if self.is_button_enabled is False:
+            now = (self.to_display_buttons or [""])[0]
+            self.to_display_buttons = [self.NEXT.get(now, ".")] * 2
+            self.clock.schedule_once(self.display_button_load, 0.3)
+        self.hud.update_button_texts(self, self.to_display_buttons)
+        self.painted.append(list(self.to_display_buttons))
+
+    def process_choice(self, function, choice_text=""):
+        self.is_button_enabled = False
+        self.clock.schedule_once(self.display_button_load, 0)
+
+    def chains(self):
+        """回っている点送りの本数（予約されている `display_button_load` の数）。"""
+        return sum(1 for cb in self.clock.once
+                   if getattr(cb, "__name__", "") == "display_button_load")
+
+
+class FakeWindow(object):
+    """`kivy.core.window.Window` の代わり。結んだ手を1本ずつ持つ。"""
+
+    def __init__(self):
+        self.handlers = []
+
+    def bind(self, on_resize=None):
+        self.handlers.append(on_resize)
+
+    def unbind(self, on_resize=None):
+        self.handlers.remove(on_resize)
+
+
+def with_fake_kivy(body):
+    """Kivy が在るゲームの中と同じ経路を通すため、偽の `kivy.clock` / `kivy.core.window` を差す。"""
+    names = ("kivy", "kivy.clock", "kivy.core", "kivy.core.window")
+    saved = {name: sys.modules.get(name) for name in names}
+    clock, window = FakeClock(), FakeWindow()
+    for name in names:
+        sys.modules[name] = types.ModuleType(name)
+    sys.modules["kivy.clock"].Clock = clock
+    sys.modules["kivy.core.window"].Window = window
+    try:
+        body(clock, window)
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_clock_guard(root):
+    print("ui.scheduler / window_watcher / Screen.busy_on（Clock の中の例外と重なり）")
+    ctx = FakeCtx(root)
+
+    def body(clock, window):
+        def boom():
+            raise RuntimeError("MOD の不具合")
+
+        schedule = ui.scheduler(ctx, "guard test")
+        ran = []
+        schedule(boom)
+        schedule(lambda: ran.append(1), delay=0.5)
+        raised = None
+        try:
+            for callback in clock.once:
+                callback(0)
+        except Exception as exc:
+            raised = exc
+        check("scheduler: Clock のコールバックから例外が漏れない", raised is None, raised)
+        check("scheduler: 投げたことはローダのログに残る",
+              any("guard test" in e for e in ctx.errors), ctx.errors)
+        check("scheduler: ほかの予約はそのまま走る", ran == [1], ran)
+
+        def on_resize(_window, width, height):
+            raise RuntimeError("窓の手の不具合")
+
+        attr = ui.MOD_WIDGET_PREFIX + "guard_test_resize"
+        watch = ui.window_watcher(ctx, on_resize, attr, "guard test")
+        check("window_watcher: 結べた", watch() and len(window.handlers) == 1,
+              window.handlers)
+        del ctx.errors[:]
+        raised = None
+        try:
+            window.handlers[0](window, 800, 600)
+        except Exception as exc:
+            raised = exc
+        check("window_watcher: リサイズの手から例外が漏れない", raised is None, raised)
+        check("window_watcher: 投げたことはログに残る",
+              any("guard test" in e for e in ctx.errors), ctx.errors)
+        # 注入し直した世代は、前の世代が残した包みを外してから結ぶ。
+        again = ui.window_watcher(ctx, on_resize, attr, "guard test")
+        check("window_watcher: 結び直しても手は1本",
+              again() and len(window.handlers) == 1, window.handlers)
+
+        # 待機表示。点を送るのはゲーム自身で、こちらは旗を下ろして1回だけ回し始める。
+        # 以前は自前でもコマを送り、塗るたびに `display_button_load` を呼んで
+        # ゲームの点送りを1本ずつ増やしていた（点が飛んだ。実機 2026-09-25）。
+        del clock.once[:]
+        del clock.intervals[:]
+        hud_module = types.ModuleType(ui.HUD_MODULE)
+        setattr(hud_module, ui.HUD_CLASS, FakeHUD)
+        saved_hud = sys.modules.get(ui.HUD_MODULE)
+        sys.modules[ui.HUD_MODULE] = hud_module
+        screen = ui.Screen(ctx, lambda line: None, tag="guard test")
+        app = WaitingApp(clock)
+        screen.busy_on(app)
+        check("busy_on: その場で押せなくなる", app.is_button_enabled is False,
+              app.is_button_enabled)
+        clock.step()
+        check("busy_on: 点送りを1本だけ回し始める", app.chains() == 1, app.chains())
+        check("busy_on: 1コマ目は「.」", app.to_display_buttons == [".", "."],
+              app.to_display_buttons)
+        check("busy_on: 自前の interval は立てない", not clock.intervals,
+              len(clock.intervals))
+        screen.busy_on(app)          # 待機表示を出したまま、もう一度
+        clock.step()
+        check("busy_on: 重ねても点送りは1本", app.chains() == 1, app.chains())
+        frames = []
+        for _ in range(4):
+            clock.step()
+            frames.append(app.to_display_buttons[0])
+        check("busy_on: 1フレームに1コマずつ、飛ばずに進む",
+              frames == ["...", ".", "..", "..."], frames)
+        screen.paint(app, ["x", "y"])
+        clock.step()
+        check("busy_on: 待機中に塗っても点送りは増えない", app.chains() == 1,
+              app.chains())
+        screen.busy_off(app, restore=False)
+        check("busy_on: 重ねた後の busy_off で押せる状態へ戻る",
+              app.is_button_enabled is True, app.is_button_enabled)
+        clock.step()
+        clock.step()
+        check("busy_off: 点送りは止まる", app.chains() == 0, app.chains())
+
+        # ゲーム自身の待機がまだ回っているところで出す（活動の直後など）。
+        app = WaitingApp(clock)
+        app.is_button_enabled = False
+        app.display_button_load(0)           # ゲームが回し始めた
+        screen.busy_on(app)
+        clock.step()
+        check("busy_on: ゲームの点送りが回っていれば足さない", app.chains() == 1,
+              app.chains())
+        screen.busy_off(app, restore=False)
+
+        # ゲームが自分の待機を終えたその場で覆う（活動の後の選択肢）。
+        # 待機を終えるとゲームは旗を戻して選択肢を組み、次のフレームで今の一覧を塗る。
+        # 覆いがその塗りに間に合わないと1フレームだけ選択肢が見えた（実機 2026-09-25）。
+        del clock.once[:]
+        app = WaitingApp(clock)
+        app.is_button_enabled = False
+        app.display_button_load(0)           # ゲームの待機（「.」）
+        clock.step()                         # 「..」
+        app.is_button_enabled = True         # ゲームが待機を終え、選択肢を組んだ
+        app.to_display_buttons = ["休養をとる", "宿泊を終える"]
+        screen.busy_on(app)                  # 組んだその場（ワーカー）で覆う
+        check("busy_on: 枠の点をそのまま一覧に書く（次の塗りも点になる）",
+              app.to_display_buttons == ["..", ".."], app.to_display_buttons)
+        check("busy_on: その場で押せなくなる（組んだ直後）", app.is_button_enabled is False,
+              app.is_button_enabled)
+        clock.step()
+        check("busy_on: 点送りは続きから進む（「..」の次は「...」）",
+              app.hud.buttons[0].text == "...", app.hud.buttons[0].text)
+        check("busy_on: 引き継いだ点送りは1本のまま", app.chains() == 1, app.chains())
+
+        # 覆ったまま次の場面を起こす（滞在を締める）。
+        # 次の場面の `process_choice` も点送りを始めるので、前のを外さないと2本になる。
+        screen.start_phase(app, types.SimpleNamespace(), "宿泊を終える")
+        clock.step()
+        check("start_phase: 回っている点送りを外してから起こす（1本のまま）",
+              app.chains() == 1, app.chains())
+        frames = []
+        for _ in range(3):
+            clock.step()
+            frames.append(app.hud.buttons[0].text)
+        check("start_phase: 点は1フレームに1コマ", frames == ["..", "...", "."], frames)
+        screen.busy_off(app, restore=False)
+        if saved_hud is None:
+            sys.modules.pop(ui.HUD_MODULE, None)
+        else:
+            sys.modules[ui.HUD_MODULE] = saved_hud
+
+    with_fake_kivy(body)
+
+
+def test_watch_aliases_superseded():
+    print("llm.watch_aliases（注入し直されて降りるときも1行残す）")
+    lines = []
+    state = {"superseded": False}
+    ctx = types.SimpleNamespace(
+        resolve=lambda target: (None, None, None),     # 別名はまだ生えない
+        superseded=lambda: state["superseded"],
+        log=lambda msg, level="INFO": lines.append(msg),
+        log_exc=lambda msg: lines.append("EXC " + msg))
+    old_poll = llm.ALIAS_POLL_SECONDS
+    llm.ALIAS_POLL_SECONDS = 0.02
+    try:
+        watched = llm.watch_aliases(ctx, ["llm_manager:send_request"],
+                                    lambda target: None, label="alias test")
+        check("生えていない対象は見張りに回る", watched == ["llm_manager:send_request"],
+              watched)
+        state["superseded"] = True
+        deadline = time.monotonic() + 5.0
+        while not lines and time.monotonic() < deadline:
+            time.sleep(0.01)
+        check("降りたことと対象が記録に残る",
+              any("alias test" in line and "send_request" in line
+                  and "superseded" in line for line in lines), lines)
+    finally:
+        llm.ALIAS_POLL_SECONDS = old_poll
+
+
 def main():
     root = tempfile.mkdtemp(prefix="instantale_common_")
     try:
@@ -415,6 +893,13 @@ def main():
         test_pressed_entry()
         test_records(root)
         test_enroll()
+        test_args()
+        test_sounds(root)
+        test_widgets()
+        test_sys_world_store(root)
+        test_gold()
+        test_clock_guard(root)
+        test_watch_aliases_superseded()
     finally:
         shutil.rmtree(root, ignore_errors=True)
     if FAILURES:

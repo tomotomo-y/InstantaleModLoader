@@ -1304,16 +1304,6 @@ def apply(ctx):
         """仲間が `MIN_MEMBERS` 人以上か。1人なら本体の会話と変わらないので出さない。"""
         return len(party_ids(app)) >= MIN_MEMBERS
 
-    def back_button_index(buttons):
-        """一覧の「やめる」の位置。無ければ None（一覧が組み上がっていない）。
-
-        自前のボタンも同じ無害 spec なので、MOD の印が無いものを採る（`320_` と同じ）。
-        """
-        for index, entry in enumerate(buttons):
-            if ui.spec_cls_name(entry) == ui.SAFE_CLS and not screen.marked_by_a_mod(entry):
-                return index
-        return None
-
     def talk_list_slot(buttons):
         """「会話する」の相手一覧なら、差し込む位置。違えば None。"""
         if not st["talk_list"]:
@@ -1324,7 +1314,7 @@ def apply(ctx):
             return None
         # 相手が居なければ一覧は「やめる」1つだけ（ギルドの「会話する」など。実機で確認）。
         # 人数は問わず、「やめる」が在れば一覧とみなす。
-        return back_button_index(buttons)
+        return screen.back_button_index(buttons)
 
     def wants_own_talk_choice(app, buttons):
         """NPC 不在で本体の「会話する」が無い根のメニューか。
@@ -1484,14 +1474,15 @@ def apply(ctx):
         write("hid the party-only choices of other mods ({} left)".format(len(buttons)))
 
     @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False, safe=True)
-    def press(orig, self, index, *args, **kwargs):
+    def press(orig, self, button_index, *args, **kwargs):
         """自前の選択肢だけ横取りする。他は本体へ。
 
         会話の開始は次のフレームへ予約する（押下の処理の中で phase を切り替えると
         本体が同じ押下の後始末で上書きするため）。
+        引数名は本体と同じにする（キーワードで渡されても二重にならない。版9）。
         """
         try:
-            action = screen.mark_of(ui.pressed_entry(self, index))
+            action = screen.mark_of(ui.pressed_entry(self, button_index))
         except Exception:
             action = None
         if action == TALK_MARK:
@@ -1499,7 +1490,7 @@ def apply(ctx):
             open_own_talk_list(self)
             return None
         if action != START_MARK:
-            return orig(self, index, *args, **kwargs)
+            return orig(self, button_index, *args, **kwargs)
         write("pressed {!r}".format(START_LABEL))
         screen.schedule(lambda: open_talk(self), 0)
         return None

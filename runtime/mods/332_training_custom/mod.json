@@ -1,0 +1,206 @@
+{
+  "entry": "training_custom.py",
+  "api": 1,
+  "kind": "feature",
+  "name": {
+    "en": "Customize the training hall",
+    "ja": "訓練所のカスタマイズ"
+  },
+  "description": {
+    "en": "Change the training fee, how much training one course buys, how long one session takes (a base period times a per-activity multiplier), and whether you may train again where you graduated; the wording follows the real length. Defaults are the game's own values, so nothing changes until you edit them",
+    "ja": "訓練所の代金・1回の修行の量・1段の期間（ベース期間×修行内容ごとの倍率）を変えられる。卒業した施設での再訓練も選べる。文言もAIの描写も実際の期間に揃う。既定は素のゲームの値のままで、変えた項目だけが効く"
+  },
+  "version": "13",
+  "author": "R01/Flossian",
+  "after": [
+    "306_party_train_exp"
+  ],
+  "tool": {
+    "entry": "tool.py",
+    "label": {
+      "ja": "ワールド別の訓練所設定",
+      "en": "Training hall settings by world"
+    },
+    "note": {
+      "ja": "ワールドごとに代金・年数・1段の期間を変える。ここの設定は全ワールド共通の値",
+      "en": "Per-world fee, course length and session length. The settings here are the shared defaults"
+    }
+  },
+  "settings": {
+    "TRAINING_PRICE": {
+      "type": "int",
+      "default": 300,
+      "min": 0,
+      "max": 10000000,
+      "label": {
+        "ja": "訓練の代金",
+        "en": "Training fee"
+      },
+      "note": {
+        "ja": "素のゲームは300G（施設によらず固定）。300のままなら触らない。0でタダ。手持ちがこの額に満たないと押した時点で断られる",
+        "en": "The game's own fee is 300G, the same at every facility. Left at 300, nothing is touched. 0 makes it free; pressing the button with less than this is refused"
+      }
+    },
+    "COURSE_YEARS": {
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 30,
+      "label": {
+        "ja": "1回の修行の行動回数",
+        "en": "Actions in one training course"
+      },
+      "note": {
+        "ja": "素のゲームは3回ぶん。行動ごとの消費量（ただ鍛える1・基礎を積む2・技を磨く2・新たな技を学ぶ3）がここから引かれ、0 で卒業する。だから3なら「ただ鍛える」を3回か、「新たな技を学ぶ」を1回で終わる。決めるのは回数で、期間ではない（実際に進む暦は下のベース期間×倍率の合計）。増やすと1回の代金で何回も行動できる。ゲームはこの数を年で言うので、画面には「あと3年間」と出る（その文言は下の設定で実際の期間に直せる）",
+        "en": "The game gives 3. Each action spends its own amount (1/2/2/3) and you graduate at 0, so three buys three sessions of the cheapest action or one of the costliest. It sets how many actions one fee buys, not how long they take: the days that pass come from the base period below. The game words the count in years, which is why the screen says \"3 years left\"."
+      }
+    },
+    "BASE_PERIOD": {
+      "type": "choice",
+      "values": [
+        "1ヵ月",
+        "2ヵ月",
+        "3ヵ月",
+        "6ヵ月",
+        "1年"
+      ],
+      "default": "1年",
+      "label": {
+        "ja": "1段のベース期間",
+        "en": "Base period of one session"
+      },
+      "note": {
+        "ja": "いちばん短い修行（ただ鍛える）1回で進む暦。他の修行はこれの倍率で決まる。素のゲームは「1年」（365日）で、3年の修行は1095日ぶん暦が飛ぶ。「1ヵ月」（30日）にすると ただ鍛える=1ヵ月・新たな技を学ぶ=3ヵ月 になる。ボタンにはこの期間が出るので表示と実態はずれない",
+        "en": "How much calendar one 'ただ鍛える' session costs; every other activity is a multiple of it. The game's own value is 1年 (365 days), which makes a three-year activity jump 1095 days. At 1ヵ月 (30 days) the four activities take 1/2/2/3 months. The buttons show the real length"
+      }
+    },
+    "SIMPLE_FACTOR": {
+      "type": "int",
+      "default": 1,
+      "min": 1,
+      "max": 60,
+      "label": {
+        "ja": "「ただ鍛える」の倍率",
+        "en": "Multiplier: ただ鍛える"
+      },
+      "note": {
+        "ja": "ベース期間の何倍か。素のゲームは1年の修行なので1倍。ゲームが数える年数（1年）は変わらないので、卒業までの段数は倍率を変えても変わらない",
+        "en": "How many base periods this activity costs. The game's own value is 1 (a one-year activity). The years the game counts are unchanged, so the number of sessions per course stays the same"
+      }
+    },
+    "FUNDAMENTAL_FACTOR": {
+      "type": "int",
+      "default": 2,
+      "min": 1,
+      "max": 60,
+      "label": {
+        "ja": "「基礎を積む」の倍率",
+        "en": "Multiplier: 基礎を積む"
+      },
+      "note": {
+        "ja": "ベース期間の何倍か。素のゲームは2年の修行なので2倍",
+        "en": "How many base periods this activity costs. The game's own value is 2 (a two-year activity)"
+      }
+    },
+    "TRAIN_SKILL_FACTOR": {
+      "type": "int",
+      "default": 2,
+      "min": 1,
+      "max": 60,
+      "label": {
+        "ja": "「技を磨く」の倍率",
+        "en": "Multiplier: 技を磨く"
+      },
+      "note": {
+        "ja": "ベース期間の何倍か。素のゲームは2年の修行なので2倍",
+        "en": "How many base periods this activity costs. The game's own value is 2 (a two-year activity)"
+      }
+    },
+    "LEARN_NEW_SKILL_FACTOR": {
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 60,
+      "label": {
+        "ja": "「新たな技を学ぶ」の倍率",
+        "en": "Multiplier: 新たな技を学ぶ"
+      },
+      "note": {
+        "ja": "ベース期間の何倍か。素のゲームは3年の修行なので3倍",
+        "en": "How many base periods this activity costs. The game's own value is 3 (a three-year activity)"
+      }
+    },
+    "START_BUTTON": {
+      "type": "str",
+      "default": "{name}({price}G)",
+      "label": {
+        "ja": "訓練を受けるボタンの表示",
+        "en": "Training button label"
+      },
+      "note": {
+        "ja": "使える変数: {name}（ボタンから括弧を落とした呼び名）{price} {years}。代金を変えたときだけこの形で表示し直す",
+        "en": "Variables: {name} (the label without its brackets), {price} and {years}. Used only when you change the fee"
+      }
+    },
+    "PHASE_BUTTON": {
+      "type": "str",
+      "default": "{name}({length})",
+      "label": {
+        "ja": "修行内容のボタンの表示",
+        "en": "Activity button label"
+      },
+      "note": {
+        "ja": "使える変数: {name} {length}（実際に進む期間。「3ヵ月」「2年」）{days}（日数）{factor}（倍率）{base}（ベース期間）。ベース期間が「1年」ならゲームの表示と同じ文字列になるので、既定のままなら1文字も変わらない",
+        "en": "Variables: {name}, {length} (the real length, e.g. 3ヵ月), {days}, {factor} and {base}. With the 1年 base this reproduces the game's own labels exactly"
+      }
+    },
+    "ALLOW_RETRAIN": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "卒業した施設でも再訓練できる",
+        "en": "Allow training again where you graduated"
+      },
+      "note": {
+        "ja": "既定 ON（この MOD を入れると受けられる）。素のゲームは断る（「十分に学んだ。これ以上ここで得るものはないだろう。」で代金も日数も動かない）。断りの根拠は施設に付く訓練済みの印（config の trained）で、ON だとその印をたたむだけ。ゲームは卒業していない施設とまったく同じ道を通るので、代金も背景も選択肢も文言も全部ゲームのまま。OFF にすれば素のゲームどおり断る",
+        "en": "On by default: installing this mod lets you train again. The game itself refuses a second course at the same facility. The refusal comes from a \"trained\" mark on the facility itself; on, that mark is simply folded away, so the game runs exactly as it does at a facility you have not graduated from, with its own fee, background, choices and wording. Turn it off to get the game's own refusal back."
+      }
+    },
+    "PERIOD_WORDING": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "文言の「N年間」も実際の期間に直す",
+        "en": "Match the wording to the real length"
+      },
+      "note": {
+        "ja": "ON だと、訓練中に出る「あと3年間。どうする？」「一年間、ひたすら鍛錬した。」の年数を実際の期間に直す（「あと3ヵ月。」「1ヵ月、ひたすら鍛錬した。」）。素の設定では直す先が同じ文字列なので1文字も変わらない。切るとゲームの言い方のまま残り、暦と文言が食い違う。AIが書く描写（「これからの三年間…」）はどちらでも触らない",
+        "en": "Rewrites the years the game states during training (あと3年間 / 一年間、…) into the real length. With the game's own settings the result is the same string, so nothing changes. Off keeps the game's wording, which then disagrees with the calendar. The AI's own narration is never touched"
+      }
+    },
+    "LLM_PERIOD_WORDING": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "AI に渡す頼み文の年数も直す",
+        "en": "Match the AI's prompt to the real length"
+      },
+      "note": {
+        "ja": "ゲームは頼み文にも年数を焼き込む（「残り訓練年数: 3年」「費用と3年の時間を費やす」など）ので、切っていると画面は3ヵ月なのに師範のセリフだけが「三年間」と言う。ON だと訓練の頼み文の年数だけを実際の期間に直す。人生ログ（「3年間の過酷な基礎訓練を終え」）や土地との縁（「合計2年暮らしている」）は過去の記録なので触らない",
+        "en": "The game bakes the years into its prompts (残り訓練年数: 3年 and so on), so with this off the trainer's own lines still say three years even when the screen says three months. On, only the training prompt's years are rewritten; the life log and the years someone has lived in a town are records of the past and are never touched"
+      }
+    },
+    "REFUSE_TEXT": {
+      "type": "str",
+      "default": "（訓練の代金{price}Gに足りない ― 手持ち{gold}G）",
+      "label": {
+        "ja": "代金に足りないときの一言",
+        "en": "Line shown when you cannot pay"
+      },
+      "note": {
+        "ja": "使える変数: {price} {gold}。代金を変えたときだけ出る（素の300Gのままならゲームに任せる）",
+        "en": "Variables: {price} and {gold}. Shown only when you changed the fee; at the game's own 300G the game decides"
+      }
+    }
+  }
+}

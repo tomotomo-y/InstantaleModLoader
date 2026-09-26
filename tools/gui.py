@@ -45,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -72,6 +73,10 @@ MODS_DIR = os.path.join(RUNTIME_DIR, "mods")
 # MOD が配布用の順序ファイルへ書き戻される。
 OUT_DIR = os.path.join(ROOT, "out")
 STATUS_PATH = os.path.join(OUT_DIR, ml.STATUS_NAME)
+# 取った Release の本文の控え（`fetch_notes`）。
+# 一度取れたら、次からはネットに出ずに読める。
+# out/ に置くのは、消しても次に読むときに取り直すだけだから（ログの世代送りは *.log しか触らない）。
+NOTES_CACHE = os.path.join(OUT_DIR, "release_notes.json")
 
 # MOD が持つ永続データ（進行中の道中、依頼の出所、NPC の控え）。
 # out/ とは別。
@@ -85,9 +90,18 @@ STATE_DIR = ml.state_dir(RUNTIME_DIR)
 SETTINGS_DIR = C.settings_dir(RUNTIME_DIR)
 CONFIG_PATH = os.path.join(SETTINGS_DIR, "gui.json")
 
+# ヘルプメニューの「GitHub を開く」。
+REPO_URL = "https://github.com/Flossian/InstantaleModLoader"
 # 更新の確認先。起動のたびに別スレッドで1回だけ見る（`App._check_update`）。
 RELEASE_API = ("https://api.github.com/repos/Flossian/InstantaleModLoader"
                "/releases/latest")
+# 更新後に出す本文の取り先（`App._check_notes`）。
+# 版が変わった後の起動で1回だけ見る。
+# 何版も飛ばして上げた人にも間の分を出すので、最新1件ではなく一覧を取る。
+RELEASES_API = ("https://api.github.com/repos/Flossian/InstantaleModLoader"
+                "/releases?per_page=30")
+# 更新の zip を落とすときの、1回の読みを待つ上限（秒）。全体の所要時間の上限ではない。
+UPDATE_TIMEOUT = 30
 # 上書きで消えないもの。確認の文に出す（zip に入らないので展開は触らない）。
 UPDATE_KEEPS = ("settings\\・state\\・local\\・手元で足した MOD\n"
                 "（書き換えた *.default.txt / *.default.json は "
@@ -151,7 +165,9 @@ def keep_edited_default(path: str) -> bool:
 
 
 def _vtuple(ver: str) -> tuple[int, ...]:
-    return tuple(int(x) for x in ver.lstrip("v").split("."))
+    # 数字だけを拾う。
+    # タグには `v1.9.0a` のような字の付いたものがあり、`int("0a")` で落ちる。
+    return tuple(int(x) for x in re.findall(r"\d+", ver))
 
 
 def newer_release(current: str = ml.__version__) -> tuple[str, str] | None:
@@ -172,6 +188,137 @@ def newer_release(current: str = ml.__version__) -> tuple[str, str] | None:
     return None
 
 
+def pick_notes(releases: list, since: str | None,
+               current: str = ml.__version__) -> list[dict]:
+    """Release の一覧から、`since` より新しく `current` 以下のものを新しい順に返す。
+
+    `since` が None なら `current` と同じ版だけ（前の版を覚えていない。`App._check_notes`）。
+    下書きと pre-release は出さない（更新ボタンも `/releases/latest` なので拾わない）。
+    並びは GitHub の返す順（新しい順）のまま。上げた先の版が一番上に来る。
+    """
+    cur = _vtuple(current)
+    low = _vtuple(since) if since else None
+    picked = []
+    for r in releases:
+        if r.get("draft") or r.get("prerelease"):
+            continue
+        ver = _vtuple(str(r.get("tag_name", "")))
+        if not ver or ver > cur:
+            continue
+        if low is None:
+            if ver != cur:
+                continue
+        elif ver <= low:
+            continue
+        tag, body = str(r["tag_name"]), (r.get("body") or "")
+        # 続けて出したときの境目。
+        # v1.8.0 から本文は `# InstantaleModLoader v…` で始めているが、それより前は見出しが無い。
+        if not body.lstrip().startswith("# "):
+            body = "# {}\n\n{}".format(tag, body)
+        picked.append({"tag": tag, "body": body, "url": r.get("html_url") or ""})
+    return picked
+
+
+def fetch_releases() -> list:
+    """GitHub の Release の一覧（新しい順）。ネットが無い等は例外のまま返す。"""
+    import urllib.request
+    with urllib.request.urlopen(RELEASES_API, timeout=5) as r:
+        data = json.load(r)
+    if not isinstance(data, list):
+        raise ValueError("Release の一覧ではありません")
+    return data
+
+
+def fetch_notes(since: str | None, current: str = ml.__version__,
+                cache: str | None = None, fetch=fetch_releases) -> list[dict]:
+    """`pick_notes` を Release の一覧に掛ける。一覧は控え（`NOTES_CACHE`）を先に見る。
+
+    控えに `current` の Release があれば、ネットに出ずに控えから選ぶ。
+    `current` が控えにあるなら、それより前の版も同じ一覧に入っている（新しい順に 30 件取っている）ので、
+    何版か飛ばした起動時の分も控えで足りる。
+    無ければ取り直して控えを置き換える。
+    GitHub で後から本文を直しても、控えに今の版がある間は取り直さない（窓の「GitHub で開く」で最新を読める）。
+    """
+    cache = cache or NOTES_CACHE
+    cur = _vtuple(current)
+    kept = _read_json(cache)
+    if isinstance(kept, list) and any(
+            isinstance(r, dict) and _vtuple(str(r.get("tag_name", ""))) == cur
+            for r in kept):
+        return pick_notes(kept, since, current)
+    data = fetch()
+    # 窓に出すのに要る分だけ残す（一覧の生の形は assets や作者の情報で 10 倍ほど重い）。
+    keys = ("tag_name", "body", "html_url", "draft", "prerelease")
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    ml.write_json(cache, [{k: r.get(k) for k in keys} for r in data], indent=1)
+    return pick_notes(data, since, current)
+
+
+# 本文の Markdown のうち、リリースノートで使っている分だけを読む。
+# 見出し（#・##・###）、箇条書き（- ）、行の中の **太字** と `コード`。
+# それ以外（リンク・表）は書いたままの字で出る。
+_BOLD_MD = re.compile(r"\*\*(.+?)\*\*")
+_CODE_MD = re.compile(r"`([^`]+)`")
+
+
+def _inline_runs(text: str, tags: tuple[str, ...]) -> list[tuple[str, tuple[str, ...]]]:
+    """行の中の **太字** と `コード` を分ける。
+
+    太字で先に切ってから、それぞれの中のコードを切る。
+    見出しの項目は「**…を足しました（`combat`）**」のように太字の中にコードを書くので、
+    1本の正規表現で左から拾うと太字が先に取ってバッククォートが字のまま残る。
+    """
+    runs = []
+    pos = 0
+    for m in list(_BOLD_MD.finditer(text)) + [None]:
+        plain = text[pos:m.start() if m else len(text)]
+        for piece, extra in _split_code(plain):
+            runs.append((piece, tags + extra))
+        if m:
+            for piece, extra in _split_code(m.group(1)):
+                runs.append((piece, tags + ("bold",) + extra))
+            pos = m.end()
+    return [r for r in runs if r[0]]
+
+
+def _split_code(text: str) -> list[tuple[str, tuple[str, ...]]]:
+    parts = _CODE_MD.split(text)
+    # split は括弧の中身を奇数番目に挟んで返す。
+    return [(p, ("code",) if i % 2 else ()) for i, p in enumerate(parts)]
+
+
+def markdown_runs(body: str) -> list[tuple[str, tuple[str, ...]]]:
+    """本文を (字, Text の tag) の並びにする。Tk を使わないのでテストで通せる。
+
+    tag は行の種類（h1 / h2 / item / cont / para / gap）と、行の中の bold / code。
+    箇条書きの下に続く行（空行まで）は `cont` で、項目と同じ深さに下げる。
+    本文は「- **見出し**」の次の行から説明を書く形なので、下げないと説明がどの項目の物か読めない。
+    空行は `gap`（続けて何行あっても1つ）。
+    本文は一文一行なので、行の間隔だけでは段落の切れ目が見えない。
+    """
+    runs: list[tuple[str, tuple[str, ...]]] = []
+    in_item = False
+    for line in body.replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            in_item = False
+            if runs and runs[-1][1] != ("gap",):
+                runs.append(("\n", ("gap",)))
+            continue
+        m = re.match(r"(#{1,6})\s+(.*)", stripped)
+        if m:
+            kind, text = ("h1" if len(m.group(1)) == 1 else "h2"), m.group(2)
+            in_item = False
+        elif stripped[:2] in ("- ", "* "):
+            kind, text = "item", "・" + stripped[2:]
+            in_item = True
+        else:
+            kind, text = ("cont" if in_item else "para"), stripped
+        runs.extend(_inline_runs(text, (kind,)))
+        runs.append(("\n", (kind,)))
+    return runs
+
+
 def extract_release(zip_path: str, dest: str = ROOT) -> int:
     """full zip を dest へ上書き展開して、書いたファイルの数を返す。
 
@@ -182,15 +329,20 @@ def extract_release(zip_path: str, dest: str = ROOT) -> int:
     出す約束（消す判断をここでしない）。
 
     開発の作業ツリーで押すと、配布物の中身で作業中の変更が上書きされる
-    （2026-09-05 に実際に起きた。git で戻せるが、戻す前に何を失ったか見ること）。
+    （実際に起きた。git で戻せるが、戻す前に何を失ったか見ること）。
     """
     count = 0
+    # 書き先は絶対パスにして dest の中かを確かめる（`install_from_zip` と同じ）。
+    # `..` を見るだけでは、Windows でドライブ名（`C:`）や `\` を含む名前が dest の外を指す。
+    base = os.path.abspath(dest)
     with zipfile.ZipFile(zip_path) as z:
         for info in z.infolist():
             parts = info.filename.split("/")[1:]
             if info.is_dir() or not parts or ".." in parts:
                 continue
-            path = os.path.join(dest, *parts)
+            path = os.path.abspath(os.path.join(base, *parts))
+            if not path.startswith(base + os.sep):
+                continue
             os.makedirs(os.path.dirname(path), exist_ok=True)
             keep_edited_default(path)
             with z.open(info) as src, open(path, "wb") as dst:
@@ -827,6 +979,10 @@ def install_from_zip(zip_path: str) -> list[str]:
         if not roots:
             raise ValueError("{} が見つかりません（MOD の zip ファイルではありません）".format(
                 ml.MANIFEST_NAME))
+        # 別の mod のフォルダの中にある mod.json は、その mod の中身として一緒に写す。
+        # 独立した mod として mods/ 直下へもう1つ置くと、同じものが2回読み込まれる。
+        roots = {r for r in roots
+                 if not any(o != r and (o == "" or r.startswith(o + "/")) for o in roots)}
 
         installed = []
         for root in sorted(roots):
@@ -1084,6 +1240,105 @@ class SettingsDialog(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------
+# 更新内容のウィンドウ
+# --------------------------------------------------------------------------
+class ReleaseNotesDialog(tk.Toplevel):
+    """上げた版の Release の本文を出す（`App._check_notes`）。
+
+    更新ボタンを押すだけで GitHub も Discord も見ない人に、何が変わったかを届けるための窓。
+    何版も飛ばしたときは、間の版を新しい順に続けて出す。
+    モーダルにしない。読みながら一覧で新しい MOD を探せるように。
+    """
+
+    def __init__(self, master: tk.Misc, notes: list[dict]):
+        super().__init__(master)
+        if len(notes) == 1:
+            self.title("{} の更新内容".format(notes[0]["tag"]))
+        else:
+            self.title("{} から {} までの更新内容".format(notes[-1]["tag"], notes[0]["tag"]))
+        self.configure(background=PALETTE["bg"])
+        self.transient(master)
+        self.url = notes[0]["url"]
+
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+        box = ttk.Frame(outer)
+        box.pack(fill="both", expand=True)
+        # 書体と地の色は一覧の説明欄（`App._build_info`）と揃える。
+        text = tk.Text(box, wrap="char", relief="flat", bd=0,
+                       width=1, height=1, padx=12, pady=8,
+                       font="TkDefaultFont",
+                       background=PALETTE["surface"],
+                       foreground=PALETTE["text"],
+                       highlightthickness=1,
+                       highlightbackground=PALETTE["control_edge"],
+                       highlightcolor=PALETTE["control_edge"],
+                       cursor="arrow")
+        text.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        scroll.pack(side="left", fill="y")
+        text.configure(yscrollcommand=scroll.set)
+
+        base = tkfont.nametofont("TkDefaultFont")
+        h1 = base.copy()
+        h1.configure(weight="bold", size=FONT_SIZE + 4)
+        h2 = base.copy()
+        h2.configure(weight="bold", size=FONT_SIZE + 1)
+        bold = base.copy()
+        bold.configure(weight="bold")
+        gap = base.copy()
+        gap.configure(size=max(4, FONT_SIZE // 2))
+        # Python 側の Font が捨てられると Tk の font も消えて既定の字に戻るので、窓が持つ。
+        self._fonts = (h1, h2, bold, gap)
+        indent = base.measure("・")
+        text.tag_configure("h1", font=h1, spacing1=14, spacing3=6)
+        text.tag_configure("h2", font=h2, foreground=PALETTE["accent_dim"],
+                           spacing1=10, spacing3=4)
+        text.tag_configure("para", spacing2=3, spacing3=2)
+        text.tag_configure("item", spacing1=4, spacing2=3, spacing3=2,
+                           lmargin1=4, lmargin2=4 + indent)
+        text.tag_configure("cont", spacing2=3, spacing3=2,
+                           lmargin1=4 + indent, lmargin2=4 + indent)
+        text.tag_configure("gap", font=gap)
+        # 太字とコードは行の tag の後ろに足すので、後から作った方が勝つ（Tk の規則）。
+        text.tag_configure("bold", font=bold)
+        text.tag_configure("code", foreground=PALETTE["text_sub"],
+                           background=PALETTE["raised"])
+
+        for note in notes:
+            for chunk, tags in markdown_runs(note["body"]):
+                text.insert("end", chunk, tags)
+            text.insert("end", "\n", ("gap",))
+        text.configure(state="disabled")
+        self.text = text
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(10, 0))
+        ttk.Label(bar, text="GitHub の Release と同じ内容です",
+                  style="Faint.TLabel").pack(side="left")
+        ttk.Button(bar, text="閉じる", command=self.destroy).pack(side="right")
+        if self.url:
+            ttk.Button(bar, text="GitHub で開く", command=self._open).pack(
+                side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        # 一覧の窓に重ねて出す。
+        # 窓の外に出ると気付かれないので、置き場所は覚えない。
+        master.update_idletasks()
+        w = min(760, max(480, master.winfo_width() - 120))
+        h = min(680, max(360, master.winfo_height() - 80))
+        x = master.winfo_rootx() + (master.winfo_width() - w) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - h) // 2
+        self.geometry("{}x{}+{}+{}".format(w, h, max(0, x), max(0, y)))
+        self.lift()
+        self.focus_set()
+
+    def _open(self) -> None:
+        import webbrowser
+        webbrowser.open(self.url)
+
+
+# --------------------------------------------------------------------------
 # 説明の吹き出し
 # --------------------------------------------------------------------------
 class Tooltip:
@@ -1210,7 +1465,9 @@ class App(ttk.Frame):
         self.drag: str | None = None      # ドラッグ中の mod のフォルダ名
         self.dirty = False
         self.busy = False
-        self.update: tuple[str, str] | None = None   # 新しい版（版, full zip の URL）
+        # 新しい版（版, full zip の URL）。
+        # `update` と名付けると tkinter の `Misc.update()` を覆うので別の名前にする。
+        self.available_update: tuple[str, str] | None = None
         self._status_text = ""            # 状態表示に今出ている文言
         self.shown_count = 0              # 絞り込みの結果、一覧に出ている数
         # デバッグモード。
@@ -1233,7 +1490,8 @@ class App(ttk.Frame):
         self.log_rotate_var = tk.BooleanVar(value=True)
         # 注入は別スレッドで動くので、進捗はキュー越しに受け取ってメインスレッドの
         # after で描く（tkinter は他スレッドから触れない）。
-        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        # 中身は文言が主で、"notes" だけ Release の一覧（`_check_notes`）。
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         # 最大化していない状態の大きさと位置。
         # 最大化中の値を覚えると、
         # 次に開いたときに画面いっぱいの「普通の窓」になってしまうので分けて持つ。
@@ -1242,6 +1500,8 @@ class App(ttk.Frame):
         self._build()
         self.reload()
         threading.Thread(target=self._check_update, daemon=True).start()
+        threading.Thread(target=self._check_notes, args=(read_config(),),
+                         daemon=True).start()
         # 進捗を拾う繰り返し。
         # 閉じるときに止める（止めないと、消えた widget を相手に1回だけ走って
         # Tk がエラーを吐く）。
@@ -1695,7 +1955,7 @@ class App(ttk.Frame):
         ("<Control-o>", "add_mod"),
         ("<Control-s>", "save"),
         ("<Control-f>", "focus_search"),
-        ("<F5>", "reload"),
+        ("<F5>", "reload_from_disk"),
         ("<F9>", "launch"),
     )
 
@@ -1708,7 +1968,8 @@ class App(ttk.Frame):
                            command=self.add_mod)
         m_file.add_separator()
         m_file.add_command(label="保存", accelerator="Ctrl+S", command=self.save)
-        m_file.add_command(label="再読み込み", accelerator="F5", command=self.reload)
+        m_file.add_command(label="再読み込み", accelerator="F5",
+                           command=self.reload_from_disk)
         m_file.add_separator()
         m_file.add_command(label="ゲームの場所を設定…", command=self.choose_game)
         m_file.add_separator()
@@ -1763,6 +2024,12 @@ class App(ttk.Frame):
                               variable=self.log_rotate_var,
                               command=self._toggle_log_rotate)
         bar.add_cascade(label="実行", menu=m_run)
+
+        # 更新の直後に出る窓（`_check_notes`）を閉じた後で、もう一度読むための口。
+        m_help = tk.Menu(bar, tearoff=0)
+        m_help.add_command(label="このバージョンの更新内容…", command=self.show_notes)
+        m_help.add_command(label="GitHub を開く", command=self.open_github)
+        bar.add_cascade(label="ヘルプ", menu=m_help)
 
         master.configure(menu=bar)
 
@@ -1835,24 +2102,34 @@ class App(ttk.Frame):
         self.save_btn.state(["!disabled"] if self.dirty else ["disabled"])
 
     # -- 一覧 --------------------------------------------------------------
-    def reload(self) -> None:
-        found = read_mods()
-        self.mods = found["mods"]
-        self.disabled = found["disabled"]
-        self.problems = found["problems"]
-        # 一覧を作り直すたびに読み直す。
-        # GUI を開いたまま `settings/loader.json` を手で書き換えた場合にも、
-        # F5 で追いつけるようにしておく。
-        self.debug_mode = found["debug_mode"]
-        self.debug_var.set(self.debug_mode)
+    def reload(self, keep_edits: bool = False) -> None:
+        """ディスクから読み直して一覧を作り直す。
+
+        `keep_edits` は注入の後の追従（`_finish` / `_reload_while_deferred`）が使う。
+        未保存の並び替えや有効/無効があるときは、一覧をディスクから作り直さず、
+        結果（status.json）と設定だけを読み直す。
+        追従は 10 秒ごとに 2 分ほど続くので、作り直すとその間の編集が黙って消える。
+        人が押す再読み込みと MOD の追加は、先に `_settle_unsaved` で聞いてからここを呼ぶ。
+        """
+        if not (keep_edits and self.dirty):
+            found = read_mods()
+            self.mods = found["mods"]
+            self.disabled = found["disabled"]
+            self.problems = found["problems"]
+            # 一覧を作り直すたびに読み直す。
+            # GUI を開いたまま `settings/loader.json` を手で書き換えた場合にも、
+            # F5 で追いつけるようにしておく。
+            self.debug_mode = found["debug_mode"]
+            self.debug_var.set(self.debug_mode)
+            self.dirty = False
         # 世代管理は logrotate に聞く。
         # **GUI で覚えない**のが要点で、環境変数や logrotate.py の既定値でも変わるため、
         # こちらで持つと実際と食い違う。
         self.log_rotate_var.set(logrotate.enabled())
         self.settings = C.load_store(RUNTIME_DIR)
         self.status = read_status()
-        self.dirty = False
-        self._refresh()
+        selected = self.tree.selection()
+        self._refresh(keep=selected[0] if selected else None)
         self._update_actions()
 
         known, off = len(self._known_mods()), len(self._off_known())
@@ -1871,8 +2148,35 @@ class App(ttk.Frame):
         skipped = (self.status.get("patches") or {}).get("skipped") or []
         if skipped:
             msg += " ｜ この実行では通らない経路のフック {} 件".format(len(skipped))
+        if self.dirty:
+            msg += " ｜ 順序と有効/無効の変更は未保存"
         self._set_status(msg)
         self._show_warnings()
+
+    def reload_from_disk(self) -> None:
+        """F5 とメニューの「再読み込み」。未保存の編集があれば先に聞く。"""
+        if self._settle_unsaved("読み直します"):
+            self.reload()
+
+    def _settle_unsaved(self, doing: str) -> bool:
+        """未保存の並び替えや有効/無効があれば、保存するか捨てるかを聞く。
+
+        続けてよければ True。
+        「キャンセル」と、保存に失敗したときは False で、呼ぶ側は何もしない。
+        一覧を作り直す操作（再読み込み・MOD の追加）と、窓を閉じる操作の前に呼ぶ。
+        """
+        if not self.dirty:
+            return True
+        answer = messagebox.askyesnocancel(
+            "未保存の変更",
+            "順序と有効/無効の変更が未保存です。保存してから{}か？\n"
+            "「いいえ」を選ぶと、変更は失われます。".format(doing))
+        if answer is None:
+            return False
+        if answer:
+            self.save()
+            return not self.dirty
+        return True
 
     def _show_warnings(self) -> None:
         lines = list(self.problems)
@@ -2317,7 +2621,7 @@ class App(ttk.Frame):
         entry = os.path.join(mod_dir, tool["entry"])
         if not os.path.isfile(entry):
             messagebox.showerror("道具が見つかりません",
-                                 "{} が無い。\n{}".format(tool["entry"], mod_dir))
+                                 "{} がありません。\n{}".format(tool["entry"], mod_dir))
             return
         env = dict(os.environ)
         env["IML_ROOT"] = ROOT
@@ -2354,9 +2658,10 @@ class App(ttk.Frame):
         if dialog.result is None:
             return          # キャンセル
 
-        store = C.load_store(RUNTIME_DIR)
-        store[mod["dir"]] = dialog.result
         try:
+            # 読めないファイルを `{}` として扱うと、1件足して書いた時点で他の MOD の設定が消える。
+            store = C.load_store_for_write(RUNTIME_DIR)
+            store[mod["dir"]] = dialog.result
             C.save_store(RUNTIME_DIR, store)
         except Exception as exc:
             messagebox.showerror("保存に失敗しました", f"{type(exc).__name__}: {exc}")
@@ -2371,6 +2676,10 @@ class App(ttk.Frame):
 
     # -- mod の追加とフォルダ ------------------------------------------------
     def add_mod(self) -> None:
+        # 追加の後は一覧を読み直して順序を書き戻すので、未保存の編集はその前に片付ける
+        # （黙って読み直すと、捨てた編集の上にディスクの内容を書き戻すことになる）。
+        if not self._settle_unsaved("追加します"):
+            return
         path = filedialog.askopenfilename(
             title="MOD の zip ファイルを選択（フォルダから追加する場合はキャンセル）",
             filetypes=[("zip", "*.zip"), ("すべて", "*.*")])
@@ -2562,9 +2871,14 @@ class App(ttk.Frame):
 
             report(f"pid {pid}: 注入中…")
             injector.rotate_logs(None, log=report)
-            ok = watcher.inject_pid(pid)
-            if ok:
+            result = watcher.inject_pid(pid)
+            if result == watcher.INJECTED:
                 self.events.put(("done", f"pid {pid} に注入しました"))
+            elif result == watcher.PENDING:
+                # 失敗ではない。ゲームが処理中で GIL が空くのを待っているだけで、後から完走する。
+                # 結果は status.json の追従（`_reload_while_deferred`）で拾う。
+                self.events.put(("pending", f"pid {pid}: 注入の完了待ちです"
+                                            "（ゲームが処理中のため。手が空けば自動で完了します）"))
             else:
                 self.events.put(("error", f"pid {pid}: 注入に失敗しました"
                                           "（out/bootstrap.log を確認してください）"))
@@ -2580,6 +2894,9 @@ class App(ttk.Frame):
             rc = injector.inject(pid, payload)
             if rc == 0:
                 self.events.put(("done", f"pid {pid}: MOD を外しました"))
+            elif rc == injector.INJECT_PENDING:
+                self.events.put(("pending", f"pid {pid}: 解除の完了待ちです"
+                                            "（ゲームが処理中のため。手が空けば自動で完了します）"))
             else:
                 self.events.put(("error", f"pid {pid}: 解除に失敗しました"
                                           f"（PyRun_SimpleString が {rc}）"))
@@ -2594,12 +2911,32 @@ class App(ttk.Frame):
                     self._set_status(msg)
                 elif kind == "done":
                     self._finish(msg, reload=True)
+                elif kind == "pending":
+                    self._finish(msg, reload=True)
+                    messagebox.showinfo("注入の完了待ち", msg)
                 elif kind == "error":
                     self._finish(msg)
                     messagebox.showerror("エラー", msg)
                 elif kind == "update":
                     self.update_btn.configure(text="更新 (v{})".format(msg))
                     self.update_btn.pack(side="right")
+                elif kind == "notes":
+                    # 出したら覚える。空（この版の Release が無い）でも覚えて、次から取りに行かない。
+                    update_config(seen_version=ml.__version__)
+                    if msg:
+                        ReleaseNotesDialog(self.winfo_toplevel(), msg)
+                elif kind == "notes_menu":
+                    # メニューから頼まれた分。
+                    # 頼まれて何も出ないと押せていないように見えるので、無いときも知らせる。
+                    if isinstance(msg, str):
+                        messagebox.showerror("更新内容", msg)
+                    elif msg:
+                        ReleaseNotesDialog(self.winfo_toplevel(), msg)
+                    else:
+                        messagebox.showinfo(
+                            "更新内容",
+                            "この版（v{}）の Release は GitHub にありません。".format(
+                                ml.__version__))
                 elif kind == "restart":
                     self._restart()
         except queue.Empty:
@@ -2613,7 +2950,7 @@ class App(ttk.Frame):
         if reload:
             # 結果（status.json）はローダが書き出す。
             # 少し待ってから読む ―注入が返った直後はまだ boot の途中のことがある。
-            self.after(1500, self.reload)
+            self.after(1500, lambda: self.reload(keep_edits=True))
             # 1.5 秒では足りないことがある。
             # ゲームの起動直後に注入すると、モジュールが出揃って段階適用が終わるまで実測で 80 秒ほどかかり、その間の
             # status.json は「対象が見つからない」が並んだ途中経過になる。
@@ -2634,7 +2971,7 @@ class App(ttk.Frame):
     def _reload_while_deferred(self, remaining: int | None = None) -> None:
         if remaining is None:
             remaining = self._SETTLE_CHECKS
-        self.reload()          # 状態表示は reload が書く。続きはその後ろに足す
+        self.reload(keep_edits=True)   # 状態表示は reload が書く。続きはその後ろに足す
         patches = self.status.get("patches") or {}
         waiting = patches.get("deferred") or []
         if waiting and remaining > 0:
@@ -2669,13 +3006,53 @@ class App(ttk.Frame):
         except Exception:
             return
         if found:
-            self.update = found
+            self.available_update = found
             self.events.put(("update", found[0]))
 
-    def _update(self) -> None:
-        if self.busy or not self.update:
+    def _check_notes(self, cfg: dict) -> None:
+        """別スレッド。前に開いたときより版が上がっていれば、間の Release の本文を出す。
+
+        更新ボタンで上げても、zip を手で上書きしても、次に開いたときに出る。
+        前の版は `gui.json` の `seen_version`。
+        これが無いときは2通りある。
+          ・`window` も無い … 初めて開いた。出さずに今の版を覚える
+          ・`window` はある … この仕組みより前の版から上げた。今の版の分だけ出す
+        `window` は閉じるたびに書く（`_close`）ので、一度でも開いた人には必ずある。
+        取れなかった（ネットが無い等）ときは覚えずに黙る。次に開いたときにまた取りに行く。
+        """
+        seen = cfg.get("seen_version")
+        if seen is None and "window" not in cfg:
+            self.events.put(("notes", []))
             return
-        ver, url = self.update
+        if seen is not None and _vtuple(str(seen)) >= _vtuple(ml.__version__):
+            return
+        try:
+            notes = fetch_notes(seen)
+        except Exception:
+            return
+        self.events.put(("notes", notes))
+
+    def open_github(self) -> None:
+        import webbrowser
+        webbrowser.open(REPO_URL)
+
+    def show_notes(self) -> None:
+        """メニューの「このバージョンの更新内容」。今の版の Release だけを出す。"""
+        threading.Thread(target=self._fetch_current_notes, daemon=True).start()
+
+    def _fetch_current_notes(self) -> None:
+        """別スレッド。取れなければ理由の文言を返す（起動時と違い、頼まれた操作なので黙らない）。"""
+        try:
+            notes = fetch_notes(None)
+        except Exception as e:
+            self.events.put(("notes_menu", "更新内容を取得できませんでした: {}".format(e)))
+            return
+        self.events.put(("notes_menu", notes))
+
+    def _update(self) -> None:
+        if self.busy or not self.available_update:
+            return
+        ver, url = self.available_update
         if not messagebox.askokcancel(
                 "更新",
                 "v{} をダウンロードしてこのフォルダへ上書きし、\n"
@@ -2698,7 +3075,11 @@ class App(ttk.Frame):
         try:
             self.events.put(("status", "ダウンロード中…"))
             os.makedirs(OUT_DIR, exist_ok=True)
-            urllib.request.urlretrieve(url, path)
+            # 待ちには上限を付ける（`urlretrieve` には無い）。
+            # 通信が止まったまま戻らないと `busy` が落ちず、起動ボタンが押せないまま残る。
+            with urllib.request.urlopen(url, timeout=UPDATE_TIMEOUT) as r, \
+                    open(path, "wb") as f:
+                shutil.copyfileobj(r, f)
             self.events.put(("status", "展開中…"))
             extract_release(path)
             os.remove(path)
@@ -2708,10 +3089,19 @@ class App(ttk.Frame):
         self.events.put(("restart", ""))
 
     def _restart(self) -> None:
+        # 未保存の確認はしない。
+        # ディスクは新しい版に置き換わった後で、手元の一覧は古い版のものなので、
+        # ここで保存すると新しい版の順序ファイルを古い並びで上書きする。
         subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=ROOT)
-        self._on_close()
+        self._close()
 
     def _on_close(self) -> None:
+        """窓の ×・メニューの「終了」。未保存の編集があれば先に聞く。"""
+        if not self._settle_unsaved("閉じます"):
+            return
+        self._close()
+
+    def _close(self) -> None:
         master = self.winfo_toplevel()
         update_config(window=self.geom,
                       window_maximized=(master.state() == "zoomed"),

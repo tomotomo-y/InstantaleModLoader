@@ -5,7 +5,7 @@
 `llm_manager:area_move_rejector` に拒否の一言を書かせて戻る（運賃も日数も動かない。
 GAME.md §2.18、`217_` の `out\\area_move.log` で `days=[] texts=1`）。
 
-分岐が読むのは `relationship["player"]["relationship"]` の配列（`228_` の実機記録、2026-09-10。
+分岐が読むのは `relationship["player"]["relationship"]` の配列（`228_` の実機記録。
 雇用 NPC は `['同行中']`）。友好度（版1）も `Character.state`（版2）も読んでいない。
 「家族になろう」の会話で `二人は家族になった。` と書く経路がこの配列に `家族` を入れると読む。
 
@@ -69,7 +69,12 @@ def apply(ctx):
         write("restore ({}): {}".format(reason, ", ".join(sorted(lifted))))
 
     def lift(app):
-        lifted = {}
+        """同行者の配列を `['家族']` に置き換える。控え（`state["lifted"]`）には1人書くごとに積む。
+
+        書き終えてから控えを返す形だと、途中で落ちたとき（名前の引き方など）に、
+        それまでに書いた `['家族']` を戻す手掛かりが無くなり、そのままセーブに残る。
+        """
+        lifted = state["lifted"] = {}
         state["marker"] = list(FAMILY)   # 同一性で見分けるので毎回新しい list
         for npc_id in ui.party_member_ids(app):
             character = ui.character_of(app, npc_id)
@@ -86,7 +91,6 @@ def apply(ctx):
             lifted[str(npc_id)] = (slot, before, saved_before)
             write("lift: {} ({}) relationship {!r} -> {!r}".format(
                 npc_id, ui.character_name(app, npc_id), before, FAMILY))
-        return lifted
 
     def app_of(self):
         return getattr(self, "app", None) or ui.find_app()
@@ -96,7 +100,7 @@ def apply(ctx):
         app = app_of(self)
         state["rejected"] = False
         try:
-            state["lifted"] = lift(app)
+            lift(app)
         except Exception:
             ctx.log_exc("area move party: cannot lift relationship")
         try:

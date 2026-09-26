@@ -57,8 +57,6 @@ MOD 本体は import しない。
 どの道具も同じなので `tools/modtool.py` に在る（TECH.md §3.12）。
 """
 
-import io
-import json
 import os
 import sys
 import time
@@ -190,14 +188,8 @@ def name_of(key):
     return key.rsplit("/", 1)[-1]
 
 
-def load_json(path):
-    """ファイル全体。無い・読めないときは空の辞書。"""
-    try:
-        with io.open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+#: ファイル全体。無い・読めないときは空の辞書（`modtool` の語彙。`322_` と共有）。
+load_json = modtool.read_json
 
 
 load_playlist = load_json
@@ -303,6 +295,7 @@ class Model(object):
         self.world_playlists = {}
         self.world_saved = {}
         self.cleared = set()        # 覚えた曲を消す (鍵, 群, 場所)
+        self.written = []           # 直前の保存で実際に書いた先（画面の一行に出す）
         self.reload()
 
     @property
@@ -475,16 +468,28 @@ class Model(object):
         return ordered
 
     def save(self):
-        """playlist.json・mod_settings.json・開いた世界の worlds/<世界>.json。どれかが書けなければ False。"""
+        """playlist.json・mod_settings.json・開いた世界の worlds/<世界>.json。どれかが書けなければ False。
+
+        **書いた先は `self.written` に残す**（画面がその一行を出す）。
+        3つとも書きうるのに1つの名前しか出さないと、
+        世界の指定だけ直した回でも「playlist を保存した」と読める。
+        """
+        self.written = []
         data = self.to_json()
+        changed = data != self.file or bool(self.cleared)
         if not modtool.write_json(self.root, self.playlist_path, data):
             return False
+        if changed:
+            self.written.append(self.playlist_path)
         self.file = data
         self.saved = self.snapshot()
         for key in sorted(set(k for k, _g, _p in self.world_playlists)):
             world = self.to_world_json(key)
+            moved = world != self.world_files.get(key)
             if not modtool.write_json(self.root, self.world_path(key), world):
                 return False
+            if moved:
+                self.written.append(self.world_path(key))
             self.world_files[key] = world
         self.world_saved = self.world_snapshot()
         self.cleared = set()
@@ -492,6 +497,8 @@ class Model(object):
             if not modtool.save_settings(self.root, MOD_DIR, self.settings):
                 return False
             self.saved_settings = dict(self.settings)
+            self.written.append(modtool.config_module(self.root, MOD_DIR)
+                                .store_path(os.path.join(self.root, "runtime")))
         return True
 
 
@@ -614,7 +621,7 @@ def build_window(model):
     # ---- ワールド個別設定
     per_world = ttk.Frame(tabs, padding=(6, 8, 6, 6))
     tabs.add(per_world, text="  ワールド個別設定  ")
-    ttk.Label(per_world, text="その土地・その施設だけの曲。一括設定より先に見る", style="Sub.TLabel").pack(
+    ttk.Label(per_world, text="その土地・その施設だけの曲。一括設定より先に使われる", style="Sub.TLabel").pack(
         anchor="w", pady=(0, 4))
     world_bottom = ttk.Frame(per_world)
     world_bottom.pack(side="bottom", fill="x", pady=(6, 0))
@@ -642,7 +649,7 @@ def build_window(model):
             world_tree.insert("", "end", iid=iid, text=folder, values=("",))
             world_tree.insert(iid, "end", iid=iid + "|" + LOADING, text=LOADING)
         world_status.configure(text="{} 世界（{}）".format(len(model.worlds), saves.saves_dir(model.data_root))
-                               if model.worlds else "世界が見つからない: " + saves.saves_dir(model.data_root))
+                               if model.worlds else "世界が見つかりません: " + saves.saves_dir(model.data_root))
 
     def world_target_of(iid):
         """行の id から (フォルダ, 群, 場所)。世界の行やダンジョンの束は None。"""
@@ -662,7 +669,7 @@ def build_window(model):
             world_tree.delete(child)
         places = model.open_world(folder)
         if places is None:
-            world_tree.insert(iid, "end", iid=iid + "|" + "読めない", text="（セーブを読めない）")
+            world_tree.insert(iid, "end", iid=iid + "|" + "読めない", text="（セーブを読めません）")
             return
         key = model.world_keys[folder]
         dungeons = [a for a in places["areas"] if a["size"] == "dungeon"]
@@ -711,7 +718,7 @@ def build_window(model):
     editor = ttk.Frame(main, padding=(8, 0, 0, 0))
     main.add(editor, weight=4)
 
-    head = ttk.Label(editor, text="左で場所を選ぶ", style="Sub.TLabel")
+    head = ttk.Label(editor, text="左で場所を選んでください", style="Sub.TLabel")
     head.pack(anchor="w", pady=(0, 6))
 
     bottom = ttk.Frame(editor)
@@ -854,7 +861,7 @@ def build_window(model):
         refresh_kinds()
         refresh_world_rows()
         if not t:
-            head.configure(text="左で場所を選ぶ")
+            head.configure(text="左で場所を選んでください")
             summary.configure(text="")
             pool["shown"].configure(text="")
             used["shown"].configure(text="")
@@ -867,7 +874,7 @@ def build_window(model):
             forget_button.configure(state="disabled")
         else:
             chosen = model.chosen_of(t[1], t[2], t[3])
-            head.configure(text="{}　この場所だけの曲。使う曲が無ければ一括設定の段へ落ちる{}".format(
+            head.configure(text="{}　この場所だけの曲。使う曲が無ければ一括設定の曲を鳴らす{}".format(
                 t[4], "。覚えた曲: " + name_of(chosen) if chosen else ""))
             forget_button.configure(state="normal" if chosen else "disabled")
         current_weights = weights()
@@ -889,16 +896,16 @@ def build_window(model):
         used["shown"].configure(text="{} / {} 曲".format(len(used_keys), len(used_all)))
         total = sum(current_weights.values())
         if not model.pool:
-            text = "曲が見つからない。上の2つのフォルダに .mp3 / .ogg / .wav を置く"
+            text = "曲が見つかりません。上の2つのフォルダに .mp3 / .ogg / .wav を置いてください"
         elif not used_all:
             if t[0] == "world":
-                text = "使う曲が無い。一括設定の段（{}）が使われる".format("土地の種類" if t[2] == "areas" else "施設の種類")
+                text = "使う曲がありません。一括設定の段（{}）が使われます".format("土地の種類" if t[2] == "areas" else "施設の種類")
             elif t[1].startswith("area:"):
-                text = "使う曲が無い。この種類の土地では土地に焼き付いた曲が鳴る"
+                text = "使う曲がありません。この種類の土地では土地に焼き付いた曲が鳴ります"
             else:
-                text = "使う曲が無い。この種類の施設では土地の曲がそのまま続く"
+                text = "使う曲がありません。この種類の施設では土地の曲がそのまま続きます"
         else:
-            text = "{} 曲中 {} 曲を使う。重みの合計 {}".format(len(model.pool), len(used_all), total)
+            text = "{} 曲中 {} 曲を使います。重みの合計 {}".format(len(model.pool), len(used_all), total)
         summary.configure(text=text)
         if keep and used["tree"].exists(keep):
             used["tree"].selection_set(keep)
@@ -995,8 +1002,11 @@ def build_window(model):
     def save():
         if model.save():
             refresh()
+            # 書いた先だけを並べる（`model.written`）。
+            # 何も動いていない回に名前を出すと、その先を書いたように読める。
             status.configure(text="保存しました {}  {}".format(
-                time.strftime("%H:%M:%S"), model.playlist_path))
+                time.strftime("%H:%M:%S"),
+                " / ".join(model.written) if model.written else "（変更はありません）"))
         else:
             messagebox.showerror("保存に失敗しました",
                                  "{} か worlds\\ に書けませんでした。".format(model.playlist_path), parent=root)
@@ -1043,7 +1053,7 @@ def build_window(model):
 
     if not model.pool:
         messagebox.showinfo("街・施設BGMの選曲",
-                            "曲が1つも見つからない。\n\n{}\n{}\n\nに .mp3 / .ogg / .wav を置いて「再走査」".format(
+                            "曲が1つも見つかりません。\n\n{}\n{}\n\nに .mp3 / .ogg / .wav を置いて「再走査」".format(
                                 model.asset_dir or "（ゲームの場所が未設定）", model.state_dir),
                             parent=root)
     return root

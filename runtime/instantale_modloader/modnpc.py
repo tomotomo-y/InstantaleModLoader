@@ -40,7 +40,8 @@ id で引かれる場所に残さないことを守っているのは、**保存
 |---|---|
 | `world.characters` | 保存が舐めて書く |
 | `save_data_dict['npcs']` / `world_dict['npcs']` | 素データの写し |
-| 選択肢（`buttons` / `buttons_backup` / …）と自由入力の `PhaseSpec` | `args` に id が載る（`SAVED_CHOICE_ATTRS`） |
+| 自由入力の `PhaseSpec` | `args` に id が載る（`SAVED_SPEC_ATTRS`） |
+| 選択肢（`buttons` / `buttons_backup` / …） | **落とさない**（`SAVED_CHOICE_ATTRS` は記録として残す）。落とすと、一覧を出したまま保存したセーブが「やめる」だけの画面で戻る |
 | パーティ（`ui.party_stores`）と戦闘中の敵 | 名簿と同じく id の並び |
 
 ##### 何を差し替えられるか
@@ -63,7 +64,7 @@ id で引かれる場所に残さないことを守っているのは、**保存
 値の変換も戻しもしない。MOD の NPC は実体に直接書き、保存のたびにローダが実体を控えへ写す
 （正規 NPC でゲームがやっている保存を、場所を変えてやる）。
 正規 NPC の項目を書けばそれは本物の変更で、ゲームがセーブに書く。
-「セーブに残さず画面上だけ変える」機構は持たない（往復の機構は同期の穴を作るので外した。2026-09-13）。
+「セーブに残さず画面上だけ変える」機構は持たない（往復の機構は同期の穴を作るので外した）。
 頼み文だけに効かせるなら `notes` / `prompt`。
 
 ##### 未確認
@@ -72,7 +73,7 @@ id で引かれる場所に残さないことを守っているのは、**保存
 文字列 id の `Character` がセーブに漏れないか、会話が始まって終わるか、
 詳細生成が素データを引かずに済むかは、この時点ではどれも見込みでしかない。
 **パーティ加入はできない**（関所が断る）。
-仲間は `save_data_dict['npcs']` に素データが在ることが前提で（実セーブで確認。2026-09-13）、
+仲間は `save_data_dict['npcs']` に素データが在ることが前提で（実セーブで確認）、
 ここで組む NPC はそこに出ないので、加入したまま保存するとロードで組み立てられない。
 仲間にしたい人物は `npcs.make_npc` で本物として作る。
 
@@ -96,7 +97,7 @@ import copy
 import inspect
 import sys
 
-from . import frames, log, log_exc, npcs, patch, state, ui
+from . import frames, items, log, log_exc, npcs, patch, state, ui
 
 #: MOD の NPC の id の接頭辞。
 #: ゲームの採番は整数の連番なので、ここが被ることはない。
@@ -113,7 +114,7 @@ INSTALLED_ATTR = "_instantale_modnpc_installed"
 #: 保存の間、MOD の NPC を名簿の**反復**から隠すか。
 #: 最初は名簿から外していたが、外している窓（実機で約0.5秒。保存は別スレッド）の間は
 #: ゲーム自身のコードもその id を引けず、`ConversationStartManager.__init__` と
-#: `resolve_conversation` が `KeyError` で落ちた（2026-09-12）。
+#: `resolve_conversation` が `KeyError` で落ちた。
 #: いまは `world.characters` を `_RosterView`（反復では隠し、id では引ける）に
 #: 差し替えるので、窓は無い。保存が名簿を読まないと分かれば False にしてよい。
 LIFT_ROSTER = True
@@ -126,7 +127,7 @@ class _RosterView(dict):
     どれで舐めても MOD の NPC は出ない（dict の C レベルの複製は `items()` を
     呼ばず内部の格納を写すので、隠し方を Python 側の `items()` だけに頼れない）。
     隠した分は `hidden` に持ち、id で引く読み（`[]` / `get` / `in`）だけそこへ落ちる。
-    保存が名簿を舐めて書く経路でも書かれず（実機 2026-09-12: 舐めている。
+    保存が名簿を舐めて書く経路でも書かれず（実機: 舐めている。
     来訪者を残すと `AttributeError` で保存が落ち、外すと通った）、
     その間にゲームが id で引いても `KeyError` にならない。
     書き込みは元の辞書にも通す（保存中に生まれた NPC を失わない）。
@@ -194,7 +195,7 @@ FIELD_TO_ATTR = {"ability_scores": "original_ability_scores",
 
 #: 誰とも話していない NPC の `relationship`。
 #: ひな型（`npcs.NEW_NPC_TEMPLATE`）は None だが、実セーブでは詳細生成前の個体を含む
-#: 87/87 がこの形だった（2026-09-12）。`make_npc` の側はゲームが埋めるが、
+#: 87/87 がこの形だった。`make_npc` の側はゲームが埋めるが、
 #: ここは素データを通らないので自分で持つ。
 DEFAULT_RELATIONSHIP = {"player": {"affinity": 0, "affinity_text": "警戒心がある",
                                    "relationship": ["初対面"],
@@ -202,7 +203,7 @@ DEFAULT_RELATIONSHIP = {"player": {"affinity": 0, "affinity_text": "警戒心が
 
 #: 組んだ直後の `config`。`npcs.DEFAULT_CONFIG` と違って `level_of_detail` は **1**。
 #: 2（詳細生成済みの値）で組むと、ゲームは「もう埋まっている」とみなして
-#: 会話の直前の `ensure_npc_detail_generated` を呼ばない（実機 2026-09-12。
+#: 会話の直前の `ensure_npc_detail_generated` を呼ばない（実機。
 #: 一覧を組むときも `config` を読んでいる）。素の生成直後の住人は 1。
 #: `fields["config"]` で上書きできる。
 DEFAULT_CONFIG = dict(npcs.DEFAULT_CONFIG, level_of_detail=1)
@@ -246,7 +247,7 @@ CONVERSATION_START_TARGET = "__main__:ConversationStartManager.__init__"
 CONVERSATION_END_TARGET = "__main__:ConversationEndManager.resolve_conversation"
 DETAIL_TARGET = "__main__:InstantaleApp.ensure_npc_detail_generated"
 #: 会話の直前の詳細生成が実際に通る入口。`ConversationStartManager.generate_npc_detail_and_ready`
-#: （別スレッド）がここを直に呼ぶ（実機 2026-09-12。`ensure_npc_detail_generated` は通らなかった）。
+#: （別スレッド）がここを直に呼ぶ（実機。`ensure_npc_detail_generated` は通らなかった）。
 #: LLM の答えを `save_data_dict['npcs'][id]` へ書くので、素データの写しが無いと `KeyError`。
 DETAIL_GEN_TARGET = "__main__:InstantaleApp.generate_npc_detail"
 IMAGE_TARGET = "__main__:InstantaleApp.update_character_image"
@@ -288,7 +289,9 @@ def npc_id_of(app, character, world=None):
         return ""
     characters = _roster(app, world)
     if isinstance(characters, dict):
-        for key, value in characters.items():
+        # 頼み文の包みと詳細生成は別スレッドで走り、その間にメインスレッドが
+        # 名簿を変えうる。複製してから回す（`names_in_use` と同じ）。
+        for key, value in list(characters.items()):
             if value is character:
                 return str(key)
     value = getattr(character, "id", None)
@@ -315,9 +318,11 @@ def _record(npc_id):
         record = reg[npc_id] = {
             "id": npc_id,
             "layers": [],        # 積んだ順。同じ持ち主は1つだけ
-            "character": None,   # MOD の NPC の実体
+            "character": None,   # MOD の NPC の実体（名簿に居ればそちらが真実）
+            "built_in": None,    # その実体を組んだ世代（`patch._generation`）
+            "stale_placed": False,  # 名簿の実体が差し替わった。置き直しが要る
             "snapshot": None,    # 控えから読んだ実体の写し（次の spawn の材料）
-            "placed": None,      # (area_id, facility_id, 主の元の値)
+            "placed": None,      # (area_id, facility_id, 主の元の値, 主か, 一覧に出すか)
         }
     return record
 
@@ -357,6 +362,52 @@ def entries(owner=None):
     return sorted(out)
 
 
+def names_in_use(app, skip=()):
+    """その世界で既に使われている人名。**人を作る前にここを見る。**
+
+    集めるのは3つ。実行時の名簿（`world.characters`）・セーブの素データ
+    （`npcs.save_npcs`。まだ実体になっていない人も載っている）・
+    登録されている MOD の NPC（持ち主をまたいで全部）。プレイヤーの名も入れる。
+
+    名前が既存の人物と重なると、**名前でしか相手を引けない場所**で別人に当たる
+    （ゲームの人物欄は `visible_character_sheet_data` に id を持たず、名前しか渡さない。
+    実機。`330_` の管理人と素の NPC が同じ名前になり、
+    `120_` の衝突の記録にも並んだ）。
+    MOD どうしは相手の名簿を知らないので、**跨ぐ集約はローダが持つ**
+    （`330_` と `331_` の主人が同じ名前になった回も、ここを見ていれば避けられた）。
+
+    `skip` はその id の名前を数えない（自分の建て直しで自分の名前を避けないため）。
+    返すのは重複を畳んだ並び（`taken` にそのまま渡せる）。
+    """
+    skip = {str(one) for one in (skip or ())}
+    found = []
+
+    def add(name):
+        name = str(name or "").strip()
+        if name and name not in found:
+            found.append(name)
+
+    player = getattr(app, "player", None)
+    add(getattr(player, "name", None))
+    roster = _roster(app) or {}
+    for npc_id, character in list(roster.items()):
+        if str(npc_id) in skip:
+            continue
+        add(getattr(character, "name", None))
+    try:
+        for npc_id, entry in npcs.save_npcs(app).items():
+            if str(npc_id) in skip or not isinstance(entry, dict):
+                continue
+            add(entry.get("name"))
+    except Exception:
+        log_exc("modnpc: cannot read the plain npc data for the names in use")
+    for npc_id in entries():
+        if str(npc_id) in skip:
+            continue
+        add(fields_of(npc_id).get("name"))
+    return found
+
+
 def register(owner, npc_id=None, *, key=None, fields=None, prompt=None,
              notes=None, sites=None, priority=0, on=None, place=None,
              app=None, write=None):
@@ -378,7 +429,7 @@ def register(owner, npc_id=None, *, key=None, fields=None, prompt=None,
 
     `notes` は「何を書くか」だけを MOD に残すための口。
     `311_` / `317_` / `321_` / `403_` は「相手を複製して `profile` に足し、引数を
-    差し替える」手順を4本とも自前で持っていて（2026-09-12 に確認）、
+    差し替える」手順を4本とも自前で持っていて（確認済み）、
     外側の層から順に複製の複製ができ、繋ぐ順は `load_order.json` の並びでしか決まらなかった。
     ここに寄せると複製は1つ、順は宣言、ログは1行になる。
 
@@ -396,16 +447,29 @@ def register(owner, npc_id=None, *, key=None, fields=None, prompt=None,
              "sites": frozenset(sites) if sites is not None else NOTES_SITES,
              "priority": int(priority), "on": dict(on or {}), "place": place}
     record = _record(npc_id)
-    replaced = any(old["owner"] == owner for old in record["layers"])
     record["layers"] = [old for old in record["layers"]
                         if old["owner"] != owner]
     record["layers"].append(layer)
-    if replaced and record.get("character") is not None:
-        # 同じ持ち主が登録し直した＝その MOD の `apply()` が走り直した。
-        # 登録簿は注入をまたいで生きるので、前の版で組んだ実体が残っている。
-        # 次の `spawn` で今の `fields` と今の `build` から組み直す
-        # （実機 2026-09-12。`build` を直しても古い実体が使い回されて同じ場所で落ちた）。
+    if record.get("character") is not None and is_mod_npc(npc_id) \
+            and owner == owner_of_id(npc_id) \
+            and record.get("built_in") != getattr(patch, "_generation", None):
+        # **その id の持ち主**が登録し、実体は**前の世代**で組んだもの＝注入し直された。
+        # 登録簿は注入をまたいで生きるので、前の版の `build` と `fields` で組んだ実体が残る
+        # （実機。`build` を直しても古い実体が使い回されて同じ場所で落ちた）。
+        # 次の `spawn` で今の `fields` と今の `build` から組み直す。
+        #
+        # 見るのは**世代**で「登録し直したか」ではない（`modfacility` の `built_in` と同じ）。
+        # 後者だと、塗り直しのたびに層を積む MOD が毎回実体を組み直してしまう。
+        # それを避けようと MOD 側が「層は一度だけ積む」とすると、今度は登録簿が注入をまたぐぶん
+        # **前の版の層（`notes` / `fields`）が残り続ける**（実機。
+        # 331 の主人に足したはずの出資者の一文が、注入し直しても頼み文に出なかった）。
+        #
+        # 別の持ち主が層を積み直しただけ（`229_` が施設の主に被せる）では捨てない。
+        # 捨てると `place` / `unplace` / `snapshot_all` が実体に触れなくなり、
+        # `.location` が据わらないまま会話の一覧から消える（実機。331 の主人）。
         record["character"] = None
+        record["built_in"] = None
+        record["rebuild"] = True          # 次の `spawn` は名簿に居ても採らず組み直す
     if write:
         write("modnpc: {} registered {} ({} layer(s))".format(
             owner, npc_id, len(record["layers"])))
@@ -505,7 +569,7 @@ def build(fields, npc_id=None, write=None, data=None):
 
     ひな型は `npcs.NEW_NPC_TEMPLATE` をそのまま使う。
     セーブに出さないので並び順は要らないが、控えに落とした中身を
-    セーブと見比べられる形にしておく（`914_` の保管庫と同じ考え）。
+    セーブと見比べられる形にしておく（`330_` の保管庫と同じ考え）。
     深い複製にするのは、入れ子（`ability_scores` / `memory` / `image_src`）が
     作った NPC 全員で同じ辞書になるのを避けるため。
     """
@@ -523,7 +587,7 @@ def build(fields, npc_id=None, write=None, data=None):
     # `npcs.CHARACTER_KWARGS` の15個だけだと `life_log` / `current_log` /
     # `memory` / `knowledges` が既定の None のままになり、会話の第一声を組む
     # `context_manager.get_life_log_text` が `'NoneType' object is not iterable`
-    # で落ちる（実機 2026-09-12）。素データ経由なら `[]` / `{}` が渡る項目。
+    # で落ちる（実機）。素データ経由なら `[]` / `{}` が渡る項目。
     kwargs = {}
     accepts = _accepted_kwargs(cls)
     for field, value in data.items():
@@ -590,6 +654,14 @@ def spawn(app, npc_id, *, world=None, write=None):
     record = _record(npc_id)
     character = record.get("character")
     if character is None:
+        # 参照だけ落ちて実体は名簿に居る（別の持ち主の層の積み直しなど）なら、それを採る。
+        # 組み直すと会話の記憶や HP がその時点の写しまで巻き戻る。
+        roster_now = _roster(app, world)
+        found = roster_now.get(npc_id) if isinstance(roster_now, dict) else None
+        if found is not None and not record.get("rebuild"):
+            character = record["character"] = found
+            record["built_in"] = getattr(patch, "_generation", None)
+    if character is None:
         # 材料は 宣言時の初期値（fields）の上に控えの写し（snapshot）。
         # 写しはゲームの保存と同じ時点の実体なので、記憶も HP も死もそこから戻る。
         fields = dict(fields_of(npc_id))
@@ -606,7 +678,11 @@ def spawn(app, npc_id, *, world=None, write=None):
                 character.id = npc_id
             except Exception:
                 log_exc("modnpc: cannot put the id on {}".format(npc_id))
+        # 持ち物は `Character.__init__` が受けないので、組んだ後に戻す。
+        set_items(app, character, fields.get("inventory"), write=write)
         record["character"] = character
+        record["built_in"] = getattr(patch, "_generation", None)
+        record["rebuild"] = False
     characters = _roster(app, world)
     if characters is not None:
         characters[npc_id] = character
@@ -616,7 +692,7 @@ def spawn(app, npc_id, *, world=None, write=None):
     for layer in layers(npc_id):
         if layer.get("place"):
             area_id, facility_id = layer["place"]
-            place(app, npc_id, area_id, facility_id, write=write)
+            place(app, npc_id, area_id, facility_id, world=world, write=write)
             break
     if write:
         write("modnpc: {} {!r} is in the world".format(
@@ -660,6 +736,7 @@ def forget(write=None):
     """
     for record in registry().values():
         record["character"] = None
+        record["built_in"] = None
         record["data"] = None
         record["snapshot"] = None
         record["placed"] = None
@@ -699,7 +776,7 @@ def install_plain(app, npc_id, write=None):
     """素データの写しを素データの辞書すべてに置く。置いた数を返す。
 
     ゲームの詳細生成（`generate_npc_detail`）は結果を `save_data_dict['npcs'][id]` へ書く
-    （実機 2026-09-12: 無いと LLM の答えが返った直後に `KeyError` で会話のスレッドが死ぬ）。
+    （実機: 無いと LLM の答えが返った直後に `KeyError` で会話のスレッドが死ぬ）。
     置くのは `plain_data` の**同じ辞書**なので、どこに書かれても1つに集まる。
     保存の間は `hide` が反復から隠す。
     """
@@ -727,21 +804,74 @@ def remove_plain(app, npc_id):
 
 
 def _character_at(app, npc_id, world=None):
-    """その id の実体。MOD の NPC は記録から、正規 NPC は名簿から。"""
+    """その id の実体。**名簿に居ればそれが真実**で、記録の参照は名簿に合わせる。
+
+    ゲームは詳細生成（会話の直前）の後に `Character` を作り直して名簿を差し替える
+    （実機。331 の主人が `config['difficulty_level']` を変えて別の実体になり、
+    記録が掴んでいた古い実体に `.location` を据えても新しい方には届かず、
+    会話の一覧から消えた）。記録だけを信じると、置いたつもりの人物がどこにも居ない。
+    """
     record = registry().get(npc_id)
+    characters = _roster(app, world)
+    listed = characters.get(str(npc_id)) if isinstance(characters, dict) else None
+    if isinstance(record, dict) and is_mod_npc(npc_id) and listed is not None:
+        if record.get("character") is not listed:
+            record["character"] = listed
+            record["built_in"] = getattr(patch, "_generation", None)
+            record["stale_placed"] = True     # 置いたのは前の実体。置き直しが要る
+        return listed
     if isinstance(record, dict) and record.get("character") is not None:
         return record["character"]
-    characters = _roster(app, world)
-    if isinstance(characters, dict):
-        return characters.get(str(npc_id))
-    return None
+    return listed
+
+
+def replace_if_stale(app, npc_id, world=None, write=None):
+    """名簿の実体が差し替わっていたら、控えの置き場所へ置き直す。置き直したら True。
+
+    差し替えは `_character_at` が見つけて印（`stale_placed`）を立てる。
+    ここで消すのは印だけで、置き場所は記録の `placed`（エリア・施設・主か・一覧に出すか）を使う。
+    """
+    npc_id = str(npc_id)
+    record = registry().get(npc_id)
+    if not isinstance(record, dict) or not record.get("stale_placed"):
+        return False
+    record["stale_placed"] = False
+    spot = record.get("placed")
+    if not spot:
+        return False
+    area_id, facility_id, owner_was, was_owner, listed = _spot_of(spot)
+    record["placed"] = None          # 前の実体の置き場所。`place` に据え直させる
+    if write:
+        write("modnpc: {} was rebuilt by the game; placing the new instance again"
+              .format(npc_id))
+    done = place(app, npc_id, area_id, facility_id, owner=bool(was_owner),
+                 listed=listed, world=world, write=write)
+    current = record.get("placed")
+    if done and was_owner and current:
+        # 施設の主は前の実体のときから自分なので、`place` が取った「元の主」は自分の id。
+        # そのままだと `unplace` が主を自分へ戻し、保存に `mod:` の id が焼かれる。
+        record["placed"] = current[:2] + (owner_was,) + tuple(current[3:])
+    return done
+
+
+def _spot_of(spot):
+    """記録の `placed` を `(area, facility, 主の元の値, 主か, 一覧に出すか)` に揃える。"""
+    spot = tuple(spot)
+    listed = bool(spot[4]) if len(spot) > 4 else True
+    return spot[0], spot[1], spot[2], spot[3], listed
 
 
 # --------------------------------------------------------------------------
 # 置く
 # --------------------------------------------------------------------------
-def place(app, npc_id, area_id, facility_id, *, owner=False, write=None):
+def place(app, npc_id, area_id, facility_id, *, owner=False, listed=True,
+          world=None, write=None):
     """施設の名簿に載せる。載ったら True。
+
+    **`world` を渡すこと。** `World.__init__` を包んでいる間は `app.world` がまだ
+    前の世界を指していて、渡さないと**前の世界の施設**に置く（そこには前の建物が
+    残っている）。実体の `.location` が古いオブジェクトになるので、
+    「会話する」の一覧はその人物を出さない（実機。331 の主人が消えた）。
 
     `move_npc_to_facility` は通さない。
     あちらは素データ側にも登録する引数（`register_facility`）を持っていて、
@@ -751,10 +881,27 @@ def place(app, npc_id, area_id, facility_id, *, owner=False, write=None):
     GAME.md §2.7）。
 
     `owner=True` は施設の主にも据える。
-    元の主は記録に控えて `unplace` で戻す（`914_` の滞在中の差し替えと同じ形）。
+    元の主は記録に控えて `unplace` で戻す（`330_` の滞在中の差し替えと同じ形）。
+
+    `listed=False` は**主に据えるだけで「会話する」の一覧には出さない**。
+    ゲームの宿泊は主を名簿から引くだけなので、これでも通る。
+    自分の家のように「他人がそこに住んでいるように見えてはいけない」建物のため
+    （`330_` の大家）。店の主人のように話せる相手は既定（`listed=True`）のまま。
+    """
+    return _place(app, npc_id, area_id, facility_id, owner=owner, listed=listed,
+                  world=world, write=write, persist=True)
+
+
+def _place(app, npc_id, area_id, facility_id, *, owner, listed, world, write,
+           persist):
+    """`place` の中身。`persist=False` は控えを書かない（保存の間の戻し）。
+
+    保存の窓の外し・戻しは置き場所を変えない。控えを書くと保存のたびに
+    2回書き込み、間で落ちると控えに `place=None` が残る。
     """
     npc_id = str(npc_id)
-    area = ui.world_areas(app).get(str(area_id))
+    areas = ui.areas_of_world(world) if world is not None else ui.world_areas(app)
+    area = areas.get(str(area_id))
     facility, node = None, None
     if area is not None:
         try:
@@ -767,15 +914,19 @@ def place(app, npc_id, area_id, facility_id, *, owner=False, write=None):
                   .format(area_id, facility_id, npc_id))
         return False
     roster = getattr(facility, "characters", None)
-    if isinstance(roster, list) and npc_id not in roster:
+    if listed and isinstance(roster, list) and npc_id not in roster:
         roster.append(npc_id)
     # 「会話する」の一覧は `world.characters` を舐めて各人物の `.location` を
-    # 今の施設と突き合わせる（実機 2026-09-12。名簿に居ても `.location` が
+    # 今の施設と突き合わせる（実機。名簿に居ても `.location` が
     # 施設オブジェクトでなければ出ない）。実行時の NPC と同じ形で持たせる。
     # 保存には出ない（`_RosterView` が反復から隠す）ので、オブジェクトを持っても焼かれない。
     was_at = None
     record = _record(npc_id)
-    character = record.get("character")
+    character = _character_at(app, npc_id, world)     # 名簿に居ればそれ（記録も合わせる）
+    record["stale_placed"] = False
+    if not listed:
+        # `.location` を据えない＝「会話する」の一覧に出ない（主にはなる）。
+        character = None
     if character is not None:
         was_at = {name: getattr(character, name, None)
                   for name in ("location", "current_node", "current_area")}
@@ -795,32 +946,39 @@ def place(app, npc_id, area_id, facility_id, *, owner=False, write=None):
                 write("WARN modnpc: cannot set the owner of {}/{}: {}: {}"
                       .format(area_id, facility_id, type(exc).__name__, exc))
             owner_was = None
-    record["placed"] = (str(area_id), str(facility_id), owner_was, bool(owner))
+    record["placed"] = (str(area_id), str(facility_id), owner_was, bool(owner),
+                        bool(listed))
     record["was_at"] = was_at
-    if is_mod_npc(npc_id):
+    if persist and is_mod_npc(npc_id):
         _persist(app, owner_of_id(npc_id), npc_id,
-                 place=[str(area_id), str(facility_id), bool(owner)])
+                 place=[str(area_id), str(facility_id), bool(owner), bool(listed)])
     if write:
-        write("modnpc: {} is at {}/{}{}".format(
-            npc_id, area_id, facility_id, " as the owner" if owner else ""))
+        write("modnpc: {} is at {}/{}{}{}".format(
+            npc_id, area_id, facility_id, " as the owner" if owner else "",
+            "" if listed else " (not in the talk list)"))
     return True
 
 
-def unplace(app, npc_id, write=None):
+def unplace(app, npc_id, world=None, write=None):
     """施設の名簿から外し、主を元へ戻す。"""
+    return _unplace(app, npc_id, world=world, write=write, persist=True)
+
+
+def _unplace(app, npc_id, *, world, write, persist):
+    """`unplace` の中身。`persist=False` は控えを書かない（保存の間の外し）。"""
     npc_id = str(npc_id)
     record = registry().get(npc_id)
     if not isinstance(record, dict) or not record.get("placed"):
         return False
-    area_id, facility_id, owner_was, was_owner = record["placed"]
-    facility = facility_of(app, area_id, facility_id)
+    area_id, facility_id, owner_was, was_owner, _listed = _spot_of(record["placed"])
+    facility = facility_of(app, area_id, facility_id, world)
     if facility is None:
         record["placed"] = None
         return False
     roster = getattr(facility, "characters", None)
     if isinstance(roster, list):
         roster[:] = [key for key in roster if str(key) != npc_id]
-    character = record.get("character")
+    character = _character_at(app, npc_id, world)
     if character is not None and isinstance(record.get("was_at"), dict):
         for name, value in record["was_at"].items():
             try:
@@ -835,16 +993,16 @@ def unplace(app, npc_id, write=None):
             log_exc("modnpc: cannot restore the owner of {}/{}".format(
                 area_id, facility_id))
     record["placed"] = None
-    if is_mod_npc(npc_id):
+    if persist and is_mod_npc(npc_id):
         _persist(app, owner_of_id(npc_id), npc_id, place=None)
     if write:
         write("modnpc: {} left {}/{}".format(npc_id, area_id, facility_id))
     return True
 
 
-def facility_of(app, area_id, facility_id):
+def facility_of(app, area_id, facility_id, world=None):
     """エリア id と施設 id から実行時の `Facility`。引けなければ None。"""
-    area = ui.world_areas(app).get(str(area_id))
+    area = (ui.areas_of_world(world) if world is not None else ui.world_areas(app)).get(str(area_id))
     if area is None:
         return None
     try:
@@ -865,49 +1023,13 @@ STATE_DIRNAME = "modnpc"
 _KEY_OVERRIDE_ATTR = "_instantale_modnpc_key_override"
 
 
-def bind_store(ctx, write=None):
-    """控えを今の世代の `ctx` に繋ぐ（`install` が毎回呼ぶ）。"""
-    found = getattr(sys, STORE_ATTR, None)
-    if isinstance(found, state.WorldStore):
-        return found.rebind(ctx, write)
-    found = state.WorldStore(ctx, STATE_DIRNAME, write=write)
-    setattr(sys, STORE_ATTR, found)
-    return found
-
-
-def store():
-    """控え。`install` がまだなら None（控えずに動く）。"""
-    found = getattr(sys, STORE_ATTR, None)
-    return found if isinstance(found, state.WorldStore) else None
-
-
-def _current_key(app):
-    override = getattr(sys, _KEY_OVERRIDE_ATTR, None)
-    if isinstance(override, str) and override:
-        return override
-    return state.world_key(app) if app is not None else state.UNKNOWN_WORLD
-
-
-def _bucket(app):
-    """`(世界の鍵, 控え)`。控えが無いか世界が分からなければ `(None, None)`。"""
-    found = store()
-    if found is None or app is None:
-        return None, None
-    key = _current_key(app)
-    if not key or key == state.UNKNOWN_WORLD:
-        return None, None
-    return key, found.load(key)
-
-
-def _jsonable(value):
-    """控えに入れてよい値か。JSON に落ちるものだけ（実行時のオブジェクトは控えない）。"""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return True
-    if isinstance(value, (list, tuple)):
-        return all(_jsonable(v) for v in value)
-    if isinstance(value, dict):
-        return all(isinstance(k, str) and _jsonable(v) for k, v in value.items())
-    return False
+#: 繋ぎ方は `modnpc` / `modfacility` で同じなので `state` に1つ（違うのは上の3つの名前だけ）。
+_stores = state.SysWorldStore(STORE_ATTR, STATE_DIRNAME, _KEY_OVERRIDE_ATTR)
+bind_store = _stores.bind           # 控えを今の世代の `ctx` に繋ぐ（`install` が毎回呼ぶ）
+store = _stores.store               # 控え。`install` がまだなら None（控えずに動く）
+_current_key = _stores.current_key
+_bucket = _stores.bucket            # `(周回の鍵, 控え)` か `(None, None)`
+_jsonable = state.jsonable
 
 
 def _persist(app, owner, npc_id, **changes):
@@ -965,6 +1087,30 @@ def _layer_of(owner, npc_id):
 SNAPSHOT_SKIP = frozenset(("location", "current_area", "current_location"))
 
 
+def items_of(character, write=None):
+    """持ち物を控えの形（`{鍵: 辞書}`）で。読めなければ None。
+
+    入れ物も品も JSON に落ちないオブジェクトなので、`items` が1件ずつ均す。
+    素直に属性を控えると持ち物が丸ごと落ちる（実機。
+    `331_` の店の主人に品が並んでいても控えは空だった。入れ物だけ剥がしても
+    中身が `Item` のままなので、やはり落ちる）。
+    """
+    records, _lost = items.to_records(character, write=write)
+    return records
+
+
+def set_items(app, character, records, write=None):
+    """控えの持ち物を実体へ戻す。戻した件数を返す。
+
+    入れ物は `Character.__init__` が作る（`inventory` は受け取らない）。
+    品はゲーム自身に作り直させる（`items.rebuild`）。
+    """
+    made = items.rebuild(app, character, records, write=write)
+    if made and write:
+        write("modnpc: {} item(s) put back".format(made))
+    return made
+
+
 def snapshot_of(character):
     """実体の33項目のうち JSON に落ちるものを写す（セーブの項目名で）。"""
     out = {}
@@ -975,6 +1121,8 @@ def snapshot_of(character):
         if not hasattr(character, attr):
             continue
         value = getattr(character, attr)
+        if field == "inventory":
+            value = items_of(character)      # 入れ物ではなく1件ずつ均した辞書
         if _jsonable(value):
             out[field] = copy.deepcopy(value)
     return out
@@ -988,11 +1136,14 @@ def snapshot_all(app, write=None):
     """
     done = []
     for npc_id, record in list(registry().items()):
-        if not is_mod_npc(npc_id) or record.get("character") is None:
+        if not is_mod_npc(npc_id):
+            continue
+        character = _character_at(app, npc_id)
+        if character is None:
             continue
         if not (record.get("placed") or npc_id in (_roster(app) or {})):
             continue
-        snap = snapshot_of(record["character"])
+        snap = snapshot_of(character)
         if _persist(app, owner_of_id(npc_id), npc_id, snapshot=snap):
             done.append(npc_id)
     if write and done:
@@ -1010,9 +1161,9 @@ def restore_world(app, world=None, save_data_dict=None, write=None):
     found = store()
     if found is None:
         return []
-    key = state.world_key_of_dict(save_data_dict, None) if save_data_dict is not None else None
+    key = state.playthrough_key_of_dict(save_data_dict, None) if save_data_dict is not None else None
     if not key:
-        key = state.world_key(app)
+        key = state.playthrough_key(app)
     if not key or key == state.UNKNOWN_WORLD:
         return []
     setattr(sys, _KEY_OVERRIDE_ATTR, key)
@@ -1033,9 +1184,11 @@ def restore_world(app, world=None, save_data_dict=None, write=None):
                     spawn(app, npc_id, world=world, write=write)
                     spot = entry.get("place")
                     if isinstance(spot, (list, tuple)) and len(spot) >= 2:
+                        # 読み直しの最中は `app.world` がまだ前の世界なので `world` を渡す。
                         place(app, npc_id, spot[0], spot[1],
                               owner=bool(spot[2]) if len(spot) > 2 else False,
-                              write=write)
+                              listed=bool(spot[3]) if len(spot) > 3 else True,
+                              world=world, write=write)
                 done.append((owner, npc_id))
     finally:
         try:
@@ -1272,18 +1425,26 @@ def fire_all(site, app, *, args=None, world=None, write=None):
 # --------------------------------------------------------------------------
 # 関所
 # --------------------------------------------------------------------------
-#: セーブに焼かれる、NPC の id を載せた器（`app` の属性。`game_variables` はここから組まれる）。
-#: **名簿と素データを隠すだけでは足りない。**
+#: セーブに焼かれる、NPC の id を載せた選択肢の器（`app` の属性。`game_variables` はここから組まれる）。
 #: 実セーブの `game_variables.buttons_backup` に
-#: `{"spec": {"cls_name": "ConversationStartManager", "args": ["35"]}}` が在った（2026-09-13 に確認）。
-#: 「会話する」の一覧を出したまま保存すると、そこへ `mod:` の id が焼かれ、
-#: MOD を外した後にその選択肢を押すと `ConversationStartManager(app, "mod:…")` が `KeyError` で落ちる。
+#: `{"spec": {"cls_name": "ConversationStartManager", "args": ["35"]}}` が在る（確認済み）。
+#: **ここは落とさない**。落としていた頃は、「会話する」の一覧を出したまま保存すると
+#: MOD の NPC の項目だけが抜けた一覧が焼かれ、ロードで「やめる」だけの画面が戻った
+#: （実機。店で主人の一覧を出したまま保存→ロードで「店の選択肢が消えた」）。
+#: ゲームは一覧を出したままの保存を再開できるので、その挙動を壊さない（会話の途中と同じ判断）。
+#: 押されるのは `restore_world` が NPC を戻した後なので id は解ける。
+#: MOD を外した後にその項目を押せば `ConversationStartManager(app, "mod:…")` が `KeyError` で落ちるが、
+#: それは会話の途中を保存したセーブと同じ（`CONVERSATION_ATTR`）。
 SAVED_CHOICE_ATTRS = ("buttons", "buttons_backup", "buttons_backup_for_shopping")
 #: 選択肢と同じ形の `PhaseSpec` を1つだけ持つ器（自由入力が次に呼ぶもの）。
 SAVED_SPEC_ATTRS = ("function_correspond_to_input", "input_backup",
                     "input_backup_for_shopping")
 #: 戦闘中の敵（`{id: 情報}`）。MOD の NPC と戦っている最中の保存で焼かれうる。
 SAVED_ENEMY_ATTRS = ("current_enemy_dict",)
+#: 相手の id を持つ旗。`in_conversation` は真偽ではなく**話している相手の id**が入る
+#: （実機）。**ここは落とさない。** 落とすと会話の途中で保存したセーブが
+#: 会話から再開できなくなる（同日の指摘。`talking_with`）。
+CONVERSATION_ATTR = "in_conversation"
 #: パーティの id が並ぶ器。`ui.party_stores` は「いまのパーティ」だけを見るが、
 #: セーブには `original_party`（クエスト前の編成）も焼かれる。
 #:
@@ -1331,32 +1492,21 @@ def _entry_mentions(entry, mod_ids):
     return _spec_mentions(entry.get("spec"), mod_ids)
 
 
-def scrub_saved_refs(app, mod_ids, write=None):
+def scrub_saved_refs(app, mod_ids, write=None, undo=None):
     """保存に焼かれる器から MOD の NPC への参照を落とす。戻すための控えを返す。
 
     落とすのは保存の窓の間だけで、`unscrub_saved_refs` が元の器をそのまま戻す
     （中身を組み直さない ― ゲームが同じ器を握っているので、差し替えた側を戻す）。
+    `undo` に並びを渡すと、書き換えるたびにそこへ積む（途中で投げても、
+    そこまでに落としたものは戻せる）。
     """
+    if undo is None:
+        undo = []
     mod_ids = set(str(npc_id) for npc_id in mod_ids)
     if not mod_ids:
-        return []
-    undo = []
-    for attr in SAVED_CHOICE_ATTRS:
-        value = getattr(app, attr, None)
-        if not isinstance(value, list):
-            continue
-        kept = [entry for entry in value if not _entry_mentions(entry, mod_ids)]
-        if len(kept) == len(value):
-            continue
-        try:
-            setattr(app, attr, kept)
-        except Exception:
-            log_exc("modnpc: cannot scrub {}".format(attr))
-            continue
-        undo.append(("attr", attr, value))
-        if write:
-            write("modnpc: save: {} choice(s) pointing at a mod npc lifted from {}"
-                  .format(len(value) - len(kept), attr))
+        return undo
+    # 選択肢（`SAVED_CHOICE_ATTRS`）は落とさない。落とすと一覧を出したまま保存したセーブが
+    # 「やめる」だけの画面で戻る（実機。定数の注記）。
     for attr in SAVED_SPEC_ATTRS:
         value = getattr(app, attr, None)
         if value is None or not _spec_mentions(value, mod_ids):
@@ -1409,27 +1559,59 @@ def unscrub_saved_refs(app, undo):
             log_exc("modnpc: cannot put {} back after the save".format(target))
 
 
-def hide(app, *, world=None, write=None):
+def talking_with(app):
+    """いま会話している相手の id。会話していなければ空。
+
+    `in_conversation` は真偽ではなく**相手の id**が入る（実機）。
+    """
+    value = getattr(app, CONVERSATION_ATTR, None)
+    return str(value) if isinstance(value, str) and value else ""
+
+
+def hide(app, *, world=None, write=None, into=None):
     """保存の直前。MOD の NPC を名簿と素データの反復から隠す。
 
     戻すための控えを返す（`restore` にそのまま渡す）。
+    `into` に空の dict を渡すと控えをそこへ書くたびに積むので、途中で投げても
+    そこまでに外したものは `restore(app, into)` で戻る（保存の関所はこちらを使う）。
+
+    **いま話している相手だけは痕跡を残す。** ゲームは会話の途中を保存して再開できる
+    （`in_conversation` に相手の id、`current_conversation_history` に流れ、選択肢は会話のもの）。
+    その id を選択肢や旗から落とすと、**ロードしても会話から再開できない** ―
+    相手の居ない会話の残骸だけが並ぶ（実機。「NPC が消えた」）。
+    ロードは `restore_world` が名簿を戻してから続きが動くので、id は解ける。
     """
-    characters = _roster(app, world)
+    hidden = into if into is not None else {}
     taken = []
     placed = []
+    scrubbed = []
+    plain_views = []
+    hidden.update({"taken": taken, "placed": placed, "view": None,
+                   "plain_views": plain_views, "scrubbed": scrubbed, "world": world})
+    characters = _roster(app, world)
+    talking = talking_with(app)
     # 名簿と素データだけでは足りない。選択肢・自由入力・パーティ・敵にも id が載る。
-    scrubbed = scrub_saved_refs(
-        app, [npc_id for npc_id in registry() if is_mod_npc(npc_id)], write=write)
+    # 会話中の相手は除く（上の注記）。
+    scrub_saved_refs(
+        app, [npc_id for npc_id in registry()
+              if is_mod_npc(npc_id) and npc_id != talking], write=write,
+        undo=scrubbed)
+    if talking and is_mod_npc(talking) and write:
+        write("modnpc: save: {} is in a conversation; its trace is kept so the "
+              "save can pick it up".format(talking))
     for npc_id in list(registry()):
         if not is_mod_npc(npc_id):
             continue
         record = registry()[npc_id]
-        if record.get("placed"):
-            placed.append((npc_id, record["placed"]))
-            unplace(app, npc_id)
+        spot = record.get("placed")
+        if spot:
+            # 置き場所は変わらないので控えは書かない（`_place` の注記）。
+            # 積むのは外し終えてから。外す前に投げた人を戻しで置き直すと、
+            # 自分を「元の主」として取り直してしまう。
+            _unplace(app, npc_id, world=world, write=None, persist=False)
+            placed.append((npc_id, spot))
         if LIFT_ROSTER and characters is not None and npc_id in characters:
             taken.append(npc_id)
-    view = None
     if taken:
         # 名簿から外さない。反復だけ隠す辞書に差し替える（`_RosterView`）。
         target = world if world is not None else getattr(app, "world", None)
@@ -1437,11 +1619,10 @@ def hide(app, *, world=None, write=None):
         view = _RosterView(source, taken)
         try:
             target.characters = view
+            hidden["view"] = view
         except Exception:
             log_exc("modnpc: cannot swap the roster for the save")
-            view = None
     # 素データの写しも同じ形で隠す（保存は `save_data_dict['npcs']` をそのまま書く）。
-    plain_views = []
     if LIFT_ROSTER:
         mod_ids = [npc_id for npc_id in registry() if is_mod_npc(npc_id)]
         for holder, key in _plain_containers(app):
@@ -1454,14 +1635,15 @@ def hide(app, *, world=None, write=None):
             plain_views.append((holder, key, plain_view))
     if write and taken:
         write("modnpc: save: {} instance(s) hidden from the roster".format(len(taken)))
-    return {"taken": taken, "placed": placed, "view": view,
-            "plain_views": plain_views, "scrubbed": scrubbed, "world": world}
+    return hidden
 
 
 def restore(app, hidden, *, world=None, write=None):
-    """保存の直後。引き上げたものを戻す。"""
+    """保存の直後。引き上げたものを戻す。`hide` が途中で投げた控えも受ける。"""
     if not isinstance(hidden, dict):
         return
+    if world is None:
+        world = hidden.get("world")
     view = hidden.get("view")
     if view is not None:
         target = world if world is not None else getattr(app, "world", None)
@@ -1475,8 +1657,14 @@ def restore(app, hidden, *, world=None, write=None):
         if holder.get(key) is view:
             holder[key] = view.source
     for npc_id, spot in hidden.get("placed") or ():
-        area_id, facility_id, _owner_was, was_owner = spot
-        place(app, npc_id, area_id, facility_id, owner=was_owner)
+        area_id, facility_id, _owner_was, was_owner, listed = _spot_of(spot)
+        try:
+            # 置き場所は保存の前と同じなので控えは書かない。`listed` も引き継ぐ
+            # （落とすと一覧に出さない人が保存のたびに一覧へ出る）。
+            _place(app, npc_id, area_id, facility_id, owner=bool(was_owner),
+                   listed=listed, world=world, write=None, persist=False)
+        except Exception:
+            log_exc("modnpc: cannot place {} back after the save".format(npc_id))
 
 
 def installed():
@@ -1490,7 +1678,7 @@ def gate_is_live():
 
     登録簿は `sys` に在って関所より長生きする。
     関所を立てた MOD の `apply()` が失敗した世代では、前の世代の実体が名簿に残ったまま
-    関所だけが無く、次の保存が名簿を舐めて落ちる（実機 2026-09-12 18:58。
+    関所だけが無く、次の保存が名簿を舐めて落ちる（実機。
     `AttributeError: 'NoneType' object has no attribute 'id'`）。
     だから `spawn` はここが真でなければ載せない。
     """
@@ -1544,11 +1732,13 @@ def _install(ctx, write):
 
     def save_game(orig, self, *args, **kwargs):
         """保存の間だけ、MOD の持ち物を世界から外す。"""
-        hidden = None
+        # 控えは先に作って `hide` に埋めさせる。途中で投げても、そこまでに
+        # 外したもの（パーティ・敵・施設の主など）は後ろの `restore` が戻す。
+        hidden = {}
         try:
             fire_all("save", self, args={"phase": "hide"}, write=write)
             snapshot_all(self, write=write)     # ゲームの保存と同じ時点で実体を写す
-            hidden = hide(self, write=write)
+            hide(self, write=write, into=hidden)
         except Exception:
             log_exc("modnpc: cannot lift the mod npcs before the save")
         try:
@@ -1577,7 +1767,7 @@ def _install(ctx, write):
         # 控えの鍵は引数の `save_data_dict` から決めて持ち回る。
         # `app.world_dict` はこの時点でまだ前の世界を指していることがあり、
         # `on["world"]` の中で MOD が `spawn` すると前の世界の控えに書いてしまう。
-        key = state.world_key_of_dict(save_data_dict, None)
+        key = state.playthrough_key_of_dict(save_data_dict, None)
         if key:
             setattr(sys, _KEY_OVERRIDE_ATTR, key)
         try:
@@ -1643,7 +1833,15 @@ def _install(ctx, write):
         if is_mod_npc(npc_id):
             install_plain(self, npc_id, write=write)
         result = orig(self, character_instance, *args, **kwargs)
-        fire("detail_done", self, npc_id, character=character_instance,
+        if is_mod_npc(npc_id):
+            # 本体は埋めた後に `Character` を作り直して名簿を差し替えることがある。
+            # 置き場所は前の実体に付いているので、新しい実体へ据え直す。
+            try:
+                _character_at(self, npc_id)
+                replace_if_stale(self, npc_id, write=write)
+            except Exception:
+                log_exc("modnpc: cannot re-place {} after the detail generation".format(npc_id))
+        fire("detail_done", self, npc_id, character=_character_at(self, npc_id),
              args={"result": result, "site": site}, write=write)
         return result
 
@@ -1662,7 +1860,7 @@ def _install(ctx, write):
         """**MOD の NPC は仲間にできない。** 断って記録を残す。
 
         仲間は `save_data_dict['npcs']` に素データが在ることが前提
-        （実セーブで確認。2026-09-13: `game_variables.party` の id が `npcs` の鍵を指し、
+        （実セーブで確認: `game_variables.party` の id が `npcs` の鍵を指し、
         その人物は `areas/<id>/adventurer_npcs` にも載っている）。
         MOD の NPC の素データは保存の直前に隠すので、加入したまま保存すると
         **ロードのときに組み立てられない**。
@@ -1855,7 +2053,7 @@ def _bind(target, args, kwargs):
 
     署名は `orig` ではなく**素の関数**から取る。
     同じ対象を包む MOD が他に居ると `orig` は内側の MOD のラッパで、
-    その署名は `(*args, **kwargs)` でしかない（実機 2026-09-12。
+    その署名は `(*args, **kwargs)` でしかない（実機。
     `conversation_starter` に9本が載っていて、名前が1つも引けずに素通りした）。
     `safe=True` の包みでは `orig` 自体がローダの閉包で `__original__` すら持たない
     （同日。底が `(*a, **kw)` で止まった）ので、`orig` からはたどらない。

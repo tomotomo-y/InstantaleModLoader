@@ -4,13 +4,13 @@
   "kind": "feature",
   "name": {
     "en": "Travel the dangerous road",
-    "ja": "危険な道を行く"
+    "ja": "ダンジョン経由のエリア移動"
   },
   "description": {
     "en": "Adds a third way to travel between areas: clear a dungeon on the road and you arrive at the destination",
     "ja": "エリア移動に「危険な道を行く」を追加する。道中のクエストを踏破すると目的地に着く"
   },
-  "version": "1",
+  "version": "4",
   "author": "R01/Flossian",
   "after": [
     "301_quest_from_conversation"
@@ -99,8 +99,8 @@
         "en": "Hide the long-journey line"
       },
       "note": {
-        "ja": "到着の移動中だけ。道中を踏破した後に「徒歩で目指す。長旅だ...」と出るのを伏せる",
-        "en": "Only while arriving after the road has been cleared"
+        "ja": "道中を踏破した後の到着の移動で「徒歩で目指す。長旅だ...」と出るのを伏せる。ふつうのエリア移動の文言には触らない",
+        "en": "Hides the line while arriving after the road has been cleared. Ordinary area moves keep their wording"
       }
     },
     "NOTE_IN_SUMMARY": {

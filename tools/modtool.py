@@ -100,15 +100,9 @@ def locate(mod_dir):
     if not game_dir:
         # 直接起動（`python runtime/mods/322_battle_bgm/tool.py`）では環境変数が無い。
         # 設定画面が覚えているゲームの場所を借りると、そのときも曲や絵が見える。
-        # `AttributeError` も捕るのは、`gui.json` が配列だったときに
-        # `.get` が無くて落ちるため（壊れた設定で道具が開かないのは割に合わない）。
-        try:
-            with io.open(gui_config_path(root), encoding="utf-8") as fh:
-                game_path = json.load(fh).get("game_path") or ""
-            if game_path:
-                game_dir = os.path.dirname(game_path)
-        except (OSError, ValueError, AttributeError):
-            game_dir = ""
+        # `gui.json` が配列でも `read_json` が空の辞書にするので、壊れた設定で道具が開かないことはない。
+        game_path = read_json(gui_config_path(root)).get("game_path") or ""
+        game_dir = os.path.dirname(game_path) if isinstance(game_path, str) and game_path else ""
     return root, state_dir, game_dir
 
 
@@ -199,12 +193,7 @@ def world_name(save, fallback="", root="", mod_dir=""):
 # ----------------------------------------------------------------- 宣言と設定
 def manifest(mod_dir):
     """`mod.json`。読めなければ `{}`。"""
-    try:
-        with io.open(os.path.join(mod_dir, "mod.json"), encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return read_json(os.path.join(mod_dir, "mod.json"))
 
 
 def decls(mod_dir, root=""):
@@ -274,7 +263,8 @@ def save_settings(root, mod_dir, values, strict=False):
         name = mod_name(mod_dir)
         # 読んでから書く。他の MOD の項が同じファイルに同居しているので、
         # 丸ごと置き換えると隣を消す。
-        store = config.load_store(runtime)
+        # 同じ理由で、在るのに読めないファイルは書かずに断る（`load_store` だと `{}` になる）。
+        store = config.load_store_for_write(runtime)
         # 既定と同じ値は書かない（§3.8）。
         # 書いてしまうと、後で本体の既定を変えたときに
         # 「触っていない項目が古い値に固定される」が起きる。
@@ -310,7 +300,7 @@ def coerce_all(mod_dir, raw, root=""):
     try:
         config = config_module(root, mod_dir)
     except Exception:
-        return None, "設定の読み方が引けない"
+        return None, "設定の読み方が引けません"
     values = {}
     for key, decl in decls(mod_dir, root).items():
         ok, value, why = config.coerce(decl, raw.get(key))
@@ -321,6 +311,21 @@ def coerce_all(mod_dir, raw, root=""):
 
 
 # ----------------------------------------------------------------- 書き込み
+def read_json(path):
+    """ファイル全体（辞書）。無い・読めない・辞書でないときは空の辞書。
+
+    `write_json` の対。設定画面が控えや `gui.json` を読む形はどれもこれだった
+    （`322_` の `load_playlist` と `324_` の `load_json` は同じ本体の写し）。
+    壊れたファイルで道具が開かないより、空から始めるほうがよい。
+    """
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def write_json(root, path, data, indent=1):
     """ローダの `write_json`（tmp → fsync → replace）で書く。
 
@@ -356,13 +361,9 @@ def write_json(root, path, data, indent=1):
 # ----------------------------------------------------------------- 窓の記憶
 def load_window(root, mod_dir):
     """前回の窓の大きさと位置。`{"geometry": "WxH+X+Y", "maximized": bool}`。無ければ空。"""
-    try:
-        with io.open(gui_config_path(root), encoding="utf-8") as fh:
-            cfg = json.load(fh)
-        entry = (cfg.get(WINDOW_KEY) or {}).get(mod_name(mod_dir)) or {}
-        return entry if isinstance(entry, dict) else {}
-    except (OSError, ValueError, AttributeError):
-        return {}
+    windows = read_json(gui_config_path(root)).get(WINDOW_KEY)
+    entry = windows.get(mod_name(mod_dir)) if isinstance(windows, dict) else None
+    return entry if isinstance(entry, dict) else {}
 
 
 def save_window(root, mod_dir, window):
@@ -391,18 +392,17 @@ def save_window(root, mod_dir, window):
             window.state("normal")
             window.update_idletasks()
         geometry = window.geometry()
+        if maximized:
+            # 寸法を取ったら最大化へ戻す。
+            # 呼ぶ側は閉じる前にここを通してから未保存の確認を出すので、
+            # 確認で「キャンセル」を選ぶと、戻さない限り最大化の解けた窓が残る。
+            window.state("zoomed")
         path = gui_config_path(root)
         # `gui.json` はローダの設定画面と共有している。
         # 丸ごと書くと `game_path` やローダ自身の窓の記憶を消すので、読んでから足す。
-        try:
-            with io.open(path, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-        except (OSError, ValueError):
-            cfg = {}
-        # 辞書でなければ捨てて作り直す。壊れた `gui.json` のせいで
+        # 辞書でなければ捨てて作り直す（`read_json` が空にする）。壊れた `gui.json` のせいで
         # 以降ずっと窓を覚えられないより、1回分の覚えを失うほうがよい。
-        if not isinstance(cfg, dict):
-            cfg = {}
+        cfg = read_json(path)
         windows = cfg.get(WINDOW_KEY)
         if not isinstance(windows, dict):
             windows = {}
@@ -523,6 +523,39 @@ def load_world_settings(found, path, base):
     return values
 
 
+def world_record(found, base, values):
+    """その世界の控えに**実際に書かれる中身**（一括設定と違う項目だけ）。
+
+    空なら控えは持たない（ファイルは消える）。
+    保存の後に「何を書いたか」を出す側（`saved_paths`）も同じ式を見るので、
+    ここ1か所に置いてある。
+    """
+    return dict((k, v) for k, v in values.items() if k in found and v != base.get(k))
+
+
+def saved_paths(found, was, now, shared_path, world_path):
+    """保存で**実際に書いた先**の並び。何も動いていなければ空。
+
+        was / now   … {"shared": 一括設定, "world": その世界の値}（押す前 / 押した後）
+        world_path  … 空なら世界が無い（一括設定だけを見る）
+
+    入力欄が同じままでも、**一括設定を動かすと個別の控えの中身は変わる**
+    （控えは差分なので、消えることもある）。
+    だから「入力欄が変わったか」ではなく、書かれる中身が変わったかで見る。
+    """
+    written = []
+    if now["shared"] != was["shared"]:
+        written.append(shared_path)
+    if world_path:
+        before = world_record(found, was["shared"], was["world"])
+        after = world_record(found, now["shared"], now["world"])
+        if before != after:
+            # 全部一括設定と同じになった回は、控えを書くのではなく消している。
+            written.append(world_path if after
+                           else world_path + "（一括設定と同じになったので削除）")
+    return written
+
+
 def save_world_settings(root, path, found, base, values):
     """一括設定と違う項目だけを書く。全部同じならファイルを消す。書けなければ False。
 
@@ -533,7 +566,7 @@ def save_world_settings(root, path, found, base, values):
     全部同じならファイルを消すのは、空の控えを残すと
     「この世界は個別設定を持っている」と読めてしまうため。
     """
-    record = dict((k, v) for k, v in values.items() if k in found and v != base.get(k))
+    record = world_record(found, base, values)
     if not record:
         try:
             os.remove(path)
@@ -736,7 +769,7 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
     per_world = ttk.Frame(tabs, padding=(6, 8, 6, 6))
     tabs.add(per_world, text="  ワールド個別設定  ")
     ttk.Label(per_world, text="その世界だけ。一括設定と違う項目だけが state\\{}\\<世界名>.json に入る。"
-              "セーブは世界名を読むだけで書かない".format(state_dirname(mod_dir)),
+              "セーブからは世界名を読むだけで、セーブには何も書かない".format(state_dirname(mod_dir)),
               style="Sub.TLabel").pack(anchor="w", pady=(0, 4))
     picker = ttk.Frame(per_world)
     picker.pack(fill="x", pady=(0, 4))
@@ -750,7 +783,7 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
     world_status = ttk.Label(world_bottom, style="Faint.TLabel")
     world_status.pack(side="left", fill="x", expand=True)
     world_status.configure(text="{} 世界（{}）".format(len(worlds), store)
-                           if worlds else "世界が見つからない: " + store)
+                           if worlds else "世界が見つかりません: " + store)
     body = ttk.Frame(per_world, padding=(0, 0, 6, 0))
     body.pack(fill="both", expand=True)
     world_form = _Form(_scrollable(body), found, lambda k: "一括設定: " + shown(shared[k]))
@@ -811,7 +844,8 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
     load_into_form(world_var.get())
 
     status = ttk.Label(footer, style="Faint.TLabel",
-                       text="一括設定は次の注入から、ワールド個別設定は次にその世界を見たときから効く")
+                       text="一括設定は次にゲームへ注入したときから、"
+                            "ワールド個別設定は次にその世界を開いたときから効く")
     status.pack(side="left")
 
     def save():
@@ -825,6 +859,8 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
         新しい一括設定を `shared` に入れてから差分を取る必要がある。
         """
         nonlocal shared
+        # **押す前の保存済み**を控えてから書く。何が動いたかは後で出す。
+        was = {"shared": dict(saved["shared"]), "world": dict(saved["world"])}
         new_shared, bad = coerce_all(mod_dir, shared_form.get(), root_dir)
         if bad:
             messagebox.showerror("一括設定を確かめてください", bad, parent=root)
@@ -849,10 +885,15 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
             return False
         # 世界が無いときは個別設定を持たないので、基準を一括設定に揃える。
         saved["world"] = dict(new_world) if name else dict(shared)
-        # 書いた先を出す。控えが消えた（全部一括設定と同じ）ときもこのパスが出るが、
-        # そのときファイルは無い。VERIFICATION.md §3.57 の #3 がその道。
+        # 書いた先を出す。**実際に動いたものだけ**を並べる。
+        # 一括設定だけ直したのに世界の控えのパスが出ると、
+        # その世界を保存したように読める（実機で踏んだ）。判断は `saved_paths`。
+        written = saved_paths(found, was,
+                              {"shared": new_shared, "world": new_world},
+                              config.store_path(runtime), path_of(name))
         status.configure(text="保存しました {}  {}".format(
-            time.strftime("%H:%M:%S"), path_of(name) if name else config.store_path(runtime)))
+            time.strftime("%H:%M:%S"),
+            " / ".join(written) if written else "（変更はありません）"))
         return True
 
     def close():

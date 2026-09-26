@@ -69,7 +69,7 @@ save_area_json, save_world_json, api_key_manager, build_type, sdcpp_cuda
 
 | 項目 | 値 |
 | --- | --- |
-| ゲーム本体 | `C:\Program Files\Epic Games\Instantaleq6Ve7\instantale.exe` |
+| ゲーム本体 | `<Epic のライブラリ>\Instantaleq6Ve7\instantale.exe`（ライブラリの既定は `C:\Program Files\Epic Games`。フォルダ名はマニフェストの `MandatoryAppFolderName` で決まっていて、置き場所を変えても同じ） |
 | ランタイム | CPython 3.10.11 / Kivy / SDL2 |
 | `game_version` | `014`（`__main__.get_game_version()`）。Epic の `AppVersion`（`main_025`）は別系統 |
 | ロード済みモジュール | 4226（うち 3212 が Nuitka コンパイル済み）／ゲーム自身は 67（main_025 のダンプ） |
@@ -81,12 +81,13 @@ save_area_json, save_world_json, api_key_manager, build_type, sdcpp_cuda
 Epic の `AppVersion` は
 `%PROGRAMDATA%\Epic\EpicGamesLauncher\Data\Manifests\*.item` の
 `AppVersionString` から、ゲームを起動せずに読める。
+実際のインストール先も同じファイルの `InstallLocation` にある。
 
 ### 1.5 更新の記録
 
 `game_version` は main_023 以降 `014` のまま据え置きで、
 上がっているのは Epic の `AppVersion` だけ（`main_023` → `024` → `025`）。
-`python310.dll` は 2026-06-03 のままなので**注入基盤は無傷**。
+`python310.dll` は更新の前後で変わっていないので**注入基盤は無傷**。
 
 | 版 | ゲーム側の変化 | MOD 側 |
 | --- | --- | --- |
@@ -124,9 +125,9 @@ Epic の `AppVersion` は
 > 上流の状態を `upstream:` 行に記録する。
 > 能動的に起こせないバグはこの形でしか判定できない。
 > ただし**「何を測ったか」を自分で検算させること**。
-> 最初の版は再注入で前回のラッパを測っていて（層を剥がすのは `ctx.wrap` の中＝控えより後）、
-> clamp 済みの関数はどの入力でも落ちないので誤判定した。
-> いまは `__original__` を最下層までたどり、剥がした層数と、
+> 再注入のときに控えた関数は、前回のラッパのことがある（層を剥がすのは `ctx.wrap` の中＝控えより後）。
+> clamp 済みの関数はどの入力でも落ちないので、それを測ると誤判定する。
+> `101_` は `__original__` を最下層までたどり、剥がした層数と、
 > 底にローダの印が残っていないかを併せて記録する。
 
 伏せる／残すの判断は、**セーブに残るものを書き換えるか**で分かれる。
@@ -175,39 +176,33 @@ Epic の `AppVersion` は
 
 ### 1.7 起動直後に注入したときの見え方（更新とは無関係）
 
-段階適用の途中経過が WARN として大量に出るので、更新で壊れたように見える。
+ゲームのモジュールがまだ揃っていないうちに注入すると、当たらない対象を保留にして、揃うたびに当て直す。
+その途中の `patches:` の数だけを見ると、更新で壊れたように見える。
 
-| 起動からの時間 | patches | 中身 |
-| --- | --- | --- |
-| 3秒 | 11 / 9 target / 9 mod | `__main__` がまだ空。`has no attribute 'InstantaleApp'` が大量に出る |
-| 9秒 | 47 / 35 / 20 | 一部のモジュールが import され、再適用 |
-| 85秒 | 137 / 93 / 26 | 満額 |
+見張り（`tools\watch.bat`）は窓が出るのを待ってから注入する。
+同じ日の起動3回とも次の3段で、間隔も件数もほぼ同じだった（MOD 111本）:
+
+| 注入からの時間 | patches | 保留 | 中身 |
+| --- | --- | --- | --- |
+| 0秒 | 288 / 210 target / 48 mod | 569 | `__main__` を組み立てている途中。保留のうち 400件が `__main__` の対象 |
+| 8秒 | 881 / 397 / 106 | 9 | 残りは画像生成のモジュール（`image_generation.*` / `scripts.image_processing.*`）の import 待ち |
+| 19秒 | 908 / 417 / 109 | 0 | 満額 |
 
 - **`boot complete: N/N mod(s) applied` は「掴めた」ことの証拠にならない**
   （`apply()` が例外を出さなければその数になる）。
   見るのは次の行の `patches: N applied on M target(s)`
 - 再注入は安全（`replacing a previous patch layer` が出て二重には掛からない）
-- `ERROR bgm restore: channel scan failed`（`mixer not initialized`）もこの状況で出る。
-  掃除が mixer 起動前に走っただけで、捕捉済み・処理は継続
 
-### 1.8 影響を確かめていないこと
+### 1.8 クラウド LLM 経路ではプロンプト系 MOD が素通りする
 
-- **クラウド LLM 経路ではプロンプト系 MOD が素通りする**（確定）。
-  経路はプロバイダごとの `request_llm_inference_*` で、`LlamaCppClient` を通らない（§2.12）。
-  `111_` は v4 でプロバイダ非依存の `llm_manager` 別名包みに置き換えて対処済み。
-  素通りの実害があるのは `103_` だけ（`quest_event_log` の肥大はマネージャ層で起きるのでクラウドでも育つ）。
-  `102_` は本体が直済み、`105_` の対象はローカル固有。
-  `301_` は `LlamaCppClient` を使っていないのでクラウドでも効く。
-  **1本の MOD の中で半分だけ効く形もありうる**（`llm_manager:quest_referee*` に仕掛けた側は効く）
-- 自由生成施設（`FreeFacilityManager`）の最中に `300_` の施設イベントが乗るか未確認。
-  どちらも「施設に入ったとき」に働くので二重に始まる余地がある（§2.5）
-- 四体以上の敵との戦闘を更新後に通していない。
-  公式修正が入った箇所なので `106_` / `107_` / `207_` と噛み合うかはこれから
-- サイドカーの多重起動抑止が三者競合（ゲーム自身の修正・`LlamaCppSidecar` の所有者調停・
-  InstantaleLLMProxy）になった（§2.12）
-- 装備強化の画面が `109_` と噛み合うか未確認（`upgrade_level` が詳細欄に出るなら文字量が増える）
-- `InventoryGrid.try_place_item` / `get_unique_items` は `108_` が掴む
-  `place_existing_item` とは別経路。強化画面のグリッドで同じはみ出しが起きるかは未確認
+経路はプロバイダごとの `request_llm_inference_*` で、`LlamaCppClient` を通らない（§2.12）。
+`111_` は v4 でプロバイダ非依存の `llm_manager` 別名包みに置き換えて対処済み。
+素通りの実害があるのは `103_` だけ（`quest_event_log` の肥大はマネージャ層で起きるのでクラウドでも育つ）。
+`102_` は本体が直済み、`105_` の対象はローカル固有。
+`301_` は `LlamaCppClient` を使っていないのでクラウドでも効く。
+**1本の MOD の中で半分だけ効く形もありうる**（`llm_manager:quest_referee*` に仕掛けた側は効く）。
+
+ゲームの更新で増えた経路のうち、まだ通していないものは VERIFICATION.md §3.74 に置く。
 
 ---
 
@@ -242,7 +237,10 @@ app.refresh_choice_buttons(reset_page=True)
 押されると `getattr(__main__, cls_name)(app, *args)` が組み立てられ
 `app.process_choice(それ, 文字列)` に渡る。
 押された添字は `display_button_map` で引き直される（`ui.pressed_entry` が同じことをする）。
-選択肢が1ページ（8枠）に収まらないときは最後の枠が `次` になり、`display_button_map` のその枠には添字ではなく文字列 `'next'` が入る（`206_` の記録: `['<int>'×7, 'next']`。`choice_button_page` は 0）。整数でない枠はボタンではないので `ui.pressed_entry` は None を返し、`次` の押下はどの MOD のログにも出ない（素通し。添字そのままに落ちて `buttons[7]` を引き、自前の一覧を出す MOD がページ送りを横取りしていた不具合は 直した。VERIFICATION.md §3.50）。2ページ目以降の枠の文字列（戻る側）は未実測。
+選択肢が1ページ（8枠）に収まらないときは最後の枠が `次` になり、`display_button_map` のその枠には添字ではなく文字列 `'next'` が入る（`206_` の記録: `['<int>'×7, 'next']`。`choice_button_page` は 0）。
+整数でない枠はボタンではないので `ui.pressed_entry` は None を返し、`次` の押下は素通しになる。
+添字のまま `buttons[7]` を引くと、自前の一覧を出す MOD がページ送りを横取りする（VERIFICATION.md §3.50）。
+2ページ目以降の枠の文字列（戻る側）は未実測。
 
 > `app.function_correspond_to_input` は名前に反して対応表ではなく `PhaseSpec` 1個。
 > 「いま自由入力を送ったら何を呼ぶか」を保持している。
@@ -298,6 +296,11 @@ app.refresh_choice_buttons(reset_page=True)
 
 いずれも `ui.Screen.apply_buttons` / `paint` に入っている。MOD 側で書き直さないこと。
 
+ロードも組み直さない。
+`game_variables["buttons"]` に焼かれている選択肢をそのまま戻すだけなので、
+保存の瞬間に選択肢が空だった画面はロードしても空のままで、そこから動けない。
+立ち位置を書き換える MOD は、その場所の選択肢も一緒に置く（TECH.md §5.8）。
+
 仲間欄も同じ構図で、`app.party` を書き換えただけでは変わらない。
 塗るのは `InstantaleApp.update_party_member(dt)` と `InstanTaleHUD.update_party_display(*args)` の
 2手（`ui.Screen.paint_party`）。
@@ -308,7 +311,7 @@ app.refresh_choice_buttons(reset_page=True)
 
 | 何 | どこ |
 | --- | --- |
-| 選択肢の文字 | `hud.buttons[i].text`（`app.to_display_buttons` とは別物）。枠数は 4 で固定 |
+| 選択肢の文字 | 左の `hud.buttons[i].text`（入れ物は `button_layout`）と右の `hud.right_buttons[i].text`（`right_button_layout`）。どちらも4枠で、合わせると §2.2 の1ページ8枠と数が合う（右の `right_buttons[0]` に `会話する` が入った実例がある。どの添字がどちらへ塗られるかは未実測）。`app.to_display_buttons` とは別物 |
 | 自由入力の可否 | `hud.text_send_button.disabled` |
 | 本文（情景描写・LLM の応答） | `hud.text_display`（`kivy.uix.label.Label`） |
 
@@ -350,7 +353,36 @@ app.refresh_choice_buttons(reset_page=True)
 | `app.text_input_disabled` | `False` のまま（＝これは機構ではない） |
 | `app.buttons`（spec の一覧） | 触らない。表示だけ差し替えるので後始末が要らない |
 
+**点を送っているのはゲーム自身**（`234_probe_busy_display` の実機、2026-09-25。宿屋の休養の待ち）。
+
+```text
+process_choice(...)                 is_button_enabled = False
+display_button_load(dt)  Clock      点を1コマ進めて to_display_buttons に書き、
+    → update_ui → hud.update_button_texts   塗って、約0.3秒後の自分を予約し直す
+    ...（0.3秒ごとに . → .. → ... ）
+finish_button_load（ワーカー）       is_button_enabled = True → refresh_choice_buttons
+display_button_load(dt)             True を見て今の一覧を塗り、予約しない（止まる）
+```
+
+- **待機中に `display_button_load` を呼ぶと、その呼び出しからも予約が始まる**。
+  呼んだ数だけ点送りが並んで回り、1回の周期に何コマも進む（点が飛ぶ）。
+  True に戻ったときは並んだ本数だけ塗って止まる（実機で4本が同じ1ミリ秒に止まった）
+- 点を書く先は `to_display_buttons` なので、待機の後は一覧を組み直すまで点が残る。
+  ゲームは待機の終わりに `refresh_choice_buttons` を呼んでから塗る
+- **次のコマは今の一覧の文字から決まる**（`.`→`..`→`...`→`.`、点でない文字の次は `.`）。
+  コマ数を数えているわけではない
+- **`process_choice` は旗を下ろして、自分で点送りを1本始める**。
+  別の点送りが回っているところで場面を起こすと2本になり、点が速く進む
+  （実機 2026-09-25。締めの場面の間だけ 0.1 秒刻みになった）
+- 待機を終えるときは、ワーカーで `is_button_enabled = True` → `refresh_choice_buttons` と進み、
+  **次のフレーム**で今の一覧を塗る。
+  そこを覆いたいなら、組んだその場（ワーカー）で旗を下ろし、一覧を点にしておく
+- 送信ボタンの無効・有効は `scripts.functions` の中から（`disable_text_send_button` /
+  `enable_text_send_button`）
+
 自前の処理でも同じものを出せる（`ui.Screen.busy_on` / `busy_off`）。
+ローダは旗を下ろし、点送りが回っていなければ1回だけ回し始める（自分ではコマを送らない）。
+枠に点が出ていればその点を一覧に書いておき、`start_phase` は回っている点送りを外してから起こす。
 
 画面の繋ぎ目を隠すのにも使える。
 会話を閉じてから次の画面を開くまでの間、`ConversationEndManager` の終了処理が
@@ -435,6 +467,22 @@ Clock で見張り、手が空いてから実行する（`ui.Screen.when_idle`�
 戦闘・会話中かを見るフラグは6つ。
 `in_battle` / `in_boss_battle` / `in_colosseum_battle` /
 `in_conversation` / `in_free_input` / `in_action_in_conversation`。
+
+**いま見えている背景も焼かれる**（`game_variables["location_image"]` に絵のフルパス。実セーブで確認）。
+`location_image` は画面の背景そのもので、ゲームの背景替え（`change_background_image_*`）はこれを書き、後から `update_ui` が HUD の `update_image_source` で塗る（`234_probe_busy_display` 版2 の実機。呼び出しから塗りまで約2秒）。保存のあいだだけ書き換えて戻すと、そのたびに背景が切り替わって見える（`330_` の滞在で実機）。
+ロードはそれをそのまま出すので、立ち位置を書き換える MOD は絵も一緒に替える（TECH.md §5.8）。
+
+ゲームの施設なら、この絵は立ち位置と揃っている。
+手元の7つのセーブで立ち位置の施設名と絵のフォルダ名を突き合わせたところ、
+素の施設に立っている5つは全て一致した（残る2つは入口と出口の対で、移動の途中の保存）。
+実行時に足した施設（`mod:` の id）では更新されない。
+`331_` の道場の中で保存したセーブの絵は、繋ぎ先の区画
+（素の `ward`）のままだった。
+画面に何が出ているかは別に測ること（この突き合わせはセーブの中身だけを見ている）。
+
+**`in_conversation` は真偽ではなく、話している相手の id が入る**（実セーブで確認。
+`game_variables.in_conversation` に NPC の id が焼かれていた）。真偽として読むぶんには困らないが、
+**id を書き込む器**でもあるので、セーブに出したくない id を持つ MOD はここも掃除する（TECH.md §5.7）。
 
 移動が終わった瞬間は `MovePhaseManager.move_phase` の**復帰後**。
 情景描写（`llm_manager:narrator`）は `move_phase` の内側で呼ばれる。
@@ -609,10 +657,10 @@ app.world_dict['quests']  {id: dict}                 世界の雛形
 
 新規 id の検出は両者の合併を取る（どちらに登録されるかを決め打ちしない）。
 
-#### 2.9.1 `world_dict` はセーブの中身ではなく世界の雛形（訂正）
+#### 2.9.1 `world_dict` はセーブの中身ではなく世界の雛形
 
-以前ここには「`world_dict['quests']` がセーブに出るほう」「書くときは必ず両方」と
-書いてあった。どちらも実測に反する。
+セーブに出るのは `app.world.quests` の側で、`world_dict['quests']` ではない。
+依頼を書くときに両方へ書く必要も無い。
 
 | | 中身 | 書き出し先 |
 | --- | --- | --- |
@@ -783,11 +831,11 @@ QuestEventManager(app, event_name, enemies_info, event_turn)
 
 戦闘終了マネージャは3つあり、経路によって挙動が違う。
 
-| マネージャ | 入口 | `end_phase` 完了時の `in_battle` |
+| マネージャ | 入口 | `end_phase` 完了時 |
 | --- | --- | --- |
-| `BattleEndManager` | 通常の戦闘 | 0（ゲーム自身が下ろす） |
-| `BattleEndInFreeAction` | 自由入力・会話から入った戦闘 | 1（下ろし忘れ。main_024 で解消） |
-| `BattleEndInColosseum` | コロシアム | - |
+| `BattleEndManager` | 通常の戦闘と、**闘技場からの撤退** | `in_battle` は 0（ゲーム自身が下ろす）。`in_colosseum_battle` は**1のまま** |
+| `BattleEndInFreeAction` | 自由入力・会話から入った戦闘 | `in_battle` が 1（下ろし忘れ。main_024 で解消） |
+| `BattleEndInColosseum` | 闘技場で勝ったとき | 両方 0（ゲーム自身が下ろす） |
 
 `in_battle` はセーブに入り、ロード時の分岐に使われる
 （`instantale.py:1458` が戦闘BGM、`:1460` がエリアBGM）。
@@ -796,7 +844,75 @@ MOD 側でも「戦闘中は出さない」条件に使われるので、残骸�
 残骸かどうかは `app.current_enemy_dict` が空かで見分ける。
 
 `in_boss_battle` はボス戦の後の戦闘（闘技場）で 0 に戻っていた（1回観測。`322_` のログ）。
-`in_colosseum_battle` の 1→0 は未観測。
+`in_colosseum_battle` は `BattleEndInColosseum.execute` の後始末で `in_battle` と一緒に 0 に戻る
+（`331_` の闘技場での試合。`322_` のログで2秒差）。
+**ただし戻るのは勝ったときだけで、撤退すると立ったまま残る**（`233_probe_colosseum` の実機。
+撤退は `BattleEndManager(end_type='escaped')` を通り、そこでは誰も下ろさない）。
+`BattleEndManager(app, end_type)` の `end_type` で観測できている値は
+`'won'`（通常の戦闘・ボス戦に勝ったとき）と `'escaped'`（逃げたとき）の2つ。
+どちらも呼び出し元は `BattlePhaseManager.check_battle_end`。
+
+残ると次の戦闘を巻き込む。**その戦闘の終わりにゲームが `BattleEndInColosseum` を選び**、
+闘技場に立っていないので施設の `config` に `current_phase` が無く、
+`KeyError: 'current_phase'`（`instantale.py:8070`）でワーカースレッドが死ぬ
+（画面は待機表示のまま止まる）。実測の並びは
+「闘技場で撤退 → 依頼の戦闘の `battle_start` に `in_colosseum_battle=1` → その戦闘の終わりで例外」。
+`107_fix_battle_flag_stuck` がこの旗も下ろす（版2）。
+
+#### 逃げたときと倒れたとき（主人公の一覧と終わり方）
+
+`233_probe_colosseum` 版3 の実機で、`check_battle_end` と `BattleEndManager.execute` の前後の app を比べた
+（`331_` の闘技場。ゲーム自身の逃走と、`334_colosseum_custom` が負けを逃走扱いで切り上げた回）。
+
+| 段 | 逃げたとき | 倒れたとき |
+|---|---|---|
+| 主人公が一覧から外れる | `resolve_battle_effect`（`instantale.py:7329`）の `remove_party_member('player')`。外した主人公は `app.escaped_member_in_battle` に預ける | `check_character_death`（`instantale.py:7361`）の `remove_party_member('player')`。どこにも預けない |
+| `check_battle_end` の中 | 敵の一覧を空にし（`current_enemy_dict` 1 → 0）、敵を消す演出を1つ予約する（`fade_effect_cue` 0 → 1）。`BattleEndManager(app, 'escaped')` を作り（`instantale.py:7817`）、`True` を返す | `GameOverManager` を作る |
+| 判定の後 | `BattlePhaseManager.battle` が終わり方を実行する。その中で預かりを一覧へ戻す（`app.party` 0 → 1、預かり 1 → 0）。旗 `in_battle` は下りる（`in_colosseum_battle` は上の表のとおり残る） | ゲームオーバー |
+
+- `app.party` は鍵が `'player'` と仲間の id の辞書（実機のログで `['player', '78']` など）。
+  `app.escaped_member_in_battle` も辞書で、値は `Character`（`{'player': 'Character'}` を実測）。
+  セーブの `game_variables` では `escaped_member_in_battle` は配列、`party` は id の配列になる。
+- `check_battle_end` が `True` を返すと `battle` は戦闘の繰り返しを抜ける。
+  `None` を返すと抜けず、敵の次の手（継続効果など）を処理しに行く。
+  一覧から消えた敵を引くと `KeyError`（`resolve_opponents`、`instantale.py:7266`）でワーカースレッドが死ぬ。
+- 敵の一覧が残ったまま戦闘の欄が畳まれると（大きさ 0）、その後に走る敵の欄の更新が
+  `ZeroDivisionError`（`scripts/hud/new_hud.py:2306` の `update_enemy_display`）でゲームごと落ちる。
+  ゲーム自身の逃走は判定の中で敵を先に空にするので、この更新は欄が畳まれる前に済む。
+- 倒れた仲間も同じく `check_character_death` で一覧から外されるだけで、預けられない。
+  一覧に居る仲間は主人公と一緒に動くので、もともと居場所（`location` の area / node / facility）を持たない
+  （戦闘の前の控えでも、一覧に居る仲間の居場所はすべて None だった）。
+  その状態のまま一覧から外されるので、戦闘の後は世界のどこにも立たず、会話にも呼び出しにも出ない
+  （セーブでは体力が負のまま、居場所がすべて None、一覧にも居ない。`state` は空のまま）。
+  死亡の印は付かず、居なくなるのは一覧から外れて居場所が無いことの結果。
+- 倒れた主人公を戻さずに終わり方だけを起こすと、主人公が一覧に居ないまま場所の画面に戻る。
+  画面の右の欄が空になり、HUD の防御が 0・経験値が負で表示された。
+  敵も一覧に残るので、`modfacility` は「ゲームが忙しい」と見て 331 の建物に出口を足さない。
+
+- 逃げる手で審判が逃走と一緒に敵へダメージを付けることがある（実機。`extreme` の `instant_damage`）。
+  その一撃で敵が倒れると、判定は逃走より先に全滅を見て `'won'` になり、勝ちの終わり方（`BattleEndInColosseum`）へ進む。
+  勝ちの終わり方は預かりを一覧へ戻さないので、逃げた主人公は一覧に居ないまま画面から消え、そのままセーブに焼かれる
+  （一覧 `['88']`・預かり `['player']`）。`107_fix_battle_flag_stuck` 版4 が戦闘の終わりとロードの直後に戻す。
+
+MOD が負けを逃走扱いで終わらせるなら、判定の外から終わり方を起こす前にこの状態を揃える
+（敵の一覧を空にし、外された主人公を預かりに入れて、戻すのはゲームに任せる。`334_` の `prepare_escape`）。
+
+#### 戦闘の最中のセーブ
+
+戦闘の最中にも保存できる。セーブの `game_variables` に
+`in_battle`（`"normal"` のような戦闘の種類の文字列）・`in_colosseum_battle`・
+`current_enemy_data`（敵）・`buttons`（`攻撃` など）が入る。
+ロードの後の画面は、戦闘のボタンが戻る回と、場所のボタン（移動など）が出る回の2通りを実機で見た。
+どちらの回でも、セーブの敵は `current_enemy_dict` に戻る。
+なので残骸かどうかを敵の有無では見分けられない。ロードの直後は、並んだボタンのクラスで見分ける
+（`BattlePhaseManager` / `SkillChoicePhaseManager` / `UtteranceChoiceInBattleManager` / `CancelBattleActionManager`）。
+
+| ロードの後 | 旗を下ろすと | 旗を残すと |
+|---|---|---|
+| 戦闘のボタン | 戦闘の欄が畳まれたままボタンだけが残り、攻撃した後に上の `ZeroDivisionError` で落ちた | 戦闘の続き |
+| 場所のボタン | 普段どおり（残った敵も空にする） | 旗と敵を残したまま依頼を始め、闘技場の相手と依頼の敵が1つの戦闘に混ざった |
+
+`107_fix_battle_flag_stuck` 版3 はこの見分けで、戦闘の画面に戻ったときだけ旗を残す。
 
 #### 1手ぶんの内訳（`BattlePhaseManager`）
 
@@ -817,7 +933,7 @@ check_battle_end / enemy_delete_animation / convert_llm_output_to_instruction_di
 - 1手で複数の敵に当たる手がある（スキル）
 - 倒れた敵は1手の中で `current_enemy_dict` から抜ける。
   1手の前後で敵の状態を比べる MOD は、この抜けた敵を別に拾わないと取りこぼす
-  （`308_` が実機1回目でとどめの一撃を落とした原因）
+  （`308_` がとどめの一撃を取りこぼした原因）
 
 > 入れ子の順序（`calculate` → `resolve` → `process`）は署名から読んだだけで実測していない。
 > `308_` はこの順序に寄りかからない形（1手の外側で HP の差を測る）にしてある。
@@ -833,8 +949,8 @@ check_battle_end / enemy_delete_animation / convert_llm_output_to_instruction_di
 | プレイヤー | `app.player` |
 | 同行者 | 名簿の id から `world.characters`（§2.8） |
 
-`Character` 側は `current_hp` / `physical_integrity` / `max_physical_integrity`（実測）。
-最大 HP は `update_max_hp()` があることから `max_hp` と推測しているだけで未実測。
+`Character` 側は `current_hp` / `max_hp` / `physical_integrity` / `max_physical_integrity`（実測）。
+`max_hp` は耐久から決まる（§2.10.4）。
 
 #### 2.10.1 戦闘の審判 LLM の語彙（output_data の実記録より）
 
@@ -899,15 +1015,15 @@ resolve_battle_effect                      防御を引いて HP に当てる
   `get_base_damage_value` が `statistics.geometric_mean` を呼ぶ
   （0 を渡すと StatisticsError。実測 390・500 → 883.176 = 2×√(390×500) が一致）
 - プレイヤー（能力値オール30・武器500）の実引数は毎手 (390, 500) で不動。
-  390 = 13×30 と読めるが、このキャラは全能力30なので**どの能力かは切り分け不能**
+  390 は `Character.attack_power`（筋力 × レベル係数。§2.10.4）
 - **`get_base_damage_value` を通るのはプレイヤーの手だけ**。
   敵も同行の仲間も通らない（VERIFICATION_LOG.md §2.68 / §2.69。仲間の全手が `base=-`）。
   これは仕様。**NPC は武器を参照しない旨、公式の回答がある**
   （過去の問い合わせへの返答。実測と一致するのでここに残す。
   この文書で実測でない出どころはこの1件）。
-  NPC の素点（weak 194〜489 など）がどこから来るかは未計測（武器でないことだけ確定）
-- power × multiplier は基礎値に対し weak×1.5 で ×0.92〜1.08、normal×1 で ×1.24 を観測。
-  同じ組でも ±10% ほど散る（素点側に乱数がある）。表を出すには通り数が足りない
+  NPC の素点は 2 × `attack_power`（魔法は `magic_power`）× 裁きの係数（§2.10.4）
+- 裁きの係数は power だけで決まり、`multiplier` はこの段の素点に入らない（§2.10.4）。
+  同じ組でも ±5% ほど散る（素点側に乱数がある）
 
 ##### 防御（`get_instant_damage(attack, defense)`）
 
@@ -917,10 +1033,9 @@ resolve_battle_effect                      防御を引いて HP に当てる
 | --- | --- | --- |
 | ダメージ | **attack − defense**（正確に一致） | 緩い曲線で 1 まで落ちる。attack=defense で ≈0.29×attack |
 
-- 敵の防御は `get_npc_defense()`（レベル36で 96〜139。能力値との式は未特定）
-- 味方の防御に渡った実値は 500 ＝ 防具の`防御力`と読める
-  （`get_npc_defense(プレイヤー)` は 390 で、使われたのは 500 のほう。
-  装備を変えた切り分けは未実測）
+- 敵の防御は `get_npc_defense()`（6能力値の平均 × レベル係数。§2.10.4）
+- プレイヤーの防御に渡るのは防具の`防御力`（500 の防具で 500、123 の防具で 123。
+  `get_npc_defense()` の値は使われない）
 
 ##### 大味さの実体（この帯の実測）
 
@@ -946,7 +1061,7 @@ LLM の power の選択は extreme の端でしか意味を持たない。
 
 #### 2.10.3 審判は実際に何を出しているか（記録2869件の集計）
 
-`output_data` に溜まった審判の記録を全部数えた（2026-09-09。集計の手順は
+`output_data` に溜まった審判の記録を全部数えた（集計の手順は
 VERIFICATION_LOG.md §2.85）。
 §2.10.1 が「何を出せるか」（スキーマ）、ここが「何を出したか」（分布）。
 
@@ -1025,6 +1140,114 @@ increase の small と medium が付いた手は**素より低い**ので、
 （開始直後 1.66・n=592、序盤 1.53・n=246、中盤 1.31・n=35）。
 どちらも端のサンプルが少ないので傾きの形までは言えない。
 
+#### 2.10.4 戦闘の値の出どころ（`236_probe_enemy_stats` で実測）
+
+敵・仲間・プレイヤーは、HP・攻撃・防御を同じ式で持つ。
+どれも「能力値 × レベル係数」で、レベルは係数にだけ効く。
+
+```text
+m = (レベル + 5) ÷ 5                     レベル係数（Lv21 で 5.2、Lv47 で 10.4、Lv60 で 13）
+
+max_hp            = 耐久 × 4 × m
+attack_power      = 筋力 × m
+magic_power       = 知力 × m
+get_npc_defense() = 6能力値の平均 × m     = get_attribute_average() × m
+```
+
+- 敵15体・仲間2人・プレイヤー1人（Lv21〜74）が、四捨五入の範囲（HP は ±2）で全員この式に乗った
+- `Character.defense` という項目もあるが、観測した全員が 0。防御に使われるのは `get_npc_defense()`
+- 能力値はレベルアップでは上がらない。
+  プレイヤーの能力値はキャラクタ作成で決まり、上がるのは訓練所での訓練だけ
+  （実セーブの Lv1 は 筋力 16〜17・耐久 15〜16・平均 12.5〜13.2）
+
+##### 敵の能力値（段と型）
+
+敵の能力値は、段ごとの基準点を型で振り分けて作る。
+
+```text
+get_enemy_attributes_base_point(段, 難易度)  -> 基準点
+get_character_attributes(基準点, 型)         -> 6能力値
+```
+
+| 段 | 基準点（難易度 20） | 基準点（難易度 46） |
+| --- | --- | --- |
+| `normal`（雑魚） | 11.37 | 12.34 |
+| `miniboss`（中ボス） | 13.37 | 14.50 |
+| `boss`（ボス） | 16.52 | 17.92 |
+
+- 敵のレベルは難易度 + 1（§2.20 の表と同じ）
+- 基準点は難易度でほとんど伸びない。敵が強くなるのは主にレベル係数 m の側
+- 観測した型は `balanced`（雑魚）、`tank` / `striker`（中ボス）、`striker` / `juggernaut`（ボス）。
+  型は能力値の振り分けを変える（`tank` は耐久が突出、`juggernaut` は筋力と耐久がともに高い）
+- 同じレベルの敵でも HP・攻撃・防御が別々に散るのは、段と型による能力値の差
+  （Lv77 の既存の記録で、素点は 2.3 倍、HP は 1.9 倍、防御は 1.6 倍の開き）
+- NPC の生成でも `get_npc_attributes(値)` が基準点を出し、`get_character_attributes(基準点, 型)` が振り分ける
+  （観測1件。型 `scout`）
+
+##### 素点（`calculate_battle_effect`）
+
+```text
+NPC（敵・仲間）の物理   2 × attack_power × k
+NPC（敵・仲間）の魔法   2 × magic_power × k
+プレイヤーの物理        2 × √(attack_power × 武器の攻撃力) × k   （get_base_damage_value）
+プレイヤーの魔法        2 × √(magic_power × 武器の攻撃力) × k
+```
+
+| 裁き（power） | weak | normal | strong | very_strong | extreme |
+| --- | --- | --- | --- | --- | --- |
+| 係数 k | 1.0 | 1.2 | 1.5 | 約 1.95 | 約 2.45 |
+
+- 5人（敵3体・仲間2人）× 裁き5段 × 物理と魔法を、1通り3回ずつゲームに計算させて得た値（下の「測り方」）。
+  NPC の係数は5人とも同じ並びに乗った
+- プレイヤーの √ の形はゲーム自身の `get_base_damage_value`（`scripts\functions.py` の `statistics.geometric_mean`。§2.10.2）。
+  MOD が変えるのは渡る武器の値だけで、`333_equipment_slots` が入っていると両手の合算に差し替わる（両手に武器が無ければ素の値のまま）。
+  3版の実測は 333 入りで、プレイヤーの素点から逆算した武器は 892、その戦闘で渡った値は 900（差し替え無し）。
+  魔法の手にも同じ武器の値が渡る
+- 仲間も敵と同じ式で、武器は使わない（§2.10.2 の公式の回答と一致）
+- 物理か魔法かは、使う能力（`attack_power` か `magic_power`）が変わるだけ
+- 審判の `modifications` から畳まれる `multiplier`（2・0.67 など）は、この段の素点に入らない。
+  weak の倍率 2 と 0.67 の素点は、倍率 1 と同じだった。
+  次の `resolve_battle_effect` でも掛からない。この段が返した素点が、そのまま `get_instant_damage` の第1引数になる
+  （`236_` の記録で、戻りに素点のあった実際の手 38 回すべてで一致）。
+  つまり素のゲームでは `multiplier` はダメージに効いていない
+- 同じ相手に `instant_damage` が2本あると、戻りの `{相手: 素点}` は後の1本の素点で上書きされる。
+  weak×2 と extreme の組は、extreme 1本の素点（基礎値 1185 に対し 2592〜3127）だった。
+  前の1本はダメージに効かない
+- 揺らぎは1通り3回の幅で平均の 9.8%（中央）、最大 19%。±5% 前後の乱数
+- 戻り値は8つの枠の並びで、ダメージは1つ目の枠に `{相手の名前: 素点}` で入る。
+  残りの枠は `instant_heal` など他の鍵に対応すると見られる（ダメージの手しか観測していない）
+- この段は HP も状態異常も `battle_action` も動かさない（実際の手 18 回で確認）。
+  HP に当たるのは次の `resolve_battle_effect` だけ
+
+##### スキルの使用回数
+
+スキルは `Character.skills` に `{名前: {..., "current_uses": 残り, "max_uses": 上限}}` で入る
+（逃げるは `-1 / -1` で上限なし）。ゲームは使うたびに残りを減らす。
+`236_` の戦闘開始の記録（2日・25回）で分かったこと:
+
+- **NPC（仲間と敵）は使い切っても止まらない**。残りがマイナスのスキルもそのまま審判（`referee_npc`）の
+  一覧に `uses_left: -23` のように載り、審判はそれを選び続ける。
+  仲間の自己強化が 5 回の上限に対し −23、ボスの全体弱体が 2 回に対し −2 まで減った
+- **仲間の残りはゲームが戻さない**。クエストの終わりをまたいでも、宿屋の休養を2回挟んでも減り続けた
+- **プレイヤーの残りは戻る**。3/4 だった回数が、クエストの終わりから宿屋の休養までの間に 4/4 へ戻っていた
+  （どちらで戻したかは切り分けていない）
+- 通常攻撃（`16 / 16`）の残りは、仲間も敵も一度も減っていなかった
+- **スキルの強化・弱体（`type: buff` / `debuff`）は数に落ちない**。
+  変換後の `battle_action` に現れる鍵は `instant_damage` / `instant_heal` / `text_status` / `escape_from_battle` / `other_action` だけで、
+  `222_` の記録の 990 手に強化・弱体の入れ物は一度も無かった（審判の追加効果の `AttributeEffect` と同じ。§2.10.2）。
+  同じ 990 手の前後の差分で動いた項目は `current_hp` / 場への出入り / `status` / `equipments` だけで、`ability_scores` は一度も動いていない。
+  それでも NPC の審判の記録 344 件のうち、強化 84 件・弱体 53 件（4割）がこうしたスキルを選んでいた
+
+`137_fix_npc_skill_uses` が、使い切ったスキルと効果の続いている強化・弱体を審判から隠し、仲間の回数を休養で戻す。
+スキルの強化・弱体を状態異常として効かせるのは `319_battle_tactics`。
+
+##### 測り方
+
+`236_probe_enemy_stats` の設定「素点の試し打ち」を ON にすると、戦闘の開始で
+全員について `instant_damage` を1本だけ持つ行動を作り、ゲームの `calculate_battle_effect` に渡して素点を録る。
+`BattlePhaseManager` は空の実体に `app` だけ持たせて呼べた。
+呼ぶ前後で全員の HP と状態異常を比べ、変わらなかった（`dry_abort` は出ていない）。
+
 ##### 記録に残らないもの
 
 **自由入力の入力文そのものは残っていない**。
@@ -1059,6 +1282,27 @@ apply_music_volume(app)         main_023 で追加
 
 止められなくなった曲は、止めずに `app.music` へ入れ直すと音が途切れず、
 しかも以後ゲーム自身の `stop_music` が効くようになる。
+
+#### 効果音（`235_probe_sound_effects` で実測）
+
+効果音は2通りで鳴る。
+
+```text
+play_sound(app, 名前)              起動時に読んだ `SoundManager.sounds` の鍵。戦闘の '斬撃' / 'ダメージ1' / 'ダメージ3' など
+play_sound_from_src(app, パス)     'Assets/sounds/sounds/ui/拠点/移動(屋外-屋内).wav' / '購入.wav' /
+                                   'ui/クエスト/戦闘開始(雑魚).wav' など、画面の操作の音
+```
+
+装備の音は `ui/常時/装備する.wav` と `ui/常時/装備を外す.wav`（`play_sound_from_src`）で、
+`ItemEquipManager.equip_item` / `ItemUnequipManager.unequip_item` を1回呼ぶたびに1回鳴る。
+所持品の窓を開く音は `ui/常時/アイコン_鞄.wav`。
+
+どちらも**呼んだ関数の中では鳴らさず、Clock に預けた lambda からメインスレッドで鳴らす**
+（呼び出し元は `<lambda> (instantale.py:7237)` ← `post_idle`）。
+戦闘の手はワーカースレッドで走り、その手の効果音は数百ミリ秒遅れてメインスレッドで鳴る。
+したがって「ある関数を呼んでいる間だけ音を止める」ような包みでは止まらない。
+鳴らしたくない音は、音の元になる呼び出し（装備なら `ItemEquipManager.equip_item`）をしないことで止める
+（`333_` の版20）。
 
 #### エリアBGM
 
@@ -1106,6 +1350,91 @@ apply_music_volume(app)         main_023 で追加
 | 衛兵 | `in_battle=1` | `'guard'`（§2.20） |
 
 （2戦＋7戦。`322_battle_bgm` の `[BGMPICK]` の行）
+
+闘技場の相手は `scripts.llm.llm_manager:colosseum_enemy_generator(location, area, world, npc_difficulty_level)` が作り、
+施設の `config` に `current_phase` と `enemy_data`（相手の素、鍵は `"0"` / `"2"` / `"4"` …）として貯まる。
+頼み文は 世界観 / エリア名と概要 / 施設名と概要（`location` の `name` と `description`） / 強さのランク の4つだけで、
+**前に出た相手は載らない**（`output_data\...\colosseum_enemy_generator\N.json`）。
+同じ施設で同じ人物に収束することがある（`331_` の闘技場で4試合とも同じ名。あちらは既出の名を概要に足して避けている）。
+
+**相手のランクはその土地の依頼の難易度から決まる**（`233_probe_colosseum` の実機。4つの闘技場・16点が一致）。
+
+    rank(n) = round(D * (9 + 4n) / 18)     D = その土地の依頼の難易度、n = current_phase / 2
+
+初戦は D の半分で、1試合ごとに D の 2/9 ずつ増える。**頭打ちは無い**。
+
+| 闘技場 | D | ランク（`current_phase` 0, 2, 4 …） |
+| --- | --- | --- |
+| 素の闘技場 A | 29 | 14 / 21 / 27 |
+| `331_` が建てた闘技場 | 60 | 30 / 43 / 57 / 70 / 83 / 97 |
+| 素の闘技場 B | 61 | 30 / 44 |
+| 以前に採った闘技場 | 70 | 35 / 51 / 66 / 82 / 97 |
+
+`D` は `get_quest_difficulties(area, world)` が返す一覧の**平均を四捨五入した値**
+（店の品揃えと同じ源。§2.13.1.1）。4つの闘技場で一致し、中央値では合わない。
+
+| 土地の難易度の一覧 | 平均 | 中央値 | `D` | ランクの実測 |
+|---|---|---|---|---|
+| 61 / 60 / 62 | 61.00 | 61 | 61 | 30 / 44 / 58 |
+| 63 / 61 / 57 | 60.33 | 61 | 60 | 30 / 43 / 57 / 70 / 83 / 97 |
+| 72 / 70 / 66 | 69.33 | 70 | 69 | 34 / 50 |
+| 28 / 34 / 33 | 31.67 | 33 | 32 | 16 / 23 / 30 / 37 |
+
+切り捨てと四捨五入を分けたのは4つ目の土地で、切り捨ての 31 なら 16 / 22 / 29 / 36 になる。
+**プレイヤーのレベルには依らない**（レベル1の主人公でも 30 で始まった）。
+頼み文の中の説明ではランク1が雑魚、**ランク70が「歴史に名を残す勇者や魔王、神の化身に値するほどの強者」**なので、
+D が 60 を超える土地では5〜6試合目にその上へ出る。
+
+ゲームは決めた格を**3か所で別々に使う**。
+
+| 使い道 | どこ |
+|---|---|
+| 頼み文に載せる | `colosseum_enemy_generator` の第4引数 |
+| 施設に焼く | `config.enemy_data.<phase>.data.rank`（LLM の応答に `rank` は無い） |
+| 相手の数値を作る | `scripts.functions:get_enemy_exp_lvl` / `get_enemy_attributes_base_point` の第2引数（§2.20） |
+
+**頼み文の値だけを書き換えても相手は弱くならない**（`334_colosseum_custom` 版1の実機）。
+上限70を当てて頼み文を 71 → 70 / 85 → 70 に下げたが、
+敵のレベルは 72 と 86 のまま、焼かれた `data.rank` も 71 / 85 のままで、
+懸賞金も焼かれた格のほうで決まった（同じ回で 426 と 452 と別々の額）。
+強さを動かすなら3か所とも揃える。
+敵のレベルは `格 + 1`、HP は同じ格でもばらつく（rank 44 で 440 と 640）。
+採った場所は `state\modfacility\<世界×主人公>.json` の `snapshot.config.enemy_data.<phase>.data.rank` と、
+`output_data\...\colosseum_enemy_generator\N.json` の頼み文末尾の「相手のランク」。
+これはゲーム自身が決める値で、`331_facility_investment` は難易度に何も渡していない。
+
+試合の終わり方は3つあり、`current_phase` の動きが違う（`233_` の実機）。
+
+| 終わり方 | 通る道 | `current_phase` |
+| --- | --- | --- |
+| 勝ち | `BattleEndInColosseum.execute` → `end_phase` → `colosseum_battle_summarizer` | +2 |
+| 逃げ | `BattleEndManager.end_phase`（`BattleEndInColosseum` は来ない） | 据え置き。次に申し込むと同じランクの相手が作り直される |
+| 負け | `check_character_death` → `GameOverManager`（`in_colosseum_battle` は立ったまま） | ゲームオーバー |
+
+報酬は勝ったときだけで、`end_phase` の中で所持金に入る
+（`BattleEndInColosseum.execute` → `instantale.py:8105`、ワーカースレッド。Clock 待ちではない）。
+額に**乱数は乗っていない**
+（同じ闘技場・同じランク58で、セーブ → 勝つ → ロード → 勝つ を実機で通し、
+相手の名前が変わっても2回とも 359）。
+ただし**ランクだけでは決まらない**。ランク30 は `D` 60 と 61 の初戦ではどちらも 173 だったが、
+`D` 32 の3試合目では 177 だった。
+
+| `D` | 試合（`n`） | ランク → 額 |
+|---|---|---|
+| 32 | 0 / 1 / 2 / 3 | 16 → 133 / 23 → 154 / 30 → 177 / 37 → 244 |
+| 60・61 | 0 / 1 / 2 / 3 / 4 / 5 | 30 → 173 / 43 → 282・44 → 288 / 58 → 359 / 71 → 426 / 85 → 452 / 97 → 454 |
+| 69 | 0 / 1 / 2 / 3 / 4 / 5 | 34 → 211 / 50 → 317 / 65 → 393 / 80 → 450 / 96 → 452 / 111 → 454 |
+
+**額は施設に焼いた `data.rank` からは決まらない**（`334_colosseum_custom` の実機）。
+上限で `data.rank` を下げた試合でも、ゲーム自身が計算したランクの額が出た
+（`D` 69 の3試合目でランク 65 を 40 に下げても 393、2試合目で 50 を 40 に下げても 317）。
+ゲームは `D` と `n` から額を別に計算していると見られるが、式は当てていない。
+伸びは高いランクで鈍り、**ランク70を超えると頭打ちになる**（80 以上はどれも 450〜454）。
+単純な式（線形・対数・平方根・飽和型）はどれもランクの点に乗らないので、**式は未確定**。
+倍率で乗せるぶんには困らない（`334_colosseum_custom`）。
+参加費は取らない（受付の口上は「報酬は客の賭け具合で決まる」）。
+試合の要約は `colosseum_battle_summarizer` が作るが、
+`output_data` には `guard_battle_summarizer` の名前で落ちる（ゲーム側の取り違え）。
 
 `play_music_from_src` は絶対パスをそのまま受け付ける（ゲームのフォルダの外に置いた曲が鳴った）。
 `106_` の戦闘曲判定は `/musics/battle/` の部分一致なので、外に置く曲もそのフォルダ名の下に置けば戦闘曲として扱われる。
@@ -1311,9 +1640,9 @@ InstantaleApp.normalize_shop_inventory_prices(shop_obtainer, player_obtainer)
 ```
 
 - `execute` はワーカースレッドで走り、売買画面を開く `toggle_twin_inventory_window` は Clock でメインスレッドへ回す（`instantale.py:3208` の lambda）。
-  **メインスレッドは `execute` が戻る前にこれを走らせうる。**
+  メインスレッドは `execute` が戻る前にこれを走らせうる。
   `execute` の戻り際に主の持ち物の辞書へ触ると、`normalize_shop_inventory_prices`（`instantale.py:2660`。辞書を直に回す）と競合して
-  `RuntimeError: dictionary changed size during iteration` でゲームごと落ちる（2026-09-07 実機。VERIFICATION.md §3.52）。
+  `RuntimeError: dictionary changed size during iteration` でゲームごと落ちる（実機。VERIFICATION.md §3.52）。
   持ち物を触るなら `toggle_twin_inventory_window` の手前（同じスレッド、辞書を回す前）で
 - 主の持ち物はセーブの `npcs[<id>].inventory`。
   実セーブでは51人中8人だけが中身を持っていた（**中身を持っているのは店として開いた施設の主だけ**）
@@ -1470,6 +1799,22 @@ scripts.items:Item.__init__(self, name, item_type, attributes, description,
 `get_other_item_price` の3つで、**gold ではない**。
 gold に直すのは `get_item_base_price` と `get_randomized_item_price`。
 
+##### 武器の攻撃力は難易度から（`get_weapon_spec`）
+
+武器の `攻撃力` は `get_weapon_spec(難易度)` が作る（§2.13.1.2 の品揃えの経路）。
+`221_` / `225_` のログに残った呼び出し 108 件の、難易度の帯ごとの中央値:
+
+| 難易度 | 4 | 7.5 | 16.5 | 27.5 | 34 | 45 | 55 | 63 | 76 | 81.5 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `攻撃力` | 26 | 38.5 | 76.5 | 117 | 151 | 203 | 237 | 271 | 327.5 | 314.5 |
+
+- 同じ難易度でも1割ほど散る（難易度 76 の9件で 292〜353）
+- 76 まではほぼまっすぐ伸びる（1 あたり 4.3 前後）。77〜85 の4件は 300〜336 で、76 より強くならない
+- 渡る難易度は 70 を越える（85 まで観測）。スキーマの「1〜70」は LLM に見せる目盛りの説明で、ゲームの関数が切る値ではない。
+  値段の関数の定義域は 0..76（§3 の `get_npc_employ_price` の走査）で、`318_` の難易度の上限の既定もこれに合わせてある。
+  `get_weapon_spec` は 85 でも値を返した
+- 防具の `防御力` が同じ関数から作られるかは測っていない
+
 ##### 値段は `attributes` に書かれている
 
 **`買価` と `売価` は排他**で、どちらか一方しか書かれない（実セーブ151個で例外なし）。
@@ -1536,6 +1881,54 @@ ItemPopupMenu.on_consume_item          右クリックの「消費」
 `簡易寝台なら10G、個室なら100G、…高級個室も1000G`（3ヵ月単位の長期滞在、前払い）。
 比較用に、NPC の雇用は難易度76 で 5,045G。
 **アイテムの買価の上端（2,000G 台）より、宿の高級個室2部屋ぶんのほうが近い**という開きがある。
+
+#### 2.13.3 装備と装備欄
+
+`333_equipment_slots` を組むときに確かめたこと（VERIFICATION.md §3.70）。
+
+- 本体が読む装備は `equipments` の `weapon` と `wearable` の2つだけ。セーブの形は
+  `{"wearable": "item_2", "weapon": "item_0"}`（id の文字列）で、実行時は `Item` オブジェクト。
+  書いているのは `ItemPopupMenu` 側で、`Item.equip()` は書かない
+- 装備の種類は `attributes['item_detail']`（`weapon`: `small_weapon` / `medium_weapon` /
+  `long_weapon` / `large_weapon` / `throwable`、`wearable`: `shield` / `clothing` /
+  `body_armor` / `accessory` / `legwear` / `leg_armor` / `gauntlets` / `headgear`）。
+  `Item` に `sub_type` の属性は無く、`ITEM_TYPE_SUBTYPES` の語彙がここに写っている
+  （`leg_armor` と `legwear` は両方 `Data\item_embeddings\` に在る）
+- `ItemEquipManager` / `ItemUnequipManager` はロード時に1度だけ作られ（`223_` の記録: `__init__` が
+  ロード直後）、`execute` はそのとき束縛した参照で呼ばれる。だから `execute` をクラス属性で包んでも
+  popup からの呼び出しには届かない。`execute` はワーカースレッドで走り、所持品の窓を閉じる。
+  `equip_item` / `unequip_item` が HUD の Atk/Def を更新する
+- 本体の unequip は渡された品の種類の枠（`equipments[item_type]`）を無条件に落とす。
+  装備している品と別の品を外しても、その種類の枠ごと消える
+- 本体は仲間側（店の品も同じ）の品に popup を出さない。`ItemPopupMenu` を作るだけで親を付けない
+- `InventoryGrid(cols, rows, item_dict, obtainer, ...)` はマス（`InventorySlot`）だけを子に持つ
+  `GridLayout`。品（`InventoryItem`）はグリッドの親（窓の `FloatLayout`）に置かれ、
+  `item_dict` からは並べない（並べるのは HUD の toggle）。品を子にすると `GridLayoutException`
+- `InventoryGrid.place_existing_item(widget)` は `widget.item_instance.grid_pos = [x, 下から y]` の
+  位置に置く（ウィジェットの座標は見ない。同じフレームで置くとマスの位置がまだ無い）。
+  `is_valid_placement(grid_x, grid_y, w, h)` の `grid_y` も下から。
+  `current_slots` の添字は `grid_y * cols + grid_x`。マス 64px + 隙間 1px で、品の位置は grid.x ＋ 列 × 65 の
+  固定の単位（`InventorySlot` の大きさやグリッドの `size` を変えても追随しない）
+- `InventoryItem.on_touch_up`: まず落とす先のグリッドで `is_valid_placement` の下見（new_hud.py:924）。
+  通らなければ `try_place_item` を呼ばず、品を元の位置へ戻す。通れば `target.try_place_item(self, pos)`（:961）→
+  可否に関わらず `self.change_inventory(target)`（:962）。途中で `ItemUnequipManager.unequip_item` と
+  `ItemEquipManager.equip_item` を通す。`change_inventory` は移動元の `item_dict` から鍵を消し、移動先へ入れる
+  （元に無ければ KeyError）。断ったドロップの後の `equipments` に `healing_item` のような余計な鍵が残ることがある
+- `InventoryItem.get_all_inventories()` は HUD の `FloatLayout` の中の `InventoryGrid` を全部拾う
+  （MOD が足したものも）
+- 本体は持ち物の辞書を回している最中に `save_game` を呼ぶことがある（戦利品の窓を組む途中）
+- 右側の選択肢は `hud.right_buttons`（入れ物は `right_button_layout`）。所持品の窓を開くとき、本体は
+  左の `button_layout` を 0×0 に畳み、右は `right_button_layout.opacity` を 0 にするが、ボタンはそのまま描かれる
+- 画面上部の能力欄は `InstanTaleHUD.status_texts` の1本の文字列（`Atk:432(+500)`）。括弧の中が装備の値で、
+  `update_status_texts(instance, value)` の `value` を直せば描き変わる（`130_` と同じ口）。
+  見張りは文字列が変わったときだけ呼ばれる
+- 戦闘の数は `resolve_battle_effect` の中で `get_instant_damage(素点, 防御)` に落ちる。味方被弾の防御は
+  防具の防御力がそのまま、敵被弾の防御は直前の `get_npc_defense()` の値（§2.10.2）。
+  プレイヤーの火力は `get_base_damage_value(能力, 武器攻撃力)` で、通るのはプレイヤーの手だけ。
+  どちらも `scripts.functions` のモジュール関数で、包みが効く
+- 仲間の被弾の防御は `get_npc_defense(その仲間)`（本人のレベル由来の値。同行 3 人で 255・294・298 のように
+  人ごとに違い、日を追って上がる）。主人公だけ防具の防御力が渡る。`resolve_allies` の中で仲間ごとに
+  `get_npc_defense` が呼ばれる（`222_` の記録、仲間の被弾 160 件）。仲間の攻撃は `get_base_damage_value` を通らない
 
 ### 2.14 アイテム詳細ボックス
 
@@ -1698,6 +2091,14 @@ cipher[i]  = plaintext[i] ^ b"Instantale_Save_Key_2026"[i % 24]
 日付は世界に1つ（`world.days_elapsed`。セーブでは `world_data.days_elapsed`）。
 進めているのは `InstantaleApp.elapse_days(days)`（§2.18）。
 
+任意の保存は無い。
+ゲームは何か行動するたびに `save_game` でセーブを上書きする（実機で確認）。
+好きな時点のセーブを選んで戻る手段が無いので、`state\` に持つ控えとセーブが食い違うのは、
+控えを書いてから次の保存までの間にゲームが落ちたときだけになる。
+控えをセーブと揃えたい MOD は、`save_game` が戻った後で書き、
+`World.__init__`（ロードと新規開始）でまだ書いていない分を捨てる（`327_`）。
+`save_game` は書き終えてから戻る（前後で名簿を外して戻す `modnpc` の形が、保存に漏れず実機で通っている。§2.23）。
+
 ### 2.17 経験値・レベル・訓練
 
 ```text
@@ -1716,7 +2117,7 @@ Character.calculate_current_required_exp_on_display() / _gained_exp_on_display(g
 
 | キャラ | `point_use` | 合計 | 各値の幅 |
 | --- | --- | --- | --- |
-| テスト女性 / テスト男性 | 16 | 66 | 11 一律 |
+| 既定のまま作ったキャラ（2体） | 16 | 66 | 11 一律 |
 | 才能点を少し積んだキャラ | 31 | 71 | 9〜15 |
 | 才能点を大量に積んだキャラ | 300 | 142 | 18〜26 |
 
@@ -1725,7 +2126,7 @@ Character.calculate_current_required_exp_on_display() / _gained_exp_on_display(g
 セーブで見た上端は 30。
 
 > 能力値に閾値を置く調整は、9〜16 の側を基準にしないと新規キャラで一度も発火しない
-> （`313_` が実機1回目でこれを踏んだ）。
+> （`313_` がこれを踏んだ）。
 
 その他:
 
@@ -1765,10 +2166,13 @@ process_choice(VacationEndManager,   '宿泊を終える')
 - 部屋は4つ。`犬小屋(0G)`＝`'kennel'` / `簡易寝台(10G)`＝`'bunk'` /
   `個室(100G)`＝`'private_room'` / `高級個室(1000G)`＝`'luxury_suite'`。
 - `宿泊する(Nヵ月)` の月数はプレイヤーの年齢の変動式（若いと3ヵ月、最長6ヵ月）。
+  N は滞在の上限で、1回の長さではない。
+  部屋選びが渡す `VacationStartManager` の第1引数は常に 1（実機5回とも `init_args=['1', ...]`）。
+  MOD が N を渡すと N ヵ月分の暦と宿代が一度に動く（`331_` が踏んだ）。
   実測は 20代=3・31歳=4 の2点だけで、年齢ごとの境目は未実測
 - 日数と宿代は `VacationStartManager.execute` の中で1回ずつ動く。
   宿泊の開始時点で全期間ぶんが一度に進むので、途中の活動を何回挟んでも暦は動かない
-- 1泊＝活動1回。`out/vacation.jsonl` の宿泊 54 回（2026-08-18〜09-05）すべてが
+- 1泊＝活動1回。`out/vacation.jsonl` の宿泊 54 回すべてが
   `VacationStartManager` → 活動1回 → `VacationEndManager` で、活動2回に見える 5 回は社交
   （`VacationSocializeManager` と `...ResolveManager` の対）。
   宿代は活動1回の料金で、同時に暦を 30 日払っている（`327_` の土台）
@@ -1777,17 +2181,57 @@ process_choice(VacationEndManager,   '宿泊を終える')
 - LLM の描写のプロンプトは「このエリアで数ヵ月の宿泊をし」と月数を焼き込んでいる。
   宿泊の長さを変える MOD から見ると、
   ゲームの文言は月数を持つのに LLM 側は「数ヵ月」で固定される
+- **その頼み文に「どこに泊まったか」は入らない**（休養の `vacation_rest_overview_generator` も、
+  社交の場面の `vacation_scene_generator` も。実測）。
+  渡るのは上の一文と `【エリアの構造】`（そのエリアの全ロケーションの説明と NPC）だけで、
+  宿屋の名前も立ち位置も入らない。
+  素のゲームは街に泊まれる場所が宿屋しか無いので困らないが、
+  **MOD が泊まれる場所を足すと、読み手はそちらを選ぶことがある**
+  （`330_real_estate` の家で、同じ街の3回のうち2回。VERIFICATION.md §3.62）
 
 > 「いま訓練の中か」を `frames.MethodWatch` で見るときは、その `execute` が包まれていないかを気にする。
 > 包まれていると生の `__code__` はローダのラッパのもので、これは全パッチが共有するため誤爆する。
 > **ローダ側で塞いである**ので答えは正しくなるが、名前で見る予備の経路に落ちるので重い。
 > 自分で包むなら `MethodWatch` をやめて自分のラッパで印を立てる方が速い（TECH.md §6.3）。
 
+#### 訓練の流れ（実測、`231_probe_training`）
+
+```text
+process_choice(DisplayTrainingChoice, '訓練する')          args=['訓練']（training_type）
+    選択肢: 訓練を受ける(300G)   spec=TrainingStartManager args=[3, 300]   ← 年数3・代金300
+process_choice(TrainingStartManager, '訓練を受ける(300G)')
+    所持金 -300（代金はここ）。日数は進まない
+    「あと3年間。どうする？」
+    選択肢: ただ鍛える(1年) / 基礎を積む(2年) / 技を磨く(2年) / 新たな技を学ぶ(3年)
+            spec=TrainingPhaseManager args=[type, remaining_years, training_log]
+            type は 'simple' / 'fundamental' / 'train_skill' / 'learn_new_skill'
+process_choice(TrainingPhaseManager, '新たな技を学ぶ(3年)')
+    elapse_days(1095)    ← 3年 × 365日。この段の中で1回
+    残り 3-3=0 →「訓練を終えた。卒業だ...」
+同じ施設でもう一度                「十分に学んだ。これ以上ここで得るものはないだろう。」代金も日数も動かない
+```
+
+- **1年＝365日**（1095 ＝ 3×365。360 なら 1080）。進むのは各段の `TrainingPhaseManager.execute` の中で、
+  その活動の年数ぶんが1回で進む。`TrainingStartManager.execute` では進まない
+- 活動の年数はボタンの `(N年)` と `remaining_years` から。1年の活動は `elapse_days(365)`、2年は `elapse_days(730)`
+  （2回目の実測）。段を終えると `remaining_years` が減り（3 → 2）、
+  **残り年数に収まる活動だけが並ぶ**（残り2年では 1年・2年の2つ）。`training_log` には前の段の文
+  （`一年間、ひたすら鍛錬した。0の経験値を得た。`）が渡る
+- 代金は **300 で固定**。年数は修行内容の選択肢で決まる（1年・2年・3年。本人の知識）。
+  `TrainingStartManager` の args の 3 は開始時の残り年数（`remaining_years`）で、
+  施設は `331_facility_investment` の `training_facility`（道場）。331 は年数も代金も書いていない。
+  開始時の年数が施設や等級で変わるかは未計測（観測は 331 の道場2軒、どちらも3年。素の施設は未観測）
+- 同じ施設では、卒業した直後の2回目も断られる（「十分に学んだ。」レベル60でも、新しい主人公でも同じ）。
+  卒業前に途中で出て戻れるかは未計測
+- ローダの `durations.TRAINING` はこの暦（1年の日数と活動ごとの年数）だけを持つ（TECH.md §3.3.2）。
+  当てているのは `332_training_custom`（代金・修行の量・1段の期間）。
+  活動ごとの年数と残り年数の減り方は引数に出てこないので、MOD からは触れない
+
 ### 2.18 エリア移動（土地から土地へ）
 
 ```python
 process_choice(DisplayAreaMoveChoice, '他の土地へ行く')
-process_choice(AreaMoveCofirmation,   '陽光の砦')
+process_choice(AreaMoveCofirmation,   '<エリア名>')
 process_choice(AreaMoveManager,       '馬車(1000G)' / '徒歩(3ヵ月)')
 ```
 
@@ -1917,6 +2361,37 @@ app.buttons      = ['労働の募集をみる', '市民権の発行', '出る', 
 - **手配を解く選択肢は素のゲームには無い**（`309_` と二重にならない）
 - `出る` が `会話する` より前に来る。
   施設の選択肢は「操作 → 退出」の順とは限らないので、位置を文字列や並び順で決め打ちしない
+- **宿屋だけ `出る` が先頭に来る**。
+  同じ記録で店は `売買する / 出る / 会話する`、鍛冶屋は `装備の強化 / 出る / 会話する`、
+  役場は上のとおりだが、宿屋は `出る / 宿泊する(Nヵ月) / 会話する` になる。
+  残っている宿屋の記録は5軒・全件がこの並びで、例外が無い。
+  **MOD を1つも当てない状態でも同じ**（本人が実機で確認。ゲームを入れ直しても同じ）ので、原因はゲームの側にある。
+  `Facility.choices` を触っている MOD は1本も無く、画面を組むときに生まれる `PhaseSpec` は
+  `DisplayVacationChoice` と `DisplayTalkChoice` の2つだけで `MovePhaseManager` は含まれない
+  （出るは施設が元から持っている選択肢）。
+  `315_vacation_custom` の宿泊期間を素の3ヵ月に戻しても変わらない（直接試した）
+- **セーブの `game_variables["buttons"]` を手で並べ替えると、その並びでロードされる**
+  （実際にやって確認）。
+  ロードが終わった最初の描画は手で直した `宿泊する(1週間) / 出る / 会話する` で出た。
+  ロードが選択肢を組み直さず焼かれたものを戻すだけであること（§2.3）の裏取りになる。
+  **ただし直るのはその1画面だけ**で、一度出て入り直すと `出る` が先頭に戻る。
+  並びを決めているのは施設に入る経路のほうで、そこは手で直せない。
+  ゲームが `宿泊する` を先頭に組んだ記録は1件も無い
+- **原因は `Facility.choices` の中身**（`232_probe_facility_choices` で実測。起動2回）。
+  `choices` は集合ではなく **dict**（挿入順）で、宿屋は `['出る']` の**1つだけ**。
+  店は `['売買する', '出る']`、区画は繋がる施設の名前の並び。
+  ゲームは `choices` の並びでボタンを組み、宿屋の `宿泊する`（期間の引数を持つ
+  `DisplayVacationChoice(app, period_months)`。静的な `choices` に入っていない）を**その後ろに足し**、
+  最後に `会話する` を足す。店の操作は `choices` の中に `出る` より前で入っているので先に出る。
+  宿屋だけ操作が `choices` の外に居る。
+  文字列のハッシュは無関係（`hash_randomization=1` で `出る` の枠が起動ごとに 0 → 3 と変わったのに並びは同じ）。
+  並びが「入れ替わった」記録は無い。
+  残っているログの最初の宿屋（main_025）から `出る` が先頭で、
+  ゲームの版の差分（上の表。023 → 025）にも施設の選択肢に触るものは無い。
+  `宿泊する` が先頭に出るのは、**MOD が建てた宿**（`331_` の自分の宿。`choices` が空で
+  ゲームの `出る` が出ない。`quest_flow.log` に 239 画面）と、
+  セーブの `buttons` を手で並べ替えた直後の1画面だけ。
+  描く直前に並べ直すのが `135_fix_inn_button_order`（`出る` より前に `宿泊する` が無いときだけ動かす）
 - 会話を挟むと抜けた後に施設の選択肢が組み直されるので、
   足した自前のボタンは組み直しのたびに入れ直す必要がある
 
@@ -1940,7 +2415,7 @@ BattleStartManager(app, enemy_type='guard', enemy_content=None)
 
 | 項目 | 分かっていること |
 | --- | --- |
-| `enemy_type` | 衛兵の経路では `'guard'`。コロシアム・クエストの語は未採取 |
+| `enemy_type` | 衛兵の経路では `'guard'`。依頼中の戦闘（ボス戦を含む）は `'in_quest'`、闘技場は `'colosseum'`（§2.11 の戦闘BGM の表） |
 | `enemy_content` | 衛兵の経路では `None`。中身はマネージャ側が作る |
 | 難易度 | **数値1つ**。敵のレベルも能力値もこれ1つから決まる（`get_enemy_*` の第2引数） |
 | `enemy_tier` | `'normal'`（`get_enemy_*` の第1引数） |
@@ -1970,6 +2445,11 @@ BattleStartManager(app, enemy_type='guard', enemy_content=None)
 
   **レベルは難易度+1**、**敵の数は難易度で動かない**。
   基準点はほとんど動かず、強さの差はレベルと HP の側から来ている
+- **闘技場から逃げても、その土地の手配度が 10 下がる**（`334_colosseum_custom` の実機。自分で `逃げる` を押した1回で 0 → -10。逃走5回で 45 → -5 とも合う）。
+  逃走の終わり方は衛兵戦と同じ `BattleEndManager.end_phase` で、締めの要約も `guard_battle_summarizer` で呼ばれる。
+  逃走1回で -10・闘技場で勝つと +5 は、別の区切りでも合った（10 から逃走2回と勝ち2回で 0）。
+  下がるのは終わり方（`BattleEndManager.execute` / `end_phase`）が済んだ後で、その後の最初の画面が整った合図（`refresh_choice_buttons`）の時点では下がっている
+  （負けて逃走扱いで切り上げた回の実測。衛兵戦で `316_` が下がった値を拾う時機と同じ）
 - **衛兵と戦うと、その土地の手配度が 10 下がる**。
   手配の有無に関わらず一律で、**手配されていない土地（平常10）でも `0` になる**
   （実測2回。`-10` → `-20` と `10` → `0`）
@@ -2008,7 +2488,7 @@ world_dict["free_facility_enabled"]      # 世界生成時のオプション
 
 ```python
 facility.facility_type = 'free'
-facility.choices       = {'利用する', '出る'}
+facility.choices       = {'利用する': …, '出る': …}   # dict（挿入順）。集合ではない（`232_` で実測）
 facility.config = {"level_of_detail": 0, "concept": "…",
                    "program_id": "free_10",              # = "free_" + facility.id
                    "free_flags": {"visited_fire": 1}}    # ← フラグの実体はここ
@@ -2171,14 +2651,12 @@ npc_id = npcs.make_npc(app, fields, area_id, facility_id, write=write)   # 作�
 生成した NPC は HP・スキル・装備・立ち絵のいずれも空でよい
 （ゲームが会話の直前に `ensure_npc_detail_generated` で埋める）。
 
-> **戦闘はそこを通らない。**
-> ここには「会話や戦闘の直前に埋める」と書いてあったが、戦闘では埋まらない。
+> 埋まるのは会話の直前だけで、戦闘はそこを通らない。
 > スキルが空のまま敵ターンを迎えると空の `Literal[]` が組まれて落ち
 > （VERIFICATION_LOG.md §2.40）、`image_src` が `None` のままだと
 > `StringProperty` への代入で落ちる（同 §2.42）。
-> 実測で落ちた相手は `make_npc` で作った詳細生成前の NPC（`902_` の容疑者、2026-08-08 の1件）で、
+> 実測で落ちた相手は `make_npc` で作った詳細生成前の NPC（`902_` の容疑者の1件）で、
 > 素の住人が落ちた記録は無い（素の住人は会話の直前に埋まる）。
-> 「ゲーム自身が作った街の住人」と書いていたのは §2.40 の状態の描写の読み違い（2026-09-12 に訂正）。
 > 本体が空を守っていない穴を塞ぐなら VERIFICATION.md §3.6 の1位と2位（どちらも未着手）で、
 > 作る側は先に会話を通させるか `skills` と `image_src` を持たせる。
 
@@ -2237,7 +2715,7 @@ npc_id = npcs.make_npc(app, fields, area_id, facility_id, write=write)   # 作�
 > ゲームが id で引く場所（`npcs` / `party` / ボタンの引数 / 敵の辞書）には残らない
 > （ほかの住人の記憶に名前は残り、それは消さない。TECH.md §5.7）。
 > 同じ仕掛けで正規 NPC の属性に被せることもできる。
-> 実機で会話の一巡と保存の非漏洩まで通した（2026-09-12。VERIFICATION.md §3.59）。
+> 実機で会話の一巡と保存の非漏洩まで通した（VERIFICATION.md §3.59）。
 >
 > そこで分かったゲーム側の事実:
 > **保存は `world.characters` を舐める**（文字列 id の `Character` を残すと
@@ -2260,7 +2738,7 @@ npc_id = npcs.make_npc(app, fields, area_id, facility_id, write=write)   # 作�
 > 素データが在れば `skills`（`通常攻撃` / `逃げる`）・HP・立ち絵（`fullbody` / `face`）を埋めて
 > `level_of_detail` を 2 にする（`modnpc` の写しで実測）。
 >
-> **仲間は素データが在ることが前提**（実セーブで確認。2026-09-13）。
+> **仲間は素データが在ることが前提**（実セーブで確認）。
 > `game_variables.party` の id は `npcs` の鍵を指し、その人物は
 > `areas/<エリア>/adventurer_npcs` にも載る。
 > 素データを持たない人物を `party` に入れると、ロードのときに組み立てられない。
@@ -2606,6 +3084,8 @@ app.save_data_dict   saves\<世界>\savedata.json
 world 側の NPC にも33項目のものが81人居る。
 `world_data.json` は生成時の雛形のまま固定されるのではなく、遊んでいる間も更新されている
 （後ろの4項目は savedata 化された形。§2.23）。
+**書かれるのはセーブのとき**（3回セーブした最後の時刻と `world_data.json` の更新時刻が一致。
+書き手は `scripts.save_codec:write_obfuscated_json_file` で、`modfacility` はここを包んで `mod:` の施設を落としている）。
 更新は届いているのに、追加だけが届いていない。
 
 #### 症状
@@ -2721,7 +3201,7 @@ Atk:<n>(+<n>)\nDef:<n>(+<n>)\nExp:<n>/<n>\nGold:<n>\nAge:<n>\nSta:…\nLocation:
 > 通貨の呼び名は3通りに綴られている。
 > 文中の `ゴールド`、英語表示の ` gold`、そして画面上部の `Gold`。
 > 呼び名を差し替える側は3つとも拾うこと
-> （`130_` は最初これを2つだと思っていて、画面上部だけ英語で残った）。
+> （文中の2つだけを拾うと、画面上部だけ英語で残る。`130_` が踏んだ）。
 
 日本語の `所持金` は別物で、**キャラクタ作成画面**の見出し
 （`筋力` `器用` `耐久` `知力` `判断` `魅力` `所持金` と並ぶ側。属性は `gol`）。
@@ -2793,6 +3273,19 @@ Atk:<n>(+<n>)\nDef:<n>(+<n>)\nExp:<n>/<n>\nGold:<n>\nAge:<n>\nSta:…\nLocation:
 └─ worlds\<世界名>\characters\<名前>\    立ち絵
 ```
 
+背景は `worlds\<世界名>\backgrounds\<施設名>\image.png`。宿泊の部屋は
+`backgrounds\<施設名> - room(<等級>)\image.png`（等級は `luxury_suite` など。実セーブで確認）で、
+`change_background_image_to_inn_room(quality)` はこの絵を `game_variables["location_image"]` に据える。
+ロードはこの値の絵をそのまま出す（§2.3）。
+
+`change_background_image_from_location_id` は、呼ばれたら必ず落ちる。
+関数の中で `self.app` を読むが、`InstantaleApp` にその属性は無い
+（`instantale.py:2349` で `AttributeError`）。
+素のゲームでこの経路を通るのは、相手が別の施設に居る社交の場面だけで、
+宿屋の中で完結する宿泊では呼ばれない。
+**MOD が泊まれる場所を足すとここを通る**ので、包んで `AttributeError` だけ握り、先へ通す。
+絵が変わらないだけで、描写も好感度の変動もそのまま走る（握らないとその先が丸ごと来ない）。
+
 インストール先には無い。
 Epic 版の `instantale.exe` の隣に `saves` も `worlds` も無かった。
 
@@ -2804,7 +3297,7 @@ Epic 版の `instantale.exe` の隣に `saves` も `worlds` も無かった。
 `face_image.png` の大きさは揃っていない。
 実データ194件のうち 144件が 165×165、**40件は 32×64**、残り10件はまちまち。
 
-##### 施設は生成されるまで無い。生成されたらギルドと宿が揃う
+#### 施設は生成されるまで無い。生成されたらギルドと宿が揃う
 
 5世界の非ダンジョンのエリア45件のうち、
 
@@ -2813,10 +3306,152 @@ Epic 版の `instantale.exe` の隣に `saves` も `worlds` も無かった。
 
 「ギルドが無くて宿だけ在る町」は生成されたデータには無い。
 
-##### NPC に装備は無い
+#### NPC に装備は無い
 
 5世界 369体の `equipments` は**全て空**。
 持ち物（`inventory`）は 28体（7.6%）が持っている。
+
+### 2.32 主人公が死んだ後、同じ世界で新しい主人公を作れる（セーブは `world_data.json` から組み直される）
+
+セーブは世界に1つ（`saves\<世界名>\savedata.json`。§2.31）。
+主人公が死ぬと、同じ世界でもう一度主人公を作って遊べる。
+そのときゲームは `savedata.json` を `worlds\<世界名>\world_data.json`（骨格）から組み直す。
+NPC の記憶も進みも無い、初期化された同じ世界になる。
+
+実セーブで見えたこと（世界A。前の主人公の控えは `backups\` の zip 12本）:
+
+| | 前の主人公（A） | 新しい主人公（B） |
+| --- | --- | --- |
+| `player_data.name` / `experience_level` / `age` | 主人公A / 80 / 25 | 主人公B / 1 / 23 |
+| `world_data.days_elapsed` | 2175 | 390（`world_data.json` 側の値） |
+| `index.facility` / `index.item` | 317 / 62 | 318 / 90 |
+| `game_variables.quest_log` | 27件 | 0件 |
+
+周回を見分ける id はセーブに無い。
+`player_data` の項目で作成時から変わらないように見えるものも、遊んでいる間に変わる:
+`original_ability_scores` は Lv1 → Lv60 の間に1度変わり（12本のうち最初の1本だけ別の値）、
+`age` は 22 → 25 に進む。変わらなかったのは `name` / `category` / `look_description` / `image_src`。
+`memory.brief_summary` は Lv80 でも「ゲーム開始」のまま。
+
+ゲームの入口は3つ:
+
+| 入口 | 何か | 根拠 |
+| --- | --- | --- |
+| `InstantaleApp.load_game_new(world_name)` | **続きから**（タイトルのロード） | `224_` が6回のロードで前後を測った（VERIFICATION.md §1）。`107_` / `110_` / `120_` がロード地点として包む |
+| `scripts.hud.hud_charamake:CharacterCreateScreen.start_story(instance)` | 作成画面の確定 | `214_` が包んだ |
+| `InstantaleApp.start_game(world_name)` | 作成から呼ばれる | `123_` が包む。**続きからも通るかは未測** |
+
+MOD の控え（`state\<MOD>\`）は世界名で引いていたので、前の主人公が建てた建物や結んだ契約が
+新しい主人公に引き継がれた（`331_` の実機。新しい主人公が前の主人公の施設の出資者として迎えられた）。
+セーブと同じ寿命のものは **世界×主人公** で持つ（`state.playthrough_key`。TECH.md §5.4）。
+同じ名前で作り直せば前の周回を引き継ぐ。
+
+### 2.33 画像生成のバックエンドと出口（`230_` で実測）
+
+画像生成は選ばれた**一族**だけが import される。
+選択は `config.json` の `ai_setting.local_model_setting.sd_backend.name`（§2.12.1 と同じファイル）。
+実機で4つを通した。
+
+| `sd_backend.name` | 上の層（種類が分かる） | 出口（生成そのもの） |
+| --- | --- | --- |
+| `sdcpp_cuda` | `image_generation.sdcppcuda.stable_diffusion_manager` | `sdcpp_cuda.stable_diffusion:StableDiffusion.generate_image` |
+| `sdcpp_vulkan` | `image_generation.sdcppvulkan.stable_diffusion_manager` | `sdcpp_vulkan.stable_diffusion:StableDiffusion.generate_image` |
+| `sdcpp_cpu` | `image_generation.sdcppcpu.stable_diffusion_manager` | `sdcpp_cpu.stable_diffusion:StableDiffusion.generate_image` |
+| `diffusers_openvino` | `image_generation.diffusers_openvino.stable_diffusion_manager` | `optimum.intel.openvino.modeling_diffusion:OVStableDiffusionPipeline.__call__` |
+
+名前は組み立てられない。
+`image_generation.` の下では下線が落ち（`sdcpp_cuda` から `sdcppcuda`）、`sdcpp_*` の側では残る。
+`diffusers_openvino` の出口はゲームのパッケージですらない（optimum）。
+クラスを属性で持っているのは sdcpp 系の `stable_diffusion_manager` だけなので、
+**出口のクラスは生きた `txt2img_pipe` の型から引く**のが4つとも通る唯一の道。
+
+#### 出口は一族につき1つ
+
+実機の生成6回はすべて上の表の出口を通り、`upscale()` と `generate_video()` は0回。
+立ち絵の2段（`generate_image_anime` の 256x512 と `image_to_image_anime` の 512x1024）も同じ出口で、
+`character_generation_quality = 'highres_upscale'` の「upscale」は `upscale()` ではなく img2img のこと。
+
+引数の名前は一族で変わる。
+
+| | sdcpp 系 | `diffusers_openvino` |
+| --- | --- | --- |
+| 寸法 | `width` / `height` | `width` / `height` |
+| サンプラー | `sample_method` / `sample_steps` / `cfg_scale` / `scheduler` | `num_inference_steps` / `guidance_scale` |
+| 種 | `seed`（実測は `-1`） | 実測では来ていない |
+| img2img | `image_to_image_anime` が `init_image` 付きで同じ出口へ | 関数ごと無い |
+| LoRA | ゲームが上の層と出口の**間**で `<lora:...>` を足す | 概念が無い（`lora_dir` も `taesd_path` も無い） |
+
+素の値（`sdcpp_cuda`、実測）:
+
+| 種類 | 寸法 | サンプラー / steps / cfg | 通る関数 |
+| --- | --- | --- | --- |
+| 背景 | 1024x512 | `lcm` / 5 / 1 | `generate_image_real_lcm` |
+| 立ち絵1段目 | 256x512 | `euler_a` / 20 / 8 | `generate_image_anime` |
+| 立ち絵2段目（img2img） | 512x1024 | `dpmpp2m` / 15 / 7 | `image_to_image_anime` |
+| 敵・モンスター | **512x512（1段だけ）** | `lcm` / 5 / 1 | `generate_image_real_lcm` |
+
+画質の設定で立ち絵の経路が変わる。
+`highres_upscale` は上の2段（`generate_image_anime` と `image_to_image_anime`）を通り、
+`highres_faster` は **LCM の段1回**（`generate_image_real_lcm`、512x1024）で描く（実測）。
+LCM の段を通る回はプロンプトに `<lora:LCM_LoRA_Weights_SD15:1>` が入る。
+
+敵・モンスターは立ち絵と同じ経路だと読めるが、実際は別物で、
+正方形を1段で描き、サンプラーは背景と同じ LCM（実測 1.5 秒）。
+入口は `generate_enemy_image`（`image_generation_creature.py:235` から `generate_image_real_lcm` を呼ぶ）。
+
+背景のプロンプトには出口の時点で `<lora:LCM_LoRA_Weights_SD15:1>` が入っている。
+上の層の引数には入っていないので、**LoRA の付け替えは出口でしか掛からない**。
+
+#### パイプラインは1プロセスに1回だけ建つ（最初のワールド選択）
+
+```text
+AIManager.set_ai_models (instantale.py:510〜516)   一族を import する行（実測: cuda 510 / vulkan 512 / openvino 514 / cpu 516）
+                        (instantale.py:536)        load_sd_pipeline() で建てる
+  呼ばれ方: AIManager.__init__ (307) から。さらに InstantaleApp.show_world_choice (782)、ボタンの on_touch_up
+```
+
+- プロセス起動時でもモジュールの import 時でもない。
+  `set_ai_models` に**入った時点では一族がまだ import されていない**（実測4回とも0件）
+- import から構築の開始まで **0.27〜0.62 秒**（4つの一族・6回の実測）
+- 構築そのものは sdcpp 系が 1.2〜1.3 秒、`diffusers_openvino` が 6.3〜7.4 秒
+- 構築は manager のモジュール変数をそのまま渡す（`sdcpp_cpu` で実測）。
+  `model_path_anime` が `model_path` へ、`lora_dir` が `lora_model_dir` へ、
+  `taesd_path` と `vae_path` はそのままの名前で渡る。
+  `wtype='default'` / `rng_type='cuda'`（CPU バックエンドでも `cuda` のまま渡る）
+
+チェックポイント・TAESD・VAE は、このモジュール変数を建つ前に書き換えれば差し替わる
+（実機。`taesd_path` を空にして建て、`StableDiffusion.__init__` にそのまま渡った。VERIFICATION.md §3.65）。
+
+建つのは1プロセスに1回だけ。
+`set_ai_models` に入った時点で `txt2img_pipe` が既に在ると `load_sd_pipeline` は呼ばれない。
+タイトルへ戻ってワールドを選び直しても、`set_ai_models` は走るのに `txt2img_pipe` の id は前後で変わらない
+（実測 11 回。`pipe=null` の4回は建ち、既に在る7回は建たなかった）。
+モジュール変数の差し替えを効かせるには、ゲームの起動し直しが要る。
+
+> バックエンドを切り替えても画質の設定は付いてこない。
+> `diffusers_openvino` の manager には `image_to_image_anime` が無いのに、
+> `character_generation_quality` が `highres_upscale`（2段で描く指定）のまま残ると、
+> ゲーム自身が `UnboundLocalError: local variable 'generated_image' referenced before assignment`
+> （`image_generation\diffusers_openvino\image_generation_creature.py:83`）で落ちる。
+> 同梱の初期テンプレートはこの一族に `lowres_faster` を組み合わせている。
+>
+> この一族は**形を固定して変換したモデル**を回すので、
+> 出口へ渡す寸法を変えるとモデルの作り直しが走る。
+> 背景を 1024x512 から 1536x768（画素 x2.25）にした実機では、
+> 64GB の RAM を使い切って SSD へページングを始めた。
+> 1152x576（画素 x1.27）なら 15.1 秒で通る（素の 1024x512 は 10.5 秒）が、
+> **通った回も RAM は伸びたまま、ゲームを閉じるまで戻らない**。
+> 寸法ごとに作り直したものが常駐すると読める。
+
+> 別配布の画質強化 MOD（`stable-diffusion.dll` のプロキシ）が入っていると、
+> この出口の**後ろ**でもう一度書き換わる。
+> そちらのログ（`InstantaleSDMod\proxy_resize.log`。以前の記録）では、
+> 出口の `euler_a` / 20 / 8 がプロキシ側で `dpm++2mv2` / 15 / 5 になっていた。
+> 上の実測はプロキシが入っていない状態で録ったもので、
+> 3つのバックエンドとも `stable-diffusion.dll` は退避されている `-real.dll` とハッシュが一致していた
+> （入っているかどうかはこの比較で分かる。`-real.dll` の有無では分からない）。
+
+---
 
 ## 3. 調査手法
 

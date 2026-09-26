@@ -17,7 +17,7 @@ r"""MOD が持つ NPC と、正規 NPC への被せがどこまで通るかを�
 |---|---|---|
 | 1 | 保存に漏れないか | `at=disk`。保存の直後にディスクのセーブを読み、`npcs` と `characters` に `mod:` の鍵が無いかを数える |
 | 2 | 会話が始まって終わるか | `at=conversation_start` / `at=prompt` / `at=conversation_end` |
-| 3 | 詳細生成が要るか | `at=detail`。既定では本体へ通さない。`TRY_DETAIL` を立てると通す |
+| 3 | 詳細生成が要るか | `at=detail`。既定では本体へ通す（ローダの既定と同じ）。`TRY_DETAIL` を切ると通さない |
 | 4 | 被せが頼み文に載るか | `at=prompt` の `mark`。正規 NPC の `profile` に足した印が引数に含まれるか |
 | 5 | 立ち絵 | `at=image`。作り直しの入口が呼ばれるか |
 
@@ -85,7 +85,7 @@ AUTO_TALK_LINGER = 6
 AUTO_LOAD_WORLD = ""
 #: 自動の会話を起こす前に置く秒数。起動直後は LLM の口がまだ無い
 #: （ロードの3秒後に起こして `conversation_starter` が `'NoneType' object is not callable`
-#: で落ち、画面が「…」のまま止まった。実機 2026-09-12）。
+#: で落ち、画面が「…」のまま止まった。実機）。
 AUTO_TALK_DELAY = 45
 #: 保存の間、来訪者を名簿から外す（ローダの `modnpc.LIFT_ROSTER`）。
 #: 切って `leaked` が空のままなら、保存は名簿を読んでいない。
@@ -347,6 +347,40 @@ def apply(ctx):
             type(self).reads += 1
             return list.__len__(self)
 
+    def swap_in(owner, name, make):
+        """`owner` の `name`（属性、`owner` が dict なら鍵）を読みを数える写しに置き換える。
+        戻り値は `put_back` に渡す `(元, 写し, 写した時点の鍵)`。"""
+        original = dict.get(owner, name) if isinstance(owner, dict) else getattr(owner, name)
+        spied = make(original)
+        if isinstance(owner, dict):
+            owner[name] = spied
+        else:
+            setattr(owner, name, spied)
+        return original, spied, set(dict.keys(original)) if isinstance(original, dict) else None
+
+    def put_back(owner, name, original, spied, taken):
+        """写しを外し、窓の間に写しへ入った書き込みを元のオブジェクトへ移す。
+
+        写しに置き換えている間も本体や保存スレッドが名簿へ書くので、元へ戻すだけでは
+        その分が消える。窓の間に本体が別のオブジェクトを置いていたらそちらを残す。
+        写した後に元へ直接入った書き込み（元を握っていた側の分）は残し、写しから消えた鍵だけ元からも消す。
+        読みの印は通さない（`dict.items` / `list.__getitem__` を直に呼ぶ）。
+        """
+        if isinstance(owner, dict):
+            current = dict.get(owner, name)
+            if current is spied:
+                owner[name] = original
+        elif getattr(owner, name, None) is spied:
+            setattr(owner, name, original)
+        if isinstance(original, dict):
+            items = list(dict.items(spied))
+            kept = set(key for key, _ in items)
+            for key in taken - kept:
+                original.pop(key, None)
+            original.update(items)
+        else:
+            original[:] = list.__getitem__(spied, slice(None))
+
     @ctx.wrap(TALK_TARGET, required=False, safe=True)
     def talk_choice(orig, self, *args, **kwargs):
         """「会話する」の一覧が組まれる間、施設の名簿が読まれるかを見る。
@@ -358,27 +392,28 @@ def apply(ctx):
         app = getattr(self, "app", None) or ui.find_app()
         facility = getattr(getattr(app, "player", None), "location", None)
         roster = getattr(facility, "characters", None)
-        swapped = isinstance(roster, list)
-        if swapped:
+        listed = [str(k) for k in (roster or [])]
+        swapped = None
+        if isinstance(roster, list):
             ReadCountingList.reads = 0
-            facility.characters = ReadCountingList(roster)
+            swapped = swap_in(facility, "characters", ReadCountingList)
         try:
             return orig(self, *args, **kwargs)
         finally:
             try:
                 if swapped:
-                    facility.characters = list(facility.characters)
+                    put_back(facility, "characters", *swapped)
                 offered = [str(ui.spec_args(entry)[0])
                            for entry in (getattr(app, "buttons", None) or [])
                            if ui.spec_cls_name(entry) == "ConversationStartManager"
                            and ui.spec_args(entry)]
                 note("talk_choice", offered=offered,
-                     facility_characters=[str(k) for k in (roster or [])],
+                     facility_characters=listed,
                      owner=str(getattr(facility, "owner", None)),
                      roster_reads=ReadCountingList.reads if swapped else None,
                      visitor_offered=seen["npc_id"] in offered)
                 write("talk choice: offered={} roster={} reads={}".format(
-                    offered, [str(k) for k in (roster or [])],
+                    offered, listed,
                     ReadCountingList.reads if swapped else "?"))
             except Exception:
                 ctx.log_exc("mod npc: cannot record the talk choice")
@@ -482,16 +517,13 @@ def apply(ctx):
         swapped = {}
         try:
             if isinstance(getattr(world, "characters", None), dict):
-                swapped["roster"] = world.characters
-                world.characters = RosterSpy(world.characters)
+                swapped["roster"] = swap_in(world, "characters", RosterSpy)
             if isinstance(save, dict) and isinstance(save.get("npcs"), dict):
-                swapped["npcs"] = save["npcs"]
-                save["npcs"] = NpcsSpy(save["npcs"])
+                swapped["npcs"] = swap_in(save, "npcs", NpcsSpy)
             roster = getattr(facility, "characters", None)
             if isinstance(roster, list):
-                swapped["facility"] = roster
                 ReadCountingList.reads = 0
-                facility.characters = ReadCountingList(roster)
+                swapped["facility"] = swap_in(facility, "characters", ReadCountingList)
             if visitor is not None:
                 swapped["visitor_cls"] = spy_visitor(visitor)
         except Exception:
@@ -501,11 +533,11 @@ def apply(ctx):
         finally:
             try:
                 if "roster" in swapped:
-                    world.characters = swapped["roster"]
+                    put_back(world, "characters", *swapped["roster"])
                 if "npcs" in swapped:
-                    save["npcs"] = swapped["npcs"]
+                    put_back(save, "npcs", *swapped["npcs"])
                 if "facility" in swapped:
-                    facility.characters = swapped["facility"]
+                    put_back(facility, "characters", *swapped["facility"])
                 if swapped.get("visitor_cls") is not None:
                     visitor.__class__ = swapped["visitor_cls"]
                 offered = offered_ids(app)
@@ -524,7 +556,7 @@ def apply(ctx):
 
     # -- 自動の会話（画面を押せない環境用）--------------------------------------
     def stale():
-        """前の世代の見張りは降りる（注入し直すと2世代が並走した。実機 2026-09-12）。"""
+        """前の世代の見張りは降りる（注入し直すと2世代が並走した。実機）。"""
         return "superseded" if ctx.superseded() else None
 
     def open_talk_list(app, npc_id):
@@ -532,7 +564,7 @@ def apply(ctx):
 
         `process_choice(DisplayTalkChoice(app), "会話する")` で開かせた回から、
         その直後にゲームが別スレッドで走らせる `save_game` が戻らなくなった
-        （実機 2026-09-12 16:44 以降、5本の保存が宙に浮き、ディスクは書かれなかった）。
+        （実機。途中から5本の保存が宙に浮き、ディスクは書かれなかった）。
         一覧の中身は `talk_step` の受動の記録（`__init__` / `update_button_display` の包み）で
         取れているので、ここでは開かずに来訪者へ進む。
         """
@@ -545,7 +577,7 @@ def apply(ctx):
         """`ConversationStartManager(app, id)` をゲームの経路で起こす（GAME.md §2.5）。"""
         cls = ui.cls_of("ConversationStartManager")
         if modnpc.is_mod_npc(npc_id) and not in_roster(app):
-            # 名簿から消えていた（実機 2026-09-12: 一覧を開いた後の `KeyError`）。
+            # 名簿から消えていた（実機: 一覧を開いた後の `KeyError`）。
             # 誰が消したかは `talk_step` の前後で分かる。ここでは組み直して続ける。
             note("auto", step=npc_id, vanished=True)
             write("auto talk: the visitor is not in the roster any more; respawning")
@@ -607,7 +639,7 @@ def apply(ctx):
     @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False,
               safe=True)
     def refresh(orig, self, *args, **kwargs):
-        """選択肢が組み直されるたびに居場所を見る（`914_` と同じ契機）。"""
+        """選択肢が組み直されるたびに居場所を見る（`330_` と同じ契機）。"""
         result = orig(self, *args, **kwargs)
         try:
             follow(self)
@@ -620,7 +652,7 @@ def apply(ctx):
     def save_game(orig, self, *args, **kwargs):
         """保存の直後にディスクのセーブを読む。関所の外側から数える。
 
-        16:43 以降、包みは呼ばれるのに読み直しが1度も走らなかった（実機 2026-09-12）。
+        途中から、包みは呼ばれるのに読み直しが1度も走らなかった（実機）。
         `orig` が投げてここを素通りしている可能性があるので、入り・戻り・投げを1行ずつ残す。
         """
         write("save: entering (in_conversation={} thread={})".format(
@@ -662,7 +694,7 @@ def apply(ctx):
                                       if modnpc.is_mod_npc(str(k)))
         # `npcs` と `characters` だけでは足りない。
         # `game_variables` の選択肢（`buttons_backup` の `ConversationStartManager`）・
-        # 自由入力・パーティ・敵にも id が載る（2026-09-13 に実セーブで確認）。
+        # 自由入力・パーティ・敵にも id が載る（実セーブで確認）。
         # セーブ全体を1つの文字列にして `mod:` を数え、出どころの鍵も並べる。
         whole = json.dumps(data, ensure_ascii=False, default=str)
         leaked["anywhere"] = whole.count(modnpc.PREFIX)
@@ -685,7 +717,7 @@ def apply(ctx):
         """`AIManager.set_ai_models()` を別スレッドで。
 
         タイトルのロードは LLM を用意してから世界を読むが、`load_game_new` を直に呼ぶと
-        そこを飛ばす（実機 2026-09-12: `conversation_starter` が
+        そこを飛ばす（実機: `conversation_starter` が
         `'NoneType' object is not callable`、4分半待っても変わらず）。
         """
         # 属性は2つある（`ai_mamanger` と `ai_manager`。`210_` の97属性の記録）。
@@ -700,7 +732,7 @@ def apply(ctx):
                 break
         if fn is None:
             # 正規の起動が組む `AIManager(app, config)` が無い（`ai_manager` は None。
-            # 実機 2026-09-12 の診断）。同じ引数で組んで、同じ属性に置く。
+            # 実機の診断）。同じ引数で組んで、同じ属性に置く。
             diagnose_llm(app)
             cls = ui.cls_of("AIManager")
             config = getattr(getattr(app, "auto_configuration_screen", None), "config", None)

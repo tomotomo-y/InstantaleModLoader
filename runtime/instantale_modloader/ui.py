@@ -34,6 +34,30 @@
     駄目。** 押下と同じ流れの中で差し替えると、ゲームがその後に描画するので古い
     画面に戻る。`apply_buttons` が `Clock.schedule_once(..., 0)` に載せて
     「次のフレーム・メインスレッド」で行うのはこのため
+
+## どのスレッドから呼ぶか
+
+断りが無ければ**ゲームのスレッド（Kivy のメインスレッド）から呼ぶ**。
+背景スレッド（`jobs.Worker` に渡した `run` の中）から直に呼んでよいのは、
+
+  * `Screen.schedule(fn)` と `scheduler(ctx)` が返す `schedule(fn)`
+    ― どちらも「メインスレッドの次のフレームへ渡す」ための入口そのもの
+  * `app` に載っている素のデータを読むだけのもの（`gold_of` / `current_area` /
+    `area_record` …）。読んでいる間にゲーム側が書き換えないことまでは見ていない
+
+の2つだけ。
+
+**`when_idle` と `end_conversation` は、最初の1回を呼んだスレッドでそのまま行う。**
+`when_idle` の1回目の `tick` は `is_button_enabled` / `is_adding_text` /
+`is_popup_window_opened` をその場で読む（`Clock` に載るのは2回目以降の見張りと
+`then` の実行）。`end_conversation` はその場で `app.process_choice` を呼ぶ。
+背景の仕事が終わってから画面を触りたいときは、`schedule` を1枚挟んでから呼ぶ:
+
+    def run(job):                       # 背景スレッド
+        result = ask_llm(job)
+        schedule(lambda: screen.when_idle(app, lambda: show(result)))
+
+`apply_buttons` は中身を丸ごと `schedule` に載せているので、この縛りは無い。
 """
 
 from __future__ import annotations
@@ -207,6 +231,29 @@ def conversation_partner(buttons):
     return (str(args[0]) if args else None), entry
 
 
+#: ゲーム自身の衛兵の戦闘を指す `enemy_type`（GAME.md §2.20）。
+GUARD_ENEMY_TYPE = "guard"
+
+
+def guard_encounter(buttons):
+    """衛兵に見つかった画面なら「抵抗する！」のボタンを返す。そうでなければ None。
+
+    ゲームはこの画面で旗を何も立てず、「大人しく捕まる／抵抗する！」だけを並べる
+    （`300_` の実機）。抵抗するほうは `BattleStartManager(app, 'guard', None)` を組む
+    （`bounty_hunter.log` の呼び出し元が `on_button_press`）。
+    文字列ではなく、spec のクラス名と `args[0]` で見分ける。
+    """
+    if not isinstance(buttons, (list, tuple)):
+        return None
+    for entry in buttons:
+        if spec_cls_name(entry) != "BattleStartManager":
+            continue
+        args = spec_args(entry)
+        if args and args[0] == GUARD_ENEMY_TYPE:
+            return entry
+    return None
+
+
 def pressed_entry(app, button_index):
     """押された添字から `app.buttons` の要素を引く。
 
@@ -325,6 +372,115 @@ def overlay_host(hud):
     return hud            # 子を持たない画面なら HUD 自身に（従来どおり）
 
 
+def children_of(widget):
+    """ウィジェットの子の写し（Kivy の並びは新しい順）。読めなければ空。"""
+    children = frames.attr(widget, "children")
+    return list(children) if isinstance(children, (list, tuple)) else []
+
+
+def walk_widgets(root, max_depth=None, seen=None, oldest_first=False):
+    """ウィジェット木を深さ優先の前順で辿る生成器。同じものは1度だけ。
+
+    `max_depth` … `root` を 0 として、この深さのものまで出す（その子へは降りない）。
+    `seen` … 出したものの `id` を入れる集合。2本の木を続けて辿るとき、
+    同じ集合を渡せば重なった分を二度出さない（`115_` が HUD と窓の直下で使う）。
+    `oldest_first` … 兄弟を古い順（`children` の逆）に出す。
+    「最初に見つかった1つ」を採る呼び手（`330_` / `402_` の見出し探し）は
+    この順で実機を確かめてあるので、変えないこと。
+
+    `330_` / `402_` の `walk_widgets` と `115_` / `124_` / `333_` の `walk`（深さの上限つき）を寄せた。
+    """
+    if root is None:
+        return
+    if seen is None:
+        seen = set()
+    stack = [(root, 0)]
+    while stack:
+        widget, depth = stack.pop()
+        if id(widget) in seen:
+            continue
+        seen.add(id(widget))
+        yield widget
+        if max_depth is not None and depth >= max_depth:
+            continue
+        children = children_of(widget)
+        if not oldest_first:
+            children.reverse()      # 積んだ逆から出るので、並びどおりに出すには逆に積む
+        stack.extend((child, depth + 1) for child in children)
+
+
+#: 本文を描けるウィジェットが持っている property（`is_label` の既定）。
+LABEL_ATTRS = ("text", "texture_update", "text_size")
+
+
+def is_label(widget, needs=LABEL_ATTRS):
+    """本文を描けるウィジェットか。**型では見ない**（GAME.md §1.3）。
+
+    ゲーム側の派生クラスや別名の Label がありうるので、
+    `needs` の property が全部在り、`text` が文字列であることで見分ける。
+    触る property が違う呼び手は `needs` を渡す（`112_` は `line_height`）。
+    """
+    for name in needs:
+        if frames.attr(widget, name) is frames.MISSING:
+            return False
+    return isinstance(frames.attr(widget, "text"), str)
+
+
+def is_scroller(widget):
+    """縦に送れる枠（`ScrollView` の類）か。型では見ない。"""
+    for name in ("scroll_y", "do_scroll_y"):
+        if frames.attr(widget, name) is frames.MISSING:
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# 寸法（`113_` / `116_` が共有する）
+# --------------------------------------------------------------------------
+def numbers(value, count):
+    """`size_hint` / `size` などを素の tuple にする（Kivy の可変列を持ち歩かない）。"""
+    try:
+        return tuple(value)[:count]
+    except Exception:
+        return None
+
+
+def rect_of(widget):
+    """`(x, y, 幅, 高さ)`（親の座標系）。読めなければ None。"""
+    size = numbers(frames.attr(widget, "size"), 2)
+    pos = numbers(frames.attr(widget, "pos"), 2)
+    if not size or not pos:
+        return None
+    try:
+        return (float(pos[0]), float(pos[1]), float(size[0]), float(size[1]))
+    except (TypeError, ValueError):
+        return None
+
+
+def same_rect(rect, target, slack, ratio):
+    """見た目に同じ矩形か。枠線・背景はぴったり重ならず数 px ずれて置かれている。
+
+    許すずれは `max(slack, 寸法 × ratio)`（位置）とその2倍（寸法）。
+    `113_` / `116_` はどちらも `slack=12.0, ratio=0.03` を渡している。
+    """
+    if rect is None or target is None:
+        return False
+    slack_x = max(slack, target[2] * ratio)
+    slack_y = max(slack, target[3] * ratio)
+    return (abs(rect[0] - target[0]) <= slack_x
+            and abs(rect[1] - target[1]) <= slack_y
+            and abs(rect[2] - target[2]) <= slack_x * 2
+            and abs(rect[3] - target[3]) <= slack_y * 2)
+
+
+def close_enough(value, wanted):
+    """寸法が「もうその値になっている」か。浮動小数の丸め（0.5 未満）は差と見ない。"""
+    try:
+        return abs(float(value) - float(wanted)) < 0.5
+    except (TypeError, ValueError):
+        return False
+
+
 # --------------------------------------------------------------------------
 # プレイヤーの所持金と、画面を出してはいけない状態
 # --------------------------------------------------------------------------
@@ -441,6 +597,30 @@ def rewrite_coins(text):
     return _rewrite_coins(text, _coin_names["long"], _coin_names["short"])
 
 
+class _KeepMissing(dict):
+    """テンプレートに無い変数名が来ても落とさない（`{typo}` はそのまま残る）。"""
+
+    def __missing__(self, key):
+        return "{" + str(key) + "}"
+
+
+def fill_template(template, **values):
+    """設定のテンプレートを埋め、通貨の表記を今の表記へ直す。
+
+    壊れたテンプレートでも素の文字列で返す。
+    知らない変数名（`{typo}`）はそのまま残す。打ち間違いを画面で見えるようにするため。
+    設定のテンプレートは素のゲームの言い方（`G`）のままでよい
+    （`130_` が差し替えていれば `馬車(1000G・14日)` → `馬車(1000円・14日)`）。
+
+    `314_` / `315_` / `332_` の `fmt` に1字違わず写されていた。
+    """
+    try:
+        filled = str(template).format_map(_KeepMissing(values))
+    except Exception:
+        filled = str(template)
+    return rewrite_coins(filled)
+
+
 def parse_coin(text):
     """ラベルから額を読む。読めなければ `None`。
 
@@ -468,8 +648,8 @@ def parse_coin(text):
         return None
 
 
-def gold_of(app):
-    """プレイヤーの所持金。読めなければ `None`。
+def _raw_gold(app):
+    """所持金の素の値（`int` か `float`）。読めなければ `None`。
 
     **`bool` を弾く。**
     Python では `True` は `int` なので、
@@ -478,26 +658,55 @@ def gold_of(app):
     value = frames.attr(frames.attr(app, "player", None), "gold", None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return int(value)
+    return value
 
 
-def add_gold(app, amount, on_error=None):
-    """所持金を増減する。書けたら新しい額、書けなければ `None`。
+def gold_of(app):
+    """プレイヤーの所持金（`int` に切り捨てる）。読めなければ `None`。"""
+    value = _raw_gold(app)
+    return None if value is None else int(value)
 
-    ゲーム自身の支払い経路を通さずに直接触るので、**呼ぶ側が理由を記録する** こと（報酬・罰金など）。
-    読めない所持金には書き込まない。
+
+def set_gold(app, value, on_error=None):
+    """所持金を `value` にする。書けたら新しい額、書けなければ `None`。
+
+    **今の型を保つ。**
+    `float` の所持金には `float` を、`int` の所持金には丸めた `int` を書く
+    （float の世界に int を混ぜない）。
+    この式は `314_` / `315_` / `332_` に1字違わず写されていた。
+
+    読めない所持金には書き込まない（`gold_of` が `None` を返す相手）。
+    ゲーム自身の支払い経路を通さずに直接触るので、**呼ぶ側が理由を記録する** こと。
     """
-    current = gold_of(app)
+    current = _raw_gold(app)
     if current is None:
         return None
     try:
         player = frames.attr(app, "player", None)
-        player.gold = current + int(amount)
+        player.gold = float(value) if isinstance(current, float) else int(round(value))
         return player.gold
     except Exception:
         if on_error is not None:
             on_error("cannot change the player's gold")
         return None
+
+
+def add_gold(app, amount, on_error=None):
+    """所持金を増減する。書けたら新しい額、書けなければ `None`。
+
+    足すのは**素の値**に対して（`gold_of` の切り捨てを通さない）。
+    書き方は `set_gold` と同じで、今の型を保つ。
+    """
+    current = _raw_gold(app)
+    if current is None:
+        return None
+    try:
+        target = current + amount
+    except Exception:
+        if on_error is not None:
+            on_error("cannot change the player's gold")
+        return None
+    return set_gold(app, target, on_error=on_error)
 
 
 # --------------------------------------------------------------------------
@@ -542,6 +751,40 @@ def quest_of(app, quest_id):
         if quest_id in store:
             return store[quest_id]
     return None
+
+
+def world_overview(app, limit=600):
+    """世界観の文（`world_data.overview`）。LLM への頼み文に入れる。無ければ空。
+
+    `save_data_dict` → `world_dict` の順に見て、先に読めた方を `limit` 字で切る。
+    `330_` / `331_` に同じ本体が写されていた。
+    `405_` は別の読み方（遊んでいる世界の控えと `app.world` まで見る）なので寄せていない。
+    """
+    for attr in ("save_data_dict", "world_dict"):
+        holder = frames.attr(app, attr, None)
+        data = holder.get("world_data") if isinstance(holder, dict) else None
+        text = data.get("overview") if isinstance(data, dict) else None
+        if isinstance(text, str) and text.strip():
+            return frames.short(text.strip(), limit)
+    return ""
+
+
+def current_quest_id(app):
+    """ゲームがいま進めているクエストの id（文字列）。クエスト中でなければ None。
+
+    これがゲーム自身の答え。
+    `QuestStartManager` を捕まえられなくても（注入し直しをまたいだ場合など）、
+    これを見れば道中のクエストの最中かどうかが分かる。
+    `app.current_quest_data` はクエスト中だけ `Quest` が入り、
+    それ以外は None（`206_` の記録で確認済み）。
+
+    `307_` / `325_` に同じ本体が写されていた。
+    """
+    quest = frames.attr(app, "current_quest_data", None) if app is not None else None
+    if quest is None:
+        return None
+    value = quest.get("id") if isinstance(quest, dict) else frames.attr(quest, "id", None)
+    return str(value) if value is not None else None
 
 
 def id_sort_key(value):
@@ -1205,6 +1448,154 @@ def party_member_ids(app):
             if member_id and member_id != PLAYER_ID]
 
 
+def paint_choices(app, texts, oops=None):
+    """選択肢の文字列を実際に画面へ塗る。効いた手段の一覧を返す（`Screen.paint` の中身）。
+
+    `refresh_choice_buttons()` が組み直すのは `to_display_buttons` までで、画面の文字は
+    HUD 側の `update_button_texts` を呼ばないと変わらない（冒頭の事実）。`app.buttons` だけ
+    直して塗らないと、見えている文字と押される処理が食い違う（ロード後の組み直しで実機）。
+    `oops(what)` は例外の記録先。無ければ黙って続ける。
+    """
+    done = []
+
+    def failed(what):
+        if oops is not None:
+            oops(what)
+
+    loader = getattr(app, "display_button_load", None)
+    if getattr(app, "is_button_enabled", None) is False:
+        # 待機中（「…」を出している間）は呼ばない。`display_button_load` は待機中に
+        # 呼ばれると次のコマを自分で予約し直すので、呼ぶたびにゲームの点送りが1本ずつ増え、
+        # 点が飛ぶ（`234_probe_busy_display` の実測。GAME.md §2.4）。
+        # 待機中の枠はどのみちゲームが点で塗り直す。
+        done.append("display_button_load skipped (waiting)")
+    elif callable(loader):
+        try:
+            loader(0)
+            done.append("display_button_load")
+        except Exception:
+            failed("display_button_load failed")
+
+    hud = find_hud(app)
+    updater = getattr(hud, "update_button_texts", None) if hud is not None else None
+    if callable(updater):
+        try:
+            updater(app, list(texts))
+            done.append("hud.update_button_texts")
+        except Exception:
+            failed("hud.update_button_texts failed")
+    elif hud is None:
+        # ここが出たら画面は塗り替わらない。
+        # 型で探して見つからない＝ HUD の構成が変わったということなので、
+        # その合図として残す。
+        done.append("hud not found")
+
+    return done
+
+
+BUSY_DOTS = (".", "..", "...")
+
+
+def shown_dots(app):
+    """いま選択肢の枠に出ている点（`.` / `..` / `...`）。点でなければ None。"""
+    hud = find_hud(app)
+    widgets = getattr(hud, "buttons", None) if hud is not None else None
+    if not isinstance(widgets, (list, tuple)) or not widgets:
+        return None
+    text = getattr(widgets[0], "text", None)
+    return text if text in BUSY_DOTS else None
+
+
+def stop_button_load(app):
+    """回っているゲームの点送り（`display_button_load` の予約）を Clock から外す。
+
+    外したら True。`process_choice` は自分で点送りを始めるので、
+    回っているまま次の場面を起こすと2本になり、点が速くなる（GAME.md §2.4）。
+    """
+    loader = getattr(app, "display_button_load", None)
+    if loader is None or not button_load_pending(app):
+        return False
+    try:
+        from kivy.clock import Clock
+        Clock.unschedule(loader)
+    except Exception:
+        return False
+    return True
+
+
+def button_load_pending(app):
+    """ゲームの点送り（`display_button_load` の予約）が Clock に載っているか。
+
+    真なら回っている。読めないときは None（呼ぶ側は「回っていない」として1回だけ回す。
+    点が出ないより、1本多いほうがまし）。
+    """
+    try:
+        from kivy.clock import Clock
+        events = Clock.get_events()
+    except Exception:
+        return None
+    for event in events or ():
+        try:
+            callback = event.get_callback()
+        except Exception:
+            callback = getattr(event, "callback", None)
+        if getattr(callback, "__name__", "") == "display_button_load":
+            return True
+    return False
+
+
+_AFTER_LOAD_ATTR = "_instantale_after_load"
+
+
+def refresh_choices_after_load(ctx, write=None, tries=12, interval=0.25):
+    """ロードのあと、名簿（party）が復元されてから選択肢を 1 度組み直す。
+
+    ロード中に本体が選択肢を組む時点では `app.party` がまだ `['player']` で、同行者との会話を
+    復元しても相手が仲間だと分からない（`302_` が「ここで別れる」を落とし、`301_` が依頼の
+    選択肢を足した。実機）。名簿に同行者が入るまで（上限 `tries` 回、`interval` 秒おき）待ってから
+    `refresh_choice_buttons()` を 1 度呼び、画面にも塗る（`paint_choices`。組み直すだけでは文字が
+    古いままで、押される処理と食い違った。実機）。同行者が居ないセーブでは上限で 1 度呼ぶ（害は無い）。
+    何本の MOD が呼んでも、1 回のロードで組み直すのは 1 度（後から入った層の見張りが勝つ）。
+    Kivy の Clock が無ければ（ゲームの外）何もしない。
+    """
+    shared = getattr(sys, _AFTER_LOAD_ATTR, None)
+    if not isinstance(shared, dict):
+        shared = {"token": None}
+        setattr(sys, _AFTER_LOAD_ATTR, shared)
+
+    @ctx.wrap("__main__:InstantaleApp.load_game_new", required=False, safe=True)
+    def load_game_new(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
+        try:
+            from kivy.clock import Clock
+        except Exception:
+            return result
+        token = object()
+        shared["token"] = token
+        left = [int(tries)]
+
+        def check(_dt):
+            if shared.get("token") is not token:
+                return False                          # 別の層（または次のロード）が引き継いだ
+            left[0] -= 1
+            if not party_member_ids(self) and left[0] > 0:
+                return True
+            shared["token"] = None
+            try:
+                before = list(getattr(self, "to_display_buttons", []) or [])
+                self.refresh_choice_buttons()
+                after = list(getattr(self, "to_display_buttons", []) or [])
+                done = paint_choices(self, after, ctx.log_exc)
+                if write:
+                    write("refreshed the choices after the load (party={}): {} -> {} via {}".format(
+                        party_ids(self), before, after, "+".join(done) if done else "(nothing)"))
+            except Exception:
+                ctx.log_exc("after load: refresh_choice_buttons failed")
+            return False
+        Clock.schedule_interval(check, interval)
+        return result
+
+
 def describe_stores(app):
     """名簿の在り処と中身を1行で。切り分けのときこれが頼りになる。"""
     return "; ".join("{}={}".format(label, store_ids(store))
@@ -1246,7 +1637,18 @@ def scheduler(ctx, tag="mod"):
     同じ経路を通したいので、ゲームの外では即時実行に落ちる。
     ボタンを挿す mod は `Screen` の方を使うこと（あちらは
     Clock が無い＝画面が無いので、実行せず諦めるのが正しい）。
+
+    Clock から呼ぶ `fn` の例外はここで握ってローダのログへ残す。
+    Clock の中で投げるとゲームごと落ちる（TECH.md §5.1.2）ので、mod が素の関数を
+    渡しても窓口の側で守る。ゲームの外の即時実行は握らない
+    （検査で例外がそのまま見える方がよい）。
     """
+    def guarded(fn):
+        try:
+            fn()
+        except Exception:
+            ctx.log_exc("{}: scheduled call failed".format(tag))
+
     def schedule(fn, delay=0.0):
         try:
             from kivy.clock import Clock
@@ -1254,10 +1656,53 @@ def scheduler(ctx, tag="mod"):
             fn()              # ゲームの外（オフライン検証）ではその場で
             return
         try:
-            Clock.schedule_once(lambda _dt: fn(), delay)
+            Clock.schedule_once(lambda _dt: guarded(fn), delay)
         except Exception:
             ctx.log_exc("{}: could not schedule".format(tag))
     return schedule
+
+
+#: `saver` が保存を呼ぶまでの待ち（秒）。同じ操作の中で続く書き換えを済ませてから保存する。
+SAVE_DELAY = 0.15
+
+
+def saver(ctx, write=None, tag="mod", delay=SAVE_DELAY):
+    """ゲーム自身の `save_game` を少し待ってから呼ぶ関数を1つ作る。
+
+        save_soon = ui.saver(ctx, write, "real estate")
+        save_soon(app, "rent")      # 続けて呼べば、保存は最後の1回だけ
+
+    `state/` の控えとセーブの両方にまたがる変更をした MOD が、控えを書いた直後に呼ぶ。
+    控えはその場でファイルになるが、所持金や持ち物はメモリの中で動くだけなので、
+    保存しないまま終えたりロードし直したりすると控えだけが進んだ形が残る
+    （家や道がタダで手に入る、預けた品が控えと持ち物の両方に残る）。
+
+    続けて呼ばれたら古い予約は捨てる（世代で見分ける。1回の操作で何度動かしても保存は1回）。
+    実行は `scheduler` と同じく次のフレーム以降のメインスレッドで、ゲームの外では
+    その場で保存する。落ちた `save_game` はローダのログへ残す。
+    `330_` と `402_` が同じ形を持っていて、`331_` / `325_` が3本目・4本目になるところで移した。
+    """
+    schedule = scheduler(ctx, tag)
+    generation = [0]
+
+    def save_soon(app, why):
+        generation[0] += 1
+        mine = generation[0]
+
+        def do_save():
+            if mine != generation[0]:
+                return
+            try:
+                app.save_game()
+            except Exception:
+                ctx.log_exc("{}: save_game after {} failed".format(tag, why))
+                return
+            if write is not None:
+                write("{}: save_game complete".format(why))
+
+        schedule(do_save, delay)
+
+    return save_soon
 
 
 def window_watcher(ctx, handler, attr, tag="mod"):
@@ -1288,8 +1733,18 @@ def window_watcher(ctx, handler, attr, tag="mod"):
 
     ゲームの外（オフライン検証）では Kivy が無いので**何もしない**。
     窓が無いのだから結ぶ相手も居ない、というだけで異常ではない。
+
+    `handler` は `scheduler` と同じく例外を握る包みに入れてから結ぶ
+    （リサイズの通知も Kivy の中から呼ばれる）。`Window` に残す印も包みの方。
     """
     watching = [False]
+
+    def guarded(*args, **kwargs):
+        try:
+            return handler(*args, **kwargs)
+        except Exception:
+            ctx.log_exc("{}: window resize handler failed".format(tag))
+            return None
 
     def watch_window():
         if watching[0]:
@@ -1307,8 +1762,8 @@ def window_watcher(ctx, handler, attr, tag="mod"):
             except Exception:
                 pass          # 既に外れている（Kivy が畳んだ後）
         try:
-            Window.bind(on_resize=handler)
-            setattr(Window, attr, handler)
+            Window.bind(on_resize=guarded)
+            setattr(Window, attr, guarded)
             return True
         except Exception:
             watching[0] = False
@@ -1335,7 +1790,7 @@ class Screen(object):
         self.tag = tag
         self.mark = mark
         self.safe_cls = safe_cls
-        self._busy = {"on": False, "frame": 0, "enabled": None}
+        self._busy = {"on": False, "enabled": None}
 
     # -- 例外を外へ出さないための土台 ---------------------------------------
     def _oops(self, what):
@@ -1487,6 +1942,19 @@ class Screen(object):
         return any(isinstance(key, str) and key.startswith(MARK_PREFIX)
                    for key in entry)
 
+    @staticmethod
+    def back_button_index(buttons):
+        """ゲーム側の「やめる」の位置。無ければ None（＝一覧ではない／まだ組み上がっていない）。
+
+        無害 spec（`SAFE_CLS`）で、どの MOD の印も付いていないもの。
+        自前のボタンも同じ spec を使うので、印で除く。
+        `320_` / `326_` / `404_` に同じ本体が写されていた。
+        """
+        for index, entry in enumerate(buttons):
+            if spec_cls_name(entry) == SAFE_CLS and not Screen.marked_by_a_mod(entry):
+                return index
+        return None
+
     def instantiate_spec(self, app, entry_or_spec):
         """ボタンの `PhaseSpec` から、それが呼ぶはずのマネージャを組み立てる。
 
@@ -1543,31 +2011,7 @@ class Screen(object):
         Clock コールバックの形なので `dt` を渡せば直接呼べる）も通す。
         描画のためにゲームを落とさないよう、例外はどれも外へ出さない。
         """
-        done = []
-
-        loader = getattr(app, "display_button_load", None)
-        if callable(loader):
-            try:
-                loader(0)
-                done.append("display_button_load")
-            except Exception:
-                self._oops("display_button_load failed")
-
-        hud = find_hud(app)
-        updater = getattr(hud, "update_button_texts", None) if hud is not None else None
-        if callable(updater):
-            try:
-                updater(app, list(texts))
-                done.append("hud.update_button_texts")
-            except Exception:
-                self._oops("hud.update_button_texts failed")
-        elif hud is None:
-            # ここが出たら画面は塗り替わらない。
-            # 型で探して見つからない＝ HUD の構成が変わったということなので、
-            # その合図として残す。
-            done.append("hud not found")
-
-        return done
+        return paint_choices(app, texts, self._oops)
 
     def paint_party(self, app):
         """HUD の仲間欄を塗り直す。効いた手段の一覧を返す。
@@ -1609,18 +2053,23 @@ class Screen(object):
 
     # -- 待機表示（「.」→「..」→「...」）-----------------------------------
     #
-    # **ゲーム自身の待機表示を実測して、そのまま真似る**（値は GAME.md §2.4）:
+    # **点を送っているのはゲーム自身**（GAME.md §2.4。`234_probe_busy_display` の実測）:
     #
-    #   * `is_button_enabled = False` を立てる
-    #   * 点は1個の `…` ではなく `.` → `..` → `...` のアニメーションで、
-    #     **ボタン全枠**に出る（枠数は `hud.buttons` の数）
+    #   * `is_button_enabled` が False のあいだ、Clock に載った
+    #     `InstantaleApp.display_button_load` が約0.3秒ごとに `.` → `..` → `...` を
+    #     `to_display_buttons` に書いて塗り、次のコマを自分で予約し直す
+    #   * 待機中に `display_button_load` を呼ぶと、その呼び出しからも予約が始まる
+    #     （**回し手が1本増える**）。True に戻ると、どの回し手も今の一覧を塗って止まる
     #   * `text_send_button.disabled = True`（自由入力を塞ぐ）
     #   * `app.text_input_disabled` は False のまま ＝ **これは機構ではない**
     #
+    # だからこちらは旗を下ろすだけにし、回っていなければ1回だけ回し始める。
+    # 以前は自前でコマを送っていて、ゲームの回し手と二重に回ったうえ、
+    # 塗るたびに `display_button_load` を呼んで回し手を増やしていた（点が飛び、
+    # 解いた後にも点が一瞬戻った。実機 2026-09-25）。
+    #
     # **`app.buttons`（spec の一覧）には触らない。** ゲームも表示だけ差し替えて
     # いるので、こちらも表示だけにすれば後始末が要らない。
-    BUSY_FRAMES = (".", "..", "...")
-    BUSY_INTERVAL = 0.3
 
     def busy_slots(self, app):
         """待機表示を出す枠の数。実物のボタンウィジェット数に合わせる。"""
@@ -1651,14 +2100,30 @@ class Screen(object):
         return bool(self._busy["on"])
 
     def busy_on(self, app):
-        """待機表示を出す。ゲーム自身と同じ見た目・同じ止め方。
+        """待機表示を出す。ゲーム自身と同じ出し方（上の説明。GAME.md §2.4）。
 
         LLM を待つ間これを出さないと、**画面が固まったように見える**（GAME.md
         §2.4）。
+
+        ワーカースレッドからも呼べる。ここで直に触るのは旗と一覧（`to_display_buttons`）
+        だけで、画面に触る手（送信ボタン・点送りの始動）は Clock へ回す。
+        ゲームが選択肢を組んだその場で覆いたいとき（組んだ次のフレームでゲームが塗る）に使う。
+
+        枠に点が出ていれば（ゲームの待機の直後）、その点を一覧に書いておく。
+        ゲームは待機を終えた次のフレームで今の一覧を塗るので、書いておかないと
+        そのフレームだけ選択肢が見える。点送りは一覧の文字から次のコマを決めるので、
+        続きから進む（実機 2026-09-25）。
+
+        出している間にもう一度呼ばれても、戻す値（`is_button_enabled`）は
+        取り直さない。取り直すと自分が立てた `False` を覚えてしまい、
+        `busy_off` の後も選択肢が押せないまま残る。
+        入れ子は数えない（先に来た `busy_off` で解く）。`busy_on` と対でなく
+        `busy_off` だけを呼ぶ経路があるので、数えると解けなくなる側に倒れる。
         """
         busy = self._busy
-        busy["enabled"] = getattr(app, "is_button_enabled", None)
-        busy["frame"] = 0
+        again = bool(busy["on"])
+        if not again:
+            busy["enabled"] = getattr(app, "is_button_enabled", None)
         busy["on"] = True
         slots = self.busy_slots(app)
 
@@ -1666,23 +2131,32 @@ class Screen(object):
             app.is_button_enabled = False
         except Exception:
             self._oops("cannot clear is_button_enabled")
+        frame = shown_dots(app)
+        if frame is not None:
+            try:
+                app.to_display_buttons = [frame] * slots
+            except Exception:
+                self._oops("cannot hold the dots")
         self.set_send_button(app, False)
 
-        def tick(_dt):
-            if not busy["on"]:
-                return False                    # Clock から外れる
-            frame = self.BUSY_FRAMES[busy["frame"] % len(self.BUSY_FRAMES)]
-            busy["frame"] += 1
-            try:
-                texts = [frame] * slots
-                app.to_display_buttons = texts
-                self.paint(app, texts)
-            except Exception:
-                self._oops("busy frame failed")
-            return True
+        if again:
+            self.write("{}: busy on again ({} slots)".format(self.tag, slots))
+            return slots
 
-        self.schedule(lambda: tick(0), 0)       # 1コマ目はすぐ
-        self._interval(tick, self.BUSY_INTERVAL)
+        def start():
+            # 待っている間に解かれていたら何もしない。
+            if not busy["on"]:
+                return
+            pending = button_load_pending(app)
+            if pending:
+                # ゲームの点送りが回っている（ゲーム自身の待機の直後など）。増やさない。
+                self.write("{}: the game is already turning the dots".format(self.tag))
+                return
+            loader = getattr(app, "display_button_load", None)
+            if callable(loader):
+                loader(0)       # 1コマ目を塗り、以後はゲームが自分で予約し直す
+
+        self.schedule(start, 0)
         self.write("{}: busy on ({} slots) -> {}".format(
             self.tag, slots, self.busy_state(app)))
         return slots
@@ -1747,7 +2221,14 @@ class Screen(object):
         描画の面倒はその経路が見ているので、同じ経路に乗せる。
         フェーズは `execute(choice_text)` だけを持つ自前クラスでよい。
         **`PhaseSpec` には決して載せない。**
+
+        待機中（点送りが回っている）なら外してから起こす。
+        `process_choice` は自分で点送りを始めるので、残すと2本になって点が速くなる
+        （実機 2026-09-25。締めの場面の間だけ 0.1 秒刻みになった。GAME.md §2.4）。
         """
+        if getattr(app, "is_button_enabled", None) is False and stop_button_load(app):
+            self.write("{}: stopped the running dots before {}".format(
+                self.tag, type(phase).__name__))
         try:
             app.process_choice(phase, choice_text)
             return True

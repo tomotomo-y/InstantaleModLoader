@@ -9,8 +9,9 @@
 
   場所    … 環境変数が優先。無ければ MOD の3つ上。game_dir は gui.json の game_path から
   宣言    … 項目と既定値は mod.json の "settings" から。写しを持たない
-  設定    … 既定と違う値だけ mod_settings.json に入る。他の MOD の項は触らない
-  窓      … 最大化中は normal に戻してから寸法を取る。他の覚えごとを落とさない
+  設定    … 既定と違う値だけ mod_settings.json に入る。他の MOD の項は触らない。
+            在るのに読めない mod_settings.json には書かない
+  窓      … 最大化中は normal に戻してから寸法を取り、最大化へ戻す。他の覚えごとを落とさない
   書込    … ローダの write_json（tmp → fsync → replace）。tmp を残さない
   無状態  … 1プロセスで2つの MOD を扱っても混ざらない
 """
@@ -122,6 +123,29 @@ try:
     check("読めない値は宣言の既定へ",
           modtool.load_settings(root, first) == {"COUNT": 3, "LOUD": True},
           modtool.load_settings(root, first))
+    # 在るのに読めないファイルに書くと、`{}` に1件足した形で丸ごと置き換わり、
+    # 他の MOD の設定が全部消える。書かずに断る。
+    broken_store = '{"802_second_mod": {"COUNT": 1},}'      # 末尾のカンマ1つ
+    with io.open(store_path, "w", encoding="utf-8") as fh:
+        fh.write(broken_store)
+    check("壊れた設定ファイルには書かない（False）",
+          modtool.save_settings(root, first, {"COUNT": 7, "LOUD": True}) is False)
+    with io.open(store_path, encoding="utf-8") as fh:
+        check("壊れた設定ファイルがそのまま残る", fh.read() == broken_store)
+    try:
+        modtool.save_settings(root, first, {"COUNT": 7, "LOUD": True}, strict=True)
+        raised = None
+    except ValueError as exc:
+        raised = exc
+    check("strict では理由を例外で返す（ファイルの場所を含む）",
+          raised is not None and "mod_settings.json" in str(raised), raised)
+    with io.open(store_path, "w", encoding="utf-8") as fh:
+        fh.write("[1, 2]")
+    check("オブジェクトでない設定ファイルにも書かない",
+          modtool.save_settings(root, first, {"COUNT": 7, "LOUD": True}) is False)
+    os.remove(store_path)
+    check("ファイルが無ければ書ける",
+          modtool.save_settings(root, first, {"COUNT": 7, "LOUD": True}))
     os.remove(store_path)
 
     print("[入力欄の値を整える]")
@@ -136,6 +160,16 @@ try:
     with io.open(target, encoding="utf-8") as fh:
         check("読み返せる", json.load(fh) == {"a": 1})
     check("tmp を残さない", not os.path.exists(target + ".tmp"))
+    check("read_json で読み返せる", modtool.read_json(target) == {"a": 1})
+    check("無いファイルは空の辞書", modtool.read_json(os.path.join(tmp, "none.json")) == {})
+    broken = os.path.join(tmp, "broken.json")
+    with io.open(broken, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    listed = os.path.join(tmp, "listed.json")
+    with io.open(listed, "w", encoding="utf-8") as fh:
+        fh.write("[1, 2]")
+    check("壊れたファイルも辞書でないものも空の辞書",
+          modtool.read_json(broken) == {} and modtool.read_json(listed) == {})
 
     print("[窓の記憶]")
     import tkinter as tk
@@ -159,6 +193,9 @@ try:
           entry.get("geometry", "").startswith("800x600")
           and not entry.get("geometry", "").startswith(zoomed_geometry.split("+")[0]),
           (entry.get("geometry"), zoomed_geometry))
+    # 閉じる前に寸法を残し、その後の未保存の確認で取り消されることがある。
+    # 最大化が解けたまま残らないこと。
+    check("寸法を取った後は最大化に戻っている", window.state() == "zoomed", window.state())
     cfg = gui_json(root)
     check("他の覚えごとを落とさない",
           cfg.get("game_path") == "X:/games/instantale.exe"
@@ -174,6 +211,44 @@ try:
         fh.write("{ not json")
     check("読めなければ空を返す（例外にしない）", modtool.load_window(root, first) == {})
     check("locate も倒れない", modtool.locate(first)[0] == root)
+    # ----------------------------------------------------------------- 書いた先
+    # 保存の後に出す一行は、**実際に書いた先だけ**を並べる。
+    # 一括設定だけ直したのに世界の控えのパスが出ると、その世界を保存したように読める
+    # （実機で踏んだ）。
+    print("[書いた先]")
+    decls = {"A": {"default": 1}, "B": {"default": "x"}}
+    shared_path, world_path = r"settings" + chr(92) + "mod_settings.json", \
+        r"state" + chr(92) + "mod" + chr(92) + "世界.json"
+
+    def targets(was_shared, was_world, now_shared, now_world, world=world_path):
+        return modtool.saved_paths(
+            decls, {"shared": was_shared, "world": was_world},
+            {"shared": now_shared, "world": now_world}, shared_path, world)
+
+    check("一括設定だけ変えたら一括設定だけ",
+          targets({"A": 1}, {"A": 1}, {"A": 2}, {"A": 2}) == [shared_path],
+          targets({"A": 1}, {"A": 1}, {"A": 2}, {"A": 2}))
+    check("個別だけ変えたら控えだけ",
+          targets({"A": 1}, {"A": 1}, {"A": 1}, {"A": 5}) == [world_path],
+          targets({"A": 1}, {"A": 1}, {"A": 1}, {"A": 5}))
+    check("両方変えたら両方",
+          targets({"A": 1}, {"A": 5}, {"A": 2}, {"A": 9}) == [shared_path, world_path],
+          targets({"A": 1}, {"A": 5}, {"A": 2}, {"A": 9}))
+    check("何も変えなければ空", targets({"A": 1}, {"A": 1}, {"A": 1}, {"A": 1}) == [])
+    check("世界が無ければ一括設定だけを見る",
+          targets({"A": 1}, {"A": 1}, {"A": 2}, {"A": 2}, world="") == [shared_path])
+    # 控えは差分なので、入力欄が同じままでも一括設定を動かすと中身が変わる。
+    gone = targets({"A": 1}, {"A": 5}, {"A": 5}, {"A": 5})
+    check("一括設定が個別に追いついたら控えは消える（その旨を出す）",
+          len(gone) == 2 and gone[0] == shared_path
+          and gone[1].startswith(world_path) and "削除" in gone[1], gone)
+    born = targets({"A": 1}, {"A": 1}, {"A": 2}, {"A": 1})
+    check("一括設定だけ動かして差が生まれたら控えも書く",
+          born == [shared_path, world_path], born)
+    check("宣言に無い項目は差分に数えない",
+          modtool.world_record(decls, {"A": 1}, {"A": 1, "Z": 9}) == {},
+          modtool.world_record(decls, {"A": 1}, {"A": 1, "Z": 9}))
+
 finally:
     for key in ("IML_ROOT", "IML_STATE_DIR", "IML_GAME_DIR"):
         os.environ.pop(key, None)

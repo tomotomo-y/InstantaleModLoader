@@ -38,6 +38,7 @@ if RUNTIME_DIR not in sys.path:
 import instantale_modloader as ml                                   # noqa: E402
 from instantale_modloader import llm as llm_module                  # noqa: E402
 from instantale_modloader import ui as ui_module                    # noqa: E402
+from instantale_modloader.state import PLAYTHROUGH_SEP            # noqa: E402
 
 QUEST_END = "__main__:QuestEndManager.execute"
 WORLD_INIT = "__main__:World.__init__"
@@ -230,13 +231,34 @@ def clear_quest(app, area_id="3"):
     return types.SimpleNamespace(app=app)
 
 
-def read_cache(module, world="テスト世界"):
+#: 控えは周回（世界×主人公）ごと。主人公は `make_app` の「旅人リン」。
+PLAYTHROUGH = "テスト世界" + PLAYTHROUGH_SEP + "旅人リン"
+
+
+def cache_path(module, key):
     from instantale_modloader.state import world_filename
-    path = os.path.join(STATE_DIR, module.STATE_DIRNAME, world_filename(world))
+    return os.path.join(STATE_DIR, module.STATE_DIRNAME, world_filename(key))
+
+
+def read_cache(module, world=PLAYTHROUGH):
+    path = cache_path(module, world)
     if not os.path.exists(path):
         return None
     with io.open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def drop_other_playthroughs(world, keep):
+    """`STATE_DIR` のどのフォルダからも、`world` の `keep` 以外の周回のファイルを消す。"""
+    from instantale_modloader.state import PLAYTHROUGH_SEP, world_filename
+    own = world_filename(keep)
+    for folder in os.listdir(STATE_DIR):
+        path = os.path.join(STATE_DIR, folder)
+        if not os.path.isdir(path):
+            continue
+        for name in os.listdir(path):
+            if name.startswith(world + PLAYTHROUGH_SEP) and name != own:
+                os.remove(os.path.join(path, name))
 
 
 def clear_cache(module):
@@ -396,12 +418,40 @@ def run():
     app2 = make_app()                      # 素の文面で作り直した世界
     module, ctx = fresh_mod(app2)          # 控えは前の検査のものが残っている
     world2 = app2.world
-    save_dict = {"world_data": {"world_name": "テスト世界"}}
+    save_dict = {"world_data": {"world_name": "テスト世界"},
+                 "player_data": {"name": "旅人リン"}}
     ctx.hooks[WORLD_INIT](lambda self, d, a: None, world2, save_dict, app2)
     check("控えの文面が当たる",
           world2.areas["3"].descriptions["overview"] == "霧の晴れた湿地の町。")
     check("控えの無い土地は素のまま",
           world2.areas["7"].descriptions["overview"] == OVERVIEW0)
+
+    print("同じ世界で作り直した主人公")
+    app3 = make_app()
+    module, ctx = fresh_mod(app3)
+    other = {"world_data": {"world_name": "テスト世界"},
+             "player_data": {"name": "別の旅人"}}
+    ctx.hooks[WORLD_INIT](lambda self, d, a: None, app3.world, other, app3)
+    check("前の主人公の書き直しは当たらない",
+          app3.world.areas["3"].descriptions["overview"] == OVERVIEW0)
+
+    print("世界名だけの控え（前の版）")
+    kept = read_cache(module)
+    clear_cache(module)
+    # 別の主人公の周回が在る世界では移さない（ローダの state.adopt）。`out\test\state` は
+    # 他の検査と共有なので、この世界の別の周回（他の検査の残り）を先に片付ける
+    drop_other_playthroughs("テスト世界", PLAYTHROUGH)
+    old_path = cache_path(module, "テスト世界")
+    os.makedirs(os.path.dirname(old_path), exist_ok=True)
+    with io.open(old_path, "w", encoding="utf-8") as fh:
+        json.dump(kept, fh, ensure_ascii=False)
+    app4 = make_app()
+    module, ctx = fresh_mod(app4)
+    ctx.hooks[WORLD_INIT](lambda self, d, a: None, app4.world, save_dict, app4)
+    check("見つけた時点の主人公のものとして当たる",
+          app4.world.areas["3"].descriptions["overview"] == "霧の晴れた湿地の町。")
+    check("周回のファイルへ移り、世界名だけのファイルは消える",
+          read_cache(module) == kept and not os.path.exists(old_path))
 
     print("第一声への差し込み")
     npc = Character("店主", profile="口の固い店主。")

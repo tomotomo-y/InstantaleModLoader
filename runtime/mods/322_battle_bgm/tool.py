@@ -38,8 +38,6 @@ MOD 本体は import しない。
 どの道具も同じなので `tools/modtool.py` に在る（TECH.md §3.12）。
 """
 
-import io
-import json
 import os
 import sys
 import time
@@ -67,7 +65,7 @@ PLAYLIST_HELP = [
     "重みは比率。同じ種類の合計に対する割合が確率になる（合計 100 なら数字がそのままパーセント）",
     "0 はその種類では鳴らない。3種類とも 0 なら素の曲が鳴る",
     "曲は Assets/sounds/musics/battle と state/musics/battle の .mp3 / .ogg / .wav。同名なら state 側",
-    "見つけた曲は 0 で書き足される。設定画面で使うに入れるまで鳴らない。書いた数字は消えない",
+    "見つけた曲は 0 で書き足される。設定画面で「使う」に入れるまで鳴らない。書いた数字は消えない",
 ]
 
 # タブの並び。鍵は playlist.json の項目名。
@@ -112,14 +110,8 @@ def scan(asset_dir, state_dir):
     return sorted(found.items())
 
 
-def load_playlist(path):
-    """ファイル全体。無い・読めないときは空の辞書。"""
-    try:
-        with io.open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+#: ファイル全体。無い・読めないときは空の辞書（`modtool` の語彙。`324_` と共有）。
+load_playlist = modtool.read_json
 
 
 def weight_of(entry, category):
@@ -496,11 +488,11 @@ def build_window(model):
         used["shown"].configure(text="{} / {} 曲".format(len(used_names), len(used_all)))
         total = sum(r[category] for r in model.rows.values())
         if not model.rows:
-            text = "曲が見つからない。上の2つのフォルダに .mp3 / .ogg / .wav を置く"
+            text = "曲が見つかりません。上の2つのフォルダに .mp3 / .ogg / .wav を置いてください"
         elif not used_all:
-            text = "使う曲が無い。この種類の戦闘では素の曲が鳴る"
+            text = "使う曲がありません。この種類の戦闘では素の曲が鳴ります"
         else:
-            text = "{} 曲中 {} 曲を使う。重みの合計 {}".format(len(model.rows), len(used_all), total)
+            text = "{} 曲中 {} 曲を使います。重みの合計 {}".format(len(model.rows), len(used_all), total)
         tab["summary"].configure(text=text)
         if keep and used["tree"].exists(keep):
             used["tree"].selection_set(keep)
@@ -559,7 +551,7 @@ def build_window(model):
 
     if not model.rows:
         messagebox.showinfo("戦闘BGMの選曲",
-                            "曲が1つも見つからない。\n\n{}\n{}\n\nに .mp3 / .ogg / .wav を置いて「再走査」".format(
+                            "曲が1つも見つかりません。\n\n{}\n{}\n\nに .mp3 / .ogg / .wav を置いて「再走査」".format(
                                 model.asset_dir or "（ゲームの場所が未設定）", model.state_dir),
                             parent=root)
     return root

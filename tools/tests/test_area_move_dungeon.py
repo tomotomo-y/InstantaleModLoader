@@ -461,12 +461,19 @@ def install_fake_functions(levels):
 
 
 class FakeCtx:
+    _seq = 0
+
     def __init__(self, out_dir):
         self.out_dir = out_dir
         self.state_dir = os.path.join(out_dir, "state")
         self.hooks = {}
         self.errors = []
         self.logs = []
+        # 世代は apply() ごとに違う（本物の `ctx.generation`）。
+        # ローダの日数送りの関所は世代で「もう立てたか」を見るので、
+        # ここが同じ値だと 2本目以降の apply() で関所が立たない（durations.install）。
+        FakeCtx._seq += 1
+        self.generation = FakeCtx._seq
 
     def out_path(self, *parts):
         path = os.path.join(self.out_dir, *parts)
@@ -504,8 +511,23 @@ class FakeCtx:
         return ml.write_text(path, text, report=self.log_exc)
 
     def wrap(self, target, **kw):
+        """同じ対象に2枚当たったら層にする（本物は後から当てたほうが外側。TECH.md §3.3）。
+
+        `325_` は日数送りに「後処理だけ」の包みを持ち、日数そのものは
+        ローダの関所が渡す。1枚しか覚えないと、後から当てたほうだけが残る。
+        """
         def decorator(func):
-            self.hooks[target] = func
+            previous = self.hooks.get(target)
+            if previous is None:
+                self.hooks[target] = func
+                return func
+
+            def layered(orig, this, *args, _prev=previous, _func=func, **kwargs):
+                def inner(obj, *a, **kw2):
+                    return _prev(orig, obj, *a, **kw2)
+                return _func(inner, this, *args, **kwargs)
+
+            self.hooks[target] = layered
             return func
         return decorator
 
@@ -781,6 +803,33 @@ check("押しただけでは移動しない", app.moved == [], app.moved)
 check("道中のクエストが1件できる", len(app.world.quests) == 2, app.world.quests)
 check("受注画面へ渡す", app.accepted == [("settlement_quest", "40")], app.accepted)
 check("例外も出ない", not ctx.errors, ctx.errors)
+
+print("=== 待機表示の後に投げても後始末は通る ===")
+mod, ctx, app, classes = setup()
+show_confirmation(app, classes[0])
+real_quest_ids = mod.world.quest_ids
+reads = []
+
+
+def quest_ids_then_break(app_obj):
+    reads.append(1)
+    if len(reads) > 1:                   # 生成の後の読み直しで投げる
+        raise RuntimeError("quest table unreadable")
+    return real_quest_ids(app_obj)
+
+
+mod.world.quest_ids = quest_ids_then_break
+try:
+    press(app, "危険な道を行く")
+finally:
+    mod.world.quest_ids = real_quest_ids
+check("例外は記録に残る", any("phase failed" in e for e in ctx.errors), ctx.errors)
+check("待機表示が解ける", app.is_button_enabled is True, app.is_button_enabled)
+show_confirmation(app, classes[0])
+press(app, "危険な道を行く")
+check("生成中の印が残らない（もう一度押せば道が出る）",
+      not any("いま道の話を聞いている" in text for text in app.texts)
+      and app.accepted, (app.texts[-3:], app.accepted))
 
 print("=== 体力が足りなければ断る ===")
 mod, ctx, app, classes = setup()

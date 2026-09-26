@@ -28,6 +28,16 @@ GAME_FILE_HINTS = ("instantale.py", "\\scripts\\", "/scripts/",
 # caller() を参照。
 RUNTIME_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# 配る予定の無い MOD の置き場（`local/`）。runtime の**外**、配布フォルダの根の直下にある
+# （`__init__.LOCAL_DIRNAME`。このモジュールは os / sys しか import しないので名前を写す）。
+# ここを数えないと、`caller()` が `local/` の MOD のフレームをゲーム側の呼び出し元として出す。
+LOCAL_DIR = os.path.join(os.path.dirname(RUNTIME_DIR), "local")
+
+# `is_ours` が比べる接頭辞。区切りの向きと大文字小文字を均し、末尾に区切りを付ける
+# （`runtime_old` のような隣のフォルダを巻き込まない）。
+_OURS = tuple(os.path.join(os.path.normcase(folder).lower(), "")
+              for folder in (RUNTIME_DIR, LOCAL_DIR))
+
 # 「属性が無い」と「値が None」を区別するための番人。
 # 戦闘BGMの原因特定では、`app.music` が **None ではなく存在しない** ことが決め手になった（渡されたオブジェクトが
 # app ではなかった）。
@@ -76,6 +86,66 @@ def text_of(obj, name: str = "text"):
     except Exception:
         return None
     return value if isinstance(value, str) else None
+
+
+def _arg_index(name, index):
+    """`index` を添字に揃える。引数名の並びを渡されたら、その中の位置。無ければ None。"""
+    if index is None or isinstance(index, int):
+        return index
+    try:
+        return list(index).index(name)
+    except (TypeError, ValueError):
+        return None
+
+
+def arg(args, kwargs, name, index=None, default=None):
+    """`@ctx.wrap` の中で、位置でもキーワードでも来うる引数を1つ読む。
+
+    呼び手はコンパイル済みで読めないので、どちらの渡し方かを決め打ちできない。
+    **キーワードを先に見る**（位置は版で動きうるので、名前で当たるならそちらを採る）。
+
+    `index` は添字か、引数名の並び（`("quest_data", "player", ...)`）。
+    並びに `name` が無ければキーワードだけを見る。
+    どちらでも届いていなければ `default`。
+
+    `313_` / `215_` / `910_` / `219_` / `104_` に写されていた（添字の渡し方が3通りあった）。
+    """
+    if name in kwargs:
+        return kwargs[name]
+    index = _arg_index(name, index)
+    if index is not None and len(args) > index:
+        return args[index]
+    return default
+
+
+def replace_arg(args, kwargs, name, index, value, insert=False):
+    """来た側（位置かキーワード）に合わせて1つ差し替える。`(args, kwargs, 書けたか)`。
+
+    渡された `args` / `kwargs` 自体は書き換えない（写しを返す）。
+    `index` の受け方は `arg` と同じ。
+
+    **どちらにも届いていなかったとき**は `insert` で選ぶ:
+
+      * `False`（既定）… 触らず `(args, kwargs, False)`（`327_`）
+      * `True` … キーワードとして足す（`910_`）
+
+    足すと、素の関数がその名前を受けない版では `TypeError` になる。
+    足してよいと分かっている相手にだけ `True` を渡す。
+    """
+    if name in kwargs:
+        kwargs = dict(kwargs)
+        kwargs[name] = value
+        return tuple(args), kwargs, True
+    index = _arg_index(name, index)
+    if index is not None and len(args) > index:
+        args = list(args)
+        args[index] = value
+        return tuple(args), kwargs, True
+    if insert:
+        kwargs = dict(kwargs)
+        kwargs[name] = value
+        return tuple(args), kwargs, True
+    return tuple(args), kwargs, False
 
 
 def short(value, limit: int = 200) -> str:
@@ -130,9 +200,9 @@ def is_game_frame(filename: str) -> bool:
 
 
 def is_ours(filename: str) -> bool:
-    """このフレームがローダか mod のものか（＝ゲーム側ではない）。"""
+    """このフレームがローダか mod のものか（＝ゲーム側ではない）。`local/` の MOD も含む。"""
     try:
-        return filename.lower().startswith(RUNTIME_DIR.lower())
+        return os.path.normcase(filename).lower().startswith(_OURS)
     except Exception:
         return False
 

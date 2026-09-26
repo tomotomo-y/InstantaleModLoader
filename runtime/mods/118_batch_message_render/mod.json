@@ -11,13 +11,13 @@
   ],
   "name": {
     "en": "Batch message rendering",
-    "ja": "メッセージの表示速度と文字色"
+    "ja": "本文の一括表示と既読の灰色化"
   },
   "description": {
     "en": "Shows the rest of a message at once when the screen is clicked (or always), and grays out older text",
     "ja": "表示中に画面をクリックすると残りを一括表示する（常時一括にもできる）。古い本文は灰色にする"
   },
-  "version": "3",
+  "version": "5",
   "author": "yoshinari/tomotomo-y, R01/Flossian",
   "settings": {
     "BATCH_MODE": {
@@ -57,7 +57,7 @@
       },
       "note": {
         "ja": "古い本文の見分け方が seconds のときに使う。新しいメッセージが追加された時点で、この秒数以内の本文を白色にする。表示中には色を変えない。0なら追加直後から灰色にする",
-        "en": "Used when older text is decided by seconds. When a new message is added, messages younger than this many seconds are white. Colors do not change while idle. 0 grays them immediately"
+        "en": "Used when older text is decided by seconds. When a new message is added, messages younger than this many seconds are white. Colors never change while a message is on screen, only when the next one is added. 0 grays them immediately"
       }
     },
     "FRESH_SESSIONS": {

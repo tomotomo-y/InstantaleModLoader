@@ -280,6 +280,14 @@ check("渡した widget の装備印を落とす", widget.is_equipped is False,
 FakeClock.run_all()
 check("予約が走ると save_game が1回", app.saves == 1, app.saves)
 check("遅延後の呼び出しで例外を残さない", ctx.errors == [], ctx.errors)
+# 仲間側の品の右クリック: 本体は popup を出さないので自前のボタンを出す（Kivy 抜きでは出せず、1行残して戻る）
+SHOW = "scripts.hud.new_hud:InventoryItem.show_popup_menu"
+widget = types.SimpleNamespace(item_id="item_9", item_instance=types.SimpleNamespace(obtainer=npc, item_type="weapon"),
+                               parent=types.SimpleNamespace())
+ctx.hooks[SHOW](lambda self, pos: None, widget, (10, 20))
+FakeClock.run_all()
+check("右クリックの包みで例外を残さない", ctx.errors == [], ctx.errors)
+
 shutil.rmtree(out_dir, ignore_errors=True)
 
 
@@ -339,6 +347,38 @@ check("例外を残さない", ctx.errors == [], ctx.errors)
 shutil.rmtree(out_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- 装備欄の MOD が居るとき
+# 仲間の `equipments` を書くのは装備欄の MOD（333_）だけ。窓口 `combat.equipped` が答える持ち主では、
+# 本体の unequip も参照の掃除もしない（書き手が 2 本になると、渡した品が仲間の持ち物にも残った）
+print("装備欄の MOD が居る受け渡し")
+from instantale_modloader import combat  # noqa: E402
+ctx, app, out_dir = open_window()
+npc = app.world.characters["80"]
+player = app.player
+asked = []
+combat.declare(combat.EQUIPPED, lambda a, holder, item: asked.append(holder) or True, owner="test_slots")
+staff = Item("星詠みの魔導杖")
+staff.obtainer = npc
+staff.id = "item_212"
+npc.inventory["item_212"] = staff
+npc.equipments["weapon"] = "item_212"
+widget = InventoryItem(staff, "item_212", Grid(npc))
+FakeClock.scheduled = []
+move(ctx, app, widget, Grid(player))
+check("窓口に旧持ち主を聞く", asked == [npc], asked)
+check("本体の unequip を通さない", staff.unequip_calls == 0, staff.unequip_calls)
+check("equipments に触らない（装備欄の MOD が書く）", npc.equipments.get("weapon") == "item_212",
+      npc.equipments)
+check("持ち物の受け渡しはする", staff in player.inventory.values() and staff.obtainer is player,
+      player.inventory)
+check("任せた旨を 1 行残す", any("left to the equipment slots" in n for n in ctx.notes),
+      ctx.notes[-3:])
+combat.forget("test_slots")
+FakeClock.run_all()
+check("例外を残さない", ctx.errors == [], ctx.errors)
+shutil.rmtree(out_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- unequip の番人
 # 実体が別の場所へ移った後、古い「装備中」表示から本体popupの「外す」が飛ぶと、
 # 本体 unequip は空の equipments を引いて KeyError で落ちる（実測）。
@@ -380,6 +420,90 @@ ctx.hooks[GUARD](native_unequip, string_item)
 check("id文字列の参照も正常として通す", string_item.unequip_calls == 1,
       string_item.unequip_calls)
 check("例外を残さない", ctx.errors == [], ctx.errors)
+shutil.rmtree(out_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- 窓を閉じたら会話へ戻る
+# 売買の窓を閉じると、ゲームは `buttons_backup_for_shopping` を選択肢へ戻す。
+# 前に開いた店（ここでは鍛冶屋）の退避が残っていると、会話の旗だけ残して店の画面へ戻っていた。
+class Spec(object):
+    """実行時の spec（PhaseSpec）の代役。"""
+
+    def __init__(self, cls_name, args=()):
+        self.cls_name, self.args = cls_name, list(args)
+
+    def to_dict(self):
+        return {"cls_name": self.cls_name, "args": list(self.args)}
+
+
+CLOSE = "__main__:InstantaleApp.close_shopping_window_process"
+print("\n[窓を閉じたら会話へ戻る]")
+ctx, app, out_dir = open_window()
+blacksmith = [{"text": "装備の強化", "spec": Spec("EquipmentReinforcementStart")},
+              {"text": "出る", "spec": Spec("MovePhaseManager", ["34", "200", "5"])},
+              {"text": "会話する", "spec": Spec("DisplayTalkChoice")}]
+talk = [{"text": "ここで別れる", "spec": Spec("JustSetButtonToNormalPhase")},
+        {"text": MOD.LABEL, "spec": None, MOD.MARK: "transfer"},
+        {"text": "会話を終了する", "spec": Spec("ConversationEndManager", ["80"])}]
+app.buttons = list(talk)
+app.buttons_backup_for_shopping = list(blacksmith)
+app.in_conversation = "80"
+FakeClock.scheduled = []
+ctx.hooks[PRESS](lambda self, index: "orig", app, 1)
+FakeClock.run_all()
+check("開く前に会話の選択肢を退避へ入れる",
+      [b["text"] for b in app.buttons_backup_for_shopping] == [b["text"] for b in talk],
+      app.buttons_backup_for_shopping)
+
+
+def native_close(self):
+    # ゲームの閉じる処理の代わり。退避を選択肢へ戻す。
+    self.buttons = list(self.buttons_backup_for_shopping)
+
+
+ctx.notes[:] = []
+ctx.hooks[CLOSE](native_close, app)
+FakeClock.run_all()
+check("閉じた後は会話の選択肢", [b["text"] for b in app.buttons] == [b["text"] for b in talk],
+      [b["text"] for b in app.buttons])
+closed = [n for n in ctx.notes if n.startswith("closed the window:")]
+check("閉じた後の画面を1行残す",
+      len(closed) == 1 and "ConversationEndManager" in closed[0] and "'80'" in closed[0], closed)
+
+# 店の窓（402 が開いていない）を閉じたときは何も書かない。
+ctx.notes[:] = []
+ctx.hooks[CLOSE](native_close, app)
+FakeClock.run_all()
+check("402 の窓でなければ書かない",
+      not any(n.startswith("closed the window:") for n in ctx.notes), ctx.notes)
+check("例外を残さない（閉じる）", ctx.errors == [], ctx.errors)
+shutil.rmtree(out_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- 渡した先で鍵が重なるとき
+# 持ち物の鍵は世界全体で一意。渡した先に同じ鍵の別の品が居るときは、
+# 渡した先の辞書の中の空き番号ではなく、採番台帳から採る（TECH.md §3.2.3）。
+print("渡した先で鍵が重なる受け渡し")
+ctx, app, out_dir = open_window()
+npc = app.world.characters["80"]
+player = app.player
+app.save_data_dict = {"index": {"item": 50}, "npcs": {}}
+mine = Item("主人公の薬草", item_type="consumable")
+mine.obtainer, mine.id = player, "item_3"
+player.inventory["item_3"] = mine
+player.inventory["item_0"] = Item("主人公の最初の品", item_type="consumable")
+theirs = Item("仲間の薬草", item_type="consumable")
+theirs.obtainer, theirs.id = npc, "item_3"
+npc.inventory["item_3"] = theirs
+FakeClock.scheduled = []
+move(ctx, app, InventoryItem(theirs, "item_3", Grid(npc)), Grid(player))
+check("元の品はそのまま", player.inventory.get("item_3") is mine, player.inventory)
+check("渡した品は台帳から採った鍵に入る",
+      player.inventory.get("item_50") is theirs and theirs.id == "item_50",
+      sorted(player.inventory))
+check("台帳を進める", app.save_data_dict["index"]["item"] == 51, app.save_data_dict)
+FakeClock.run_all()
+check("例外を残さない（鍵の重なり）", ctx.errors == [], ctx.errors)
 shutil.rmtree(out_dir, ignore_errors=True)
 
 

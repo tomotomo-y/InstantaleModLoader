@@ -10,7 +10,7 @@
     "en": "Spreads item icons across similar candidates instead of always picking the single best match, and adds 305 images missing from the embedding dictionaries",
     "ja": "アイテム画像を「最も似た1枚」固定でなく似た候補の中で使用回数最少から選び、埋め込み辞書に無かった305枚も選択肢に加える"
   },
-  "version": "6",
+  "version": "7",
   "author": "R01/Flossian",
   "settings": {
     "TOP_K": {
@@ -37,7 +37,7 @@
         "en": "Similarity floor (relative to top1)"
       },
       "note": {
-        "ja": "上げるほど見た目に忠実、下げるほど多様。0.8 で clothing のような急落する品種は自動的に絞られる",
+        "ja": "上げるほど見た目に忠実、下げるほど多様。0.8 なら、clothing のように類似度が急に落ちる品種では候補が自動的に絞られる",
         "en": "Higher = closer look, lower = more variety. 0.8 auto-narrows folders where similarity falls off fast"
       }
     },

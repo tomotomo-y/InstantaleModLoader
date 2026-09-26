@@ -8,7 +8,9 @@
   層     … 同じ持ち主は積み重ならず差し替わる（注入し直しても増えない）
   組む   … `original_ability_scores` に6つの鍵が渡る（None だと実機で落ちる）
   載る   … 文字列の id で `world.characters` に載り、素データの写しが置かれる
+  出さず … `listed=False` の人は保存と実体の作り直しを通しても一覧に出ず、控えも書き換わらない
   隠す   … 保存の間だけ名簿と素データの反復から消え、id では引ける。施設の名簿と主も一緒に外れる
+           （途中で投げても、そこまでに外したものは戻る）
   写す   … 保存のたびに実体が控えへ写され、読み直しで写しから組み直される
   取っ手 … 読み書きとも実体へ素通し。正規 NPC の素データは取っ手から触らない
   窓口   … 誰にでも効く層と notes が1つの複製にまとまる
@@ -31,7 +33,7 @@ RUNTIME_DIR = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir, "runtime
 if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
-from instantale_modloader import modnpc  # noqa: E402
+from instantale_modloader import modnpc, patch  # noqa: E402
 
 ABILITY_KEYS = ("strength", "dexterity", "constitution", "intelligence",
                 "wisdom", "charisma")
@@ -42,12 +44,35 @@ CHARACTER_ATTRS = ("name", "profile", "personality", "job", "look_description",
                    "life_log", "skills", "knowledges", "physical_integrity")
 
 
+class FakeItem:
+    """`Item` の代役。**属性を持つオブジェクト**で、JSON には落ちない。"""
+
+    def __init__(self, data, item_id, owner):
+        self.id = str(item_id)
+        self.owner = owner
+        for field in ("name", "item_type", "attributes", "description", "value",
+                      "rarity", "skill", "upgrade_level", "image_src", "grid_pos"):
+            setattr(self, field, data.get(field))
+        self.size = (data.get("width_slots") or 1, data.get("height_slots") or 1)
+
+
+class FakeItemContainer:
+    """`scripts.characters.ItemContainer(inventory=None)` の代役。
+
+    持ち物は**入れ物の中の辞書**で、入れ物そのものは JSON に落ちない。
+    """
+
+    def __init__(self, inventory=None):
+        self.inventory = dict(inventory or {})
+
+
 class FakeCharacter:
     """`scripts.characters.Character` の代役。
 
     `original_ability_scores` を**添字で読む**ところまで似せる。
     実機ではここが `None` のままで落ちた（GAME.md §2.23）ので、
     ひな型が6つの鍵を渡していることをこの代役が検査する。
+    持ち物は本体と同じく `__init__` では受けず、入れ物を自分で作る。
     """
 
     def __init__(self, **kwargs):
@@ -56,8 +81,10 @@ class FakeCharacter:
             scores[key]            # None なら TypeError。鍵が無ければ KeyError
         for attr in CHARACTER_ATTRS:
             setattr(self, attr, None)
+        kwargs.pop("inventory", None)          # 本体の `Character` も受けない
         for key, value in kwargs.items():
             setattr(self, key, value)
+        self.inventory = FakeItemContainer()
 
 
 class FakeCtx:
@@ -129,6 +156,16 @@ def make_app():
     app.party = ["player"]
     app.original_party = ["player"]
     app.current_enemy_dict = {}
+    app.made_items = []
+
+    def generate_item_from_dict(data, item_id, obtainer):
+        """ゲームの `InstantaleApp.generate_item_from_dict`（実測の署名）。"""
+        item = FakeItem(data, item_id, obtainer)
+        obtainer.inventory.inventory[str(item_id)] = item
+        app.made_items.append((str(item_id), item.name))
+        return item
+
+    app.generate_item_from_dict = generate_item_from_dict
 
     def save_game():
         # 保存の瞬間に名簿へ見えているものを控える（漏れの検査）。
@@ -171,12 +208,12 @@ def main():
     print("層: 同じ持ち主は積み重ならない")
     npc_id = modnpc.register("229_probe", key="clerk", fields={"name": "受付"})
     modnpc.register("229_probe", key="clerk", fields={"name": "受付", "job": "inn"})
-    modnpc.register("914_real_estate", npc_id=npc_id, fields={"job": "guild"})
+    modnpc.register("330_real_estate", npc_id=npc_id, fields={"job": "guild"})
     ok &= check("id は mod: の文字列", npc_id == "mod:229_probe:clerk")
     ok &= check("持ち主2人で層は2つ", len(modnpc.layers(npc_id)) == 2)
     ok &= check("後から積んだ層が勝つ", modnpc.fields_of(npc_id)["job"] == "guild")
     ok &= check("entries が持ち主で絞れる",
-                modnpc.entries("914_real_estate") == [npc_id])
+                modnpc.entries("330_real_estate") == [npc_id])
 
     print("組む: 能力値の6鍵が渡る")
     built = modnpc.build(modnpc.fields_of(npc_id))
@@ -184,7 +221,7 @@ def main():
     ok &= check("名前が入る", getattr(built, "name", None) == "受付")
     ok &= check("6鍵が揃っている",
                 sorted(built.original_ability_scores) == sorted(ABILITY_KEYS))
-    # 2（詳細生成済み）で組むとゲームが会話の直前に埋めない（実機 2026-09-12）。
+    # 2（詳細生成済み）で組むとゲームが会話の直前に埋めない（実機）。
     ok &= check("level_of_detail は 1（生成直後の住人と同じ）",
                 built.config.get("level_of_detail") == 1)
 
@@ -197,7 +234,7 @@ def main():
                 modnpc.spawn(app, npc_id) is character)
     ok &= check("npc_id_of が名簿から引ける",
                 modnpc.npc_id_of(app, character) == npc_id)
-    # ゲームの詳細生成は `save_data_dict['npcs'][id]` へ書く（実機 2026-09-12: 無いと KeyError）。
+    # ゲームの詳細生成は `save_data_dict['npcs'][id]` へ書く（実機: 無いと KeyError）。
     ok &= check("素データの写しが save_data_dict['npcs'] に居る",
                 npc_id in app.save_data_dict["npcs"])
     ok &= check("world_dict['npcs'] にも同じ辞書",
@@ -209,13 +246,72 @@ def main():
     ok &= check("置けた", modnpc.place(app, npc_id, "1", "5", owner=True))
     ok &= check("施設の名簿に載る", facility.characters == [npc_id])
     ok &= check("主になった", facility.owner == npc_id)
-    # 「会話する」の一覧は各人物の `.location` を施設と突き合わせる（実機 2026-09-12）。
+    # 「会話する」の一覧は各人物の `.location` を施設と突き合わせる（実機）。
     ok &= check("location が施設オブジェクト", character.location is facility)
     ok &= check("current_area がエリア", character.current_area is world.areas["1"])
 
+    print("置く: 主にするが「会話する」の一覧には出さない（330 の大家）")
+    # 同じ施設の主を2人重ねない（外す順と戻す順が主の控えを取り違える）。
+    # 受付はいったん外し、大家の検査の後で置き直す。
+    modnpc.unplace(app, npc_id)
+    quiet = modnpc.register("330_home", key="keeper-1", fields={"name": "大家"})
+    modnpc.spawn(app, quiet)
+    ok &= check("置けた", modnpc.place(app, quiet, "1", "5", owner=True, listed=False))
+    ok &= check("主にはなる", facility.owner == quiet)
+    ok &= check("施設の名簿には載せない", quiet not in facility.characters)
+    ok &= check("location を据えない（＝一覧に出ない）",
+                getattr(world.characters.get(quiet), "location", None) is not facility)
+    ok &= check("控えにも「出さない」が残る",
+                (modnpc._persisted_entry(app, "330_home", quiet) or {}).get("place")
+                == ["1", "5", True, False])
+
+    print("置く: 一覧に出さない人は、保存を通しても出ないまま")
+    persisted = []
+    real_persist = modnpc._persist
+
+    def counting_persist(*args, **kwargs):
+        persisted.append(kwargs)
+        return real_persist(*args, **kwargs)
+
+    modnpc._persist = counting_persist
+    try:
+        hidden_q = modnpc.hide(app)
+        ok &= check("保存の間は主から外れる", facility.owner == "7")
+        modnpc.restore(app, hidden_q)
+    finally:
+        modnpc._persist = real_persist
+    ok &= check("保存の後も施設の名簿に載らない", quiet not in facility.characters)
+    ok &= check("保存の後も location を据えない",
+                getattr(world.characters.get(quiet), "location", None) is not facility)
+    ok &= check("保存の後、主には戻る", facility.owner == quiet)
+    ok &= check("保存の後も控えは「出さない」のまま",
+                (modnpc._persisted_entry(app, "330_home", quiet) or {}).get("place")
+                == ["1", "5", True, False])
+    ok &= check("保存の間の外し・戻しは控えを書かない",
+                not any("place" in kw for kw in persisted))
+
+    print("置く: 一覧に出さない人は、ゲームが実体を作り直しても出ないまま")
+    remade = FakeCharacter(name="大家", original_ability_scores=dict(
+        (key, 10) for key in ABILITY_KEYS))
+    remade.config = {"level_of_detail": 2, "is_player": False, "is_dead": False}
+    world.characters[quiet] = remade                 # 詳細生成の後に本体がやること
+    modnpc.get(app, quiet).character                 # 差し替えに気付かせる
+    ok &= check("置き直しが要ると分かる", modnpc.replace_if_stale(app, quiet))
+    ok &= check("置き直しても施設の名簿に載らない", quiet not in facility.characters)
+    ok &= check("置き直しても location を据えない",
+                getattr(remade, "location", None) is not facility)
+    ok &= check("置き直しても主のまま", facility.owner == quiet)
+    ok &= check("置き直しても控えは「出さない」のまま",
+                (modnpc._persisted_entry(app, "330_home", quiet) or {}).get("place")
+                == ["1", "5", True, False])
+    modnpc.unplace(app, quiet)
+    modnpc.unregister("330_home", quiet, app=app)
+    ok &= check("主が元の値に戻る", facility.owner == "7")
+    modnpc.place(app, npc_id, "1", "5", owner=True)  # 受付を置き直す（後の検査のため）
+
     print("隠す: 保存の間だけ引き上げる")
     # 実セーブの `game_variables.buttons_backup` には
-    # `ConversationStartManager(args=[<id>])` が入っている（2026-09-13 に確認）。
+    # `ConversationStartManager(args=[<id>])` が入っている（確認済み）。
     # 一覧を出したまま保存すると `mod:` の id がそこへ焼かれ、MOD を外した後に押すと落ちる。
     app.buttons.append({"text": "受付", "spec": {"cls_name": "ConversationStartManager",
                                                  "args": [npc_id]}})
@@ -230,7 +326,7 @@ def main():
     app.current_enemy_dict = {npc_id: {"name": "受付"}}
     hidden = modnpc.hide(app)
     # 反復からは消えるが id では引ける（保存は別スレッドで、その間にゲームが引く。
-    # 外していた頃は `KeyError` で落ちた。実機 2026-09-12）。
+    # 外していた頃は `KeyError` で落ちた。実機）。
     ok &= check("保存の間、id では引ける", world.characters.get(npc_id) is character
                 and npc_id in world.characters)
     ok &= check("保存の間、反復には出ない",
@@ -251,13 +347,15 @@ def main():
     ok &= check("保存の瞬間、主が元の値", saved["owner"] == "7")
     ok &= check("保存の瞬間、素データの写しが反復に出ない",
                 saved["plain"] == ["7"] and saved["plain_copy"] == ["7"])
-    ok &= check("保存の瞬間、選択肢に mod: が無い",
-                npc_id not in saved["buttons"] and npc_id not in saved["buttons_backup"])
+    # 選択肢は落とさない。落とすと、一覧を出したまま保存したセーブが
+    # 「やめる」だけの画面で戻る（実機。店で主人の一覧を出したまま保存→ロード）。
+    ok &= check("保存の瞬間、選択肢はそのまま（一覧を出したまま保存しても『やめる』だけにならない）",
+                npc_id in saved["buttons"] and npc_id in saved["buttons_backup"])
     ok &= check("保存の瞬間、自由入力の spec に mod: が無い", npc_id not in saved["input"])
     ok &= check("保存の瞬間、パーティに mod: が無い",
                 saved["party"] == ["player"] and saved["original_party"] == ["player"])
     ok &= check("保存の瞬間、敵の一覧に mod: が無い", saved["enemies"] == [])
-    ok &= check("落とすのは mod: を指すものだけ（他の選択肢は残る）",
+    ok &= check("他の選択肢も残る",
                 "DisplayTalkChoice" in saved["buttons"] and "やめる" in saved["buttons_backup"])
     ok &= check("保存の後、名簿に戻る", npc_id in world.characters)
     ok &= check("保存の後、施設にも戻る", facility.characters == [npc_id])
@@ -277,6 +375,35 @@ def main():
     app.original_party = ["player"]
     app.current_enemy_dict = {}
 
+    print("隠す: 途中で投げても、そこまでに外したものは戻る")
+    app.party = ["player", npc_id]
+    app.current_enemy_dict = {npc_id: {"name": "受付"}}
+    real_unplace = modnpc._unplace
+
+    def broken_unplace(*args, **kwargs):
+        raise RuntimeError("施設から外す途中の失敗")
+
+    modnpc._unplace = broken_unplace
+    partial = {}
+    try:
+        try:
+            modnpc.hide(app, into=partial)
+        except RuntimeError:
+            pass
+    finally:
+        modnpc._unplace = real_unplace
+    ok &= check("投げる前に外したパーティは控えに積まれている",
+                app.party == ["player"] and partial.get("scrubbed"))
+    modnpc.restore(app, partial)
+    ok &= check("途中までの控えでパーティと敵が戻る",
+                app.party == ["player", npc_id] and npc_id in app.current_enemy_dict)
+    ok &= check("施設の置き場所もそのまま", facility.characters == [npc_id]
+                and facility.owner == npc_id)
+    ok &= check("外せなかった人の「元の主」は取り直さない",
+                modnpc.registry()[npc_id]["placed"][2] == "7")
+    app.party = ["player"]
+    app.current_enemy_dict = {}
+
     print("写す: 保存のたびに実体が控えへ写り、読み直しで写しから組み直す")
     character.current_log = ["受付と話した"]
     character.physical_integrity = 42
@@ -288,8 +415,8 @@ def main():
                 entry["snapshot"].get("current_log") == ["受付と話した"]
                 and entry["snapshot"].get("config", {}).get("is_dead") is True)
     ok &= check("実行時のオブジェクトは写さない", "location" not in entry["snapshot"])
-    ok &= check("存在と置き場所も控えに在る",
-                entry["spawned"] is True and entry["place"] == ["1", "5", True])
+    ok &= check("存在と置き場所も控えに在る（主か・一覧に出すかも）",
+                entry["spawned"] is True and entry["place"] == ["1", "5", True, True])
     ok &= check("state/modnpc/<世界>.json に書かれている",
                 os.path.isfile(modnpc.store().path("検査の世界")))
     modnpc.forget()
@@ -347,19 +474,114 @@ def main():
                 modnpc._persisted_entry(app2, "229_probe", npc_id) is None)
     ok &= check("別の持ち主の層が残っていれば記録は残る", npc_id in modnpc.registry())
 
-    print("組み直す: 同じ持ち主が登録し直したら実体は組み直す")
+    print("名簿が真実: ゲームが実体を作り直したら、置き場所を新しい実体へ据え直す")
+    modnpc.register("229_probe", key="clerk", fields={"name": "受付"})
+    placed_one = modnpc.spawn(app2, npc_id)
+    modnpc.place(app2, npc_id, "1", "5", owner=True)
+    rebuilt_by_game = FakeCharacter(name="受付", original_ability_scores=dict(
+        (key, 10) for key in ABILITY_KEYS))
+    rebuilt_by_game.config = {"level_of_detail": 2, "is_player": False, "is_dead": False}
+    world2.characters[npc_id] = rebuilt_by_game         # 詳細生成の後に本体がやること
+    ok &= check("取っ手は名簿の実体を返す",
+                modnpc.get(app2, npc_id).character is rebuilt_by_game)
+    ok &= check("記録も名簿に合わせる",
+                modnpc.registry()[npc_id]["character"] is rebuilt_by_game)
+    ok &= check("置き直しが要ると分かる", modnpc.replace_if_stale(app2, npc_id))
+    ok &= check("新しい実体が施設に立つ",
+                getattr(rebuilt_by_game, "location", None) is fac2
+                and fac2.owner == npc_id)
+    ok &= check("古い実体はもう見ない", placed_one is not modnpc.get(app2, npc_id).character)
+    ok &= check("二度目は置き直さない", not modnpc.replace_if_stale(app2, npc_id))
+    modnpc.unplace(app2, npc_id)
+
+    print("組み直す: 注入し直した世代だけ実体を組み直す")
     # 登録簿は注入をまたいで生きる。前の版で組んだ実体を使い回すと、
-    # `build` を直しても古い実体が同じ場所で落ちる（実機 2026-09-12）。
+    # `build` を直しても古い実体が同じ場所で落ちる（実機）。
+    # 逆に「登録し直したら捨てる」だと、塗り直しのたびに層を積む MOD が毎回組み直す。
+    # それを避けて MOD が「層は一度だけ」にすると前の版の層が残る（実機。331 の notes）。
+    patch.set_generation("gen1")
     modnpc.register("229_probe", key="clerk", fields={"name": "受付"})
     stale = modnpc.spawn(app2, npc_id)
+    modnpc.register("229_probe", key="clerk", fields={"name": "受付２"},
+                    notes=lambda info: "同じ世代の積み直し")
+    ok &= check("同じ世代の積み直しでは実体を捨てない",
+                modnpc.registry()[npc_id]["character"] is stale)
+    ours = [l for l in modnpc.layers(npc_id) if l["owner"] == "229_probe"]
+    ok &= check("それでも層は新しいほうに入れ替わる",
+                len(ours) == 1 and callable(ours[0].get("notes")))
+    patch.set_generation("gen2")
     modnpc.register("229_probe", key="clerk", fields={"name": "受付２"})
-    ok &= check("実体が捨てられた", modnpc.registry()[npc_id]["character"] is None)
+    ok &= check("注入し直した世代では実体が捨てられた",
+                modnpc.registry()[npc_id]["character"] is None)
     fresh_one = modnpc.spawn(app2, npc_id)
     ok &= check("組み直された（写しが在るので名前は写しのまま）",
                 fresh_one is not stale and fresh_one.name == "受付")
     modnpc.registry()[npc_id]["snapshot"] = None
+    patch.set_generation("gen3")
     modnpc.register("229_probe", key="clerk", fields={"name": "受付２"})
     ok &= check("写しが無ければ宣言の初期値で組む", modnpc.spawn(app2, npc_id).name == "受付２")
+    patch.set_generation(None)
+
+    print("会話中の保存: その会話から再開できるように痕跡を残す")
+    # ゲームは会話の途中を保存して再開できる（`in_conversation` に相手の id、
+    # 選択肢は会話のもの）。相手の id を落とすと再開できない（実機）。
+    talking = modnpc.register("915_test", key="shoptalk", fields={"name": "主人"})
+    modnpc.spawn(app2, talking)
+    other = modnpc.register("915_test", key="passerby", fields={"name": "通行人"})
+    modnpc.spawn(app2, other)
+    app2.in_conversation = talking
+    app2.buttons = [
+        {"text": "この話から依頼を作る",
+         "spec": {"cls_name": "JustSetButtonToNormalPhase", "args": [talking]}},
+        {"text": "通行人に話しかける",
+         "spec": {"cls_name": "ConversationStartManager", "args": [other]}},
+    ]
+    hidden3 = modnpc.hide(app2)
+    ok &= check("会話の相手は旗に残る", app2.in_conversation == talking)
+    ok &= check("会話の相手を指す選択肢も残る",
+                any(talking in json.dumps(e, ensure_ascii=False) for e in app2.buttons))
+    # 選択肢は誰を指していても落とさない（落とすと一覧を出したまま保存した
+    # セーブが「やめる」だけの画面で戻る）。
+    ok &= check("他の MOD の NPC を指す選択肢も残る",
+                any(other in json.dumps(e, ensure_ascii=False) for e in app2.buttons))
+    ok &= check("相手は名簿の反復からは隠れる",
+                talking not in list(world2.characters)
+                and world2.characters.get(talking) is not None)
+    modnpc.restore(app2, hidden3)
+    ok &= check("保存が終われば選択肢も戻る",
+                sum(1 for e in app2.buttons) == 2)
+    app2.in_conversation = False
+    app2.buttons = [{"text": "会話する", "spec": {"cls_name": "DisplayTalkChoice", "args": []}}]
+    modnpc.unregister("915_test", talking, app=app2)
+    modnpc.unregister("915_test", other, app=app2)
+
+    print("持ち物: 品ごとに辞書へ均して控え、ゲームに作り直させる")
+    # 入れ物（`ItemContainer`）も品（`Item`）も JSON に落ちない。
+    # 素直に控えると持ち物が丸ごと落ちて、店の在庫がロードで消える（実機）。
+    shop_id = modnpc.register("915_test", key="shopkeeper", fields={"name": "店主"})
+    keeper = modnpc.spawn(app2, shop_id)
+    app2.generate_item_from_dict(
+        {"name": "銀の小刀", "item_type": "weapon", "value": 300,
+         "width_slots": 1, "height_slots": 2}, "7", keeper)
+    modnpc.snapshot_all(app2)
+    snap = (modnpc._persisted_entry(app2, "915_test", shop_id) or {}).get("snapshot") or {}
+    kept = (snap.get("inventory") or {}).get("7") or {}
+    ok &= check("品が控えに写る（セーブと同じ項目）",
+                kept.get("name") == "銀の小刀" and kept.get("item_type") == "weapon"
+                and kept.get("height_slots") == 2)
+    ok &= check("控えは JSON に落ちる",
+                json.dumps(snap.get("inventory"), ensure_ascii=False) is not None)
+    modnpc.forget()
+    world2.characters.pop(shop_id, None)     # ロードの形（名簿も空）
+    app2.made_items[:] = []
+    modnpc.restore_world(app2, world=world2, save_data_dict=app2.save_data_dict)
+    back = modnpc.get(app2, shop_id).character
+    made = back.inventory.inventory.get("7")
+    ok &= check("ロードで品が戻る", getattr(made, "name", None) == "銀の小刀")
+    ok &= check("作り直すのはゲーム自身", ("7", "銀の小刀") in app2.made_items)
+    ok &= check("入れ物は作り直さない（中身だけ入れ替える）",
+                not isinstance(back.inventory, dict))
+    modnpc.unregister("915_test", shop_id, app=app2)
 
     print("窓口: 誰にでも効く層と notes が1つの複製にまとまる")
     # 311 / 317 / 321 / 403 が4本とも自前で持っていた手順（相手を複製して profile に足す）を
@@ -412,6 +634,23 @@ def main():
     results = modnpc.fire("world", app3, "7")
     ok &= check("投げた層の後も次が呼ばれる", "906_quiet" in calls)
     ok &= check("戻り値は投げなかった層のぶん", ("906_quiet", True) in results)
+
+    print("名前: その世界で使われている名前を1か所から答える")
+    # 人を作る MOD が名前を決める前に見る（同名だと、名前でしか相手を引けない
+    # 場所で別人に当たる。実機。VERIFICATION.md §3.68）。
+    app3.player = types.SimpleNamespace(name="主人公")
+    app3.save_data_dict["npcs"]["9"] = {"name": "客A"}
+    modnpc.register("330_real_estate", key="keeper-6", fields={"name": "エレン"})
+    used = modnpc.names_in_use(app3)
+    ok &= check("実行時の名簿から拾う", "宿の主" in used)
+    ok &= check("セーブの素データからも拾う", "客A" in used)
+    ok &= check("他の MOD の登録からも拾う", "エレン" in used)
+    ok &= check("プレイヤーも入る", "主人公" in used)
+    ok &= check("重複は畳む", len(used) == len(set(used)))
+    skipped = modnpc.names_in_use(
+        app3, skip=[modnpc.make_id("330_real_estate", "keeper-6")])
+    ok &= check("skip に渡した id の名前は数えない", "エレン" not in skipped)
+    modnpc.unregister("330_real_estate", modnpc.make_id("330_real_estate", "keeper-6"))
 
     print("片付け: purge で登録簿が空になる")
     modnpc.register("229_probe", key="clerk", fields={"name": "受付"})
