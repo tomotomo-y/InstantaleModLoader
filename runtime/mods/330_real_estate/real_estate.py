@@ -139,6 +139,8 @@ MOD が自分で起こす滞在（`331_facility_investment` の「無料で泊�
 自分の家の滞在は `VacationStartManager.execute` の中で暦を進めるので、
 その最中に来た期限は見送り（`rent_pending`）、滞在が終わってから1回で払う。
 宿代の前払いと同じ区間で金を動かさないため。
+宿屋の宿泊も同じ `execute` の中で暦を進め、宿代を引くのはその後（GAME.md §2.17）。
+こちらは `execute` を抜けるまで見送り、宿代を引かれた後の所持金で払えるかを見る。
 
 **プレイヤーが建物の中に居るあいだは取り壊さない**（出口の無い施設に立たせないため）。
 その場合は次に外へ出たときに壊す。
@@ -153,7 +155,7 @@ import copy
 import datetime
 import sys
 
-from instantale_modloader import (durations, frames, llm, modfacility, modnpc,
+from instantale_modloader import (choices, durations, frames, llm, modfacility, modnpc,
                                   npcs, prices, ui)
 from instantale_modloader.state import (UNKNOWN_WORLD, WorldStore, playthrough_key,
                                         playthrough_key_of_dict)
@@ -227,7 +229,7 @@ TALK_CLS = "DisplayTalkChoice"
 #:
 #: 主を据えるとゲームが `会話する` を出すが、**管理人はその一覧に出さない人**なので
 #: （`place(listed=False)`）、誰も並ばない選択肢が家に残る。
-#: 大家とは話さない（管理人の存在自体を公開していないため。本人の指定）。
+#: 大家とは話さない（管理人の存在自体を公開していないため）。
 HIDDEN_HOME_CLASSES = (TALK_CLS,)
 
 # ---------------------------------------------------------------- 設定（mod.json）
@@ -238,7 +240,7 @@ HIDDEN_HOME_CLASSES = (TALK_CLS,)
 RENT_PRICE = 1600
 
 #: 賃貸の1期は滞在の何回ぶんか。
-#: 1 にすると宿屋の1泊と同じ長さになり、借りる意味が薄い（本人の指定で既定4）。
+#: 1 にすると宿屋の1泊と同じ長さになり、借りる意味が薄い（既定は4）。
 RENT_STAYS = 4
 
 #: 建売の価格。買い切りで、以後の家賃も期限も無い。
@@ -275,7 +277,7 @@ OWNED_NAME = "自分の家"
 # ---------------------------------------------------------------- 文言
 #: 役場に足す選択肢。
 #: 「物件を扱う」だと 331 の出資（店を建てて売上を得る）とも読めた
-#: ので、**自分が住む家の話だと分かる文言**にした（本人の指摘）。
+#: ので、**自分が住む家の話だと分かる文言**にした。
 OFFICE_LABEL = "家を借りる・買う"
 RENT_LABEL = "借りる({}G・{}日)"
 BUY_LABEL = "建売を買い取る({}G)"
@@ -419,6 +421,8 @@ def apply(ctx):
                 "warned": set(),
                 # 滞在の最中に来た家賃の期限（滞在が終わってから精算する）。
                 "rent_pending": False,
+                # 宿屋の宿泊の `execute` の最中（宿代が引かれるまで家賃を見送る）。
+                "inn_stay": False,
                 # 滞在のあいだ主を据える前の値（戻すために控える）。
                 "owner_was": None,
                 # 手が空くのを待っているボタンの足し直し（見張りは同時に1つ）。
@@ -639,7 +643,7 @@ def apply(ctx):
         return plan
 
     def stay_months(app):
-        """1回の滞在の月数。**宿屋と同じ**（本人の指定）。
+        """1回の滞在の月数。**宿屋と同じ**。
 
         素のゲームは3ヵ月から年齢で伸び、`315_vacation_custom` を入れていれば
         その設定が効く。どちらも自分では決めず、ローダの窓口に聞く。
@@ -706,7 +710,7 @@ def apply(ctx):
         """賃貸の1期の長さ（日）。**滞在 `RENT_STAYS` 回ぶん**。
 
         宿と同じ長さ（1回ぶん）では、家を借りても泊まり直すのと変わらない。
-        既定は4回ぶんで、その間は何度でも戻って過ごせる（本人の指定）。
+        既定は4回ぶんで、その間は何度でも戻って過ごせる。
         """
         return max(1, int(RENT_STAYS or 1)) * stay_days(app)
 
@@ -919,7 +923,7 @@ def apply(ctx):
         （`hide` / `restore`。TECH.md §5.7）ので、こちらで同じものを作らない。
 
         **一覧には出さない**（`listed=False`）。自分の家の `会話する` に大家が並ぶと、
-        他人がそこに住んでいるように見える（本人の指定）。
+        他人がそこに住んでいるように見える。
         """
         if facility is None:
             return None
@@ -1195,6 +1199,8 @@ def apply(ctx):
         最後の1軒を失ったときだけ、開く手段が無くなるので役場へ移す。
         """
         if STORAGE_SHARED:
+            # 建物ごとに預けたまま共有へ寄せていない品を先に寄せる（寄せないと、契約ごと消えて品が無くなる）
+            gather_into_shared(app)
             others = [c for c in contracts_of(current_key(app))
                       if c is not record and not c.get("lapsed")]
             if others:
@@ -1273,8 +1279,14 @@ def apply(ctx):
         見送ったことだけ `rent_pending` に控え、滞在が終わったら `end_stay` が
         1回呼び直す。滞在が終わらないまま次に暦が進んだときも、
         そちらの `check_leases` が同じ期をまとめて払う（期限は日付で見るので取りこぼさない）。
+
+        宿屋の宿泊（`inn_stay`）も見送る。`execute` の中では暦が進んだ後に宿代が引かれるので
+        （GAME.md §2.17）、ここで引くと宿代に残してあった金で家賃を払い、
+        続く宿代の引き落としで所持金が足りなくなる。
+        宿代を変える MOD の前払いで膨らんだ額で判定してしまうこともある。
+        `execute` を抜けたら `vacation_start` が1回呼び直す。
         """
-        if staying_home(app) is not None:
+        if staying_home(app) is not None or state.get("inn_stay"):
             if not state.get("rent_pending"):
                 state["rent_pending"] = True
                 write("rent: postponed while the stay is running ({})".format(why))
@@ -1644,7 +1656,7 @@ def apply(ctx):
         # （滞在を1度もしていない家でも、窓を開けたら鍵を預かっている人が出る）。
         # 引けないときだけ、その窓の間だけ生きる持ち主を立てる。
         #
-        # **見出しに管理人の名前は出さない**（本人の指定）。
+        # **見出しに管理人の名前は出さない**。
         # この人は「会話する」の一覧に出さないので、名乗る場面が無いまま名前だけが並ぶ
         # （前からある契約に後から決まった管理人には、契約のときの紹介の一文も無い）。
         # 見出しは共有なら保管庫の名、そうでなければ建物の名。
@@ -2021,8 +2033,7 @@ def apply(ctx):
             write("WARN unknown action {!r}".format(action))
 
     # ================================================================ フック
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False, safe=True)
-    def refresh_choice_buttons(orig, self, reset_page=False, *args, **kwargs):
+    def refresh_choice_buttons(self):
         """選択肢が組み直されるたびに、建物を当て直して自前のボタンを足す。
 
         最後にローダの塗り直しをもう一度呼ぶ。
@@ -2031,7 +2042,6 @@ def apply(ctx):
         先に走られると、建物を当て直す前の画面で判断されてしまう。
         二度呼んでも増えない作りなので、ここで順序を確かめる。
         """
-        result = orig(self, reset_page, *args, **kwargs)
         try:
             cover_after_activity(self)
         except Exception:
@@ -2045,7 +2055,6 @@ def apply(ctx):
             modfacility.maintain_buttons(self, write=write)
         except Exception:
             ctx.log_exc("real estate: cannot maintain the choices")
-        return result
 
     def flush_demolitions(app):
         """中に居たせいで残っていた取り壊しを、外に出た後で片付ける。"""
@@ -2081,13 +2090,9 @@ def apply(ctx):
             write("{}: swept {} lapsed contract(s)".format(why, done))
         return done
 
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
-        """自前のボタンだけ横取りする。印が無ければ必ず素通し。"""
-        entry = ui.pressed_entry(self, button_index)
-        action = screen.mark_of(entry)
-        if action is None:
-            return orig(self, button_index, *args, **kwargs)
+    def on_button_press(self, action):
+        """自前のボタンが押された（窓口 `choices` の `presses`。印で振り分けた後に呼ばれる）。"""
+        entry = choices.pressed()
         if state["acting"]:
             write("ignored {!r}: the previous press is still running".format(
                 entry.get("text") if isinstance(entry, dict) else None))
@@ -2098,6 +2103,9 @@ def apply(ctx):
         screen.start_phase(self, EstatePhase(self, action, kind), text,
                            fallback=lambda: run_action(self, action, kind))
         return None
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, after=refresh_choice_buttons, presses={"": on_button_press})
 
     @ctx.wrap("__main__:World.__init__", required=False, safe=True)
     def world_loaded(orig, self, save_data_dict, app, *args, **kwargs):
@@ -2139,7 +2147,7 @@ def apply(ctx):
         """
         if state.get("storage") is None:
             return None
-        was = getattr(app, "in_shopping", None)
+        was = getattr(app, "in_shopping", None)  # 戻すために控える。untrusted-flag-ok
         if not was:
             return None
         try:
@@ -2202,6 +2210,7 @@ def apply(ctx):
         """日付が進んだら家賃を精算する。日付を動かすのはここ1箇所（GAME.md §2.16）。
 
         滞在の最中に進んだぶんは `check_leases` が見送る（精算は `end_stay` で1回）。
+        宿屋の宿泊の最中も見送る（精算は `vacation_start` が `execute` を抜けてから1回）。
         """
         result = orig(self, days, *args, **kwargs)
         try:
@@ -2284,7 +2293,18 @@ def apply(ctx):
             # 宿屋（か、よその MOD の宿）の宿泊。
             # **実際に何日進んだか**をここで測る（月数×30 とは限らない）。
             day_before = ui.game_day(app) if app is not None else None
-            result = orig(self, choice_text, *args, **kwargs)
+            # 宿代は暦が進んだ後に引かれる（GAME.md §2.17）。
+            # 家賃はその引き落としが済むまで見送り、抜けてから払う（`check_leases`）。
+            state["inn_stay"] = True
+            try:
+                result = orig(self, choice_text, *args, **kwargs)
+            finally:
+                state["inn_stay"] = False
+                if app is not None and state.get("rent_pending"):
+                    try:
+                        check_leases(app, "after the inn stay", idle=True)
+                    except Exception:
+                        ctx.log_exc("real estate: cannot settle the rent after the inn stay")
             try:
                 day_after = ui.game_day(app) if app is not None else None
                 if isinstance(day_before, int) and isinstance(day_after, int) \

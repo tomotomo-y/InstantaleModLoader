@@ -29,6 +29,15 @@ import weakref
 from . import durations
 from . import log_exc
 
+
+#: 関所を立てた行を最後に書いた中身。同じなら繰り返さない。
+#: 関所は boot ごとに立て直すので、遅れて当て直す boot のたびに同じ行が並んでいた。
+#: 注入し直すとこのモジュールごと読み直されるので、新しいログの頭には必ず出る。
+_gate_written = None
+
+#: `adjust` の行を書いた持ち主 -> temporary か。同じなら繰り返さない（`_gate_written` と同じ）。
+_adjust_written = {}
+
 #: 宿屋の部屋1回。置く関数は `fn(app, quality=...)`、答えは `{"price": int}`。
 #: 「ゲームのままでよい」なら `None` を返す（既定へ落ちる）。
 INN_ROOM = "inn_room"
@@ -234,8 +243,19 @@ def _item_registry():
     if not isinstance(found, dict) or not isinstance(found.get("adjust"), list):
         found = {"base": None, "adjust": [], "ledger": _Ledger()}
         setattr(sys, _ITEM_ATTR, found)
-    if not isinstance(found.get("ledger"), _Ledger):
-        found["ledger"] = _Ledger()
+    ledger = found.get("ledger")
+    if not isinstance(ledger, _Ledger):
+        # 注入し直すとこのモジュールごと読み直され、前の世代の台帳は別のクラスの実体になる。
+        # 中身は引き継ぐ（捨てると、一時の段を掛けた額を素の額として控え直して段が二重に掛かり、
+        # 保存の前の外しからも漏れてセーブに焼き付いた）。
+        fresh = _Ledger()
+        weak = getattr(ledger, "weak", None)
+        if isinstance(weak, weakref.WeakKeyDictionary):
+            fresh.weak = weak
+            strong = getattr(ledger, "strong", None)
+            fresh.strong = strong if isinstance(strong, dict) else {}
+            fresh.mode = getattr(ledger, "mode", None)
+        found["ledger"] = fresh
     return found
 
 
@@ -278,7 +298,9 @@ def adjust(owner, fn, temporary=False, write=None):
         layers = registry["adjust"]
         layers[:] = [layer for layer in layers if layer[0] != name]
         layers.append((name, fn, bool(temporary), write))
-    if write:
+    # apply のたびに段を置き直すので、同じ持ち主・同じ種類なら書かない（注入1回に1度）。
+    if write and _adjust_written.get(name) != bool(temporary):
+        _adjust_written[name] = bool(temporary)
         write("prices: {!r} adjusts item prices ({})".format(
             name, "temporary" if temporary else "saved"))
 
@@ -486,6 +508,8 @@ def install(ctx, write=None):
     ここが8つの対象を1枚だけ包む。**地点ごとの `orig` の前後はここが引き受ける**
     ので、式を置く側も段を置く側も層のことを考えなくてよい。
     """
+    from . import patch as _patch
+    _patch.note_gate_writer("prices", write)
     with _LOCK:
         _item_registry()["write"] = write
     generation = getattr(ctx, "generation", None)
@@ -559,6 +583,9 @@ def install(ctx, write=None):
         # **入れ子を見張る。** `save_game` の中から保存の実体
         # （`write_obfuscated_json_file`）が呼ばれる経路があり、数えずに戻すと
         # 内側の「戻す」が外側の保存の最中に一時の段を書き戻す。
+        # 別スレッドの保存とも重なりうるので、抜けるときは入った値へ書き戻さず
+        # 1つ減らし、最後に抜けた側が戻す。先に入った側が先に抜けても、
+        # まだ書き出し中の保存へ一時の段が入らず、数も 0 へ戻る。
         with _LOCK:
             registry = _item_registry()
             depth = registry.get("saving", 0)
@@ -573,16 +600,19 @@ def install(ctx, write=None):
             return orig(*args, **kwargs)
         finally:
             with _LOCK:
-                _item_registry()["saving"] = depth
-            if depth == 0:
+                registry = _item_registry()
+                left = max(0, registry.get("saving", 0) - 1)
+                registry["saving"] = left
+            if left == 0:
                 try:
                     _rewrite_touched(temporary=True, why="save/restore")
                 except Exception:
                     log_exc("prices: could not restore temporary prices "
                             "after saving")
-                if write and stripped:
-                    write("prices: {} temporary price(s) were kept out of "
-                          "the save".format(stripped))
+            # 剥がした側が記録する。最後に抜けるのが剥がした側とは限らない。
+            if write and stripped:
+                write("prices: {} temporary price(s) were kept out of "
+                      "the save".format(stripped))
 
     for target in SAVE_TARGETS:
         ctx.wrap(target, required=False, safe=True)(saving)
@@ -590,7 +620,9 @@ def install(ctx, write=None):
 
     setattr(sys, _ITEM_GATE_ATTR, {"generation": generation,
                                    "targets": list(targets)})
-    if write:
+    global _gate_written
+    if write and _gate_written != tuple(targets):
+        _gate_written = tuple(targets)
         write("prices: the item price gate was declared on {} target(s)".format(
             len(targets)))
     return targets

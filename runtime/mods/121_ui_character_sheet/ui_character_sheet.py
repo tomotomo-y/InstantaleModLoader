@@ -54,7 +54,7 @@ import os
 import sys
 
 from instantale_modloader import frames, ui
-from instantale_modloader.state import world_filename, world_key
+from instantale_modloader.state import playthrough_key, world_filename
 
 from . import sheet
 
@@ -232,7 +232,7 @@ def apply(ctx):
         """二つ名の引き直しボタンを1度だけ作る。作れない環境では None。
 
         押すと評判 MOD への頼みのファイルを書く（`request_reroll`）。
-        絵柄は円弧＋矢尻。文字ではないので書体は要らない。
+        絵柄はサイコロ（`sheet.REROLL_STROKES`）。文字ではないので書体は要らない。
         """
         button = getattr(layout, MARK + "_reroll", None)
         if button is not None and frames.attr(button, "parent") is layout:
@@ -249,7 +249,7 @@ def apply(ctx):
 
         def repaint(*_args):
             ui.paint_icon(button, sheet.REROLL_STROKES, attr=MARK + "_icon",
-                          key=("reroll",), log_exc=ctx.log_exc)
+                          key=("dice",), log_exc=ctx.log_exc)
 
         button.bind(pos=repaint, size=repaint)
         repaint()
@@ -269,7 +269,7 @@ def apply(ctx):
         if app is None:
             return
         path = os.path.join(ctx.state_dir, sheet.REPUTATION_DIRNAME,
-                            world_filename(world_key(app), sheet.REROLL_SUFFIX))
+                            world_filename(playthrough_key(app), sheet.REROLL_SUFFIX))
         if ctx.write_json(path, {"reroll": True}):
             ctx.log("character sheet: 二つ名の引き直しを頼んだ")
         ui.show_widget(button, False)
@@ -321,12 +321,16 @@ def apply(ctx):
         置き場所は `os.path.join` で組む。`ctx.state_path()` は親フォルダを作るので、
         評判 MOD を使っていない `state/` に空のフォルダを置いてしまう（TECH.md §3.11）。
         二つ名はプレイヤーのものなので、別人の人物欄には出さない。
+        控えは周回（世界×主人公）ごとなので、周回の鍵で引く（TECH.md §5.4）。
+        世界名だけの控えは読まない。移すのは評判 MOD の仕事で、
+        移す前に読むと、同じ世界の前の主人公の二つ名を出しうる。
+        移されるまでの間は二つ名が出ないだけで済む。
         """
         player = frames.attr(app, "player")
         if player is frames.MISSING or player is None or character is not player:
             return ""
         path = os.path.join(ctx.state_dir, sheet.REPUTATION_DIRNAME,
-                            world_filename(world_key(app)))
+                            world_filename(playthrough_key(app)))
         return sheet.epithet_text(
             sheet.reputation_epithet(ctx.read_json(path, None)))
 
@@ -351,6 +355,44 @@ def apply(ctx):
             return
         setattr(info, MARK + "_written", {"base": base, "full": full})
 
+    def text_width(label):
+        """ラベルの1行目の文字の幅（px）。測れなければ None。
+
+        ラベル自身のテクスチャは箱の幅（`text_size`）で作られるので、
+        文字の幅はそこからは読めない。同じ書体と大きさで測り直す。
+        """
+        text = frames.text_of(label, "text")
+        if not text:
+            return None
+        line = text.split("\n")[0]
+        try:
+            from kivy.core.text import Label as CoreLabel
+
+            core = CoreLabel(text=line, font_size=label.font_size,
+                             font_name=label.font_name)
+            width, _height = core.get_extents(line)
+            return float(width)
+        except Exception:
+            return None
+
+    def place_reroll(hud, reroll):
+        """引き直しボタンを二つ名の直後へ置く（`sheet.reroll_pos`）。"""
+        layout = frames.attr(hud, "character_sheet_layout")
+        info = frames.attr(hud, "character_sheet_basic_info")
+        if layout in (None, frames.MISSING) or info in (None, frames.MISSING):
+            return
+        padding = frames.attr(info, "padding", None)
+        try:
+            padding_left = float(padding[0])
+        except (TypeError, ValueError, IndexError):
+            padding_left = 0.0
+        try:
+            reroll.pos_hint = sheet.reroll_pos(
+                text_width(info), padding_left, frames.attr(layout, "width", 0),
+                ui.upx(sheet.REROLL_GAP))
+        except Exception:
+            ctx.log_exc("character sheet: could not place the reroll button")
+
     def paint(app, hud, boxes, reroll=None):
         character = sheet_character(app, hud)
         if character is None:
@@ -361,6 +403,8 @@ def apply(ctx):
         if reroll is not None:
             # 二つ名が出ているときだけ押せる（無い名は引き直せない）。
             ui.show_widget(reroll, bool(epithet))
+            if epithet:
+                place_reroll(hud, reroll)
         boxes["skills"].text = sheet.list_text(
             sheet.SKILLS_HEADING, sheet.names_of(frames.attr(character, "skills")))
         # 既定を None にして「無い」も「None が入っている」も1つの判定で弾く。
@@ -433,6 +477,9 @@ def apply(ctx):
                 pass
 
         if not repaint:
+            # 窓の大きさが変わると、枠の幅と文字の大きさの比が変わる。
+            if reroll is not None:
+                place_reroll(hud, reroll)
             return
         app = ui.find_app()
         if app is not None:

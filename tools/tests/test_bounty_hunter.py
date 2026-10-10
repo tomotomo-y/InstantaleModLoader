@@ -16,7 +16,10 @@
              関所が縮めた回も縮めた後の日数で数える。控えは世界ごと
   衛兵     … 数えるのはゲーム自身の衛兵（'guard'）だけ。依頼中と闘技場は数えない
   合図     … 契機は決めるだけで、起こすのは refresh_choice_buttons の中だけ
+  窓口     … 全域手配の線を `wanted` に置く（追手が来ない設定では置かない）。
+             追手の戦闘の終わりだけを勝敗つきで1回知らせる。ゲーム自身の衛兵・途中で別の戦闘に変わった回は知らせない
   変えない … どのフックでも本体が1回だけ呼ばれ、戻り値がそのまま返る
+  補う     … 取り残された右の欄は自分で畳まない（版4から窓口 `choices`）
 """
 import importlib.util
 import io
@@ -35,6 +38,8 @@ STATE_DIR = os.path.join(OUT_DIR, "state")
 if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
+from instantale_modloader import confinement, guards  # noqa: E402
+
 TARGETS = (
     "scripts.llm.llm_manager:guard_npc_generator",
     "__main__:InstantaleApp.generate_enemy_instance_from_quest_dict",
@@ -46,6 +51,11 @@ TARGETS = (
     "__main__:InstantaleApp.elapse_days",
     "__main__:InstantaleApp.refresh_choice_buttons",
     "scripts.llm.llm_manager:master_ai_facilitator",
+    "__main__:ImprisonmentStartManager.execute",
+    "__main__:ImprisonmentEndManager.execute",
+    # ローダの窓口 `choices`（組み直しの後の合図を預けた）が、押下と保存も包む。
+    "__main__:InstantaleApp.on_button_press",
+    "__main__:InstantaleApp.save_game",
 )
 
 LOG_NAME = "bounty_hunter_send.log"
@@ -186,6 +196,10 @@ class FakeUI(object):
         self.set_lawfulness = real.set_lawfulness
         self.spec_cls_name = real.spec_cls_name
         self.game_day = real.game_day
+        self.gold_of = real.gold_of
+        self.add_gold = real.add_gold
+        self.money = real.money
+        self.rewrite_coins = real.rewrite_coins
 
     def scheduler(self, ctx, tag="mod"):
         """本物と同じく「次のフレーム」。ゲームの外ではその場で実行する。"""
@@ -208,6 +222,10 @@ class FakeUI(object):
 
     def cls_of(self, name):
         return self.manager if name == "BattleStartManager" else None
+
+    def choices_painted(self, app):
+        """選択肢が塗り終わったか。`choices_shown` を偽にすると、塗り終わるまで追手を起こさない。"""
+        return getattr(app, "choices_shown", True)
 
 
 class FakeCtx(object):
@@ -248,8 +266,15 @@ class FakeCtx(object):
         self.errors.append(msg)
 
     def wrap(self, target, **kw):
+        """同じ対象を2度包んだら、後の包みを外側に重ねる（ローダの窓口 `guards` も同じ対象を包む）。"""
         def decorator(func):
-            self.hooks[target] = func
+            inner = self.hooks.get(target)
+            if inner is None:
+                self.hooks[target] = func
+            else:
+                def layered(orig, *args, **kwargs):
+                    return func(lambda *a, **k: inner(orig, *a, **k), *args, **kwargs)
+                self.hooks[target] = layered
             return func
         return decorator
 
@@ -275,6 +300,9 @@ def fresh_mod(app, screen_cls=FakeScreen, **settings):
     BattleStartManager.last = None
     module = load_mod()
     module.ui = FakeUI(app, screen_cls)
+    # 衛兵の戦闘を組むのと強さの差し替えはローダの窓口 `guards`。偽の画面を同じに見せ、包みは当て直す。
+    guards.reset()
+    guards.ui = module.ui
     module._RNG = types.SimpleNamespace(random=lambda: 0.0)   # 抽選は必ず当たる
     for name, value in settings.items():
         setattr(module, name, value)
@@ -390,6 +418,9 @@ def main():
     check("日数が足りなければ出さない", not hunt.ready(5, 0, 10))
     check("ちょうど空けば出す", hunt.ready(10, 0, 10))
     check("クールダウン 0 なら毎回", hunt.ready(0, 0, 0))
+    check("前金は依頼1件の報酬 × 割合", hunt.purse(4500, 30) == 1350 and hunt.purse(1001, 50) == 500)
+    check("報酬が引けない・割合が 0 なら前金は 0",
+          hunt.purse(None, 30) == 0 and hunt.purse(4500, 0) == 0 and hunt.purse(True, 30) == 0)
 
     print("出す")
     app = App({"0": -22, "1": 10, "2": -18})
@@ -445,6 +476,96 @@ def main():
     check("戦闘中は出さない",
           not BattleStartManager.built
           and any("in_battle" in line for line in read_log()), read_log()[-2:])
+
+    painting = App({"0": -25})
+    painting.choices_shown = False            # ゲームの塗りがまだ（偽の画面ではずっと塗り終わらない）
+    module, ctx = fresh_mod(painting, CHANCE_PERCENT=100)
+    arrive(ctx, painting)
+    check("塗り終わらなくても、待つフレームの上限で起こす",
+          BattleStartManager.built == [("guard", None)]
+          and any("塗り終わらないまま" in line for line in read_log()), read_log()[-2:])
+    painted = App({"0": -25})
+    module, ctx = fresh_mod(painted, CHANCE_PERCENT=100)
+    seen = len(read_log())
+    arrive(ctx, painted)
+    check("塗り終わっていればすぐ起こす（待った記録は出ない）",
+          BattleStartManager.built == [("guard", None)]
+          and not any("塗り終わらないまま" in line for line in read_log()[seen:]),
+          read_log()[seen:])
+
+    print("釈放と、決まった後に軽くなった手配")
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app, ready=False)                 # 服役の年に追手が決まった（控えがある）
+    ctx.hooks["__main__:ImprisonmentEndManager.execute"](
+        lambda self: "釈放", types.SimpleNamespace(app=app))
+    ready_screen(ctx, app)
+    check("釈放されたら決まっていた追手を落とす",
+          not BattleStartManager.built
+          and any("決まっていた追手を落とし" in line for line in read_log()), read_log()[-2:])
+    arrive(ctx, app)
+    check("釈放の後は追手の間を数え直す（すぐには来ない）",
+          not BattleStartManager.built
+          and any("日空ける" in line for line in read_log()), read_log()[-2:])
+
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app, ready=False)
+    app.player.area_history["0"]["lawfulness"] = 10      # 決まった後に罰金を納めた など
+    ready_screen(ctx, app)
+    check("決まった後に手配が軽くなったら出さない",
+          not BattleStartManager.built
+          and any("決まった後に手配が軽くなった" in line for line in read_log()), read_log()[-2:])
+
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app, ready=False)
+    app.player.area_history["0"]["lawfulness"] = -60     # 決まった後にさらに罪を重ねた
+    ready_screen(ctx, app)
+    check("出すときの強さは今の手配の重さで決め直す",
+          BattleStartManager.built == [("guard", None)]
+          and any("難易度75" in line for line in read_log()), read_log()[-2:])
+
+    print("服役中")
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app, ready=False)                 # 逮捕の前に追手が決まっていた
+    ctx.hooks["__main__:ImprisonmentStartManager.execute"](
+        lambda self: "刑", types.SimpleNamespace(app=app))
+    app.buttons = [{"spec": types.SimpleNamespace(cls_name="ImprisonmentPhaseManager", args=[])}]
+    ready_screen(ctx, app)
+    check("刑が始まったら決まっていた追手を落とす",
+          not BattleStartManager.built
+          and any("刑が始まった。決まっていた追手を落とし" in line for line in read_log()), read_log()[-2:])
+    seen = len(read_log())
+    ctx.hooks["__main__:InstantaleApp.elapse_days"](counting(None)[0], app, 365)
+    ready_screen(ctx, app)
+    check("服役の年は追手を決めない",
+          not BattleStartManager.built
+          and not any("追手が決まった" in line for line in read_log()[seen:]), read_log()[seen:])
+
+    app = App({"0": -25}, buttons=("ImprisonmentPhaseManager",))     # 服役中のセーブを読んだ
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    ctx.hooks["__main__:InstantaleApp.elapse_days"](counting(None)[0], app, 365)
+    check("服役の選択肢が並んでいれば、刑の始まりを見ていなくても決めない",
+          not any("追手が決まった" in line for line in read_log()), read_log()[-3:])
+
+    # 脱獄の一覧（ゲームの服役のボタンが無い画面）は、閉じ込める側の MOD が窓口で知らせる
+    confinement.reset()
+    confinement.declare("336_test", ctx, lambda app_: "牢の中で脱獄の備えを選んでいる")
+    app.buttons = [{"spec": types.SimpleNamespace(cls_name="JustSetButtonToNormalPhase", args=[])}]
+    ctx.hooks["__main__:InstantaleApp.elapse_days"](counting(None)[0], app, 365)
+    ready_screen(ctx, app)
+    check("脱獄の一覧の間も追手を決めず、起こさない",
+          not BattleStartManager.built
+          and not any("追手が決まった" in line for line in read_log()), read_log()[-3:])
+    confinement.reset()
+    app.buttons = [{"spec": types.SimpleNamespace(cls_name="MovePhaseManager", args=[])}]
+    ready_screen(ctx, app)                        # 脱獄して牢の外の画面に戻った
+    check("牢の外の画面に戻ったら服役中の印を下ろす",
+          any("牢の外の画面に戻った" in line for line in read_log()), read_log()[-2:])
+    arrive(ctx, app)
+    check("牢を出た後は追手が来る", BattleStartManager.built == [("guard", None)], read_log()[-3:])
 
     print("強さ")
     app = App({"0": -30})            # 合計30 -> 難易度 20 + 30 = 50
@@ -627,46 +748,17 @@ def main():
           sorted(app.current_enemy_dict) == ["衛兵1"], app.current_enemy_dict)
 
     print("押されていないぶんを補う")
+    # 版4から、取り残された右の欄はローダの窓口 `choices` が畳む（tools/tests/test_choices.py の [右の欄]）。
     app = App({"0": -25}, buttons=["MovePhaseManager", "DisplayTalkChoice"])
     module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
     arrive(ctx, app)
     app.current_enemy_dict.update({"衛兵1": types.SimpleNamespace(name="衛兵")})
     ctx.hooks["__main__:BattleStartManager.start_battle"](
         counting(None)[0], BattleStartManager.last)
-    check("敵が揃っただけでは塗り直さない", app.painted == [], app.painted)
-    ready_screen(ctx, app)
-    check("選択肢がまだ戦闘のものでなければ塗り直さない（読み込みが延びた回）",
-          app.painted == [], app.painted)
     app.buttons = App({"0": -25}, buttons=["BattlePhaseManager",
                                            "SkillChoicePhaseManager"]).buttons
     ready_screen(ctx, app)
-    check("戦闘の選択肢が並んだら塗り直す", app.painted == [0], app.painted)
-    check("塗り直したことが記録に残る",
-          any("塗り直した" in line for line in read_log()), read_log()[-2:])
-    ready_screen(ctx, app)
-    check("塗り直すのは1回だけ", app.painted == [0], app.painted)
-
-    app = App({"0": -25}, buttons=["BattlePhaseManager"])
-    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
-    ctx.hooks["__main__:BattleStartManager.start_battle"](
-        counting(None)[0], types.SimpleNamespace(app=app))
-    ready_screen(ctx, app)
-    check("ゲームが起こした戦闘では塗り直さない", app.painted == [], app.painted)
-
-    app = App({"0": -25}, buttons=["MovePhaseManager"])
-    del App.display_button_load                       # 無いビルドの想定
-    try:
-        module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
-        arrive(ctx, app)
-        ctx.hooks["__main__:BattleStartManager.start_battle"](
-            counting(None)[0], BattleStartManager.last)
-        app.buttons = App({"0": -25}, buttons=["BattlePhaseManager"]).buttons
-        ready_screen(ctx, app)
-        check("塗り直せなくても落ちない（記録だけ残す）",
-              any("塗り直しはできない" in line for line in read_log()),
-              read_log()[-2:])
-    finally:
-        App.display_button_load = _display_button_load
+    check("自分では塗り直さない（右の欄は窓口 choices が畳む）", app.painted == [], app.painted)
 
     print("倒しても手配度は増えない")
     app = App({"0": -25})
@@ -735,6 +827,111 @@ def main():
         counting(None)[0], types.SimpleNamespace(app=app))
     check("見張る合図の回数を過ぎたら戻さない",
           app.lawfulness("0") == -35, app.lawfulness("0"))
+
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app)
+    app.current_enemy_dict = {"賞金稼ぎ1": object()}
+    app.buttons = App({"0": -25}, buttons=["BattlePhaseManager"]).buttons
+    for _ in range(module.PROTECT_MAX_SIGNALS + 5):     # 手番ごとに合図が来る長い戦闘
+        ready_screen(ctx, app)
+    app.current_enemy_dict = {}
+    app.buttons = []
+    app.hurt_wanted("0")
+    ready_screen(ctx, app)
+    check("戦闘中の合図では見張りが尽きない（長い戦闘の後も戻す）",
+          app.lawfulness("0") == -25, app.lawfulness("0"))
+
+    print("追手の戦闘の終わりを窓口へ知らせる")
+    from instantale_modloader import wanted
+    heard = []
+
+    def listen(app_, hunt):
+        heard.append(hunt)
+
+    def end(app_, end_type):
+        ctx.hooks["__main__:BattleEndManager.end_phase"](
+            counting(None)[0], types.SimpleNamespace(app=app_, end_type=end_type))
+
+    wanted.reset()
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    wanted.on_hunt_end("listener", None, listen)
+    check("全域手配の線を窓口に置く", wanted.hunted_line(app) == (40, "316_bounty_hunter"),
+          wanted.hunted_line(app))
+    arrive(ctx, app)
+    start_of(ctx, app, BattleStartManager.last)
+    end(app, "won")
+    check("勝った追手の戦闘を知らせる（勝敗・難易度・重さ・持ち主）",
+          len(heard) == 1 and heard[0]["outcome"] == "won"
+          and heard[0]["difficulty"] == 45 and heard[0]["here"] == 25
+          and heard[0]["by"] == "316_bounty_hunter", heard)
+    end(app, "won")
+    check("知らせるのは1回だけ", len(heard) == 1, heard)
+
+    del heard[:]
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app)
+    start_of(ctx, app, BattleStartManager.last)
+    end(app, "escaped")
+    check("逃げた回も勝敗つきで知らせる", [h["outcome"] for h in heard] == ["escaped"], heard)
+
+    print("追手に勝つと前金")
+    functions = types.ModuleType("scripts.functions")
+    functions.get_quest_reward = lambda difficulty: difficulty * 100
+    saved_functions = sys.modules.get("scripts.functions")
+    sys.modules["scripts.functions"] = functions
+
+    def hunt_once(end_type, **settings):
+        app_ = App({"0": -25})
+        app_.player.gold = 1000
+        module_, ctx_ = fresh_mod(app_, CHANCE_PERCENT=100, **settings)
+        arrive(ctx_, app_)
+        start_of(ctx_, app_, BattleStartManager.last)
+        ctx_.hooks["__main__:BattleEndManager.end_phase"](
+            counting(None)[0], types.SimpleNamespace(app=app_, end_type=end_type))
+        return app_
+
+    won = hunt_once("won")
+    check("勝てば難易度での依頼1件の報酬 × 30% が入る（難易度45 → 4500 × 30%）",
+          won.player.gold == 1000 + 1350, won.player.gold)
+    check("本文に前金の1行", any("1,350" in text for text in won.said), won.said)
+    check("逃げた回は入らない", hunt_once("escaped").player.gold == 1000)
+    check("切ってあれば入らない", hunt_once("won", BOUNTY_ENABLED=False).player.gold == 1000)
+    check("割合を変えられる", hunt_once("won", BOUNTY_PURSE_PCT=10).player.gold == 1450)
+    guard_app = App({"0": -25})
+    guard_app.player.gold = 1000
+    _module, guard_ctx = fresh_mod(guard_app, CHANCE_PERCENT=100)
+    game_guard(guard_ctx, guard_app)
+    start_of(guard_ctx, guard_app, types.SimpleNamespace(app=guard_app))
+    guard_ctx.hooks["__main__:BattleEndManager.end_phase"](
+        counting(None)[0], types.SimpleNamespace(app=guard_app, end_type="won"))
+    check("ゲーム自身の衛兵に勝っても入らない", guard_app.player.gold == 1000, guard_app.player.gold)
+    if saved_functions is None:
+        sys.modules.pop("scripts.functions", None)
+    else:
+        sys.modules["scripts.functions"] = saved_functions
+
+    del heard[:]
+    app = App({"0": -25})
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    game_guard(ctx, app)
+    start_of(ctx, app, types.SimpleNamespace(app=app))
+    end(app, "won")
+    check("ゲーム自身の衛兵の戦闘は知らせない", heard == [], heard)
+
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=100)
+    arrive(ctx, app)
+    start_of(ctx, app, BattleStartManager.last)
+    game_guard(ctx, app, "in_quest")          # 追手の戦闘が終わりを通らずに別の戦闘が始まった
+    end(app, "won")
+    check("別の戦闘が始まったら追手の戦闘と取り違えない", heard == [], heard)
+
+    module, ctx = fresh_mod(app, CHANCE_PERCENT=0)
+    check("追手が来ない設定では線を置かない", wanted.hunted_line(app) == (None, None),
+          wanted.hunted_line(app))
+    wanted.reset()
 
     print("抽選は画面ごとに1回")
     app = App({"0": -25})

@@ -292,7 +292,7 @@ def coerce_all(mod_dir, raw, root=""):
     向きが逆なのは出所が違うため:
 
         ファイルから読む   壊れていても遊べたほうがよい → 既定へ倒す（`resolve`）
-        画面に打たれた値   打った本人に直してもらう     → 断る（ここ）
+        画面に打たれた値   打ち直してもらう             → 断る（ここ）
 
     最初の不備で打ち切って、項目名を添えて返す。
     全部の不備を集めないのは、1つ直すと次が見えれば足りるため。
@@ -305,7 +305,7 @@ def coerce_all(mod_dir, raw, root=""):
     for key, decl in decls(mod_dir, root).items():
         ok, value, why = config.coerce(decl, raw.get(key))
         if not ok:
-            return None, "{}: {}".format(decl["label"]["ja"], why)
+            return None, "{}: {}".format(config.full_label(decl), why)
         values[key] = value
     return values, ""
 
@@ -434,6 +434,153 @@ def restore_window(root, mod_dir, window, fallback="900x640"):
     return remembered
 
 
+# ----------------------------------------------------------------- 試聴
+class Preview(object):
+    r"""選曲画面の試聴。曲を1つだけ鳴らす。
+
+    Windows の MCI（`winmm.mciSendStringW`）で鳴らす。
+    道具は配布物に無い pip の部品を使えない（§3.12）ので、OS に在る口を使う。
+    `winsound` は wav しか鳴らせず、ゲームの曲は mp3 が大半なので使わない。
+    `type mpegvideo` は DirectShow を通るので mp3 と wav の両方が鳴る。
+    ogg は Windows の素の構成では開けないことがあり、そのときは `play` が理由を返す。
+
+    MCI は呼んだスレッドに紐づくので、tkinter の主スレッドからだけ呼ぶ。
+    鳴っている曲は1つ。次の曲を鳴らすと前の曲は閉じる。
+    """
+
+    ALIAS = "iml_preview"
+
+    def __init__(self):
+        self.path = ""
+        try:
+            import ctypes
+            self._winmm = ctypes.windll.winmm
+            self._buffer = ctypes.create_unicode_buffer
+        except Exception:
+            self._winmm = None
+
+    @property
+    def available(self):
+        return self._winmm is not None
+
+    def _send(self, command):
+        """(エラー番号, 返り文字列)。"""
+        buf = self._buffer(256)
+        code = self._winmm.mciSendStringW(command, buf, len(buf), 0)
+        return code, buf.value
+
+    def _error(self, code):
+        buf = self._buffer(256)
+        self._winmm.mciGetErrorStringW(code, buf, len(buf))
+        return buf.value or "MCI エラー {}".format(code)
+
+    def play(self, path):
+        """鳴らす。鳴らせたら空文字、鳴らせなければ理由。"""
+        self.stop()
+        if not self.available:
+            return "この環境では試聴できません（Windows の MCI が無い）"
+        if not path or not os.path.isfile(path):
+            return "曲のファイルがありません: {}".format(path)
+        code, _ = self._send('open "{}" type mpegvideo alias {}'.format(path, self.ALIAS))
+        if code:
+            return self._error(code)
+        code, _ = self._send("play {}".format(self.ALIAS))
+        if code:
+            reason = self._error(code)
+            self.stop()
+            return reason
+        self.path = path
+        return ""
+
+    def stop(self):
+        if self.available and self.path:
+            self._send("close {}".format(self.ALIAS))
+        self.path = ""
+
+    def playing(self):
+        """鳴っている途中か。最後まで鳴り終えたら閉じて False。"""
+        if not self.path:
+            return False
+        code, mode = self._send("status {} mode".format(self.ALIAS))
+        if code or mode != "playing":
+            self.stop()
+            return False
+        return True
+
+
+def preview_bar(parent, pick):
+    """試聴の一行（▶ 試聴 / ■ 停止 / 鳴っている曲名）。戻りは (枠, 鳴らす関数)。
+
+    `pick()` は鳴らす曲の (絶対パス, 見せる名前) か None を返す。
+    どの一覧で選んだ曲を鳴らすかは道具が決める（`322_` と `324_` で一覧の形が違う）。
+    鳴らす関数は引数なしで呼ぶと `pick()` の曲を鳴らし、同じ曲が鳴っていれば止める
+    （一覧の Space に結ぶ）。窓を閉じれば止まる。
+    """
+    from tkinter import ttk
+
+    preview = Preview()
+    bar = ttk.Frame(parent)
+    play_button = ttk.Button(bar, text="▶ 試聴", width=8)
+    play_button.pack(side="left")
+    stop_button = ttk.Button(bar, text="■ 停止", width=8)
+    stop_button.pack(side="left", padx=(6, 10))
+    label = ttk.Label(bar, style="Faint.TLabel",
+                      text="一覧で曲を選んで「▶ 試聴」（Space でも鳴らす・止める）" if preview.available
+                      else "この環境では試聴できません（Windows の MCI が無い）")
+    label.pack(side="left", fill="x", expand=True)
+    poll = {"id": None, "name": ""}
+
+    def watch():
+        poll["id"] = None
+        if preview.playing():
+            poll["id"] = bar.after(500, watch)
+        elif poll["name"]:
+            label.configure(text="鳴り終えました: " + poll["name"])
+            poll["name"] = ""
+
+    def stop():
+        if poll["id"]:
+            bar.after_cancel(poll["id"])
+            poll["id"] = None
+        if preview.path:
+            label.configure(text="止めました: " + poll["name"])
+        preview.stop()
+        poll["name"] = ""
+
+    def play(toggle=False):
+        chosen = pick()
+        if not chosen:
+            label.configure(text="一覧で曲を選んでください")
+            return
+        path, name = chosen
+        if toggle and preview.path and os.path.normcase(preview.path) == os.path.normcase(path):
+            stop()
+            return
+        stop()
+        reason = preview.play(path)
+        if reason:
+            label.configure(text="鳴らせません: {}（{}）".format(name, reason.strip()))
+            return
+        poll["name"] = name
+        label.configure(text="試聴中: " + name)
+        poll["id"] = bar.after(500, watch)
+
+    play_button.configure(command=play, state="normal" if preview.available else "disabled")
+    stop_button.configure(command=stop, state="normal" if preview.available else "disabled")
+    def closed(_event=None):
+        # 見張りを残すと、窓が消えた後に `after` が消えた関数を呼んで Tcl のエラーを出す。
+        if poll["id"]:
+            try:
+                bar.after_cancel(poll["id"])
+            except Exception:
+                pass
+            poll["id"] = None
+        preview.stop()
+
+    bar.bind("<Destroy>", closed, add="+")
+    return bar, lambda: play(toggle=True)
+
+
 # ----------------------------------------------------------------- 配色と書体
 def setup_theme(window, root=""):
     r"""配色と書体は設定画面（`tools/gui.py`）のものを借りる。無ければ素の Tk。
@@ -472,15 +619,34 @@ def setup_theme(window, root=""):
 #  道具側は `world_settings_main(MOD_DIR)` を呼ぶだけ。
 # ==========================================================================
 
-def shown(value):
-    """説明に添える値の見せ方。空は（空）、真偽は ON / OFF、他はそのまま。
+def shown(value, decl=None):
+    """説明に添える値の見せ方。空は（空）、真偽は ON / OFF、表示名のある選択肢は表示名、他はそのまま。
 
     空文字をそのまま出すと説明が「既定: 」で終わって、
     値が無いのか説明が切れているのか分からない。
     """
     if isinstance(value, bool):
         return "ON" if value else "OFF"
-    return "（空）" if value == "" else str(value)
+    if value == "":
+        return "（空）"
+    if decl is not None and decl["type"] == "choice":
+        return _choice_text(decl, value)
+    return str(value)
+
+
+def _choice_text(decl, value):
+    """choice の値 -> 画面の文字（`config.choice_text`）。
+
+    宣言（`decls`）を読んだ時点でローダは `sys.path` に載っているので、ここでは引くだけ。
+    """
+    from instantale_modloader import config
+    return config.choice_text(decl, value)
+
+
+def _choice_value(decl, text):
+    """画面の文字 -> choice の値の文字列（`config.choice_value`）。"""
+    from instantale_modloader import config
+    return config.choice_value(decl, text)
 
 
 def world_store_path(root, state_dir, mod_dir, world):
@@ -654,16 +820,31 @@ class _Form(object):
         # 1列目（入力欄）だけ伸ばす。0列目のラベルは字の幅のまま。
         parent.columnconfigure(1, weight=1)
         # 1項目で2行使う（入力欄の行と、その下の説明の行）。だから row は 2 ずつ進む。
+        # 見出し（`"group"`）が変わる所では、その前に見出しの1行を挟む。
         row = 0
+        group = ""
         for key, decl in found.items():
+            heading = decl.get("group", {}).get("ja", "")
+            if heading and heading != group:
+                # 2つ目からは線も引く（`gui.SettingsDialog` と同じ見え方）。
+                if row:
+                    ttk.Separator(parent).grid(row=row, column=0, columnspan=2,
+                                               sticky="ew", pady=(14, 6))
+                    row += 1
+                ttk.Label(parent, text=heading, style="Group.TLabel").grid(
+                    row=row, column=0, columnspan=2, sticky="w")
+                row += 1
+            group = heading
             ttk.Label(parent, text=decl["label"]["ja"]).grid(
                 row=row, column=0, sticky="nw", padx=(0, 12), pady=(6, 0))
             if decl["type"] == "bool":
                 var = tk.BooleanVar()
                 ttk.Checkbutton(parent, variable=var).grid(row=row, column=1, sticky="w", pady=(6, 0))
             elif decl["type"] == "choice":
+                # 欄には表示名（`value_labels`）を出す。値との行き来は `get` / `set`。
                 var = tk.StringVar()
-                ttk.Combobox(parent, textvariable=var, values=decl["values"],
+                ttk.Combobox(parent, textvariable=var,
+                             values=[_choice_text(decl, v) for v in decl["values"]],
                              state="readonly").grid(row=row, column=1, sticky="ew", pady=(6, 0))
             else:
                 var = tk.StringVar()
@@ -679,8 +860,10 @@ class _Form(object):
             row += 2
 
     def get(self):
-        """入力欄のいまの値。`bool` 以外は文字列（`coerce_all` に渡す形）。"""
-        return dict((key, var.get()) for key, var in self.vars.items())
+        """入力欄のいまの値。`bool` 以外は文字列（`coerce_all` に渡す形）。choice は表示名を値に戻す。"""
+        return dict((key, _choice_value(self.decls[key], var.get())
+                     if self.decls[key]["type"] == "choice" else var.get())
+                    for key, var in self.vars.items())
 
     def set(self, values):
         """値を入力欄に流し込む。`bool` はそのまま、他は文字列にして入れる。
@@ -690,7 +873,12 @@ class _Form(object):
         """
         import tkinter as tk
         for key, var in self.vars.items():
-            var.set(values[key] if isinstance(var, tk.BooleanVar) else str(values[key]))
+            if isinstance(var, tk.BooleanVar):
+                var.set(values[key])
+            elif self.decls[key]["type"] == "choice":
+                var.set(_choice_text(self.decls[key], values[key]))
+            else:
+                var.set(str(values[key]))
 
 
 def build_world_settings_window(mod_dir, title="", blurb=""):
@@ -760,7 +948,7 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
     bulk_bottom.pack(side="bottom", fill="x", pady=(6, 0))
     body = ttk.Frame(bulk, padding=(0, 0, 6, 0))    # 入力欄は grid、外は pack。混ぜないための子枠
     body.pack(fill="both", expand=True)
-    shared_form = _Form(_scrollable(body), found, lambda k: "既定: " + shown(found[k]["default"]))
+    shared_form = _Form(_scrollable(body), found, lambda k: "既定: " + shown(found[k]["default"], found[k]))
     shared_form.set(shared)
     ttk.Button(bulk_bottom, text="既定に戻す", command=lambda: shared_form.set(
         dict((k, d["default"]) for k, d in found.items()))).pack(side="right")
@@ -786,7 +974,7 @@ def build_world_settings_window(mod_dir, title="", blurb=""):
                            if worlds else "世界が見つかりません: " + store)
     body = ttk.Frame(per_world, padding=(0, 0, 6, 0))
     body.pack(fill="both", expand=True)
-    world_form = _Form(_scrollable(body), found, lambda k: "一括設定: " + shown(shared[k]))
+    world_form = _Form(_scrollable(body), found, lambda k: "一括設定: " + shown(shared[k], found[k]))
     ttk.Button(world_bottom, text="一括設定に戻す",
                command=lambda: world_form.set(shared)).pack(side="right")
 

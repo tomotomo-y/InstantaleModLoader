@@ -160,6 +160,88 @@ def is_cloud_runtime() -> bool:
     return any(name != LOCAL_REQUEST_MODULE for name in request_modules())
 
 
+#: クラウドの SDK（openai / anthropic）の資源の基底クラスが居るモジュール。
+SDK_RESOURCE_MODULES = ("openai._resource", "anthropic._resource")
+
+#: 資源が作られたときにクライアントから掴む送りの手（`SyncAPIResource.__init__`）。
+SDK_RESOURCE_VERBS = ("_get", "_post", "_patch", "_put", "_delete", "_get_api_list")
+
+
+def rebind_cloud_resources() -> int:
+    """クラウドの SDK の資源が掴んでいる送りの手を、クライアントの今の手に掴み直させる。
+
+    SDK の資源（`client.messages` など）は、作られたときに `self._post = client.post` と
+    その時点の関数を掴む。注入でクラスの `post` を包み直しても、作られた後の資源は
+    前の世代の包みを呼び続け、切った MOD の差し替えもゲームを閉じるまで効いたままになる
+    （`136_` で、差し替えを切って注入し直しても前の宛先へ送り続けた。VERIFICATION.md §3.88）。
+    注入の終わりとローダを外すときに呼ぶ。掴み直した手の数を返す。
+    SDK を読み込んでいなければ何もしない。
+    """
+    import gc
+
+    classes = []
+    for name in SDK_RESOURCE_MODULES:
+        module = sys.modules.get(name)
+        cls = getattr(module, "SyncAPIResource", None) if module is not None else None
+        if isinstance(cls, type):
+            classes.append(cls)
+    if not classes:
+        return 0
+    kinds = tuple(classes)
+    count = 0
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, kinds):
+                continue
+        except Exception:
+            continue                       # 消えかけの弱参照の代理など
+        client = getattr(obj, "_client", None)
+        held_by = getattr(obj, "__dict__", None)
+        if client is None or not isinstance(held_by, dict):
+            continue
+        for verb in SDK_RESOURCE_VERBS:
+            held = held_by.get(verb)
+            fresh = getattr(client, verb[1:], None)
+            if held is None or fresh is None:
+                continue
+            if getattr(held, "__func__", None) is getattr(fresh, "__func__", None):
+                continue
+            try:
+                setattr(obj, verb, fresh)
+                count += 1
+            except Exception:
+                continue
+    return count
+
+
+#: `config.json` の `ai_setting.llm_inference` で、API キーでクラウドを使う値。
+CLOUD_API_KEY = "cloud_api_key"
+
+
+def game_choice(path=None):
+    """ゲームの設定画面で選ばれている LLM。`{"inference", "provider", "model"}`。読めなければ None。
+
+    `inference` は `local` / `cloud_api_key` など、`provider` は `OpenAI API` / `Claude API` など
+    （ゲームの設定画面の表記そのまま）、`model` はゲームの一覧の名前。
+    切り替えるとゲームが起動し直すので、注入の時に1回読めば足りる（`imagegen.backend` と同じ読み方）。
+    """
+    import io
+    import os
+
+    from . import saves
+
+    path = path or os.path.join(saves.data_dir(), "config.json")
+    try:
+        with io.open(path, encoding="utf-8-sig") as fh:
+            setting = json.load(fh)["ai_setting"]
+        cloud = setting.get("cloud_model_setting") or {}
+        return {"inference": setting.get("llm_inference"),
+                "provider": cloud.get("cloud_llm_provider"),
+                "model": cloud.get("cloud_llm")}
+    except Exception:
+        return None
+
+
 def content_of(message):
     """メッセージの本文。dict でなければ None（＝触らない）。"""
     try:
@@ -445,6 +527,27 @@ def watch_aliases(ctx, targets, install, *, label="llm", on_arm=None):
             unarmed.append(target)
     if not unarmed:
         return []
+    # 遅れて当てる包みの帰属（呼んだ MOD）。見張りのスレッドでは `ctx._mod` はもう空。
+    owner = getattr(ctx, "_mod", None)
+
+    def arm(target):
+        """boot の錠の中で、まだ今の世代かを確かめてから当てる。当てたら真。
+
+        錠の外で当てると、確かめた直後に次の boot が始まったとき、古い世代の閉包が
+        新しい世代の印で当たり（`ctx.wrap` は今の `patch` を引く）、新しい世代の包みと二重に掛かった。
+        帰属もその瞬間に適用中の別の MOD になっていた。
+        """
+        from . import _boot_lock
+        from . import patch_registry as _registry
+        with _boot_lock():
+            if ctx.superseded():
+                return False
+            _registry.begin_mod(owner or "<loader>")
+            try:
+                install(target)
+            finally:
+                _registry.end_mod()
+        return True
 
     def loop():
         deadline = time.monotonic() + ALIAS_WATCH_SECONDS
@@ -453,7 +556,8 @@ def watch_aliases(ctx, targets, install, *, label="llm", on_arm=None):
             for target in list(remaining):
                 if not can_resolve(target):
                     continue
-                install(target)
+                if not arm(target):
+                    break
                 remaining.remove(target)
                 ctx.log("{}: late-armed on {} (the alias appeared)".format(
                     label, target))

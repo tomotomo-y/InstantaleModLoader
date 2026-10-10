@@ -35,18 +35,19 @@ mod.json の `after` で 301 より後に読み込み、ゲームと 301 が選�
 1行記録して無視する（本体は無条件に辞書を引くため、食い違い状態では必ず落ちる）。
 
 装備欄の MOD（`333_`）が居るときは、仲間の `equipments` はそちらだけが書く。ローダの窓口
-`combat.equipped` が答える持ち主の品では、解除も掃除もしない（DOC.md「「装備する」ボタンは記録を書く」）。
+`equipment.equipped` が答える持ち主の品では、解除も掃除もしない（DOC.md「「装備する」ボタンは装備欄の MOD があるときだけ出る」）。
 
 ## 仲間の装備
 
 NPC の装備装着は素のゲームに存在しない（`319_` の DOC にある公式回答）。
 本体の `ItemEquipManager` はプレイヤー固定なので呼ばず、窓の右側の武器・防具を右クリックしたとき
-MOD 専用の「装備する／外す」ボタンを 1 つ出し、その NPC 自身の
-`equipments[weapon|wearable]` を id で書いて `save_game` する。
+MOD 専用の「装備する／外す」ボタンを 1 つ出し、ローダの窓口 `equipment.toggle` を通して装備欄の MOD へ品を移させる。
+ボタンを出すのは装備欄の MOD（`333_`）が窓口を置いているときだけ。本体は仲間の `equipments` を
+保存しない（GAME.md §2.13.3）ので、装備欄の MOD が無いところで書いても次のロードで消える。
 本体は仲間側の品に popup を出さない（`ItemPopupMenu` を作るだけで親を付けない。店の品と同じ扱い）ので、
 本体の popup へ足すのではなく、押した位置に自前のボタンを Window の直下に置く（品の説明の箱より上）。
-外を触れば消える。この記録を読むのは `401_`（審判への文）と、`333_`＋`319_` を入れているときの戦闘の数。
-解除時は slot キーごと落とす（本体がプレイヤーの装備を外した後と同じ形）。
+外を触れば消える。装備欄の MOD がその場で答えられない（None を返す）ときは何も書かず、1行残す
+（`equipments` を書くのは装備欄の MOD だけ。TECH.md §3.3.6）。
 
 ## ログ
 
@@ -55,7 +56,7 @@ MOD 専用の「装備する／外す」ボタンを 1 つ出し、その NPC �
 popup と装備欄の中身まで写す観測は `223_probe_party_equipment` に分けてある。
 """
 
-from instantale_modloader import combat, frames, ui
+from instantale_modloader import choices, equipment, frames, ui
 from instantale_modloader.ids import claim
 
 
@@ -86,13 +87,11 @@ def apply(ctx):
         "player": None,                  # 受け渡しの窓の左側（同一instanceで見分ける）
         "npc": None,                     # 同じく右側。この2人の間の移動だけ同期する（店の売買には触らない）
         "save_generation": 0,            # 遅延保存の世代番号。予約のたびに増やし、古い予約は走らない
-        "equipment_save_generation": 0,  # 同じく装備の書き換え後の保存
         "open": False,                   # 受け渡しの窓を開いている間 True（閉じた後の画面を1行残すため）
     }
 
     # 選択肢の dict から spec のクラス名を読む／押された index の dict を引く（ローダ共通）。
     spec_cls_name = ui.spec_cls_name
-    pressed_entry = ui.pressed_entry
 
     # ------------------------------------------------------------ 補助
 
@@ -242,7 +241,7 @@ def apply(ctx):
                 continue
             if ref is item_instance or str(ref) in wanted:
                 # 本体の解除後状態＝slotキー自体を落とす。
-                # apply_npc_equipment の解除側と同じ形にして、
+                # 本体の解除と同じ形にして、
                 # セーブ上に None 残りと キー無し の2通りを作らない。
                 equipments.pop(slot, None)
                 removed.append(slot)
@@ -366,9 +365,9 @@ def apply(ctx):
 
         # 装備欄の MOD（333_）がこの持ち主の装備を持っていれば、`equipments` はそちらが書く。
         # ここで外すと書き手が 2 本になり、装備欄から主人公側へ引いた品が仲間の持ち物にも残った
-        # （DOC.md「「装備する」ボタンは記録を書く」）。窓口が None なら装備欄は無く、ここで外す
+        # （DOC.md「「装備する」ボタンは装備欄の MOD があるときだけ出る」）。窓口が None なら装備欄は無く、ここで外す
         app = ui.find_app()
-        slots_answer = combat.equipped(app, old_owner, item_instance) if app is not None else None
+        slots_answer = equipment.equipped(app, old_owner, item_instance) if app is not None else None
 
         # 装備中なら、obtainer も equipments もまだ揃っているこの時点で
         # 本体の Item.unequip() に外させる。辞書だけ直すと、本体が解除時に行う
@@ -455,8 +454,8 @@ def apply(ctx):
     # ------------------------------------------------------------ 仲間の装備
     # 本体の ItemPopupMenu -> ItemEquipManager はプレイヤー固定で、NPC の品で押すと
     # player.equipments を書き換える。だから NPC 側ではその経路を使わず、
-    # twin inventory の NPC 側だけ、MOD専用ボタンで NPC.equipments を直接更新する。
-    # これは MOD が作る記録で、素のゲームは読まない（DOC.md「装備する」の節）。
+    # twin inventory の NPC 側だけ、MOD専用ボタンから装備欄の MOD（窓口 `equipment.toggle`）へ渡す。
+    # 装備欄の MOD が答えられないときは書かない（書き手を装備欄の MOD の1本にする）。
 
     #: 装備できる item_type。本体の equipments のキー（slot 名）と同じ文字列。
     EQUIP_TYPES = ("weapon", "wearable")
@@ -499,115 +498,6 @@ def apply(ctx):
         if item_id is None or not isinstance(eq, dict):
             return False
         return any(ref is not None and str(ref) == str(item_id) for ref in eq.values())
-
-    def save_after_equipment(app, npc, item_instance, action):
-        """装備の記録を書き換えた後の保存。`save_after_transfer` と同じ世代番号方式。"""
-        state["equipment_save_generation"] += 1
-        generation = state["equipment_save_generation"]
-
-        def do_save():
-            if generation != state["equipment_save_generation"]:
-                return
-            try:
-                write(
-                    "saving npc equipment: npc={} action={} item={!r} equipments={}".format(
-                        character_name(npc, "?"),
-                        action,
-                        frames.short(getattr(item_instance, "name", "?"), 80),
-                        frames.repr_value(getattr(npc, "equipments", None)),
-                    )
-                )
-                app.save_game()
-                write("save_game complete: npc={} equipment action={}".format(
-                    character_name(npc, "?"), action
-                ))
-            except Exception:
-                ctx.log_exc("party inventory/equipment: save_game after equipment failed")
-
-        screen.schedule(do_save, 0.10)
-
-    def apply_npc_equipment(app, npc, widget, item_instance):
-        """MOD専用ボタンを押したときの処理。装備していれば外し、していなければ装備する。
-
-        書くのは `npc.equipments[item_type]` に id 文字列を入れる／slot ごと消す、だけ。
-        本体の ItemEquipManager は呼ばない（プレイヤー固定のため）。
-        popup は閉じ、次に右クリックしたときに現在の記録から文言を決め直す。
-        """
-        if app is None or npc is None or item_instance is None:
-            return
-
-        # 押した瞬間にも所有権を再確認する。
-        if getattr(item_instance, "obtainer", None) is not npc:
-            write("equipment ignored: item no longer belongs to npc")
-            return
-
-        item_type = getattr(item_instance, "item_type", None)
-        if item_type not in EQUIP_TYPES:
-            return
-
-        item_id = item_id_in(npc, item_instance, getattr(widget, "item_id", None))
-        if item_id is None:
-            write("WARN equipment: item id not found in npc inventory")
-            return
-
-        eq = equipment_dict(npc, create=True)
-        if not isinstance(eq, dict):
-            write("WARN equipment: npc.equipments is not writable dict")
-            return
-
-        currently = any(
-            ref is not None and str(ref) == str(item_id)
-            for ref in eq.values()
-        )
-
-        if currently:
-            # 本体の解除後状態と同じく、そのslotキー自体を落とす。
-            removed = []
-            for slot, ref in list(eq.items()):
-                if ref is not None and str(ref) == str(item_id):
-                    eq.pop(slot, None)
-                    removed.append(slot)
-            action = "unequip"
-            write(
-                "npc unequipped: npc={} item_id={} item={!r} slots={} equipments={}".format(
-                    character_name(npc, "?"),
-                    item_id,
-                    frames.short(getattr(item_instance, "name", "?"), 80),
-                    removed,
-                    frames.repr_value(eq),
-                )
-            )
-            try:
-                widget.is_equipped = False
-            except Exception:
-                pass
-        else:
-            # weapon/wearableはitem_type自身がslot名。
-            previous = eq.get(item_type)
-            eq[item_type] = str(item_id)
-            action = "equip"
-            write(
-                "npc equipped: npc={} slot={} old={} -> {} item={!r} equipments={}".format(
-                    character_name(npc, "?"),
-                    item_type,
-                    frames.repr_value(previous),
-                    item_id,
-                    frames.short(getattr(item_instance, "name", "?"), 80),
-                    frames.repr_value(eq),
-                )
-            )
-            try:
-                widget.is_equipped = True
-            except Exception:
-                pass
-
-        # popupは一旦閉じる。次回右クリック時に現在のequipmentsから文言を再判定する。
-        try:
-            widget.hide_popup_menu()
-        except Exception:
-            pass
-
-        save_after_equipment(app, npc, item_instance, action)
 
     def remove_npc_menu():
         """出している自前のボタンを消す（同時に 1 つだけ）。"""
@@ -655,6 +545,13 @@ def apply(ctx):
         item_type = getattr(item_instance, "item_type", None)
         if item_type not in EQUIP_TYPES:
             return
+        # 装備欄の MOD（333_）が窓口を置いていなければ出さず、受け渡しだけにする。本体は仲間の
+        # `equipments` を保存しない（GAME.md §2.13.3）ので、ここで書いても次のロードで消える。
+        # `equipment.toggle` の答えでは見ない。装備欄の MOD が居てもその場で答えられなければ None になり、
+        # 聞くこと自体が品を移す
+        if not equipment.source_of(equipment.TOGGLE):
+            skip_once("no equipment slots mod declares equipment.toggle", widget)
+            return
         try:
             from kivy.uix.button import Button
             from kivy.core.window import Window
@@ -680,7 +577,7 @@ def apply(ctx):
                 value = getattr(template, name, None)
                 if value is not None:
                     kwargs[name] = value
-        equipped = combat.equipped(app, npc, item_instance)        # 装備欄の MOD が居ればそちらの記録
+        equipped = equipment.equipped(app, npc, item_instance)        # 装備欄の MOD が居ればそちらの記録
         if equipped is None:
             equipped = is_equipped_by(npc, item_instance, getattr(widget, "item_id", None))
         button = Button(text="外す" if equipped else "装備", **kwargs)
@@ -716,9 +613,13 @@ def apply(ctx):
 
         def pressed(*_):
             write("npc equipment button pressed: {!r}".format(button.text))
-            done = combat.toggle(app, npc, item_instance)              # 装備欄の MOD が居ればそちらが移す
+            done = equipment.toggle(app, npc, item_instance)              # 装備欄の MOD が移す
             if done is None:
-                apply_npc_equipment(app, npc, widget, item_instance)
+                # その場で答えられなかった（その仲間の装備欄・グリッド・品が画面に無い）。
+                # `equipments` を書くのは装備欄の MOD だけ（TECH.md §3.3.6）なので、ここでは書かない。
+                write("npc equipment not changed: the equipment slots could not answer "
+                      "(npc={} item={!r})".format(character_name(npc, "?"),
+                                                  frames.short(getattr(item_instance, "name", "?"), 80)))
             else:
                 write("npc equipment via the equipment slots: {}".format(done))
             remove_npc_menu()
@@ -913,8 +814,7 @@ def apply(ctx):
         state["npc_id"] = None
         return orig(self, *args, **kwargs)
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False)
-    def refresh_choice_buttons(orig, self, reset_page=False, *args, **kwargs):
+    def refresh_choice_buttons(self):
         """選択肢を描き直すたびに呼ばれる本体の関数。ここで受け渡しボタンを維持する。
 
         本体は `app.buttons` を組んでからこの関数で画面に並べる。ロード直後・
@@ -924,19 +824,18 @@ def apply(ctx):
         # ゲーム本体＋このhookより内側のMODに先に一覧を組ませる。
         # mod.json の after=["301_quest_from_conversation"] により、
         # 301の会話選択肢が先に存在する状態を狙う。
-        result = orig(self, reset_page, *args, **kwargs)
 
         try:
             buttons = getattr(self, "buttons", None)
             if not isinstance(buttons, list):
-                return result
+                return
 
             # タイトル→ロードで印を失った旧402/403/現行ボタンの残骸を掃除。
             screen.prune_stale(buttons, OUR_LABELS)
 
             # 現在の会話相手がparty memberでなければ出さない。
             if current_party_npc(self) is None:
-                return result
+                return
 
             # insert_transfer_button は ConversationEndManager を探し、
             # その直前へ入れる。301の依頼系ボタンが既に並んでいれば自然にその下になる。
@@ -946,22 +845,14 @@ def apply(ctx):
         except Exception:
             ctx.log_exc("party inventory/equipment: cannot maintain transfer button")
 
-        return result
 
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
-        """選択肢が押されたとき。押されたのが受け渡しボタンなら本体へ渡さず窓を開く。"""
-        try:
-            entry = pressed_entry(self, button_index)
-            action = screen.mark_of(entry)
-        except Exception:
-            action = None
-
-        if action != "transfer":
-            return orig(self, button_index, *args, **kwargs)
-
+    def on_button_press(self, action):
+        """受け渡しボタンが押された（窓口 `choices` の `presses`）。本体へ渡さず窓を開く。"""
         open_transfer(self)
         return None
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, after=refresh_choice_buttons, presses={"transfer": on_button_press})
 
     @ctx.wrap(
         "scripts.hud.new_hud:InventoryItem.change_inventory",
@@ -1038,7 +929,6 @@ def apply(ctx):
         state["player"] = None
         state["npc"] = None
         state["save_generation"] += 1
-        state["equipment_save_generation"] += 1
         write("return_to_title: transient transfer/equipment state cleared")
         return orig(self, *args, **kwargs)
 

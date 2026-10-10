@@ -56,7 +56,7 @@ SNAPSHOT_DIR_NAME = "recon_snapshots"
 #: `_same_build` と tools/tests/test_recon_archive.py を参照）ので、
 #: 素性が読めるようになる前後で1回の起動から2つ以上できることがある。
 #: 実測では同じ版のまま 109 個 / 23MB まで溜まっていた。
-#: `tools/logrotate.py` は `out/*.log` しか回さないので、ここで刈る。
+#: `tools/logrotate.py` は `out/` 直下の `*.log` と `*.jsonl` しか回さないので、ここで刈る。
 SNAPSHOT_KEEP = 20
 
 
@@ -154,8 +154,10 @@ def describe_class(cls: type) -> dict:
                 target = value.__func__
             entry["signature"] = safe_signature(target)
             doc = getattr(target, "__doc__", None)
-            if doc:
-                entry["doc"] = doc.strip().splitlines()[0][:200]
+            # 空白だけ・文字列でない docstring で、モジュール1本ぶんの記述ごと落とさない
+            lines = doc.strip().splitlines() if isinstance(doc, str) else []
+            if lines:
+                entry["doc"] = lines[0][:200]
         elif entry["kind"] == "property":
             entry["signature"] = "<property>"
         elif entry["kind"] == "value":
@@ -198,8 +200,9 @@ def describe_module(name: str, module: types.ModuleType, *, deep: bool) -> dict:
             # from ... import でコピーされてきた名前を見分ける手がかりになる。
             entry["module"] = getattr(value, "__module__", None)
             doc = getattr(value, "__doc__", None)
-            if doc:
-                entry["doc"] = doc.strip().splitlines()[0][:200]
+            lines = doc.strip().splitlines() if isinstance(doc, str) else []
+            if lines:
+                entry["doc"] = lines[0][:200]
         elif kind == "class":
             entry["module"] = getattr(value, "__module__", None)
             entry["detail"] = describe_class(value)

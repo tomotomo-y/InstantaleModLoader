@@ -60,20 +60,34 @@ MOD を外せば街は素のまま（建物も、そこへ繋がる道も残ら�
 
 **出口は宣言しなくても出る。** ゲームが出さないので、無いと建物から出られない。
 
-##### 未確認
+##### 実機で確かめたこと
 
-実機では何も確かめていない（測るのは `230_probe_mod_facility`）。
-文字列の施設 id が `MovePhaseManager` と背景の引きで通るか、
-保存後のセーブにその土地の施設が増えていないかは、この時点ではどれも見込みでしかない。
+書いた時点では何も確かめておらず、`230_probe_mod_facility`（作らなかった。今の `230_` は別の probe）で測る予定だった。
+その後 `330_real_estate` の通し手順で、文字列の施設 id の中に立ったままセーブ → ロードしても選択肢が戻り、
+保存後のセーブの `areas` / `buttons` に `mod:` の施設が残らないことまで通った（VERIFICATION.md §3.62）。
 整数で建てる形は `330_real_estate` が実機で通しているので、
 落ちたときの逃げ場はそちら（`ids.claim`）。
 """
 
+import contextlib
 import copy
 import os
 import sys
 
 from . import log_exc, patch, state, ui
+
+
+#: 前に書いた定型の行の中身（種類 -> 中身）。同じ中身なら繰り返さない（`_changed`）。
+#: 注入し直すとこのモジュールごと読み直されるので空に戻り、新しいログの頭には必ず出る。
+_LAST_WRITTEN = {}
+
+
+def _changed(kind, content) -> bool:
+    """`kind` の行の中身が前に書いたものと違えば控えて True。同じなら False。"""
+    if _LAST_WRITTEN.get(kind) == content:
+        return False
+    _LAST_WRITTEN[kind] = content
+    return True
 # 保存の間だけ成り代わる辞書。名簿と同じく、反復では隠し id では引ける（`veil_plain`）。
 from .modnpc import _RosterView
 
@@ -115,7 +129,7 @@ TALK_CLS = "DisplayTalkChoice"
 
 #: ゲームが後ろに置く選択肢。自前のボタンはこの手前に入れる。
 #: 素の施設は 操作 → 出る → 会話する の順なので（`232_probe_facility_choices` で実測。
-#: GAME.md §2.2）、MOD の建物もその並びに合わせる（本人の指定）。
+#: GAME.md §2.2）、MOD の建物もその並びに合わせる。
 TAIL_CLASSES = (MOVE_CLS, TALK_CLS)
 
 
@@ -174,6 +188,7 @@ def _record(facility_id):
             "built_in": None,   # その実体を組んだ世代（注入し直しで組み直すため）
             "snapshot": None,   # 控えから読んだ素データの写し（次の spawn の材料）
             "placed": None,     # (area_id, node_id, hub_id)
+            "logged": {},       # 持ち主 -> (世代, 層の数)。`registered` の行を書いた印
         }
     return record
 
@@ -262,7 +277,13 @@ def register(owner, facility_id=None, *, key=None, fields=None, choices=None,
         # 建物の登録は塗り直しのたびに走ることがあり、そのたび捨てると
         # 街から引き直す手間が毎手ぶん増える。
         record["facility"] = None
-    if write:
+    # 同じ持ち主・同じ世代・同じ層の数なら書かない。
+    # 選択肢が組まれるたびに登録し直す MOD がある（`331_` は毎手、持ち株の全部）ので、
+    # 中身が変わらない登録まで書くと、1分に170行を超えていた（実測）。
+    logged = record.setdefault("logged", {})
+    mark = (getattr(patch, "_generation", None), len(record["layers"]))
+    if write and logged.get(owner) != mark:
+        logged[owner] = mark
         write("modfacility: {} registered {} ({} layer(s))".format(
             owner, facility_id, len(record["layers"])))
     return facility_id
@@ -1058,6 +1079,33 @@ _bucket = _stores.bucket            # `(周回の鍵, 控え)` か `(None, None)
 _jsonable = state.jsonable
 
 
+@contextlib.contextmanager
+def keyed(key):
+    """`with modfacility.keyed(key):` の間、控えをその周回の鍵で読み書きする。
+
+    `World.__init__` を MOD が直に包み、orig の後で `spawn` を呼ぶと、
+    ローダの関所（`world_init`）が立てた鍵はもう消えていて、控えは `app` から決めた鍵
+    （前の周回のことがある）へ書かれる。鍵を引数の `save_data_dict` から決めて
+    （`state.playthrough_key_of_dict`）ここで立てれば、読んでいる周回へ書ける。
+    抜けるときは入る前の値へ戻す（入れ子にしても外側の鍵を消さない）。
+    鍵が空なら何も立てない。`modnpc.keyed` と対で使う。
+    """
+    missing = object()
+    previous = getattr(sys, _KEY_OVERRIDE_ATTR, missing)
+    if isinstance(key, str) and key:
+        setattr(sys, _KEY_OVERRIDE_ATTR, key)
+    try:
+        yield key
+    finally:
+        if previous is missing:
+            try:
+                delattr(sys, _KEY_OVERRIDE_ATTR)
+            except AttributeError:
+                pass
+        else:
+            setattr(sys, _KEY_OVERRIDE_ATTR, previous)
+
+
 def _persist(app, owner, facility_id, **changes):
     """1軒ぶんの控えを書く。`snapshot=`（素データの写し）／`spawned=`／`place=`。
 
@@ -1183,7 +1231,9 @@ def snapshot_all(app, write=None):
         record["snapshot_dropped"] = dropped
         if _persist(app, owner_of_id(facility_id), facility_id, snapshot=snap):
             done.append(facility_id)
-    if write and done:
+    # 控えは保存のたびに取るが、行は写した顔ぶれが変わったときだけ書く。
+    # ゲームは行動のたびに保存するので、毎回書くと行動の数だけ同じ行が並んでいた。
+    if write and done and _changed("snapshot", tuple(done)):
         write("modfacility: snapshot of {} taken".format(", ".join(done)))
     return done
 
@@ -1203,9 +1253,8 @@ def restore_world(app, world=None, save_data_dict=None, write=None):
         key = state.playthrough_key(app)
     if not key or key == state.UNKNOWN_WORLD:
         return []
-    setattr(sys, _KEY_OVERRIDE_ATTR, key)
     done = []
-    try:
+    with keyed(key):
         bucket = found.load(key, fresh=True)
         for owner, owned in list((bucket or {}).items()):
             if not isinstance(owned, dict):
@@ -1225,11 +1274,6 @@ def restore_world(app, world=None, save_data_dict=None, write=None):
                     spawn(app, facility_id, spot[0], node_id=spot[1],
                           hub_id=spot[2], world=world, write=write)
                 done.append((owner, facility_id))
-    finally:
-        try:
-            delattr(sys, _KEY_OVERRIDE_ATTR)
-        except AttributeError:
-            pass
     if write and done:
         write("modfacility: restored {} entr(y/ies) from the state of {!r}".format(
             len(done), key))
@@ -1423,7 +1467,7 @@ def keep_inside(app, facility_id, screen=None, write=None):
     層が1つでも真を返せば中のまま。既定（宣言が無い）は入口へ移す。
 
     **会話や部屋選びの最中でも中のまま。** ゲームは会話の途中を保存して再開できるので、
-    居た場所に戻すのが正しい（本人の指摘）。
+    居た場所に戻すのが正しい。
     版21〜23 はここで入口へ移していたが、再開できなかった原因は
     `modnpc` が会話の相手の id を落としていたことで、場所でも画面でもなかった。
     """
@@ -1604,13 +1648,15 @@ def _spec_mentions(value, mod_ids):
     """`PhaseSpec`（またはその辞書）の `args` が MOD の施設を指しているか。
 
     実行時は `PhaseSpec` のオブジェクト、セーブから復元された直後は辞書のことがある。
+    ボタンの辞書（`{"text", "spec"}`）にも、裸の spec（自由入力の行き先 `SAVED_SPEC_ATTRS`）にも来る。
+    どれでも読む（`ui.spec_args` はボタンの辞書しか読まず、裸の spec では一度も当たらなかった）。
     """
-    args = ui.spec_args(value)
-    if not args:
-        data = value.get("spec") if isinstance(value, dict) else None
-        if isinstance(data, dict):
-            args = data.get("args") or []
-    return any(str(a) in mod_ids for a in (args or ()))
+    spec = value.get("spec") if isinstance(value, dict) and "spec" in value else value
+    data = spec if isinstance(spec, dict) and "cls_name" in spec else ui.spec_data(spec)
+    args = data.get("args") if isinstance(data, dict) else None
+    if not isinstance(args, (list, tuple)):
+        return False
+    return any(str(a) in mod_ids for a in args)
 
 
 def scrub_saved_refs(app, mod_ids, write=None, undo=None):
@@ -1953,9 +1999,8 @@ def is_facility_screen(buttons):
 #: 部屋選び（`VacationStartManager` ＋ やめる）や会話相手の一覧
 #: （`ConversationStartManager` ＋ やめる）にはこれらが無い。
 #: ゲームが「別のこと」をしている最中の旗。ここが真の間は建物の選択肢を足さない。
-#: `in_shopping` は外す ― 店の外を往復しているだけでも真のままで（`ui.BUSY_FLAGS` の註）、
-#: 自分の店の中でこちらの選択肢が出なくなる。
-BUSY_FLAGS = tuple(flag for flag in ui.BUSY_FLAGS if flag != "in_shopping")
+#: 表はローダの1か所（`in_shopping` を入れない理由も `ui.BUSY_FLAGS` の註）。
+BUSY_FLAGS = ui.BUSY_FLAGS
 
 
 #: 戦闘の旗。ゲームはこれを下ろし忘れる経路を持っている（`107_` の表）。
@@ -2158,7 +2203,7 @@ def add_inside_buttons(app, buttons, facility_id, screen=None, write=None):
         value = _press_value(kind, facility_id, choice["key"])
         # 伏せたゲームの選択肢の代わりなら、**その選択肢が居た場所**に出す
         # （`replaces`）。自分の宿の `無料で泊まる` はゲームの `宿泊する` と
-        # 同じ並びで出す（本人の指定）。宣言が無ければ `at`（移動・会話の手前）に足す。
+        # 同じ並びで出す。宣言が無ければ `at`（移動・会話の手前）に足す。
         # 居た場所が `at` と同じでも、その場所に出す
         # （`<` にしていたら、ゲームの並びが `会話する` → `宿泊する` のとき後ろへ落ちた）。
         slot = slots.get(str(choice.get("replaces") or "")) if choice.get("replaces") \
@@ -2601,6 +2646,7 @@ def install(ctx, write=None):
     > 済ませたいときは、**MOD の側が `on["world"]` で置く**こと
     > （フレームワークどうしは順序を約束しない）。
     """
+    patch.note_gate_writer("modfacility", write)
     bind_store(ctx, write)
     generation = getattr(ctx, "generation", None)
     done = installed()
@@ -2612,7 +2658,8 @@ def install(ctx, write=None):
     setattr(sys, INSTALLED_ATTR, {"generation": generation,
                                   "owner": getattr(ctx, "_mod", None),
                                   "targets": targets})
-    if write:
+    # 対象は boot ごとに同じなので、変わったときだけ書く（遅れて当て直す boot で繰り返していた）。
+    if write and _changed("gate", tuple(targets)):
         write("modfacility: the gate was declared on {}".format(", ".join(targets)))
     return targets
 
@@ -2665,23 +2712,17 @@ def _install(ctx, write):
         """
         result = orig(self, save_data_dict, app, *args, **kwargs)
         key = state.playthrough_key_of_dict(save_data_dict, None)
-        if key:
-            setattr(sys, _KEY_OVERRIDE_ATTR, key)
-        try:
-            lift_plain(app)            # 前の世界の素データに写しを残さない
-            forget(write=write)
-            fire_all("world", app, world=self,
-                     args={"save_data_dict": save_data_dict}, write=write)
-            restore_world(app, world=self, save_data_dict=save_data_dict,
-                          write=write)
-            repair_player_location(self, save_data_dict, write=write)
-        except Exception:
-            log_exc("modfacility: cannot rebuild the town after the load")
-        finally:
+        with keyed(key):
             try:
-                delattr(sys, _KEY_OVERRIDE_ATTR)
-            except AttributeError:
-                pass
+                lift_plain(app)            # 前の世界の素データに写しを残さない
+                forget(write=write)
+                fire_all("world", app, world=self,
+                         args={"save_data_dict": save_data_dict}, write=write)
+                restore_world(app, world=self, save_data_dict=save_data_dict,
+                              write=write)
+                repair_player_location(self, save_data_dict, write=write)
+            except Exception:
+                log_exc("modfacility: cannot rebuild the town after the load")
         return result
     targets.append(WORLD_TARGET)
 

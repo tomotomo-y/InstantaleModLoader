@@ -43,6 +43,7 @@ import os
 import sys
 import threading
 
+from instantale_modloader import patch
 from instantale_modloader.state import (UNKNOWN_WORLD, world_filename,
                                         world_key)
 
@@ -62,9 +63,11 @@ EMBEDDING_MODULE = "Embedding.get_similar_id"
 
 
 def apply(ctx):
-    emb_mod = sys.modules.get(EMBEDDING_MODULE)
+    # 無ければローダの保留に積んで降りる（`patch.await_module`）。来たらローダが当て直す。
+    # `sys.modules` を見て自分で降りると保留に載らず、ほかに保留が無い構成ではその起動で一度も当たらない。
+    emb_mod = patch.await_module(EMBEDDING_MODULE, "text_to_embedding", "get_similar_embedding_id")
     if emb_mod is None:
-        ctx.log("{} not loaded; skipping".format(EMBEDDING_MODULE), level="WARN")
+        ctx.log("{} not loaded yet; waiting for it".format(EMBEDDING_MODULE))
         return
 
     log = ctx.logger("item_image.log")
@@ -189,18 +192,28 @@ def apply(ctx):
 
         top_sim, top_idx = sims.max(dim=0)
         top_sim = float(top_sim)
-        if top_sim <= 0:
-            # 近い候補がまったく無い。広げても意味が無いので素の挙動どおり。
-            chosen = int(top_idx)
-        else:
+        if top_sim > 0:
             order = sims.argsort(descending=True)[:TOP_K].tolist()
             qualified = [i for i in order if float(sims[i]) >= top_sim * SIM_FLOOR]
-            with lock:
+
+        # 選定と割り当ては1つの錠で。錠を分けると、同時に来た別の外見文が
+        # 同じ最少の絵を取り、同じ外見文なら後の1本が先の対応を別の絵で上書きする。
+        # 埋め込みの計算中に他のスレッドが同じ外見文を入れていれば、それを返す。
+        with lock:
+            ensure_world()
+            kept = state["images"].get((item_sub_type, query_text))
+            if kept is not None and kept in key_set:
+                log("{}: kept {} for {!r}".format(
+                    item_sub_type, kept, query_text[:80]))
+                return kept
+            if top_sim <= 0:
+                # 近い候補がまったく無い。広げても意味が無いので素の挙動どおり。
+                chosen = int(top_idx)
+            else:
                 chosen = min(
                     qualified,
                     key=lambda i: state["usage"].get((item_sub_type, keys[i]), 0))
-        key = keys[chosen]
-        with lock:
+            key = keys[chosen]
             state["images"][(item_sub_type, query_text)] = key
             spot = (item_sub_type, key)
             state["usage"][spot] = state["usage"].get(spot, 0) + 1

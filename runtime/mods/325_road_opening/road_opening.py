@@ -16,6 +16,8 @@
 委託は世界ごとの控えの `commissions` に期日（ゲーム内の日付）で持ち、
 日数が進んだとき（`elapse_days` の後）と画面が組み直されたときに期日を見て開く。
 開通の1行は手が空いてから出す（移動の文の最中に割り込まない）。
+委託と踏破は同じ道に重ねない。委託中の道は自ら切り拓けず、道中の依頼が出ている道には払えない
+（重なると、残った側が期日や完了でもう一度開通させ、払った代金が何も生まない）。
 
 開いた道は両側の `Area.connections` へ対称に足す。
 以後は素の「他の土地へ行く」に普通に並び、徒歩でも馬車でも行ける。
@@ -104,7 +106,7 @@ import random
 import sys
 import time
 
-from instantale_modloader import durations, ui
+from instantale_modloader import choices, durations, ui
 from instantale_modloader.state import UNKNOWN_WORLD, WorldStore
 
 
@@ -195,8 +197,17 @@ PAY_LABEL_NOW = "お金を支払い委託する（{price}G）"
 BACK_LABEL = "やめる"
 
 #: セーブから復元された残骸を見分けるための、こちらのラベルの前方一致（`prune_stale`）。
-#: 汎用語（「やめる」）は入れない。
+#: 汎用語（「やめる」）は入れない。既定の文言のもの（後方互換で残す）。使うのは `our_label_prefixes()`。
 OUR_LABEL_PREFIXES = (SEARCH_LABEL, "お金を支払い委託する（", "自ら切り拓く（")
+
+
+def our_label_prefixes():
+    """今の設定の文言から組んだ前方一致（読み込みの時点に固めると、文言を設定で変えた後の残骸を掃除できない）。
+
+    `{` より前を頭にする。頭が短すぎるもの（空や1字）は、ほかのボタンまで巻き込むので使わない。
+    """
+    heads = [SEARCH_LABEL] + [str(label).split("{")[0] for label in (PAY_LABEL, PAY_LABEL_NOW, DUNGEON_LABEL)]
+    return tuple(dict.fromkeys(head for head in heads if isinstance(head, str) and len(head) >= 2))
 
 #: 行き先一覧の1行の spec のクラス名と、`args` の並び `[target_area_id]`
 #: （`133_` の実測。GAME.md §2.18）。
@@ -226,6 +237,7 @@ NO_GOLD_TEXT = "（{price}G に足りない。手持ち {gold}G）"
 ALREADY_TEXT = "（{target}への道はもう開いている）"
 PAID_TEXT = "{price}G を支払い、{target}への道を拓いた。"
 ALREADY_COMMISSIONED_TEXT = "（{target}への道は開削を委託済み。開通まであと {days}日）"
+ALREADY_DUNGEON_TEXT = "（{target}へ抜ける道の依頼が出ている。踏破すれば道が開く）"
 REFUSE_TEXT = "この道を行くには、今は体力が無い。"
 REFUSE_DETAIL = "（体力 {value}/{limit}。休むか、医者にかかるかだ）"
 LOOKING_TEXT = "{target}へ抜ける道の話を聞いている……"
@@ -483,10 +495,13 @@ def apply(ctx):
         record = bucket.get("pending")
         if not isinstance(record, dict):
             return None
-        if time.time() - float(record.get("at") or 0) > PENDING_TTL:
+        stale = time.time() - float(record.get("at") or 0) > PENDING_TTL
+        if stale and record.get("stage") == "armed" \
+                and str(ui.current_quest_id(app)) == str(record.get("quest_id")):
+            stale = False       # ゲームがまだその依頼を進めている（ダンジョンの途中で長く中断した）
+        if stale:
             write("pending: dropped a stale record ({})".format(describe_pending(record)))
-            bucket["pending"] = None
-            worlds.save(key)
+            drop_pending(app, "stale record")      # 依頼概要に足した一文も消す
             return None
         if record.get("stage") == "moving" and \
                 time.time() - float(record.get("moving_at") or 0) > MOVE_TIMEOUT:
@@ -661,11 +676,22 @@ def apply(ctx):
         used = int(ISOLATED_HOPS) if isolated else int(hops)
         origin_level = level_of(app, origin)
         target_level = level_of(app, target)
+        # 抜き出しの難易度（`between`）は乱数なので、同じ日の同じ道は1回だけ引いて使い回す
+        # （一覧・手段の画面・受注で毎回引くと、「難易度 9」の道を選ぶとボタンは 21、依頼は 27 になった）
+        rolls = state.setdefault("difficulty_rolls", {})
+        roll_key = (worlds.playthrough(app), ui.area_id_of(origin), ui.area_id_of(target),
+                    origin_level, target_level, used, ui.game_day(app),
+                    DIFFICULTY_MODE, DIFFICULTY_PER_HOP, DIFFICULTY_OFFSET, MIN_DIFFICULTY)
+        difficulty = rolls.get(roll_key)
+        if difficulty is None:
+            if len(rolls) > 256:
+                rolls.clear()
+            difficulty = rolls[roll_key] = difficulty_for(origin_level, target_level, used)
         return {
             "hops": used,
             "isolated": isolated,
             "price": price_for(used),
-            "difficulty": difficulty_for(origin_level, target_level, used),
+            "difficulty": difficulty,
             "origin_level": origin_level,
             "target_level": target_level,
         }
@@ -788,6 +814,11 @@ def apply(ctx):
         if origin is None or target is None:
             screen.say(app, NO_ROAD_TEXT)
             return
+        waiting = commission_of(worlds.playthrough(app), ui.area_id_of(origin), target_id)
+        if waiting is not None:
+            # 候補には残す（選べば開通までの日数が分かる）。払うのも切り拓くのも断る。
+            refuse_commissioned(app, target, waiting, "means")
+            return
         graph = build_graph(ui.world_areas(app))
         offer = offer_of(app, origin, target, hops_between(graph, ui.area_id_of(origin),
                                                            str(target_id)))
@@ -831,12 +862,15 @@ def apply(ctx):
         price = offer["price"]
         waiting = commission_of(worlds.playthrough(app), ui.area_id_of(origin), target_id)
         if waiting is not None:
-            today = ui.game_day(app)
-            left = max(0, int(waiting.get("due_day", 0)) - int(today)) if today is not None else "?"
-            write("pay: {!r} is already commissioned (due day {}); not charging".format(
-                area_name(target, "?"), waiting.get("due_day")))
-            screen.say(app, ALREADY_COMMISSIONED_TEXT.format(
-                target=area_name(target, "その土地"), days=left))
+            refuse_commissioned(app, target, waiting, "pay")
+            return
+        road = dungeon_of(app, ui.area_id_of(origin), target_id)
+        if road is not None:
+            # 道中の依頼が出ている道に委託を重ねると、踏破で開いた後に期日でもう一度開通し、
+            # 代金が何も生まない。受注前（offered）も掲示板から受けられるので断る。
+            write("pay: {!r} has a road quest {!r} ({}); not charging".format(
+                area_name(target, "?"), road.get("quest_id"), road.get("stage")))
+            screen.say(app, ALREADY_DUNGEON_TEXT.format(target=area_name(target, "その土地")))
             settle(app, lambda: reopen_move_list(app))
             return
         if str(target_id) in connections_of(origin):
@@ -902,6 +936,30 @@ def apply(ctx):
             if isinstance(item, dict) and {str(item.get("from")), str(item.get("to"))} == ends:
                 return item
         return None
+
+    def refuse_commissioned(app, target, waiting, why):
+        """期日待ちの委託がある道を断り、行き先の一覧へ戻す。
+
+        二度払いのほか、委託中に自ら切り拓くのも断る。踏破で開いても委託の行は残り、
+        期日にもう一度開通して代金が何も生まないため。
+        """
+        today = ui.game_day(app)
+        left = max(0, int(waiting.get("due_day", 0)) - int(today)) if today is not None else "?"
+        write("{}: {!r} is already commissioned (due day {}); refusing".format(
+            why, area_name(target, "?"), waiting.get("due_day")))
+        screen.say(app, ALREADY_COMMISSIONED_TEXT.format(
+            target=area_name(target, "その土地"), days=left))
+        settle(app, lambda: reopen_move_list(app))
+
+    def dungeon_of(app, origin_id, target_id):
+        """その2つの街の間の道中の控え（受注前と受注後）。無ければ None。"""
+        record = pending_of(app, "offered", "armed")
+        if record is None:
+            return None
+        ends = {str(origin_id), str(target_id)}
+        if {str(record.get("origin_id")), str(record.get("target_id"))} != ends:
+            return None
+        return record
 
     def check_commissions(app, why):
         """期日が来た委託を開く。開いた数を返す。日数が進んだとき・画面が組み直されたときに呼ぶ。"""
@@ -983,6 +1041,11 @@ def apply(ctx):
         target = ui.world_areas(app).get(str(target_id))
         if origin is None or target is None:
             screen.say(app, NO_ROAD_TEXT)
+            return
+        waiting = commission_of(worlds.playthrough(app), ui.area_id_of(origin), target_id)
+        if waiting is not None:
+            # 手段の画面は委託中なら開かないので、ここに来るのは支払う前の古い画面からの押下。
+            refuse_commissioned(app, target, waiting, "dungeon")
             return
         refusal = stamina_refusal(app)
         if refusal is not None:
@@ -1108,7 +1171,7 @@ def apply(ctx):
             return False
         write("arrived: {!r} reached; the move took {} day(s) (set to {})".format(
             record.get("target_name"), record.get("days_spent"), ARRIVAL_DAYS))
-        if not record.get("days_spent"):
+        if not record.get("days_noted") and not record.get("days_spent"):
             write("WARN arrived: elapse_days was never seen; "
                   "the {}-day setting did not apply to this build".format(ARRIVAL_DAYS))
         drop_pending(app, "arrived", clear_note=False)
@@ -1244,7 +1307,7 @@ def apply(ctx):
                 write("WARN list: the game did not list the opened road to {!r}; "
                       "added the button myself (the game reads connections from "
                       "somewhere other than Area.connections)".format(other))
-            screen.prune_stale(buttons, OUR_LABEL_PREFIXES)
+            screen.prune_stale(buttons, our_label_prefixes())
             if any(screen.mark_of(entry) for entry in buttons):
                 return result
             if not candidates_of(app, origin):
@@ -1261,13 +1324,9 @@ def apply(ctx):
             ctx.log_exc("road opening: cannot add the search button")
         return result
 
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
-        """自前のボタンだけ横取りする。印が無ければ必ず素通し。"""
-        entry = ui.pressed_entry(self, button_index)
-        action = screen.mark_of(entry)
-        if action is None:
-            return orig(self, button_index, *args, **kwargs)
+    def on_button_press(self, action):
+        """自前のボタンが押された（窓口 `choices` の `presses`。印で振り分けた後に呼ばれる）。"""
+        entry = choices.pressed()
         if state["acting"] or state["generating"]:
             # 前の押下がまだ動いている。連打の2発目は捨てる（支払いの二重を防ぐ）。
             write("ignored {!r}: the previous press is still running".format(
@@ -1293,8 +1352,7 @@ def apply(ctx):
             ctx.log_exc("road opening: cannot re-apply the roads on load")
         return result
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False, safe=True)
-    def refresh_choice_buttons(orig, self, reset_page=False, *args, **kwargs):
+    def refresh_choice_buttons(self, _buttons):
         """集落の選択肢に戻ったら、待っている移動を起こす（保険の経路。`307_` と同じ）。"""
         try:
             observe_quest(self)
@@ -1316,7 +1374,9 @@ def apply(ctx):
                                  tag="arrive")
         except Exception:
             ctx.log_exc("road opening: cannot start the pending move")
-        return orig(self, reset_page, *args, **kwargs)
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press})
 
     @ctx.wrap("__main__:QuestStartManager.__init__", required=False, safe=True)
     def quest_start(orig, self, app, quest_type, quest_id, *args, **kwargs):
@@ -1440,7 +1500,8 @@ def apply(ctx):
         record = pending_of(app, "moving")
         if record is None:
             return None
-        if int(record.get("days_spent") or 0) > 0:
+        if record.get("days_noted") or int(record.get("days_spent") or 0) > 0:
+            # この道ではもう渡している（0 日を渡した回も含む。日数だけでは「まだ」と見分けられない）
             write("days: {} left alone (the road to {!r} already took {} day(s))"
                   .format(days, record.get("target_name"), record.get("days_spent")))
             return None
@@ -1450,9 +1511,9 @@ def apply(ctx):
     def days_note(app, days, granted):
         """道が実際に取った日数を控える（到着の検算が読む）。"""
         record = pending_of(app, "moving")
-        if record is None or int(record.get("days_spent") or 0) > 0:
+        if record is None or record.get("days_noted") or int(record.get("days_spent") or 0) > 0:
             return
-        advance(app, "moving", days_spent=max(0, int(granted)))
+        advance(app, "moving", days_spent=max(0, int(granted)), days_noted=True)
         write("road: the road to {!r} takes {} day(s)".format(
             record.get("target_name"), granted))
 

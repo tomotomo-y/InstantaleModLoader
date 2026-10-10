@@ -7,7 +7,7 @@ TECH.md §3.12 の契約で動く。ローダの設定画面（`tools/gui.py`）
 このファイルを別プロセスで開き、場所は環境変数で渡す。直接起動したときは自分で探す。
 
 なぜ独自の画面か: 宣言の設定は 23 項目（種類6 × 3 と共通5）で、1列に並べると読めない
-（本人の指摘「この数まで行くと独自設定 GUI を実装した方がいい」）。
+（この数まで行くと独自の設定画面のほうがよい）。
 種類を行、項目を列にした表なら 6 行で収まり、隣に「都市・最上ではいくらか」も出せる。
 
 | 画面 | 書く先 |
@@ -206,6 +206,9 @@ def build_window(mod_dir=MOD_DIR):
         var.trace_add("write", refresh_previews)
 
     saved = {"values": {}}
+    # ファイルに在る値。「既定に戻す」の後の比べ先で、保存のたびに差し替える
+    # （起動時の値のままだと、保存した後の「既定に戻す」を変更なしと読む）。
+    last = {"values": current}
 
     def load_values(values):
         table_set(values)
@@ -234,13 +237,14 @@ def build_window(mod_dir=MOD_DIR):
                 config.store_path(runtime), type(exc).__name__, exc), parent=root)
             return False
         saved["values"] = as_shown(values)
+        last["values"] = values
         status.configure(text="保存しました {}  {}".format(
             time.strftime("%H:%M:%S"), config.store_path(runtime)))
         return True
 
     def reset():
         load_values(dict((k, d["default"]) for k, d in found.items()))
-        saved["values"] = as_shown(current)         # 「既定に戻す」は未保存の変更のまま
+        saved["values"] = as_shown(last["values"])  # 「既定に戻す」は未保存の変更のまま
 
     def close():
         modtool.save_window(root_dir, mod_dir, root)

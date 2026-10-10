@@ -3,7 +3,9 @@
 
 名簿が空の間は待ち、同行者が入ったら 1 度だけ `refresh_choice_buttons()` を呼ぶこと、
 そのとき画面（HUD の `update_button_texts`）にも塗ること、
-2 本の MOD が呼んでも 1 度であること、同行者の居ないセーブでは上限で 1 度呼ぶことを見る。
+2 本の MOD が呼んでも 1 度であること、同行者の居ないセーブでは上限で 1 度呼ぶこと、
+待っている間に待機へ入ったら組み直さずに降りることを見る。
+後方互換のために残している口なので、呼ばれるたびに WARN で窓口 `choices` への移行を促すことも見る。
 """
 import os
 import sys
@@ -51,8 +53,13 @@ sys.modules[ui.HUD_MODULE] = hud_module
 
 
 class Ctx(object):
-    def __init__(self):
+    def __init__(self, mod=None):
         self.hooks = {}
+        self._mod = mod
+        self.logs = []
+
+    def log(self, line, level="INFO"):
+        self.logs.append((level, line))
 
     def wrap(self, target, **kw):
         def deco(fn):
@@ -78,9 +85,15 @@ def refresh():
 
 app.refresh_choice_buttons = refresh
 
-ctx_a, ctx_b = Ctx(), Ctx()
+ctx_a, ctx_b = Ctx("900_old_a"), Ctx("901_old_b")
 ui.refresh_choices_after_load(ctx_a, logged.append, tries=4)
 ui.refresh_choices_after_load(ctx_b, logged.append, tries=4)
+# 呼ばれるたびに、呼んだ MOD の名前つきの WARN で窓口 `choices` への移行を促す
+for ctx, mod in ((ctx_a, "900_old_a"), (ctx_b, "901_old_b")):
+    warns = [line for level, line in ctx.logs if level == "WARN"]
+    assert len(warns) == 1 and mod in warns[0] and "choices" in warns[0], ctx.logs
+ui.refresh_choices_after_load(ctx_a, logged.append, tries=4)     # 注入し直しで2回目
+assert [level for level, _l in ctx_a.logs].count("WARN") == 2, ctx_a.logs
 load_a = ctx_a.hooks["__main__:InstantaleApp.load_game_new"]
 load_b = ctx_b.hooks["__main__:InstantaleApp.load_game_new"]
 
@@ -104,4 +117,17 @@ load_a(lambda self: None, app)
 for _ in range(4):
     FakeClock.tick()
 assert app.refreshed == 2 and not FakeClock.intervals
+
+# 待っている間に待機（点送り）に入った: 組み直さず、点の上に塗らずに降りる
+painted = len(InstanTaleHUD.painted)
+load_a(lambda self: None, app)
+FakeClock.tick()
+app.is_button_enabled = False                            # プレイヤーが選択肢を押した
+app.to_display_buttons = [".", ".", "."]
+for _ in range(4):
+    FakeClock.tick()
+assert app.refreshed == 2 and not FakeClock.intervals, app.refreshed
+assert len(InstanTaleHUD.painted) == painted, InstanTaleHUD.painted
+assert app.to_display_buttons == [".", ".", "."]
+assert any("skipped the refresh after the load (waiting" in l for l in logged), logged
 print("ok")

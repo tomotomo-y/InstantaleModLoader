@@ -793,7 +793,7 @@ check("闘技場は窓口に出す（試合の間だけ素データの写しを�
       "colosseum" in cat.enabled_kinds())
 
 print("[種類ごとの設定]")
-# 建設費・1日の売上・最低の規模を種類ごとに動かせる（本人の指定）。
+# 建設費・1日の売上・最低の規模を種類ごとに動かせる。
 # 宣言は `mod.json`、既定は `catalog.KINDS` の表と同じ。
 declared = json.load(io.open(os.path.join(os.path.dirname(MOD), "mod.json"),
                              encoding="utf-8"))["settings"]
@@ -943,7 +943,7 @@ check("建ったことが本文に出る", any("建った" in t for t in app.tex
 check("役場の選択肢に戻る", app.has(EXIT_TEXT), app.labels())
 
 print("[上限]")
-# 上限は種類ごとではなく、その街に建てた合計（本人の指定）。村は1軒。
+# 上限は種類ごとではなく、その街に建てた合計。村は1軒。
 app.press(module.DESK_LABEL)
 check("村は1軒建てたら打ち止め",
       not any(app.has(module.BUILD_LABEL.format(cat.KINDS[k]["label"]))
@@ -963,7 +963,7 @@ check("いまの軒数はこちらが建てた分だけ",
       "合計1軒まで（いま0軒）" in app2.texts[-1], app2.texts[-1:])
 
 print("[主人を作らせる]")
-# 建てるときに1回だけゲームと同じ生成 AI に聞く（本人の指定）。
+# 建てるときに1回だけゲームと同じ生成 AI に聞く。
 # 読めなければ表の12人へ降りる。
 module, ctx, app, world, classes = setup()
 FakeLLM.load([{"name": "サリ", "category": "middle-aged woman",
@@ -1072,7 +1072,7 @@ check("宿屋の絵に MOD は触らない（描かず、頼まない。移動�
 
 print("[ゲームが出す画面との重なり]")
 # `inn` 型ではゲーム自身が `宿泊する(N)` を出す（実機）が、**自分の宿では伏せる**
-# （版40。宿代を取る宿泊を自分の宿に並べる理由が無い。本人の指定）。残るのは「無料で泊まる」。
+# （版40。宿代を取る宿泊を自分の宿に並べる理由が無い）。残るのは「無料で泊まる」。
 # ゲームが組む順は 操作 / 出る / 会話する（`232_probe_facility_choices` で実測。
 # 宿屋だけ `出る` が先頭に来るのは `135_fix_inn_button_order` が直す）。
 app.buttons = [{"text": "宿泊する(4ヵ月)", "spec": PhaseSpec("DisplayVacationChoice", [4])},
@@ -1083,11 +1083,11 @@ CLOCK.settle()
 check("自分の宿ではゲームの「宿泊する」を出さない", not app.has("宿泊する"), app.labels())
 check("「無料で泊まる」は出る", app.has(module.STAY_LABEL), app.labels())
 check("主人との「会話する」は残る", app.has(TALK_TEXT), app.labels())
-# 並びは動かさない。伏せた `宿泊する` が居た場所に `無料で泊まる` を出す（本人の指定）。
+# 並びは動かさない。伏せた `宿泊する` が居た場所に `無料で泊まる` を出す。
 check("「無料で泊まる」はゲームの「宿泊する」が居た場所に出る",
       app.labels().index(module.STAY_LABEL) == 0, app.labels())
 check("売上の選択肢は出る", app.has("売上を受け取る"), app.labels())
-# 素の施設と同じ並びにする（本人の指定）。ゲームは `出る` と `会話する` を後ろに置く。
+# 素の施設と同じ並びにする。ゲームは `出る` と `会話する` を後ろに置く。
 check("素の施設と同じ並び: 操作 → 出る → 会話する",
       app.labels() == [module.STAY_LABEL, "売上を受け取る(まだ無い)", EXIT_TEXT, TALK_TEXT],
       app.labels())
@@ -1287,16 +1287,31 @@ plain = app.world_dict["areas"]["2"]["nodes"]["10"]["facilities"][record["facili
 check("写しの config は実体と同じ辞書", plain["config"] is arena.config)
 check("写しは8項目・同じ並び", list(plain) == list(modfacility.FACILITY_FIELDS), list(plain))
 check("写しの主は主人", plain.get("owner") == record.get("keeper"))
-# 版12 までの主人（警戒心がある）は、当て直しで好意を持つ。
+# 建てた主人は引き上げ済みの印を持つ。遊んで下がった好感度は当て直しで戻さない。
+check("新築の帳簿に引き上げ済みの印", record.get(module.WARMED_KEY) is True, record)
 arena_keeper = world.characters.get(record.get("keeper"))
 arena_keeper.relationship = {"player": {"affinity": 0, "affinity_text": "警戒心がある",
                                         "relationship": ["初対面"], "conversation_count": 0}}
 app.refresh_choice_buttons(reset_page=True)
 CLOCK.settle()
+check("下がった好感度は戻さない", arena_keeper.relationship["player"]["affinity"] == 0,
+      arena_keeper.relationship)
+# 版12 までの主人（警戒心がある・印の無い帳簿）は、当て直しで1回だけ好意を持つ。
+live = [h for buckets in getattr(sys, module.STATE_STORE_ATTR)["worlds"]._buckets.values()
+        for h in buckets.get("holdings") or [] if h.get("facility") == record.get("facility")]
+for holding in live:
+    holding.pop(module.WARMED_KEY, None)
+app.refresh_choice_buttons(reset_page=True)
+CLOCK.settle()
 check("古い主人の好感度が初期値まで上がる",
-      arena_keeper.relationship["player"]["affinity"] == cat.KEEPER_AFFINITY
+      live and arena_keeper.relationship["player"]["affinity"] == cat.KEEPER_AFFINITY
       and "出資者" in arena_keeper.relationship["player"]["relationship"],
       arena_keeper.relationship)
+arena_keeper.relationship["player"]["affinity"] = 10
+app.refresh_choice_buttons(reset_page=True)
+CLOCK.settle()
+check("引き上げは1回だけ", arena_keeper.relationship["player"]["affinity"] == 10
+      and all(h.get(module.WARMED_KEY) for h in live), arena_keeper.relationship)
 arena_keeper.relationship["player"]["affinity"] = 90
 app.refresh_choice_buttons(reset_page=True)
 CLOCK.settle()
@@ -1594,7 +1609,7 @@ app.go(world_c.areas["2"].nodes["10"].facilities["9"])
 print("[新しい主人公]")
 # 主人公が死んで同じ世界で作り直すと、ゲームは世界を world_data.json から組み直す
 # （初期化された同じ世界）。帳簿は 世界×主人公 で持つので、前の主人公の建物も主人も
-# 新しい主人公には現れない（本人の指定。実機では新しい主人公が前の主人公の
+# 新しい主人公には現れない（実機では新しい主人公が前の主人公の
 # 施設の出資者として迎えられた）。
 before = holdings()
 first_player, first_save = app.player, app.save_data_dict
@@ -1671,7 +1686,7 @@ check("戻した主人は元の主人公を出資者と知っている",
       PLAYER_NAME in (back_note or "") and "二代目" not in (back_note or ""), back_note)
 
 print("[設定画面]")
-# 23 項目を1列に並べると読めないので、種類を行・項目を列にした表の画面を同梱する（本人の指摘）。
+# 23 項目を1列に並べると読めないので、種類を行・項目を列にした表の画面を同梱する。
 # 窓は開かず、純粋な部分（設定名の規則・共通の項目・参考の値札・保存に渡す形）だけ見る。
 TOOLS_DIR = os.path.join(RUNTIME_DIR, os.pardir, "tools")
 for extra in (os.path.normpath(TOOLS_DIR), os.path.dirname(MOD)):
@@ -1718,6 +1733,112 @@ warns = [line for line in read_log().splitlines()
          if "WARN" in line and "the game's" not in line
          and "corrected" not in line and "is unknown" not in line]
 check("ログに WARN が無い（網が握った3行と、宿代の帳尻でわざと出した行を除く）", not warns, warns[:3])
+
+print("[起動して最初のロード]")
+# 登録簿が空のまま（起動して注入した直後）セーブを読む。層を orig の後で積むと、
+# ローダの建て直し（`restore_world`）が層の無い id を飛ばし、建物は控えの写しを使わずに
+# 層の初期値から組まれる。次の保存でその組み直しが控えを上書きして、試合の進みが消える。
+snap = (modfacility._persisted_entry(app, module.OWNER, record["facility"]) or {}).get("snapshot") or {}
+check("前提: 控えに試合の進みが在る", (snap.get("config") or {}).get("current_phase") == 1,
+      snap.get("config"))
+module, ctx, app, world, classes = setup(keep_state=True)
+# 実機のタイトル画面には世界が無く、層は1つも積まれていない。
+# `setup` の塗り直しが偽の世界に積んだ分を捨てて、その形にする。
+modfacility.registry().clear()
+modnpc.registry().clear()
+check("前提: 登録簿は空から始まる", not modfacility.entries(module.OWNER),
+      modfacility.entries(module.OWNER))
+world5 = classes["world"](make_save(), app)
+app.world = world5
+fresh_start, _node = building_of(world5, record)
+check("最初のロードでも建物は控えから建ち直る",
+      fresh_start is not None and "modfacility: restored" in read_log(),
+      [line for line in read_log().splitlines() if "modfacility:" in line][-3:])
+check("最初のロードでも試合の進みが戻る",
+      (getattr(fresh_start, "config", None) or {}).get("current_phase") == 1,
+      getattr(fresh_start, "config", None))
+check("最初のロードでも主人が戻る", record.get("keeper") in world5.characters,
+      sorted(world5.characters))
+app.save_game()
+CLOCK.settle()
+snap = (modfacility._persisted_entry(app, module.OWNER, record["facility"]) or {}).get("snapshot") or {}
+check("次の保存でも控えの試合の進みは消えない",
+      (snap.get("config") or {}).get("current_phase") == 1, snap.get("config"))
+check("ctx.log_exc に例外が出ていない（最初のロード）", not ctx.errors, ctx.errors[:3])
+
+print("[前の周回の名前]")
+# 登録簿の層は世界をまたいで残る。前に読んだ周回の人物（層だけ残って今の世界に居ない）や
+# ロードの最中にまだ残っている前の周回の素データと名前が重なっても、今の主人を改名しない。
+
+
+def keeper_name_now():
+    return next((h.get("keeper_name") for h in holdings()
+                 if h.get("keeper") == record.get("keeper")), None)
+
+
+mine_name = keeper_name_now()
+ghost = modnpc.register("330_real_estate", key="keeper-ghost", fields={"name": mine_name})
+renamed_before = read_log().count("was renamed")
+app.go(world5.areas["2"].nodes["10"].facilities["9"])
+check("前の周回の層と同じ名前でも主人は改名されない（塗り直し）",
+      keeper_name_now() == mine_name and read_log().count("was renamed") == renamed_before,
+      (mine_name, keeper_name_now()))
+stale_save = make_save()
+stale_save["npcs"]["77"] = {"name": mine_name}
+app.save_data_dict = stale_save                 # ロードの最中は前の周回の辞書のまま
+fresh_save = make_save()
+world6 = classes["world"](fresh_save, app)
+check("前の周回の層・素データと同じ名前でも主人は改名されない（ロード）",
+      keeper_name_now() == mine_name and read_log().count("was renamed") == renamed_before,
+      (mine_name, keeper_name_now()))
+app.save_data_dict = fresh_save
+app.world = world6
+check("ロードの後も主人はその名前のまま", getattr(world6.characters.get(record.get("keeper")),
+                                                  "name", None) == mine_name,
+      getattr(world6.characters.get(record.get("keeper")), "name", None))
+modnpc.unregister("330_real_estate", ghost)
+
+print("[ロードの控えの鍵]")
+# 控えに項目の無い持ち株はロードの直後に新築される。そのときまだ `app` の辞書と主人公が
+# 前の周回を指していても、控えは読んでいる周回のファイルへ書く。
+heir_key = WORLD_NAME + SEP + "二代目"
+heir_fid = str(heir_holdings[0].get("facility")) if heir_holdings else ""
+with modfacility.keyed(heir_key), modnpc.keyed(heir_key):
+    modfacility._drop_persisted(app, module.OWNER, heir_fid)
+    modnpc._drop_persisted(app, module.OWNER, heir_keeper)
+# 建物と主人の id は 土地-番 なので前の周回の控えにも同じ id の項目が在りうる。
+# 中身の比較では書いたかどうか見分けられないので、控えへ書いた鍵を数える。
+saved_keys = []
+for framework in (modfacility, modnpc):
+    found_store = framework.store()
+
+    def spy_save(key, bucket=None, real=found_store.save, name=framework.STATE_DIRNAME):
+        saved_keys.append((name, key))
+        return real(key, bucket)
+
+    found_store.save = spy_save
+heir_save = make_save()
+heir_save["player_data"] = {"name": "二代目"}
+try:
+    world7 = classes["world"](heir_save, app)  # `app.save_data_dict` と主人公は前の周回のまま
+finally:
+    for framework in (modfacility, modnpc):
+        vars(framework.store()).pop("save", None)
+heir_built, _ = building_of(world7, heir_holdings[0]) if heir_holdings else (None, None)
+check("前提: 控えに無い持ち株がロードで新築される", heir_built is not None,
+      list(world7.areas["2"].nodes["10"].facilities))
+with modfacility.keyed(heir_key), modnpc.keyed(heir_key):
+    heir_facility_entry = modfacility._persisted_entry(app, module.OWNER, heir_fid)
+    heir_keeper_entry = modnpc._persisted_entry(app, module.OWNER, heir_keeper)
+check("新築の控えは読んでいる周回へ書かれる",
+      (heir_facility_entry or {}).get("spawned") is True, heir_facility_entry)
+check("主人の控えも読んでいる周回へ書かれる",
+      (heir_keeper_entry or {}).get("spawned") is True
+      and (heir_keeper_entry or {}).get("place") is not None, heir_keeper_entry)
+first_key = WORLD_NAME + SEP + PLAYER_NAME
+check("前の周回の控えへは書かない", saved_keys
+      and not [one for one in saved_keys if one[1] == first_key], saved_keys)
+check("ctx.log_exc に例外が出ていない（前の周回の名前・控えの鍵）", not ctx.errors, ctx.errors[:3])
 
 print()
 if failures:

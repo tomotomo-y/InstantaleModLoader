@@ -10,6 +10,7 @@
   抑制   … 続けて動かすと、走るのは最後の1本だけ
   所有   … 移った先の inventory に入り、id と obtainer が同期する
   装備   … 移した品が装備欄に残っていたら、その slot の**キーごと**落ちる
+  ボタン … 仲間の武器を右クリックしても、装備欄の MOD が窓口を置いていなければ「装備」を出さない
 
 `screen.guarded(fn)` を `screen.schedule` へ渡すと、その場で `fn()` が走ったうえに
 戻り値 `None` が予約され、遅延後に `NoneType is not callable` になる。
@@ -284,9 +285,25 @@ check("遅延後の呼び出しで例外を残さない", ctx.errors == [], ctx.
 SHOW = "scripts.hud.new_hud:InventoryItem.show_popup_menu"
 widget = types.SimpleNamespace(item_id="item_9", item_instance=types.SimpleNamespace(obtainer=npc, item_type="weapon"),
                                parent=types.SimpleNamespace())
+from instantale_modloader import equipment  # noqa: E402
+ctx.notes[:] = []
 ctx.hooks[SHOW](lambda self, pos: None, widget, (10, 20))
 FakeClock.run_all()
 check("右クリックの包みで例外を残さない", ctx.errors == [], ctx.errors)
+# 装備欄の MOD（333_）が窓口 `equipment.toggle` を置いていなければボタンを出さない
+# （本体は仲間の `equipments` を保存しないので、直に書いても次のロードで消える）
+check("装備欄の MOD が無ければボタンを出さない理由を残す",
+      any("no equipment slots mod declares equipment.toggle" in n for n in ctx.notes), ctx.notes)
+check("装備欄の MOD が無ければボタンを組みに行かない",
+      not any("kivy unavailable" in n for n in ctx.notes), ctx.notes)
+equipment.declare(equipment.TOGGLE, lambda a, holder, item: "equipped", owner="test_slots")
+ctx.notes[:] = []
+ctx.hooks[SHOW](lambda self, pos: None, widget, (10, 20))
+FakeClock.run_all()
+check("装備欄の MOD が居ればボタンを組みに行く",
+      any("kivy unavailable" in n for n in ctx.notes), ctx.notes)
+equipment.forget("test_slots")
+check("右クリックの包みで例外を残さない（装備欄あり）", ctx.errors == [], ctx.errors)
 
 shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -348,15 +365,14 @@ shutil.rmtree(out_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 装備欄の MOD が居るとき
-# 仲間の `equipments` を書くのは装備欄の MOD（333_）だけ。窓口 `combat.equipped` が答える持ち主では、
+# 仲間の `equipments` を書くのは装備欄の MOD（333_）だけ。窓口 `equipment.equipped` が答える持ち主では、
 # 本体の unequip も参照の掃除もしない（書き手が 2 本になると、渡した品が仲間の持ち物にも残った）
 print("装備欄の MOD が居る受け渡し")
-from instantale_modloader import combat  # noqa: E402
 ctx, app, out_dir = open_window()
 npc = app.world.characters["80"]
 player = app.player
 asked = []
-combat.declare(combat.EQUIPPED, lambda a, holder, item: asked.append(holder) or True, owner="test_slots")
+equipment.declare(equipment.EQUIPPED, lambda a, holder, item: asked.append(holder) or True, owner="test_slots")
 staff = Item("星詠みの魔導杖")
 staff.obtainer = npc
 staff.id = "item_212"
@@ -373,7 +389,7 @@ check("持ち物の受け渡しはする", staff in player.inventory.values() an
       player.inventory)
 check("任せた旨を 1 行残す", any("left to the equipment slots" in n for n in ctx.notes),
       ctx.notes[-3:])
-combat.forget("test_slots")
+equipment.forget("test_slots")
 FakeClock.run_all()
 check("例外を残さない", ctx.errors == [], ctx.errors)
 shutil.rmtree(out_dir, ignore_errors=True)

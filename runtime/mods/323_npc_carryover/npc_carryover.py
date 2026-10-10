@@ -83,7 +83,8 @@ import os
 import random
 import sys
 
-from instantale_modloader import frames, npcs, state as loader_state, ui
+import instantale_modloader as loader
+from instantale_modloader import choices, frames, npcs, state as loader_state, ui
 from instantale_modloader.npcs import make_npc
 
 from . import carryover
@@ -126,6 +127,10 @@ SAVE_TARGET = "__main__:InstantaleApp.save_game"
 
 ARRIVED = "{name}が旅の末に{where}へ流れて来たらしい。"
 SKIPPED = "{name}はこの世界に同名の人物が居るため現れなかった。"
+DEAD = "{name}は元の世界で既に亡くなっているため現れなかった。"
+
+#: 仲間の印（`relationship.player.relationship`。GAME.md §2.18）。持ち込むときに外す。
+PARTY_MARK = "同行中"
 
 #: 施設の名前が読めなかったときに `{where}` の後ろへ入れる語。
 #: 鍵は `carryover.PLACEABLE_TYPES`。
@@ -143,6 +148,25 @@ KIND_WORDS = {"guild": "ギルド", "inn": "宿"}
 #: 到着の知らせは**ロードの後・最初の選択肢の組み直し**まで持ち越すものなので、
 #: その間に世代が変わっても残る場所に置く。
 STORE_ATTR = "_instantale_npc_carryover"
+
+
+def area_size(app, area_id):
+    """土地の種類。実行時の `Area.size` は読めないのでセーブ側から（GAME.md §2.7。`326_` と同じ）。"""
+    for attr in ("save_data_dict", "world_dict"):
+        container = getattr(app, attr, None)
+        if not isinstance(container, dict):
+            continue
+        holders = [container]
+        inner = container.get("world_data")
+        if isinstance(inner, dict):
+            holders.append(inner)
+        for holder in holders:
+            areas = holder.get("areas")
+            entry = areas.get(str(area_id)) if isinstance(areas, dict) else None
+            size = entry.get("size") if isinstance(entry, dict) else None
+            if isinstance(size, str) and size:
+                return size
+    return str(frames.attr(ui.world_areas(app).get(str(area_id)), "size", "") or "")
 
 
 def _store():
@@ -172,7 +196,7 @@ def apply(ctx):
         """
         found = []
         for area_id, area in (ui.world_areas(app) or {}).items():
-            if str(frames.attr(area, "size", "")) == DUNGEON_SIZE:
+            if area_size(app, area_id) == DUNGEON_SIZE:
                 continue
             for node in ui.nodes_of(area):
                 for key, facility in ui.facilities_of(node).items():
@@ -289,6 +313,20 @@ def apply(ctx):
                 continue
             src[key] = written.get(os.path.basename(value.replace("\\", "/")))
 
+    def drop_party_mark(fields):
+        """主人公との関係から「同行中」を外す。外して空になったら「初対面」。
+
+        元の世界で仲間だった人は `['同行中']` のまま出ている。
+        置き先では仲間の名簿に居ないのに、エリア移動の分岐はこの配列だけを読む（GAME.md §2.18）。
+        """
+        player = (fields.get("relationship") or {}).get("player")
+        marks = player.get("relationship") if isinstance(player, dict) else None
+        if not isinstance(marks, list) or PARTY_MARK not in marks:
+            return
+        kept = [mark for mark in marks if mark != PARTY_MARK]
+        player["relationship"] = kept or list(FRESH_RELATIONSHIP["player"]["relationship"])
+        write("    relationship: dropped {!r}".format(PARTY_MARK))
+
     def prepare(app, package, inherit, world):
         """`make_npc` に渡す項目を作る。`(項目, config)`。
 
@@ -308,6 +346,7 @@ def apply(ctx):
         fields["display_position_in_battle"] = None
         if not inherit.get("relationship", INHERIT_RELATIONSHIP):
             fields["relationship"] = json.loads(json.dumps(FRESH_RELATIONSHIP))
+        drop_party_mark(fields)
         if not inherit.get("life_log", INHERIT_LIFE_LOG):
             fields["life_log"] = []
         dropped = drop_belongings(fields)
@@ -410,22 +449,19 @@ def apply(ctx):
             if not os.path.isdir(folder):
                 continue                # その MOD を入れていない
             path = os.path.join(folder, loader_state.world_filename(world))
-            try:
-                with io.open(path, encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except (OSError, ValueError):
-                data = {}
-            if not isinstance(data, dict):
-                data = {}
+            # 「無い」と「在るのに読めない（一時のロック・壊れた）」を分ける。読めないのに空とみなして書くと、
+            # その世界の全員の記憶が持ち込んだ1人だけになる。読めなければ書かずに見送る。
+            exists = os.path.exists(path)
+            data = loader.read_json(path, None, report=ctx.log_exc)
+            if exists and not isinstance(data, dict):
+                write("    memory: cannot read {}; {} was not written".format(path, dirname))
+                continue
+            data = data if isinstance(data, dict) else {}
             data[str(npc_id)] = record
-            try:
-                tmp = path + ".writing"
-                with io.open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, ensure_ascii=False, indent=1)
-                os.replace(tmp, path)
+            if loader.write_json(path, data, report=ctx.log_exc):
                 done.append(dirname)
-            except OSError as exc:
-                write("    memory: cannot write {}: {}".format(path, exc))
+            else:
+                write("    memory: cannot write {}".format(path))
         if done:
             write("    memory: carried {} for {}".format(", ".join(done), npc_id))
         return done
@@ -467,6 +503,12 @@ def apply(ctx):
             write("  {}: cannot read {}".format(row.get("name"), path))
             return False, ""
         name = package.name
+        if (package.npc.get("config") or {}).get("is_dead"):
+            # 元の世界で死んでいた（`config['is_dead']`。GAME.md §2.22）。生き返らせない。
+            row["status"] = carryover.SKIPPED
+            row["reason"] = "死亡"
+            write("  {}: skipped; they are dead in the original world".format(name))
+            return False, DEAD.format(name="「{}」".format(name))
         if name in names_in_world(app):
             row["status"] = carryover.SKIPPED
             row["reason"] = "同名の人物が居る"
@@ -633,9 +675,7 @@ def apply(ctx):
             ctx.log_exc("npc carryover: cannot record the save")
         return result
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons",
-              required=False, safe=True)
-    def refresh_choice_buttons(orig, self, *args, **kwargs):
+    def refresh_choice_buttons(self, _buttons):
         # 言付けはロードの直後ではなく、画面が出来てから出す。
         if pending_words:
             words, pending_words[:] = list(pending_words), []
@@ -644,7 +684,9 @@ def apply(ctx):
                     self.add_text(text)
                 except Exception:
                     ctx.log_exc("npc carryover: cannot say it in game")
-        return orig(self, *args, **kwargs)
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, None, refresh=refresh_choice_buttons)
 
     ctx.log("npc carryover: installed (state: {})".format(
         carryover.carryover_dir(state_dir)))

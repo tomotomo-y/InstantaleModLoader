@@ -721,12 +721,12 @@ def apply(ctx):
             # 既に世界に居る人。
             # 重複だけを、しかも許しがあるときだけ直す。
             wanted = found is not None and FIX_EXISTING
-            why = "already in the world"
         else:
             # これから生まれる人。
             # `ALWAYS_RENAME` なら重複していなくても付け直す。
             wanted = ALWAYS_RENAME or found is not None
-            why = "no free name in the roster"
+        # 直そうとして名簿が尽きたのか、既にいる人なので直さなかったのか
+        why = "no free name in the roster" if wanted else "already in the world"
 
         fresh = rename_to(name, cid, context) if wanted else None
         if fresh is None:
@@ -736,9 +736,7 @@ def apply(ctx):
             if found is not None and mark not in seen:
                 seen.add(mark)
                 write("{}: id={!r} {!r} clashes with id={!r} {!r} -- left as it is ({})"
-                      .format(where, cid, name, found[0], found[1],
-                              why if wanted or loading["depth"] > 0
-                              else "no free name in the roster"))
+                      .format(where, cid, name, found[0], found[1], why))
             return None
 
         remember(cid, canonical(fresh), fresh)
@@ -800,9 +798,10 @@ def apply(ctx):
                 if str(cid) in known or not isinstance(entry, dict):
                     continue
                 raw = entry.get("name")
-                key = canonical(raw) if isinstance(raw, str) else ()
-                if key:
-                    remember(cid, key, raw)
+                if isinstance(raw, str):
+                    # 突き合わせにも通す（控えるだけだと、片方が未組み立ての既存の重複を記録も改名もしなかった。
+                    # 組み立てた後は `resolve` の番人が素通しにする）。
+                    resolve(cid, raw, where, app, entry)
         return fixed
 
     # -------------------------------------------------- 本命: 素データを直す
@@ -853,6 +852,12 @@ def apply(ctx):
         def _load(orig, self, *args, **kwargs):
             # ロードの最中に組み立てられる NPC も、その後の控え直しも、
             # どちらも「既に世界に居る人」として裁く。
+            # 外側の1回で前の世界の控えを捨てる。
+            # 残すと、ロードの最中に組まれる NPC を別の世界の名前と突き合わせ、
+            # `FIX_EXISTING` では居もしない相手との衝突で改名してしまう。
+            # 入れ子（start_game の中の load_game_new）では、外側が控えた分を消さない。
+            if loading["depth"] == 0:
+                known.clear()
             loading["depth"] += 1
             try:
                 result = orig(self, *args, **kwargs)

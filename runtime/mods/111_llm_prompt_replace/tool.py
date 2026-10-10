@@ -453,6 +453,9 @@ def validate(doc):
             if SEPARATOR in rule.from_text or SEPARATOR in rule.to_text:
                 return tab, rule, "「{}」は置換前にも置換後にも使えません（区切りに読まれます）。".format(
                     SEPARATOR)
+            if any(mark in text for text in (rule.from_text, rule.to_text) for mark in "\r\n"):
+                # ルールは1行1件。改行が残ると行が割れ、後ろ半分が別のルールとして読まれる。
+                return tab, rule, "置換前と置換後に改行は書けません（ファイルの上で行が割れます）。"
             if rule.is_regex:
                 try:
                     re.compile(rule.from_text)
@@ -462,6 +465,13 @@ def validate(doc):
                 return tab, rule, (
                     "置換前を「{}」で始めることはできません"
                     "（ファイルの上で正規表現ルールと区別できなくなります）。".format(REGEX_PREFIX))
+            elif rule.enabled and rule.from_text.startswith("#"):
+                # 有効なルールは接頭辞なしで書くので、行頭が # だと本体も `Document.parse` も
+                # コメントとして読み飛ばす。`\u0023` なら本体が復号した形でも登録するので当たる。
+                return tab, rule, (
+                    "置換前を「#」で始めることはできません"
+                    "（ファイルの上でコメントと区別できなくなります）。"
+                    "「\\u0023」と書いてください。")
     return None, None, ""
 
 
@@ -697,7 +707,7 @@ def build_window(model):
     outer.pack(fill="both", expand=True)
 
     # 画面を組む途中の代入で「変えた」と数えないための旗と、画面の控え。
-    state = {"quiet": False, "pages": [], "all": None, "test_open": False}
+    state = {"quiet": False, "pages": [], "all": None, "test_open": False, "editing": None}
 
     def update_title():
         root.title(TITLE + ("（未保存）" if model.dirty() else ""))
@@ -907,8 +917,13 @@ def build_window(model):
                           tags=() if (rule.enabled and page["tab"].enabled) else ("off",))
 
     def load_editor(rule):
-        """選んだ1件を下の欄へ。ここでの代入で「変えた」と数えない。"""
+        """選んだ1件を下の欄へ。ここでの代入で「変えた」と数えない。
+
+        **欄に載せたルールを `state["editing"]` に控える。**
+        書き戻す先（`apply_editor`）は一覧のいまの選択ではなく、この控え。
+        """
         state["quiet"] = True
+        state["editing"] = rule
         try:
             for box in (from_box, to_box, memo_box):
                 box.configure(state="normal")   # disabled のままでは書き換えが通らない
@@ -933,16 +948,20 @@ def build_window(model):
             state["quiet"] = False
 
     def apply_editor(*_args):
-        """欄の内容をルールへ。1文字打つたびに当て、その行だけ描き直す。"""
+        """欄の内容をルールへ。1文字打つたびに当て、その行だけ描き直す。
+
+        書き戻す先は**欄に載せたルール**（`state["editing"]`）。
+        一覧の選択から引いてはいけない。
+        欄から別の行を押すと、欄の `<FocusOut>` が届く時点で一覧の選択は**もう次の行**で、
+        欄の中身はまだ前の行のもの（`<<TreeviewSelect>>` は後から届く）。
+        選択から引くと、前の行の中身が次の行へ書き込まれる。
+        """
         if state["quiet"]:
             return
-        page = current_page()
-        if page is None:
-            return
-        item = page["tree"].focus()
-        rule = page["rules"].get(item)
+        rule = state["editing"]
         if rule is None:
             return
+        page, item = find_row(rule)
         rule.enabled = bool(rule_on.get())
         was_regex = rule.is_regex
         rule.is_regex = bool(rule_regex.get())
@@ -952,20 +971,32 @@ def build_window(model):
             value = None                      # 打ちかけ。最後に打てた値のままにする
         if value is not None and 0 <= value <= 100:
             rule.prob = value
-        from_text = from_box.get("1.0", "end-1c")
-        rule.from_text = from_text if rule.is_regex else from_display(from_text)
+        # 正規表現のパターンも改行は `\n` の2文字へ戻す。改行のまま持つとファイルの上で
+        # 行が割れ、後ろ半分が別のルールとして効く。パターンの `\n` は改行に当たるので意味は変わらない。
+        # 印を切り替えた直後の欄は切り替える前の見せ方のままだが、どちらの見せ方でも
+        # `from_display` がファイルの形へ戻す（`to_display` は `\n` しか変えない）。
+        rule.from_text = from_display(from_box.get("1.0", "end-1c"))
         rule.to_text = from_display(to_box.get("1.0", "end-1c"))
         memo = memo_box.get("1.0", "end-1c")
         rule.memo = [line for line in memo.split("\n") if line.strip()]
         if was_regex != rule.is_regex:
             # 正規表現に変える／やめると置換前の見せ方が変わる（復号するかどうか）。
             load_editor(rule)
-        refresh_row(page, item, rule)
+        if page is not None:
+            refresh_row(page, item, rule)
         update_title()
 
+    def find_row(rule):
+        """そのルールが載っている `(タブの控え, 行)`。一覧に無ければ `(None, None)`。"""
+        for page in state["pages"]:
+            for item, found in page["rules"].items():
+                if found is rule:
+                    return page, item
+        return None, None
+
     def on_prob_blur(_event=None):
-        """打ちかけの確率を、いまルールが持っている値に戻す。"""
-        _tab, rule = selected_rule()
+        """打ちかけの確率を、欄に載せたルールが持っている値に戻す。"""
+        rule = state["editing"]
         if rule is not None and not state["quiet"]:
             state["quiet"] = True
             rule_prob.set(str(rule.prob))
@@ -1119,11 +1150,11 @@ def build_window(model):
     def make_menu(parent, page):
         """行の操作とタブの操作を1つの menu に。右クリックも「…」も同じもの。"""
         menu = tk.Menu(parent, tearoff=0)
-        menu.add_command(label="ルールを追加\tInsert", command=lambda: add_rule(page))
-        menu.add_command(label="ルールを複製\tCtrl+D", command=lambda: dup_rule(page))
-        menu.add_command(label="ルールを削除\tDelete", command=lambda: del_rule(page))
-        menu.add_command(label="上へ\tCtrl+↑", command=lambda: move_rule(page, -1))
-        menu.add_command(label="下へ\tCtrl+↓", command=lambda: move_rule(page, 1))
+        menu.add_command(label="ルールを追加（Insert）", command=lambda: add_rule(page))
+        menu.add_command(label="ルールを複製（Ctrl+D）", command=lambda: dup_rule(page))
+        menu.add_command(label="ルールを削除（Delete）", command=lambda: del_rule(page))
+        menu.add_command(label="上へ（Ctrl+↑）", command=lambda: move_rule(page, -1))
+        menu.add_command(label="下へ（Ctrl+↓）", command=lambda: move_rule(page, 1))
         menu.add_separator()
         menu.add_command(label="タブ追加", command=add_tab)
         menu.add_command(label="タブ名変更", command=rename_tab)
@@ -1376,8 +1407,15 @@ def build_window(model):
         if page is None:
             refresh_all()
             load_editor(None)
-        else:
-            load_editor(page["rules"].get(page["tree"].focus()))
+            return
+        # 行が選ばれていなければ先頭を選ぶ。
+        # 組み直した直後のタブは選択を持たず、そのままだと欄が使えない姿で開く。
+        if not page["tree"].focus():
+            items = page["tree"].get_children()
+            if items:
+                page["tree"].selection_set(items[0])
+                page["tree"].focus(items[0])
+        load_editor(page["rules"].get(page["tree"].focus()))
 
     notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
 
@@ -1404,8 +1442,11 @@ def build_window(model):
         target_label.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0))
         ttk.Label(grid, text="指定").grid(row=2, column=0, sticky="w", pady=(6, 0))
         custom_var = tk.StringVar(value=str(model.settings.get("RULES_PATH") or ""))
-        ttk.Entry(grid, textvariable=custom_var, width=60).grid(
-            row=2, column=1, sticky="ew", padx=(8, 6), pady=(6, 0))
+        custom_entry = ttk.Entry(grid, textvariable=custom_var, width=60)
+        custom_entry.grid(row=2, column=1, sticky="ew", padx=(8, 6), pady=(6, 0))
+        # 開いた時点でフォーカスを中へ入れる。入れないとキーは元の窓へ届き、
+        # 開いてすぐの Enter / Esc が効かない（タブ名の入力窓と同じ扱いにする）。
+        custom_entry.focus_set()
 
         def browse():
             start = os.path.dirname(model.source_path or "") or MOD_DIR
@@ -1460,6 +1501,12 @@ def build_window(model):
                 else:
                     status.configure(style="Warn.TLabel",
                                      text="読む先が変わった。「再読込」で読み直す（未保存の変更は消える）")
+            if model.settings.get("RULES_PATH") != before.get("RULES_PATH"):
+                # 本体は置き場を注入の時点で決める（設定は apply の時点）。動いているゲームは前の置き場を読み続ける
+                messagebox.showinfo(
+                    "置き場を変えました",
+                    "動いているゲームが新しい置き場を読むのは、注入し直してからです。\n"
+                    "それまでは前の置き場のルールが使われます。", parent=root)
 
         def cancel(_event=None):
             model.settings.clear()

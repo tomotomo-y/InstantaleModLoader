@@ -14,7 +14,7 @@
 
 | 何を変えるか | どこで変えるか |
 |---|---|
-| 部屋の名前・ボタンの表示 | `InstantaleApp.refresh_choice_buttons` の前に `text` だけ書き換える |
+| 部屋の名前・ボタンの表示 | ローダの窓口 `choices` の組み直しの前（`InstantaleApp.refresh_choice_buttons` の `orig` の前）に `text` だけ書き換える |
 | 宿代 | ゲームが引き落とす前に差額ぶん所持金をずらす（`314_` と同じ前払い調整） |
 | 宿泊期間（月単位） | `DisplayVacationChoice.__init__` に渡る `period_months` を差し替える |
 | 宿泊期間（週単位） | `period_months` は 1 にして、宿泊の窓の間だけローダの日数送りの関所へ「残りは何日か」を出す |
@@ -71,7 +71,7 @@ import sys
 import re
 import time
 
-from instantale_modloader import durations, llm, prices, ui
+from instantale_modloader import choices, durations, llm, prices, ui
 
 LOG_BASENAME = "vacation_custom.log"
 
@@ -374,6 +374,10 @@ def apply(ctx):
     prices.declare(prices.INN_ROOM, room_price_for, owner=owner, write=write)
 
     # ============================================================ ボタンの表示
+    def game_label(slot, price):
+        """ゲーム自身が出す部屋のボタンの文言（`犬小屋(0G)` … `高級個室(1000G)`。通貨の表記は今のもの）。"""
+        return ui.rewrite_coins("{}({}G)".format(GAME_NAMES[slot], price))
+
     def relabel_room(entry):
         """部屋のボタン。描かれる前に `text` だけ書き直し、素の料金を対に控える。
 
@@ -400,7 +404,13 @@ def apply(ctx):
                           "(the game may have changed its rooms)".format(
                               old, quality))
                 return
-            if state["price_by_quality"].get(quality) != price:
+            # ロードで戻ったボタンは、保存した時に自分が書いた文言のまま（起動し直すと `our_labels` は空）。
+            # 素の料金は、ゲームの書式で、しかも今の設定で自分が書く文言ではないものからだけ控える
+            # （自分の文言から読むと、設定した額を素の額と取り違えて前払いの調整が狂った）。
+            conf = room_conf(slot)
+            ours_now = old == fmt(ROOM_BUTTON, name=conf["name"], price=conf["price"])
+            game_like = old == game_label(slot, price)
+            if game_like and not ours_now and state["price_by_quality"].get(quality) != price:
                 state["price_by_quality"][quality] = price
                 write("room: quality {!r} shows {}G -> {}".format(
                     quality, price, slot))
@@ -408,7 +418,12 @@ def apply(ctx):
         if slot is None:
             return
         if not (name_changed(slot) or price_changed(slot)):
-            return                          # 素のままの部屋には触らない
+            # 素のままの部屋。ロードで戻った自分の文言が残っていれば、ゲームの文言へ戻す
+            plain = game_label(slot, state["price_by_quality"].get(quality, GAME_PRICES[slot]))
+            if old != plain and ui.parse_coin(old) is not None:
+                entry["text"] = plain
+                write("label: {!r} -> {!r} ({}; back to the game's own)".format(old, plain, slot))
+            return
         conf = room_conf(slot)
         new = fmt(ROOM_BUTTON, name=conf["name"], price=conf["price"])
         if new != old:
@@ -430,9 +445,7 @@ def apply(ctx):
             write("label: {!r} -> {!r} (stay {})".format(old, new,
                                                          stay["length"]))
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False,
-              safe=True)
-    def refresh_buttons(orig, self, *args, **kwargs):
+    def refresh_buttons(self, _buttons):
         """ボタンが描かれる直前の1か所で、宿泊まわりのラベルだけ書き直す。
 
         宿の画面を描く入口はここに集まる（部屋選びも施設のメニューも、
@@ -456,11 +469,9 @@ def apply(ctx):
                             relabel_stay(entry, stay)
         except Exception:
             ctx.log_exc("vacation custom: cannot relabel the buttons")
-        return orig(self, *args, **kwargs)
 
     # ============================================================ 手持ちの確認
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
+    def on_button_press(self, entry, button_index):
         """設定した宿代に手持ちが満たないときは、押された時点で断る。
 
         ゲームのボタンは触らず押下だけ握る。
@@ -484,10 +495,13 @@ def apply(ctx):
                             screen.say(self, fmt(
                                 REFUSE_TEXT, name=conf["name"],
                                 price=conf["price"], gold=gold))
-                            return None
+                            return True
         except Exception:
             ctx.log_exc("vacation custom: price check failed")
-        return orig(self, button_index, *args, **kwargs)
+        return False
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, refresh=refresh_buttons, intercept=on_button_press)
 
     # ============================================================ 宿泊期間
     @ctx.wrap("__main__:DisplayVacationChoice.__init__", required=False, safe=True)

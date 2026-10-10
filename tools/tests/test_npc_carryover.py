@@ -7,7 +7,8 @@
   名前    … 使えない字は潰す。世界の控えと違って**短い印は付けない**（ゲームの
             書いたフォルダ名と同じ文字列でなければ画像が見つからない）
   往復    … 書き出した zip を読み返すと 33項目が同じ順で戻る。画像と記憶も入る
-  予約    … pending.json を書いて読める。同名の検査が効く
+  予約    … pending.json を書いて読める。同名の検査が効く。
+            画面を開いたままでも、本体が書いた placed / saved を古い控えで消さない
   絞込    … 名前は部分一致、エリア・施設・職・分類・親密度は選択、レベルは下限
   立ち絵  … `image_src` は書いた機械の絶対パス。別の機械の世界を持ってきても
             `%LOCALAPPDATA%` から繋ぎ直して見つける
@@ -173,8 +174,15 @@ class FakeCtx:
                                            .splitlines()[-1]))
 
     def wrap(self, target, **kw):
+        """本物と同じく包みを重ねる（後から包んだものが外側）。ローダの窓口 `choices` も保存を包むため。"""
         def decorator(func):
-            self.hooks[target] = func
+            inner = self.hooks.get(target)
+            if inner is None:
+                self.hooks[target] = func
+            else:
+                def layered(orig, *args, _outer=func, _inner=inner, **kwargs):
+                    return _outer(lambda *a, **k: _inner(orig, *a, **k), *args, **kwargs)
+                self.hooks[target] = layered
             return func
         return decorator
 
@@ -618,6 +626,87 @@ try:
     model.pending = kept_rows
     del mod._store()["words"][:]
 
+    print("-- 元の世界で死んでいた人・仲間だった人")
+    # 死んでいた人は生き返らせず、見送って1度知らせる。仲間だった人は「同行中」を外して置く。
+    # 予約は書き出した zip から読み直されるので、zip の中の npc.json を書き換える。
+    import zipfile
+
+    def edit_zip(path, edit):
+        with zipfile.ZipFile(path) as zf:
+            entries = [(info.filename, zf.read(info.filename)) for info in zf.infolist()]
+        out = []
+        for name, data in entries:
+            if name == "npc.json":
+                wrapper = json.loads(data.decode("utf-8"))
+                edit(wrapper["npc"])
+                data = json.dumps(wrapper, ensure_ascii=False).encode("utf-8")
+            out.append((name, data))
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in out:
+                zf.writestr(name, data)
+
+    kept_rows = json.loads(json.dumps(carryover.load_pending(state_dir)))
+    original_zip = open(lilia.path, "rb").read()
+
+    def fresh_app():
+        app_ = build_app({"0": npc_record("先住のバルガス", 0)}, index={"npc": 1, "item": 5})
+        app_.world_dict["world_data"] = {"world_name": "アルカディア"}
+        app_.save_data_dict["world_data"] = {"world_name": "アルカディア"}
+        app_.world.characters.clear()
+        return app_
+
+    try:
+        edit_zip(lilia.path, lambda npc: npc["config"].update(is_dead=True))
+        carryover.save_pending(state_dir, [])
+        model.pending = []
+        model.forget_names()
+        model.reserve(lilia, "アルカディア", {"memory": False})
+        dead_app = fresh_app()
+        hook(lambda _self, *a, **k: None, dead_app)
+        check("死んでいた人は作らない", list(dead_app.save_data_dict["npcs"]) == ["0"],
+              sorted(dead_app.save_data_dict["npcs"]))
+        died = [row for row in carryover.load_pending(state_dir)
+                if row["status"] == carryover.SKIPPED and row.get("reason") == "死亡"]
+        check("見送りの理由を「死亡」で残す", len(died) == 1, carryover.load_pending(state_dir))
+        ctx.hooks["__main__:InstantaleApp.refresh_choice_buttons"](
+            lambda _self, *a, **k: None, dead_app)
+        check("ゲーム内に1度知らせる",
+              any("亡くなっている" in (text or "") for text in dead_app.said), dead_app.said)
+
+        open(lilia.path, "wb").write(original_zip)
+        edit_zip(lilia.path, lambda npc: npc["relationship"]["player"].update(
+            relationship=["同行中", "仲間"]))
+        carryover.save_pending(state_dir, [])
+        model.pending = []
+        model.forget_names()
+        model.reserve(lilia, "アルカディア", {"memory": False})
+        party_app = fresh_app()
+        hook(lambda _self, *a, **k: None, party_app)
+        placed = [n for n in party_app.save_data_dict["npcs"].values()
+                  if n.get("name") == "星読みのリリア"]
+        marks = [n["relationship"]["player"]["relationship"] for n in placed]
+        check("仲間だった人も置く", len(placed) == 1, sorted(party_app.save_data_dict["npcs"]))
+        check("関係から「同行中」を外し、ほかの印は残す",
+              bool(marks) and "同行中" not in marks[0] and "仲間" in marks[0], marks)
+        open(lilia.path, "wb").write(original_zip)
+        edit_zip(lilia.path, lambda npc: npc["relationship"]["player"].update(
+            relationship=["同行中"]))
+        carryover.save_pending(state_dir, [])
+        model.pending = []
+        model.forget_names()
+        model.reserve(lilia, "アルカディア", {"memory": False})
+        only_app = fresh_app()
+        hook(lambda _self, *a, **k: None, only_app)
+        marks = [n["relationship"]["player"]["relationship"]
+                 for n in only_app.save_data_dict["npcs"].values()
+                 if n.get("name") == "星読みのリリア"]
+        check("外して空になったら「初対面」", marks == [["初対面"]], marks)
+    finally:
+        open(lilia.path, "wb").write(original_zip)
+        carryover.save_pending(state_dir, kept_rows)
+        model.pending = kept_rows
+        del mod._store()["words"][:]
+
     print("-- 社会関係の付け替え")
     # `403_` の記録は相手の id を鍵に持つ。元の世界の id のまま写すと、
     # 置き先では別人（か不在）を指す。名前で引き直して付け替える。
@@ -831,6 +920,41 @@ try:
           any(("始まりの泥濘のギルドへ" in text or "始まりの泥濘の宿へ" in text
                or "灰の交易都市の宿へ" in text) for text in plain_said),
           plain_said)
+
+    print("-- 画面を開いたままゲームが書いたとき")
+    # 本体は同じ pending.json に placed / saved を書く。
+    # 画面が開いたときの控えで丸ごと書き戻すと、その印が消える。
+    kept_rows = json.loads(json.dumps(carryover.load_pending(state_dir)))
+    carryover.save_pending(state_dir, [])
+    model.pending = []
+    model.reserve(lilia, "アルカディア", {"memory": False})
+    model.reserve(lilia, "アルカディア", {"memory": False})     # 同じ組を2つ
+    stale = list(model.pending)
+    game_rows = carryover.load_pending(state_dir)
+    game_rows[0].update(status=carryover.PLACED, npc_id="9",
+                        saved="2026-08-30T15:00:00")
+    game_rows[1].update(status=carryover.SKIPPED, reason="同名の人物が居る")
+    carryover.save_pending(state_dir, game_rows)
+    model.pending = stale
+    model.reserve(hans, "アルカディア", {"memory": False})
+    rows = carryover.load_pending(state_dir)
+    check("予約を足しても本体が書いた印を消さない",
+          [row["status"] for row in rows]
+          == [carryover.PLACED, carryover.SKIPPED, carryover.PENDING]
+          and rows[0].get("saved"), rows)
+    model.pending = stale                    # 画面はまだ古い控えを持っている
+    model.drop([stale[1]])
+    rows = carryover.load_pending(state_dir)
+    check("古い控えの行で消しても、同じ組の何番目かで同じ行を消す",
+          [row["status"] for row in rows] == [carryover.PLACED, carryover.PENDING]
+          and rows[0].get("saved"), rows)
+    model.pending = stale
+    model.recheck()
+    check("検査し直すと読み直す",
+          [row["status"] for row in model.pending]
+          == [carryover.PLACED, carryover.PENDING], model.pending)
+    carryover.save_pending(state_dir, kept_rows)
+    model.pending = kept_rows
 
     check("記録に例外が残っていない", not ctx.errors, ctx.errors)
 finally:

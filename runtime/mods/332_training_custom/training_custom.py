@@ -59,7 +59,7 @@ import re
 import sys
 import time
 
-from instantale_modloader import durations, llm, ui
+from instantale_modloader import choices, durations, llm, ui
 from instantale_modloader.state import UNKNOWN_WORLD, WorldStore, world_key
 
 LOG_BASENAME = "training_custom.log"
@@ -129,7 +129,7 @@ PHASE_BUTTON = "{name}({length})"
 PERIOD_WORDING = True
 
 # 卒業した施設でもう一度訓練を受けられるようにするか。
-# **ここだけは既定が素のゲームの値ではない**（本人の指定）。
+# **ここだけは既定が素のゲームの値ではない**。
 # 素のゲームは断る（`十分に学んだ。これ以上ここで得るものはないだろう。` で、
 # 代金も日数も動かない。実測）。
 # 断っている根は施設の**訓練済みの印**（`config["trained"]`。実測）で、
@@ -224,7 +224,17 @@ TAIL_RE = re.compile(r"\s*[（(][^（()）]*[)）]\s*$")
 # `基礎を積む` は `二年を`）。後ろに続く助詞（`、` `を` `で`）まで見て、
 # `三年後` のような**別の意味の年**には当てない。
 COUNT_YEARS_RE = re.compile(r"(\d+)年間")
-KANJI_YEARS_RE = re.compile(r"^([一二三四五六七八九十]+)年(?:間)?(?=[、をで])")
+# 当てるのは、ゲームが段の結果に出す決まった文の語尾が続くときだけ（実測は `out\training_custom.log`）。
+# 語尾だけを見ていたころは、AI が書いた卒業のセリフの行頭「二年間、実に精進されましたな」まで
+# 最後の段の長さで書き換えた。種類（倍率）も語尾から引く。
+PHASE_TAILS = (("、ひたすら鍛錬した", "simple"),
+               ("を基礎能力の向上に費やした", "fundamental"),
+               ("で基礎能力の向上に費やした", "fundamental"),
+               ("、技を磨くことに費やした", "train_skill"))
+_PHASE_TAILS_RE = "|".join(re.escape(tail) for tail, _activity in PHASE_TAILS)
+KANJI_YEARS_RE = re.compile(r"^([一二三四五六七八九十]+)年(?:間)?(?=(" + _PHASE_TAILS_RE + "))")
+#: 頼み文の【訓練の記録】の中の段の結果（行頭に限らない。実際の頼み文は漢数字）。
+RECORD_YEARS_RE = re.compile(r"([一二三四五六七八九十]+)年(?:間)?(?=(" + _PHASE_TAILS_RE + "))")
 KANJI_NUMBERS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
                  "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
@@ -436,6 +446,16 @@ def reprompt(text, activity=None, phase=False, budget=None):
             return build(match, said) if said else match.group(0)
 
         new = pattern.sub(one, new)
+    if phase:
+        # 【訓練の記録】は漢数字で、各段の結果の文が並ぶ（`二年間、技を磨くことに費やした。…一年間、ひたすら鍛錬した。`）
+        def record(match):
+            years = KANJI_NUMBERS.get(match.group(1))
+            if not years:
+                return match.group(0)
+            days, _factor = phase_days(dict(PHASE_TAILS).get(match.group(2), activity), years=years)
+            return length_text(days) if days != years * GAME_DAYS_PER_YEAR else match.group(0)
+
+        new = RECORD_YEARS_RE.sub(record, new)
     return new if new != text else None
 
 
@@ -468,7 +488,7 @@ def reword(text, activity=None, phase=False, budget=None):
     if match is not None:
         years = KANJI_NUMBERS.get(match.group(1))
         if years:
-            days, _factor = phase_days(activity, years=years)
+            days, _factor = phase_days(dict(PHASE_TAILS).get(match.group(2), activity), years=years)
             if days != years * GAME_DAYS_PER_YEAR:
                 new = length_text(days) + new[match.end():]
     return new if new != text else None
@@ -861,7 +881,7 @@ def apply(ctx):
                 write("WARN phase: no elapse_days call came through this phase; "
                       "the days were left as they are")
             if ALLOW_RETRAIN:
-                # 卒業した段でまた印が立つ。**立たせたままにしない**（本人の指定）。
+                # 卒業した段でまた印が立つ。**立たせたままにしない**。
                 try:
                     fold_trained(app)
                 except Exception:
@@ -982,8 +1002,7 @@ def apply(ctx):
     llm.wrap_outgoing(ctx, rewrite_outgoing, label="training custom")
 
     # ============================================================ 手持ちの確認
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
+    def on_button_press(self, entry, button_index):
         """設定した代金に手持ちが満たないときは、押された時点で断る。
 
         ゲームのボタンは触らず押下だけ握る。画面はそのまま残るので選び直せる。
@@ -1001,10 +1020,13 @@ def apply(ctx):
                             int(TRAINING_PRICE), gold))
                         screen.say(self, fmt(REFUSE_TEXT,
                                              price=int(TRAINING_PRICE), gold=gold))
-                        return None
+                        return True
         except Exception:
             ctx.log_exc("training custom: the price check failed")
-        return orig(self, button_index, *args, **kwargs)
+        return False
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, intercept=on_button_press)
 
     # ------------------------------------------------------------ 自己検証
     # 実経路は訓練所で1回訓練するまで通らない。

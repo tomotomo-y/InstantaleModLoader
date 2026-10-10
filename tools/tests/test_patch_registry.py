@@ -620,6 +620,82 @@ def main():
         del sys.modules["kivy.clock"], sys.modules["kivy"]
         ml._state["ready"] = []
 
+    print("=== await_module: apply の中でモジュールの中身を使う MOD の保留 ===")
+    absent = "fakegame_not_yet_imported"
+    sys.modules.pop(absent, None)
+    check(P.await_module(absent, "x") is None and absent in P.pending_modules(),
+          "まだ import されていなければ None で、モジュールの保留に積む")
+    loading = types.ModuleType("fakegame_loading")
+    loading.__spec__ = types.SimpleNamespace(_initializing=True)
+    sys.modules["fakegame_loading"] = loading
+    try:
+        check(P.await_module("fakegame_loading", "Later") is None
+              and "fakegame_loading:Later" in P.pending_owners(),
+              "読み込みの途中で要る属性がまだ無ければ None で、その属性を待つ")
+        loading.Later = object()
+        check(P.await_module("fakegame_loading", "Later") is loading,
+              "途中でも要る属性が揃っていればモジュールを返す")
+        loading.__spec__ = types.SimpleNamespace(_initializing=False)
+        check(P.await_module("fakegame_loading", "Missing") is loading,
+              "読み終えたモジュールは属性が欠けていても返す（欠けは本物の問題）")
+    finally:
+        sys.modules.pop("fakegame_loading", None)
+    check(P.await_module("sys") is sys, "読み込み済みならそのまま返す")
+
+    print("=== on_ready(delay): 走る前に次の boot が来たら古い世代は走らない ===")
+    # delay の間に注入し直す・遅れた当て直しが走る並び。
+    # 古い世代の関数（読み直す前のコード）は走らせず、新しい世代が積み直した分だけが走る。
+    class _HeldClock:
+        later = []
+
+        @staticmethod
+        def schedule_once(fn, delay):
+            _HeldClock.later.append(fn)
+
+    fake = types.ModuleType("kivy.clock")
+    fake.Clock = _HeldClock
+    sys.modules["kivy"] = types.ModuleType("kivy")
+    sys.modules["kivy.clock"] = fake
+    saved_generation = ml._state.get("generation")
+    try:
+        held = []
+        ml._state["generation"] = "gen_old"
+        ml._state["ready"] = []
+        check(ctx.on_ready(lambda: held.append("old"), key="heal", delay=5.0) is True,
+              "古い世代で積まれる")
+        ml._dispatch_ready()
+        old_call = _HeldClock.later.pop()
+        ml._state["generation"] = "gen_new"          # 次の boot
+        ml._state["ready"] = []
+        check(ctx.on_ready(lambda: held.append("new"), key="heal", delay=5.0) is True,
+              "前の世代が走る前なら、同じキーでも新しい世代が積み直す")
+        check(ctx.on_ready(lambda: held.append("new"), key="heal", delay=5.0) is False,
+              "同じ世代の2回目は捨てられる")
+        ml._dispatch_ready()
+        new_call = _HeldClock.later.pop()
+        old_call()
+        new_call()
+        check(held == ["new"], "走るのは新しい世代の1回だけ: {}".format(held))
+        check(ctx.on_ready(lambda: held.append("again"), key="heal") is False,
+              "走った後は積まれない")
+
+        # 新しい世代が積み直さなかった（MOD を切った・条件が外れた）なら、古い世代は捨てられ、印も外れる。
+        ml._state["generation"] = "gen_a"
+        ml._state["ready"] = []
+        ctx.on_ready(lambda: held.append("dropped"), key="gone", delay=5.0)
+        ml._dispatch_ready()
+        stale = _HeldClock.later.pop()
+        ml._state["generation"] = "gen_b"
+        stale()
+        check("dropped" not in held, "積み直されなかった古い世代も走らない: {}".format(held))
+        ml._state["ready"] = []
+        check(ctx.on_ready(lambda: held.append("later"), key="gone") is True,
+              "走らずに捨てた分は、次の boot で積める")
+    finally:
+        del sys.modules["kivy.clock"], sys.modules["kivy"]
+        ml._state["ready"] = []
+        ml._state["generation"] = saved_generation
+
     print("=== フォルダ構成の探索と読み込み ===")
     import shutil
     import tempfile
@@ -972,6 +1048,36 @@ def main():
     })
     check(sorted(decls) == ["COUNT", "MODE", "ON", "RATE"],
           "壊れた宣言は落とす（type 不明 / choice に values 無し）: {}".format(sorted(decls)))
+    grouped = C.normalize_decls({
+        "A": {"type": "int", "default": 1, "label": {"ja": "推論量", "en": "Effort"},
+              "group": {"ja": "Claude API", "en": "Claude API"}},
+        "B": {"type": "int", "default": 1, "label": "Count", "group": "Common"},
+    })
+    check(grouped["A"]["group"] == {"ja": "Claude API", "en": "Claude API"}
+          and grouped["B"]["group"] == {"ja": "Common", "en": "Common"}
+          and decls["COUNT"]["group"] == {"ja": "", "en": ""},
+          "見出し（group）は名乗りと同じ形に均す。書かなければ空: {}".format(grouped))
+    check(C.full_label(grouped["A"]) == "Claude API / 推論量"
+          and C.full_label(grouped["A"], "en") == "Claude API / Effort"
+          and C.full_label(decls["COUNT"]) == "COUNT",
+          "エラー文の名前には見出しを添える。見出しが無ければ名前だけ")
+    named = C.normalize_decls({
+        "MODEL": {"type": "choice", "values": ["off", "claude-opus-5-5"], "default": "off",
+                  "value_labels": {"claude-opus-5-5": "Claude Opus 5.5", "typo-model": "X"}},
+    })["MODEL"]
+    check(named["value_labels"] == {"claude-opus-5-5": {"en": "Claude Opus 5.5",
+                                                        "ja": "Claude Opus 5.5"}},
+          "選択肢の表示名は名乗りと同じ形に均し、選択肢に無い値への表示名は落とす: {}"
+          .format(named["value_labels"]))
+    check(C.choice_text(named, "claude-opus-5-5") == "Claude Opus 5.5"
+          and C.choice_text(named, "off") == "off",
+          "表示名があれば表示名、無ければ値の綴りのまま")
+    check(C.choice_value(named, "Claude Opus 5.5") == "claude-opus-5-5"
+          and C.choice_value(named, "off") == "off"
+          and C.coerce(named, C.choice_value(named, "Claude Opus 5.5")) == (True, "claude-opus-5-5", ""),
+          "画面の表示名は値に戻り、そのまま coerce を通る（保存するのは値）")
+    check(decls["MODE"]["value_labels"] == {} and decls["COUNT"]["value_labels"] == {},
+          "value_labels を書かなければ空")
     check(C.coerce(decls["COUNT"], "7") == (True, 7, ""),
           "文字列から拾う（GUI の入力欄も手書きの JSON も同じ経路）")
     check(C.coerce(decls["COUNT"], "99")[0] is False, "上限を外れた値は撥ねる")
@@ -980,6 +1086,9 @@ def main():
     check(C.coerce(decls["RATE"], None) == (True, None, ""),
           "allow_null なら null を通す（CHANCE_OVERRIDE の形）")
     check(C.coerce(decls["COUNT"], None)[0] is False, "allow_null でなければ null は撥ねる")
+    check(all(C.coerce(decls["RATE"], v)[0] is False for v in ("nan", "inf", "-inf", float("nan"))),
+          "数でない float（nan / inf）は撥ねる（nan は上限・下限の比較をすり抜ける）")
+    check(C.coerce(decls["RATE"], "0.25") == (True, 0.25, ""), "  → 普通の数は通す")
 
     resolved = C.resolve(decls, {"COUNT": 5, "MODE": "z", "GHOST": 1})
     check(resolved["COUNT"] == 5, "有効な選択は効く")
@@ -1062,6 +1171,22 @@ def main():
         raise RuntimeError("差し替えた側が壊れた")
 
     check(victim.plain(4) == ("original", 4), "patch でも元の実装に落ちる")
+
+    # safe=True の置換関数からも `__original__` で元を呼べる（TECH.md §3.1.3）。
+    # 下に別の層があっても、1段飛ばさずにすぐ下を呼ぶ。
+    P.set_generation("gen_safe_original")
+    victim.chain = lambda x: ("raw", x)
+
+    @P.wrap("fakegame:chain")
+    def lower(orig, x):
+        return ("lower",) + orig(x)
+
+    @P.patch("fakegame:chain", safe=True)
+    def upper(x):
+        return ("upper",) + upper.__original__(x)
+
+    check(victim.chain(6) == ("upper", "lower", "raw", 6),
+          "safe=True の patch の __original__ はすぐ下の層: {!r}".format(victim.chain(6)))
 
     # メソッドを対象にした場合（self が絡む経路）
     P.set_generation("gen_safe_method")
@@ -1663,7 +1788,7 @@ def apply(ctx):
 
 _REINJECT_DROP = '''
 import os
-from instantale_modloader import durations, prices
+from instantale_modloader import combat, durations, equipment, prices
 
 
 def apply(ctx):
@@ -1676,6 +1801,16 @@ def apply(ctx):
     durations.claim_days(owner, lambda app, days: 1)
     durations.declare(durations.INN_STAY, lambda app: {"months": 9}, owner=owner)
     prices.adjust(owner, lambda item, key, price: price)
+    combat.declare(combat.ATTACK, lambda app, holder: 1.0, owner=owner)
+    equipment.declare(equipment.GEAR, lambda app, holder: [], owner=owner)
+'''
+
+_REINJECT_LOCAL = '''
+import sys
+
+
+def apply(ctx):
+    sys._instantale_test_mod_dir = ctx.mod_dir
 '''
 
 _REINJECT_BROKEN = '''
@@ -1719,7 +1854,9 @@ def test_reinjection():
     import tempfile
     import threading
     import time
+    from instantale_modloader import combat as CB
     from instantale_modloader import durations as D
+    from instantale_modloader import equipment as EQ
     from instantale_modloader import prices as PR
 
     dist = tempfile.mkdtemp(prefix="instantale_reinject_")
@@ -1772,6 +1909,8 @@ def test_reinjection():
               "（前提）写しも含めて当たっている")
         check("200_drop" in D.owners() and "200_drop" in PR.item_price_sources()[1],
               "（前提）期間・日数・値段の登録簿に 200_drop が居る")
+        check("200_drop" in CB.owners() and "200_drop" in EQ.owners(),
+              "（前提）combat と equipment の窓口に 200_drop が居る")
 
         # 200_drop は今回 apply に失敗し、300_gate は切った。
         put_mod("200_drop", _REINJECT_BROKEN)
@@ -1790,6 +1929,9 @@ def test_reinjection():
         check(D.source_of(D.INN_STAY) == "", "  → 宿泊の期間はゲームの式に戻る")
         check("200_drop" not in PR.item_price_sources()[1],
               "  → 値段の段も一緒に外れる（prices の on_forget）")
+        check(CB.source_of(CB.ATTACK) == "" and EQ.source_of(EQ.GEAR) == "",
+              "  → combat と equipment の窓口も外れる（切った MOD の旧い関数に聞かない）: {} / {}"
+              .format(CB.owners(), EQ.owners()))
         check(P.active(), "剥がした後も記録は残る（unload で素に戻せる）")
 
         print("=== 同時に走る boot（遅延当て直しの最中の再注入） ===")
@@ -1856,20 +1998,45 @@ def test_reinjection():
         finally:
             ml.discover = real_discover
 
+        print("=== local/ の MOD でも ctx.mod_dir は在り処を指す ===")
+        local_mod = os.path.join(dist, "local", "150_local")
+        os.makedirs(os.path.join(local_mod, "data"), exist_ok=True)
+        with open(os.path.join(local_mod, "mod.json"), "w", encoding="utf-8") as fh:
+            json.dump({"entry": "m.py"}, fh)
+        with open(os.path.join(local_mod, "m.py"), "w", encoding="utf-8") as fh:
+            fh.write(_REINJECT_LOCAL)
+        with open(os.path.join(local_mod, "data", "table.json"), "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        put_order(["100_keep", "150_local"])
+        local_result = ml.boot(out)
+        check(local_result.get("150_local") == "ok", "（前提）local/ の MOD が当たる: {}"
+              .format(local_result))
+        seen = getattr(sys, "_instantale_test_mod_dir", None)
+        check(seen is not None and os.path.normcase(seen) == os.path.normcase(local_mod),
+              "apply() 中の mod_dir は local/ の在り処（runtime/mods ではない）: {}".format(seen))
+        check(seen is not None and os.path.isfile(os.path.join(seen, "data", "table.json")),
+              "  → 同梱データを引ける")
+
         print("=== unload: 期間の登録簿も空にする ===")
         D.claim_days("999_leftover", lambda app, days: 1)
+        CB.declare(CB.DEFENSE, lambda app, holder: 1.0, owner="999_leftover")
+        EQ.declare(EQ.EQUIPPED, lambda app, holder, item: True, owner="999_leftover")
         result = ml.unload(out)
         check(game.keep is keep and game.slow1(1) == ("slow", 1),
               "unload で全部素に戻る: {}".format(result))
         check(game.saved is saved, "  → 関所も剥がす（unload は全部戻す）")
         check(D.owners() == [], "日数の望みと期間の登録簿も空になる: {}".format(D.owners()))
+        check(CB.owners() == [] and EQ.owners() == [],
+              "combat と equipment の窓口も空になる: {} / {}".format(CB.owners(), EQ.owners()))
     finally:
         ml._mods_dir, ml.discover = real_mods_dir, real_discover
         ml._state["log_path"] = saved_log
         for name in ("fakegame_reinject", "fakegame_reinject.alias", "instantale_mod_100_keep",
-                     "instantale_mod_200_drop", "instantale_mod_300_gate"):
+                     "instantale_mod_200_drop", "instantale_mod_300_gate",
+                     "instantale_mod_150_local"):
             sys.modules.pop(name, None)
-        for attr in ("_instantale_test_events", "_instantale_test_gate"):
+        for attr in ("_instantale_test_events", "_instantale_test_gate",
+                     "_instantale_test_mod_dir"):
             if hasattr(sys, attr):
                 delattr(sys, attr)
         P.revert_all()
@@ -1910,23 +2077,57 @@ def test_main_thread_job():
         if queue:
             queue.pop()()                       # メインループが次のフレームで呼ぶ
         worker.join(10)
-        check(ran_on == [threading.main_thread()] and result == [7],
+        check(ran_on == [threading.main_thread()] and result == [(True, 7)],
               "仕事はメインスレッドで走り、戻り値が注入のスレッドへ返る")
 
-        # メインループが止まっていたら、待ち切った後でその場で走らせる（1回だけ）。
-        del ran_on[:], result[:], queue[:]
-        worker = threading.Thread(
-            target=lambda: result.append(ml._run_on_main_thread(job, 0.2)))
-        worker.start()
-        worker.join(10)
-        check(len(ran_on) == 1 and ran_on[0] is not threading.main_thread()
-              and result == [7], "Clock が回らなければ待ち切ってからその場で走らせる")
-        for late in list(queue):
-            late()                              # 後から Clock が呼んでも
-        check(len(ran_on) == 1, "  → 2回は走らない: {}".format(len(ran_on)))
+        # メインループが回っていて手が空かないだけなら、この場では走らせずに待つ。
+        # 待っている間に Clock が取れば、メインスレッドで走る。
+        saved_state = ml._main_loop_state
+        ml._main_loop_state = lambda: (True, "the main thread is busy in test")
+        try:
+            del ran_on[:], result[:], queue[:]
+            worker = threading.Thread(
+                target=lambda: result.append(ml._run_on_main_thread(job, 0.05, 5.0)))
+            worker.start()
+            time.sleep(0.3)                     # 何回か様子を見るあいだ
+            check(ran_on == [] and worker.is_alive(),
+                  "手が空かないだけなら、この場で走らせずに待ち続ける")
+            if queue:
+                queue.pop()()
+            worker.join(10)
+            check(ran_on == [threading.main_thread()] and result == [(True, 7)],
+                  "  → 手が空けばメインスレッドで走る")
+
+            # 上限まで待っても取られなければ、走らせずに諦める。後から Clock が呼んでも走らない。
+            del ran_on[:], result[:], queue[:]
+            worker = threading.Thread(
+                target=lambda: result.append(ml._run_on_main_thread(job, 0.05, 0.2)))
+            worker.start()
+            worker.join(10)
+            check(ran_on == [] and result == [(False, None)], "上限を過ぎたら走らせずに諦める")
+            for late in list(queue):
+                late()
+            check(ran_on == [], "  → 諦めた後に Clock が呼んでも走らない: {}".format(len(ran_on)))
+
+            # メインループが止まっていたら（ゲームが終わる途中）、待たずに諦める。
+            ml._main_loop_state = lambda: (False, "the kivy event loop is not running")
+            del ran_on[:], result[:], queue[:]
+            began = time.monotonic()
+            worker = threading.Thread(
+                target=lambda: result.append(ml._run_on_main_thread(job, 0.05, 60.0)))
+            worker.start()
+            worker.join(10)
+            check(ran_on == [] and result == [(False, None)] and time.monotonic() - began < 5,
+                  "メインループが止まっていたら、上限を待たずに走らせずに諦める")
+        finally:
+            ml._main_loop_state = saved_state
+
+        state = ml._main_loop_state()
+        check(isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], str),
+              "メインループの様子を (回っているか, 説明) で返す: {!r}".format(state))
 
         del ran_on[:], queue[:]
-        check(ml._run_on_main_thread(job, 10.0) == 7 and not queue
+        check(ml._run_on_main_thread(job, 10.0) == (True, 7) and not queue
               and ran_on == [threading.main_thread()],
               "既にメインスレッドに居れば Clock に載せずにその場で走らせる")
     finally:

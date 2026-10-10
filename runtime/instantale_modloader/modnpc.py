@@ -93,11 +93,25 @@ id で引かれる場所に残さないことを守っているのは、**保存
 MOD を外せば何も戻らない。MOD 固有の続き（例えば出資の帳簿）は `state.WorldStore` で MOD が持つ。
 """
 
+import contextlib
 import copy
 import inspect
 import sys
 
-from . import frames, items, log, log_exc, npcs, patch, state, ui
+from . import frames, items, log, log_exc, log_unrepeated, npcs, patch, state, ui
+
+
+#: 前に書いた定型の行の中身（種類 -> 中身）。同じ中身なら繰り返さない（`_changed`）。
+#: 注入し直すとこのモジュールごと読み直されるので空に戻り、新しいログの頭には必ず出る。
+_LAST_WRITTEN = {}
+
+
+def _changed(kind, content) -> bool:
+    """`kind` の行の中身が前に書いたものと違えば控えて True。同じなら False。"""
+    if _LAST_WRITTEN.get(kind) == content:
+        return False
+    _LAST_WRITTEN[kind] = content
+    return True
 
 #: MOD の NPC の id の接頭辞。
 #: ゲームの採番は整数の連番なので、ここが被ることはない。
@@ -117,7 +131,13 @@ INSTALLED_ATTR = "_instantale_modnpc_installed"
 #: `resolve_conversation` が `KeyError` で落ちた。
 #: いまは `world.characters` を `_RosterView`（反復では隠し、id では引ける）に
 #: 差し替えるので、窓は無い。保存が名簿を読まないと分かれば False にしてよい。
+#: 切り替えは `settings/loader.json` の `"modnpc_lift_roster"`（`install` が注入のたびに読む）。
+#: 元は `229_probe_mod_npc` の設定がこの旗を書き換えていて、229 を入れている間は
+#: ModNPC を使う全 MOD（`330_` など）に効いていた。ローダ全体の旗なのでローダの設定へ移した。
 LIFT_ROSTER = True
+
+#: `settings/loader.json` で `LIFT_ROSTER` を決める鍵。無ければ既定（True）。
+LIFT_ROSTER_FLAG = "modnpc_lift_roster"
 
 
 class _RosterView(dict):
@@ -323,6 +343,7 @@ def _record(npc_id):
             "stale_placed": False,  # 名簿の実体が差し替わった。置き直しが要る
             "snapshot": None,    # 控えから読んだ実体の写し（次の spawn の材料）
             "placed": None,      # (area_id, facility_id, 主の元の値, 主か, 一覧に出すか)
+            "logged": {},        # 持ち主 -> (世代, 層の数)。`registered` の行を書いた印
         }
     return record
 
@@ -362,12 +383,23 @@ def entries(owner=None):
     return sorted(out)
 
 
-def names_in_use(app, skip=()):
+def names_in_use(app, skip=(), world=None, save_data_dict=None):
     """その世界で既に使われている人名。**人を作る前にここを見る。**
 
     集めるのは3つ。実行時の名簿（`world.characters`）・セーブの素データ
     （`npcs.save_npcs`。まだ実体になっていない人も載っている）・
-    登録されている MOD の NPC（持ち主をまたいで全部）。プレイヤーの名も入れる。
+    登録されている MOD の NPC のうち**今の世界に居る**もの（持ち主はまたぐ）。
+    プレイヤーの名も入れる。
+
+    登録簿は `sys` に置かれ、世界が変わっても層は残る（`forget` が捨てるのは実体と
+    置き場所だけ）。層の名前を全部数えると、同じプロセスで前に読んだ周回の人物の名前まで
+    「使用中」になり、今の世界に居ない人と重なったという理由で今の人物が改名される。
+    そこで登録簿からは、名簿に載っているか今の世界のどこかに置かれている id だけを数える。
+
+    `world=` / `save_data_dict=` は `World.__init__` の中から呼ぶためのもの。
+    その時点では `app.world` も `app` の辞書も `app.player` も前の周回を指していることがある
+    （`state.playthrough_key` の注記）。`save_data_dict` を渡すと、素データと主人公の名は
+    `app` からではなくその辞書から読む。
 
     名前が既存の人物と重なると、**名前でしか相手を引けない場所**で別人に当たる
     （ゲームの人物欄は `visible_character_sheet_data` に id を持たず、名前しか渡さない。
@@ -387,22 +419,33 @@ def names_in_use(app, skip=()):
         if name and name not in found:
             found.append(name)
 
-    player = getattr(app, "player", None)
-    add(getattr(player, "name", None))
-    roster = _roster(app) or {}
+    if save_data_dict is not None:
+        add(state.player_name_of_dict(save_data_dict))
+    else:
+        add(getattr(getattr(app, "player", None), "name", None))
+    roster = _roster(app, world) or {}
     for npc_id, character in list(roster.items()):
         if str(npc_id) in skip:
             continue
         add(getattr(character, "name", None))
     try:
-        for npc_id, entry in npcs.save_npcs(app).items():
+        if save_data_dict is not None:
+            plain = save_data_dict.get("npcs") if isinstance(save_data_dict, dict) else None
+            plain = _plain_source(plain) if isinstance(plain, dict) else {}
+        else:
+            plain = npcs.save_npcs(app)
+        for npc_id, entry in list(plain.items()):
             if str(npc_id) in skip or not isinstance(entry, dict):
                 continue
             add(entry.get("name"))
     except Exception:
         log_exc("modnpc: cannot read the plain npc data for the names in use")
+    reg = registry()
     for npc_id in entries():
         if str(npc_id) in skip:
+            continue
+        # 名簿の `in` は `_RosterView` でも隠した分まで答える（保存の最中でも数える）。
+        if npc_id not in roster and not (reg.get(npc_id) or {}).get("placed"):
             continue
         add(fields_of(npc_id).get("name"))
     return found
@@ -470,7 +513,12 @@ def register(owner, npc_id=None, *, key=None, fields=None, prompt=None,
         record["character"] = None
         record["built_in"] = None
         record["rebuild"] = True          # 次の `spawn` は名簿に居ても採らず組み直す
-    if write:
+    # 同じ持ち主・同じ世代・同じ層の数なら書かない（`modfacility.register` と同じ。
+    # `331_` は毎手、主人の層を積み直す）。
+    logged = record.setdefault("logged", {})
+    mark = (getattr(patch, "_generation", None), len(record["layers"]))
+    if write and logged.get(owner) != mark:
+        logged[owner] = mark
         write("modnpc: {} registered {} ({} layer(s))".format(
             owner, npc_id, len(record["layers"])))
     return npc_id
@@ -666,6 +714,11 @@ def spawn(app, npc_id, *, world=None, write=None):
         # 写しはゲームの保存と同じ時点の実体なので、記憶も HP も死もそこから戻る。
         fields = dict(fields_of(npc_id))
         snapshot = record.get("snapshot")
+        if not isinstance(snapshot, dict):
+            # 登録簿に写しが無い（`unload` の `purge` が登録簿を空にした後、読み直さずに注入し直した）なら、
+            # この周回の控えの写しを使う。控えは層を外すと消える（`unregister`）ので、同じ id の別人は拾わない。
+            entry = _persisted_entry(app, owner_of_id(npc_id), npc_id)
+            snapshot = entry.get("snapshot") if entry is not None else None
         if isinstance(snapshot, dict):
             fields.update(copy.deepcopy(snapshot))
         data = plain_data(fields, npc_id)
@@ -900,6 +953,14 @@ def _place(app, npc_id, area_id, facility_id, *, owner, listed, world, write,
     2回書き込み、間で落ちると控えに `place=None` が残る。
     """
     npc_id = str(npc_id)
+    # 置いたままもう一度置かれた。別の場所なら前の置き場所（名簿・主・`.location`）を先に戻す。
+    # 同じ場所なら元の主と元の居場所の控えを引き継ぐ（取り直すと自分を「元の主」に控え、
+    # `unplace` で主が戻らなかった）。
+    previous = _spot_of(_record(npc_id)["placed"]) if _record(npc_id).get("placed") else None
+    again = previous is not None and (str(previous[0]), str(previous[1])) == (str(area_id), str(facility_id))
+    if previous is not None and not again:
+        _unplace(app, npc_id, world=world, write=None, persist=False)
+    kept_was_at = _record(npc_id).get("was_at") if again else None
     areas = ui.areas_of_world(world) if world is not None else ui.world_areas(app)
     area = areas.get(str(area_id))
     facility, node = None, None
@@ -928,8 +989,9 @@ def _place(app, npc_id, area_id, facility_id, *, owner, listed, world, write,
         # `.location` を据えない＝「会話する」の一覧に出ない（主にはなる）。
         character = None
     if character is not None:
-        was_at = {name: getattr(character, name, None)
-                  for name in ("location", "current_node", "current_area")}
+        was_at = kept_was_at if isinstance(kept_was_at, dict) else {
+            name: getattr(character, name, None)
+            for name in ("location", "current_node", "current_area")}
         for name, value in (("location", facility), ("current_node", node),
                             ("current_area", area)):
             try:
@@ -939,6 +1001,8 @@ def _place(app, npc_id, area_id, facility_id, *, owner, listed, world, write,
     owner_was = None
     if owner:
         owner_was = getattr(facility, "owner", None)
+        if again and previous[3] and str(owner_was) == npc_id:
+            owner_was = previous[2]         # 置き直し。自分を「元の主」にしない
         try:
             facility.owner = npc_id
         except Exception as exc:
@@ -1030,6 +1094,33 @@ store = _stores.store               # 控え。`install` がまだなら None（
 _current_key = _stores.current_key
 _bucket = _stores.bucket            # `(周回の鍵, 控え)` か `(None, None)`
 _jsonable = state.jsonable
+
+
+@contextlib.contextmanager
+def keyed(key):
+    """`with modnpc.keyed(key):` の間、控えをその周回の鍵で読み書きする。
+
+    `World.__init__` を MOD が直に包み、orig の後で `spawn` / `place` を呼ぶと、
+    ローダの関所（`world_init`）が立てた鍵はもう消えていて、控えは `app` から決めた鍵
+    （前の周回のことがある）へ書かれる。鍵を引数の `save_data_dict` から決めて
+    （`state.playthrough_key_of_dict`）ここで立てれば、読んでいる周回へ書ける。
+    抜けるときは入る前の値へ戻す（入れ子にしても外側の鍵を消さない）。
+    鍵が空なら何も立てない。
+    """
+    missing = object()
+    previous = getattr(sys, _KEY_OVERRIDE_ATTR, missing)
+    if isinstance(key, str) and key:
+        setattr(sys, _KEY_OVERRIDE_ATTR, key)
+    try:
+        yield key
+    finally:
+        if previous is missing:
+            try:
+                delattr(sys, _KEY_OVERRIDE_ATTR)
+            except AttributeError:
+                pass
+        else:
+            setattr(sys, _KEY_OVERRIDE_ATTR, previous)
 
 
 def _persist(app, owner, npc_id, **changes):
@@ -1146,7 +1237,8 @@ def snapshot_all(app, write=None):
         snap = snapshot_of(character)
         if _persist(app, owner_of_id(npc_id), npc_id, snapshot=snap):
             done.append(npc_id)
-    if write and done:
+    # 控えは保存のたびに取るが、行は写した顔ぶれが変わったときだけ書く（`modfacility` と同じ）。
+    if write and done and _changed("snapshot", tuple(done)):
         write("modnpc: snapshot of {} taken".format(", ".join(done)))
     return done
 
@@ -1166,9 +1258,8 @@ def restore_world(app, world=None, save_data_dict=None, write=None):
         key = state.playthrough_key(app)
     if not key or key == state.UNKNOWN_WORLD:
         return []
-    setattr(sys, _KEY_OVERRIDE_ATTR, key)
     done = []
-    try:
+    with keyed(key):
         bucket = found.load(key, fresh=True)
         for owner, owned in list((bucket or {}).items()):
             if not isinstance(owned, dict):
@@ -1190,11 +1281,6 @@ def restore_world(app, world=None, save_data_dict=None, write=None):
                               listed=bool(spot[3]) if len(spot) > 3 else True,
                               world=world, write=write)
                 done.append((owner, npc_id))
-    finally:
-        try:
-            delattr(sys, _KEY_OVERRIDE_ATTR)
-        except AttributeError:
-            pass
     if write and done:
         write("modnpc: restored {} entr(y/ies) from the state of {!r}".format(
             len(done), key))
@@ -1443,7 +1529,7 @@ SAVED_SPEC_ATTRS = ("function_correspond_to_input", "input_backup",
 SAVED_ENEMY_ATTRS = ("current_enemy_dict",)
 #: 相手の id を持つ旗。`in_conversation` は真偽ではなく**話している相手の id**が入る
 #: （実機）。**ここは落とさない。** 落とすと会話の途中で保存したセーブが
-#: 会話から再開できなくなる（同日の指摘。`talking_with`）。
+#: 会話から再開できなくなる（同日の実機で分かった。`talking_with`）。
 CONVERSATION_ATTR = "in_conversation"
 #: パーティの id が並ぶ器。`ui.party_stores` は「いまのパーティ」だけを見るが、
 #: セーブには `original_party`（クエスト前の編成）も焼かれる。
@@ -1705,7 +1791,9 @@ def install(ctx, write=None):
     立てた MOD が外されていても、`apply()` は注入のたびに全 MOD で走るので
     次の世代では別の MOD が立てる。
     """
+    patch.note_gate_writer("modnpc", write)
     bind_store(ctx, write)
+    _read_lift_roster(ctx, write)
     generation = getattr(ctx, "generation", None)
     done = installed()
     if done is not None and done.get("generation") == generation:
@@ -1714,10 +1802,34 @@ def install(ctx, write=None):
     setattr(sys, INSTALLED_ATTR, {"generation": generation,
                                   "owner": getattr(ctx, "_mod", None),
                                   "targets": targets})
-    log("modnpc: the gate was declared on {} target(s)".format(len(targets)))
-    if write:
+    log_unrepeated("modnpc: the gate was declared on {} target(s)".format(len(targets)))
+    # 対象は boot ごとに同じなので、変わったときだけ書く（遅れて当て直す boot で繰り返していた）。
+    if write and _changed("gate", tuple(targets)):
         write("modnpc: the gate was declared on {}".format(", ".join(targets)))
     return targets
+
+
+def _read_lift_roster(ctx, write):
+    """`settings/loader.json` の `LIFT_ROSTER_FLAG` を `LIFT_ROSTER` に写す。
+
+    無いか真偽値でなければ既定（True）に戻す。
+    前の注入で切ったまま `loader.json` から消した場合も、ここで戻る。
+    """
+    global LIFT_ROSTER
+    value = None
+    runtime_dir = getattr(ctx, "runtime_dir", None)
+    if runtime_dir:
+        try:
+            from . import config
+            value = config.load_flags(runtime_dir).get(LIFT_ROSTER_FLAG)
+        except Exception:
+            log_exc("modnpc: cannot read {}".format(LIFT_ROSTER_FLAG))
+    LIFT_ROSTER = value if isinstance(value, bool) else True
+    if not LIFT_ROSTER:
+        log("modnpc: {} is off; the mod npcs stay in the roster during saves".format(
+            LIFT_ROSTER_FLAG), level="WARN")
+        if write:
+            write("modnpc: {} is off".format(LIFT_ROSTER_FLAG))
 
 
 def _install(ctx, write):
@@ -1768,20 +1880,14 @@ def _install(ctx, write):
         # `app.world_dict` はこの時点でまだ前の世界を指していることがあり、
         # `on["world"]` の中で MOD が `spawn` すると前の世界の控えに書いてしまう。
         key = state.playthrough_key_of_dict(save_data_dict, None)
-        if key:
-            setattr(sys, _KEY_OVERRIDE_ATTR, key)
-        try:
-            forget(write=write)
-            fire_all("world", app, world=self,
-                     args={"save_data_dict": save_data_dict}, write=write)
-            restore_world(app, world=self, save_data_dict=save_data_dict, write=write)
-        except Exception:
-            log_exc("modnpc: cannot tell the mods that the world changed")
-        finally:
+        with keyed(key):
             try:
-                delattr(sys, _KEY_OVERRIDE_ATTR)
-            except AttributeError:
-                pass
+                forget(write=write)
+                fire_all("world", app, world=self,
+                         args={"save_data_dict": save_data_dict}, write=write)
+                restore_world(app, world=self, save_data_dict=save_data_dict, write=write)
+            except Exception:
+                log_exc("modnpc: cannot tell the mods that the world changed")
         return result
     targets.append(WORLD_TARGET)
 

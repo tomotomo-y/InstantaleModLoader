@@ -72,10 +72,24 @@ JDSherbert のアンビエント）を指しているエリア。
 最後の1つはセーブがディスクへ書かれる際に必ず通る、取りこぼし防止用。
 どれが発火しても結果は同じにしてある。
 実際にどれだったかは out/bgm.log を見れば分かる。
+
+版の記録
+--------
+版3: 曲の内訳（`[BALANCE] pool under ...` と size ごとの4行）が apply のたびに出ていた。
+遅れて当て直す boot を含めて約40日で1,120回ずつ・約700KB。
+前に書いた中身と同じなら書かないようにした（控えは `sys` に置いて1プロセスで持つ）。
+注入のときにログが世代送りされたら（ファイルが入れ替わったら）、新しいログに書き直す。
+選び直した行（`area ...: ... -> ...`）と初めて見たワールドの行は今までどおり書く。
+あわせて、ワールドごとに「最初に見たときに在ったエリア」の控え（`_seen`）を `sys` へ移した。
+版2まではモジュール変数で、boot のたびに（遅れて当て直す boot と注入し直しで）空に戻り、
+そのたびに今あるエリアを全部「前からある」として覚え直していた（`first sight` が約40日で447行）。
+作られた瞬間の包みを通らずに増えたエリアが、次の保存より前に覚え直しに当たると、
+新しいエリアなのに二度と選び直されなかった。
 """
 
 import os
 import random
+import sys
 
 from instantale_modloader import frames, sounds
 from instantale_modloader.state import world_key_of_dict
@@ -100,7 +114,46 @@ FILL_MISSING = True
 
 _rng = random.Random()          # ゲーム側の乱数列に影響しないよう専用に持つ
 _pool_cache = {}                # musics のパス -> {size: [(mood, 曲名), ...]}
-_seen = {}                      # ワールド -> 最初に見たときに存在したエリア id
+# ワールド -> 最初に見たときに存在したエリア id。1プロセスで持つ（版3。`seen_store`）。
+SEEN_ATTR = "_instantale_balance_area_bgm_seen"
+
+LOG_BASENAME = "bgm.log"
+
+# 最後に書いた曲の内訳と、ログのファイルの身元（版3）。1プロセスに1組。
+# MOD のモジュールは boot のたびに読み直されるので、モジュール変数では boot ごとに消える。
+POOL_LOG_ATTR = "_instantale_balance_area_bgm_pool_logged"
+
+
+def seen_store():
+    """ワールドごとの「最初に見たときに在ったエリア」の控え。`sys` に置いて1プロセスで持つ。
+
+    MOD のモジュールは boot のたびに読み直されるので、モジュール変数では boot ごとに空に戻る。
+    """
+    store = getattr(sys, SEEN_ATTR, None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(sys, SEEN_ATTR, store)
+    return store
+
+
+def file_id(path):
+    """ログのファイルの身元。無ければ None（世代送りで名前を変えられた直後など）。"""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def log_replaced(store, path):
+    """前の apply の後で `path` が入れ替わった（世代送り・削除）なら True。控えは今の身元へ進める。
+
+    世代送りは注入のとき（apply より前）にしか起きないので、apply の頭で見れば足りる。
+    """
+    now = file_id(path)
+    before = store.get("file")
+    store["file"] = now
+    return before is not None and before != now
 
 
 # --------------------------------------------------------------------------
@@ -398,7 +451,7 @@ def apply(ctx):
         ctx.log("bgm: no mood folders under {}; skipping".format(root), level="WARN")
         return
 
-    write = ctx.logger("bgm.log")
+    write = ctx.logger(LOG_BASENAME)
 
     def world_key(container):
         """ワールドを見分けるためのキー。名前が取れなければオブジェクト id で代用する。
@@ -430,6 +483,35 @@ def apply(ctx):
             write("[BALANCE] {} area {}: {} -> {}".format(
                 hook, aid, short(old), short(new)))
 
+    _seen = seen_store()
+
+    def area_name(area):
+        return area.get("name") if isinstance(area, dict) else None
+
+    def known_of(world, areas, hook):
+        """そのワールドで前に見たエリア（id → 名前）。初めて見るなら None。
+
+        控えはワールドの名前を鍵にプロセスの間持つので、同じ名前の別のワールド（消して同じ名前で
+        作り直した・名前の重なる別のフォルダ）を読むと、前のワールドの控えで新旧を決めていた。
+        控えた id の名前が今のエリアと食い違えば別のワールドとみなし、初めて見たことにする。
+        """
+        known = _seen.get(world)
+        if known is None:
+            return None
+        if not isinstance(known, dict):            # 名前を控える前の版の控え（id の集合）
+            known = _seen[world] = {k: None for k in known}
+        for k, name in known.items():
+            if name is not None and k in areas and area_name(areas[k]) != name:
+                write("[BALANCE] {} {!r} is a different world with the same name; "
+                      "starting over".format(hook, world))
+                _seen.pop(world, None)
+                return None
+        return known
+
+    def remember(known, areas, keys):
+        for k in keys:
+            known[k] = area_name(areas.get(k))
+
     def handle_named_area(hook, world_dict, area_id):
         """対象のエリア id が分かるフック用。そのエリアだけを選び直す。"""
         areas = areas_of(world_dict)
@@ -440,7 +522,7 @@ def apply(ctx):
         if key not in areas:
             return
         world = world_key(world_dict)
-        known = _seen.get(world)
+        known = known_of(world, areas, hook)
         if known is None:
             # **このワールドを見るのが初めて。**
             # 今あるエリアは対象外として記録するが、**いま生まれたこのエリアだけは
@@ -451,7 +533,8 @@ def apply(ctx):
             # `handle_world` が「初めてではない」と判断して保護を飛ばし、
             # **残り全エリアを新しいエリアとして選び直す**（既存の町の曲が
             # まとめて変わり、`area["bgm"]` はその場で書き換わるのでセーブに残る）。
-            known = set(areas) - {key}
+            known = {}
+            remember(known, areas, set(areas) - {key})
             _seen[world] = known
             write("[BALANCE] {} first sight of {!r}: {} existing area(s) "
                   "grandfathered".format(hook, world, len(known)))
@@ -460,7 +543,7 @@ def apply(ctx):
             return                      # 注入より前からあるエリア。触らない
         # このエリアは今この瞬間に現れた。
         # 後から「既存エリア」として除外されないよう、ここで記録しておく。
-        known.add(key)
+        remember(known, areas, [key])
         result = balance_area(areas, key, pool)
         if result:
             note(hook, [(key, result[0], result[1])])
@@ -471,17 +554,18 @@ def apply(ctx):
         if areas is None:
             return
         key = world_key(container)
-        known = _seen.get(key)
+        known = known_of(key, areas, hook)
         if known is None:
             # このワールドを見るのが初めて。
             # 今あるエリアは全て対象外として記録し、
             # 次回以降に増えた分だけを新しいエリアとして扱う。
-            _seen[key] = set(areas)
+            _seen[key] = {}
+            remember(_seen[key], areas, areas)
             write("[BALANCE] {} first sight of {!r}: {} existing area(s) "
                   "grandfathered".format(hook, key, len(areas)))
             return
-        fresh = set(areas) - known
-        _seen[key] = set(areas) | known
+        fresh = set(areas) - set(known)
+        remember(known, areas, fresh)
         if not fresh:
             return
         changes = balance_world(areas, pool, only=fresh)
@@ -553,15 +637,28 @@ def apply(ctx):
 
 
 def _report_pool(ctx, write, root, pool):
-    """見つかった曲の内訳をログに出す。size ごとの mood 数と曲数。"""
-    write("[BALANCE] pool under {}".format(root))
+    """見つかった曲の内訳をログに出す。size ごとの mood 数と曲数。
+
+    前に書いた内訳と同じなら書かない（版3）。
+    """
+    lines = ["[BALANCE] pool under {}".format(root)]
     for size in sorted(pool):
         moods = {}
         for mood, _track in pool[size]:
             moods[mood] = moods.get(mood, 0) + 1
-        write("    {:<10} {} track(s) over {} mood(s): {}".format(
+        lines.append("    {:<10} {} track(s) over {} mood(s): {}".format(
             size, len(pool[size]), len(moods),
             ", ".join("{}={}".format(m, moods[m]) for m in sorted(moods))))
+    logged = getattr(sys, POOL_LOG_ATTR, None)
+    if not isinstance(logged, dict):
+        logged = {"lines": None, "file": None}
+        setattr(sys, POOL_LOG_ATTR, logged)
+    if log_replaced(logged, ctx.out_path(LOG_BASENAME)):
+        logged["lines"] = None              # 世代送りされた新しいログにも書く
+    if logged.get("lines") != lines:
+        logged["lines"] = lines
+        for line in lines:
+            write(line)
     ctx.log("bgm: pool = {}".format(
         ", ".join("{} {}".format(s, len(pool[s])) for s in sorted(pool))))
 

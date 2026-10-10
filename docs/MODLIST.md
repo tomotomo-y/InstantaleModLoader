@@ -8,9 +8,9 @@
 手で書き換えても次の生成で消える。
 直す先は各 MOD の `mod.json` か MODS.md の見出し。
 
-同梱 122 本（基盤 2 / 修正 44 / 追加 39 / 計測 37）。
-うち 17 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
-ほかに 2 本は自作だが、外部からの提案を取り込んでいる（下の「提案を取り込んだ MOD」）。
+同梱 136 本（基盤 2 / 修正 49 / 追加 44 / 計測 41）。
+うち 19 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
+ほかに 3 本は自作だが、外部からの提案を取り込んでいる（下の「提案を取り込んだ MOD」）。
 
 並びはフォルダ名順。
 適用順はこれとは別で、GUI の `順` 列（`load_order.json`）が持つ。
@@ -37,7 +37,7 @@
 
 ---
 
-## 修正（44本）
+## 修正（49本）
 
 ゲームのバグ・不便を直す。
 
@@ -50,7 +50,7 @@
 | [`104_balance_area_bgm`](MODS.md#104_balance_area_bgm-新しいエリアのbgmの偏りを均す) | エリアBGMの偏りの均し | 新しいエリアのBGMの偏りを均す | 1 |  |
 | [`105_fix_schema_compact`](MODS.md#105_fix_schema_compact-llm-へ送るスキーマ説明を圧縮する) | スキーマ説明の圧縮 | LLM へ送るスキーマ説明を圧縮する | - |  |
 | [`106_fix_battle_bgm_restore`](MODS.md#106_fix_battle_bgm_restore-戦闘後にbgmが戻らないのを直す) | 戦闘後の戦闘BGMの停止 | 戦闘後にBGMが戻らないのを直す | 1 | 取込済 main_024 |
-| [`107_fix_battle_flag_stuck`](MODS.md#107_fix_battle_flag_stuck-闘技場から撤退した後に次の戦闘が固まるのを直す) | 戦闘後の後始末漏れの修正 | 闘技場から撤退した後に次の戦闘が固まるのを直す | - |  |
+| [`107_fix_battle_flag_stuck`](MODS.md#107_fix_battle_flag_stuck-戦闘と売買の後に残る最中の印を下ろす) | 戦闘と売買の後始末漏れの修正 | 戦闘と売買の後に残る「最中」の印を下ろす | - |  |
 | [`108_fix_shop_inventory_overflow`](MODS.md#108_fix_shop_inventory_overflow-売買画面を開くと落ちるのを直す) | 売買画面クラッシュの修正 | 売買画面を開くと落ちるのを直す | - | 取込済 main_024 |
 | [`109_fix_item_detail_autosize`](MODS.md#109_fix_item_detail_autosize-アイテムの説明が途中で切れるのを直す) | アイテム説明欄の拡張 | アイテムの説明が途中で切れるのを直す | 1 |  |
 | [`110_fix_character_name_path`](MODS.md#110_fix_character_name_path-名前のせいでnpcの画像が作れないのを直す) | 画像生成に通らない名前の置き換え | 名前のせいでNPCの画像が作れないのを直す | - | 取込済 main_024 |
@@ -64,7 +64,7 @@
 | [`113_ui_text_expand`](MODS.md#113_ui_text_expand-本文の表示域をボタンで広げる) | 本文の表示域を広げる | 本文の表示域をボタンで広げる | 10 |  |
 | [`114_ui_input_focus`](MODS.md#114_ui_input_focus-自由入力のあと入力欄にフォーカスを戻す) | 入力欄のフォーカスを保つ | 自由入力のあと入力欄にフォーカスを戻す | 3 |  |
 | [`115_ui_item_list_fit`](MODS.md#115_ui_item_list_fit-はみ出すアイテム一覧を画面内に収める) | アイテム・スキル一覧を画面に収める | はみ出すアイテム一覧を画面内に収める | 3 |  |
-| [`116_ui_party_expand`](MODS.md#116_ui_party_expand-4人目以降の仲間も表示する) | パーティ欄の4人目以降を表示 | 4人目以降の仲間も表示する | 12 |  |
+| [`116_ui_party_expand`](MODS.md#116_ui_party_expand-4人目以降の仲間も表示する) | パーティ欄の4人目以降を表示 | 4人目以降の仲間も表示する | 14 |  |
 | [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い応答が途中で切れるのを直す) | 長い本文をより多く見せる | 長い応答が途中で切れるのを直す | 1 |  |
 | [`118_batch_message_render`](MODS.md#118_batch_message_render-本文の出し方逐次一括と既読の色を選ぶ) | 本文の一括表示と既読の灰色化 | 本文の出し方（逐次／一括）と既読の色を選ぶ | 4 |  |
 | [`119_fix_crime_attribution`](MODS.md#119_fix_crime_attribution-他人の犯罪が主人公のものになるのを直す) | 他人の犯罪で手配される件の修正 | 他人の犯罪が主人公のものになるのを直す | - |  |
@@ -84,13 +84,18 @@
 | [`133_ui_area_difficulty`](MODS.md#133_ui_area_difficulty-移動先に適正レベル帯を出す) | 移動先の適正レベル帯の表示 | 移動先に適正レベル帯を出す | 9 |  |
 | [`134_balance_item_effects`](MODS.md#134_balance_item_effects-アイテムの効果を分類ごとに作り直す) | アイテム効果の調整 | アイテムの効果を分類ごとに作り直す | 18 |  |
 | [`135_fix_inn_button_order`](MODS.md#135_fix_inn_button_order-宿屋の選択肢を他の施設と同じ順にする) | 宿屋の選択肢を他の施設と同じ順にする | 宿屋の選択肢を他の施設と同じ順にする | - |  |
-| [`136_cloud_model_override`](MODS.md#136_cloud_model_override-クラウドのモデルを差し替える) | クラウドモデルの差し替え | クラウドのモデルを差し替える | 7 |  |
+| [`136_cloud_model_override`](MODS.md#136_cloud_model_override-クラウドのモデルを差し替える) | クラウドモデルの差し替え | クラウドのモデルを差し替える | 10 |  |
 | [`137_fix_npc_skill_uses`](MODS.md#137_fix_npc_skill_uses-仲間と敵は使い切ったスキルと効果中の強化弱体を使わず宿で休むと回数が戻る) | 仲間と敵は使い切ったスキルと効果中の強化・弱体を使わず、宿で休むと回数が戻る | 仲間と敵は使い切ったスキルと効果中の強化・弱体を使わず、宿で休むと回数が戻る | - |  |
+| [`138_fix_character_image_refresh`](MODS.md#138_fix_character_image_refresh-再生成した立ち絵と顔がその場で表示に反映される) | 再生成した立ち絵と顔がその場で表示に反映される | 再生成した立ち絵と顔がその場で表示に反映される | - |  |
+| [`139_fix_quest_generation_runaway`](MODS.md#139_fix_quest_generation_runaway-依頼の生成が終わらずに失敗するのを直す) | 依頼の生成で敵が増え続ける件の修正 | 依頼の生成が終わらずに失敗するのを直す | 1 |  |
+| [`140_fix_busy_dots_speed`](MODS.md#140_fix_busy_dots_speed-待機表示のを普段の速さで流す) | 待機表示の「…」を普段の速さで流す | 待機表示の「…」を普段の速さで流す | - |  |
+| [`141_ui_free_input_echo`](MODS.md#141_ui_free_input_echo-会話の外で送った文も本文に残す) | 会話の外で送った文も本文に残す | 会話の外で送った文も本文に残す | - |  |
+| [`142_balance_quest_stamina`](MODS.md#142_balance_quest_stamina-依頼のクリアで減るスタミナを難易度と被弾で変える) | 依頼のクリアで減るスタミナを難易度と被弾で変える | 依頼のクリアで減るスタミナを難易度と被弾で変える | 7 |  |
 | [`406_gemini_user_role_fix`](MODS.md#406_gemini_user_role_fix-クラウド-api-の-gemini-で-user-role-の無い依頼を補う) | Geminiの無応答の防止 | クラウド API の Gemini で user role の無い依頼を補う | - |  |
 
 ---
 
-## 追加（39本）
+## 追加（44本）
 
 ゲームに無かった遊びを足す。
 
@@ -98,7 +103,7 @@
 |---|---|---|---|---|
 | [`1308_companion_travel`](MODS.md#1308_companion_travel-npcを連れて歩ける) | NPCを連れて歩く | NPCを連れて歩ける | 5 |  |
 | [`300_event_facility_arrival`](MODS.md#300_event_facility_arrival-施設でnpcから話しかけてくる) | 施設でNPCが話しかける | 施設でNPCから話しかけてくる | 13 |  |
-| [`301_quest_from_conversation`](MODS.md#301_quest_from_conversation-会話から依頼を受けられる) | 会話から依頼を受ける | 会話から依頼を受けられる | 10 |  |
+| [`301_quest_from_conversation`](MODS.md#301_quest_from_conversation-会話から依頼を受けられる) | 会話から依頼を受ける | 会話から依頼を受けられる | 9 |  |
 | [`302_leave_party_in_conversation`](MODS.md#302_leave_party_in_conversation-会話から仲間と別れられる) | 会話で仲間と別れる | 会話から仲間と別れられる | 1 |  |
 | [`303_quest_end_party_to_guild`](MODS.md#303_quest_end_party_to_guild-解散した仲間を町のギルドに残す) | 解散した仲間をいまの町に残す | 解散した仲間を町のギルドに残す | 2 |  |
 | [`304_quest_end_keep_party`](MODS.md#304_quest_end_keep_party-クエストをクリアしても解散しない) | クエスト後も解散しない | クエストをクリアしても解散しない | 2 |  |
@@ -111,10 +116,10 @@
 | [`313_event_ability_check`](MODS.md#313_event_ability_check-行動の成否判定に能力値を効かせる) | 行動判定に能力値を効かせる | 行動の成否判定に能力値を効かせる | 9 |  |
 | [`314_area_move_custom`](MODS.md#314_area_move_custom-エリア移動の日数料金文言を変える) | 街移動のカスタマイズ | エリア移動の日数・料金・文言を変える | 16 |  |
 | [`315_vacation_custom`](MODS.md#315_vacation_custom-宿の宿泊期間部屋宿代を変える) | 宿泊のカスタマイズ | 宿の宿泊期間・部屋・宿代を変える | 14 |  |
-| [`316_bounty_hunter`](MODS.md#316_bounty_hunter-手配されていると追手が来る) | 賞金稼ぎが襲ってくる | 手配されていると追手が来る | 15 |  |
+| [`316_bounty_hunter`](MODS.md#316_bounty_hunter-手配されていると追手が来る) | 賞金稼ぎが襲ってくる | 手配されていると追手が来る | 17 |  |
 | [`317_reputation`](MODS.md#317_reputation-評判と二つ名) | 評判と二つ名 | 評判と二つ名 | 8 |  |
 | [`318_area_difficulty_growth`](MODS.md#318_area_difficulty_growth-土地が育つ依頼の難易度が上がる) | 依頼クリアで難易度上昇 | 土地が育つ（依頼の難易度が上がる） | 7 |  |
-| [`319_battle_tactics`](MODS.md#319_battle_tactics-戦闘を複数手の駆け引きにする) | 戦闘の数値とバフ・デバフの作り直し | 戦闘を複数手の駆け引きにする | 12 |  |
+| [`319_battle_tactics`](MODS.md#319_battle_tactics-戦闘を複数手の駆け引きにする) | 戦闘の数値とバフ・デバフの作り直し | 戦闘を複数手の駆け引きにする | 18 |  |
 | [`320_guild_adventurer_recruit`](MODS.md#320_guild_adventurer_recruit-ギルドの冒険者の補充) | ギルドの冒険者の補充 | ギルドの冒険者の補充 | 2 |  |
 | [`321_area_chronicle`](MODS.md#321_area_chronicle-エリアの状況を更新依頼クリアで案内文が変わる) | 功績による土地の案内文の書き換え | エリアの状況を更新（依頼クリアで案内文が変わる） | 4 |  |
 | [`322_battle_bgm`](MODS.md#322_battle_bgm-戦闘bgmを置いた曲から選んで鳴らす) | 戦闘BGMの選曲 | 戦闘BGMを置いた曲から選んで鳴らす | 2 |  |
@@ -130,15 +135,20 @@
 | [`332_training_custom`](MODS.md#332_training_custom-訓練所の代金修行の量1段の期間再訓練の可否を変える) | 訓練所のカスタマイズ | 訓練所の代金・修行の量・1段の期間・再訓練の可否を変える | 13 |  |
 | [`333_equipment_slots`](MODS.md#333_equipment_slots-インベントリに装備枠を追加) | インベントリに装備枠を追加 | インベントリに装備枠を追加 | 4 |  |
 | [`334_colosseum_custom`](MODS.md#334_colosseum_custom-闘技場の相手の強さと懸賞金を決める) | 闘技場のカスタマイズ | 闘技場の相手の強さと懸賞金を決める | 13 |  |
+| [`335_player_portrait_regenerate`](MODS.md#335_player_portrait_regenerate-人物欄から主人公の立ち絵を描き直せる) | 人物欄から主人公の立ち絵を描き直せる | 人物欄から主人公の立ち絵を描き直せる | - |  |
+| [`336_crime_overhaul`](MODS.md#336_crime_overhaul-犯罪まわりの全面改修) | 犯罪まわりの全面改修 | 犯罪まわりの全面改修 | 78 |  |
+| [`337_conversation_affinity`](MODS.md#337_conversation_affinity-会話による好感度の変動) | 会話による好感度の変動 | 会話による好感度の変動 | 4 |  |
 | [`401_battle_character_context`](MODS.md#401_battle_character_context-戦闘の審判へ同行者の人物と装備を見せる) | 戦闘の審判への仲間の情報補完 | 戦闘の審判へ同行者の人物と装備を見せる | - |  |
 | [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | 仲間とのアイテム受け渡し | 仲間とアイテムを受け渡しできる | - |  |
 | [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | NPC同士の認知と関係記憶 | NPC同士がお互いを認知し、関係を覚える | 5 |  |
 | [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | パーティーメンバーと話す | パーティーメンバー全員と話す | 7 |  |
 | [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給表示特産品) | 地域毎に物価が変動する | 街ごとの需給・表示・特産品 | 11 |  |
+| [`407_npc_starting_equipment`](MODS.md#407_npc_starting_equipment-パーティーに加わった-npc-に初期装備を一度だけ持たせる) | NPC初期装備 | パーティーに加わった NPC に初期装備を一度だけ持たせる | - |  |
+| [`408_visual_changes_based_on_equipment`](MODS.md#408_visual_changes_based_on_equipment-立ち絵を再生成すると装備の見た目が描き足される) | 装備品に応じた立ち絵の追加描写 | 立ち絵を再生成すると装備の見た目が描き足される | 1 |  |
 
 ---
 
-## 計測（37本）
+## 計測（41本）
 
 ゲームは変えない。`out\` にログを残すだけ。デバッグモードのときだけ読み込まれる。
 
@@ -151,8 +161,8 @@
 | `204_probe_prompt_bloat` | EVENTLOG / DEDUP / サイドカー起動という3つのプロンプト肥大化挙動を測る |
 | `205_probe_player_events` | プレイヤーの行動をトリガーにしたイベントの差し込み場所を特定する |
 | `206_probe_quest_flow` | クエストの受注経路と、選択肢ボタンの登録方法を特定する |
-| `207_probe_battle_bgm` | 戦闘BGMの切り替え経路（`play_music_from_src` の呼び出し元）を計測する |
-| `208_probe_item_detail` | アイテム説明欄の実寸と中身を写し取る |
+| `207_probe_battle_bgm` | BGM を鳴らす・止める呼び出しと、鳴っているミキサーの本数を見張る（戦闘BGMの直しが退行していないかの見張り） |
+| `208_probe_item_detail` | アイテム説明欄の opacity の上げ下げを見張り、閉じた後も残る原因を測る（寸法は最初の数品だけ写す） |
 | `209_probe_free_facility` | シーン記述エンジンの中身（ステップ・フラグのスコープ・プログラムの出どころ）を写し取り、MOD から使えるかを測る |
 | `210_probe_character_state` | NPC の死亡の印を特定し、誰がその NPC を参照しているかを数えて、印だけで安全に退場させられるかを測る |
 | `211_probe_text_speed` | 本文の1文字ごとの間隔・`app.text_speed`・フレームレート・ラベルのテクスチャ作り直しの重さを測る |
@@ -170,23 +180,27 @@
 | `223_probe_party_equipment` | 本体のアイテム popup と `ItemEquipManager` / `ItemUnequipManager` の入口を観測し、素のゲームが実際に誰の `equipments` を書き換えるかを測る |
 | `224_probe_npc_carryover` | ロードのどの地点から世界へ NPC を入れられるかを測る |
 | `225_probe_area_quest_difficulty` | 街を初めて訪ねたとき、依頼の難易度を誰がどう決めるかを録る |
-| `226_probe_item_consume` | 回復アイテムを使ったとき何が起きるかを録る |
+| `226_probe_item_consume` | 回復アイテムを使ったとき、何が誰にどれだけ効くかを録る |
 | `227_probe_shop_stock` | 買った品が店の棚へ戻るのはどこかを録る |
-| `228_probe_area_move_reject` | エリア移動の拒否（`AreaMoveManager.execute` → `area_move_rejector`）が同行者の何を読んで決めているかを録る |
-| `229_probe_mod_npc` | ローダの `instantale_modloader.modnpc`（MOD だけが持つ NPC と、正規 NPC への被せ）を実機に通し、どこまで通るかを録る |
-| `230_probe_image_generation` | 画像生成の出口とバックエンドを録る |
+| `228_probe_area_move_reject` | エリア移動の拒否（`area_move_rejector`）が、同行者の何を読んで決めているかを録る |
+| `229_probe_mod_npc` | ローダの `modnpc`（MOD だけが持つ NPC と、正規 NPC への被せ）を実機に通す |
+| `230_probe_image_generation` | 画像生成のバックエンドと出口を録る |
 | `231_probe_training` | 施設での訓練の暦を録る |
 | `232_probe_facility_choices` | 宿屋だけ `出る` が先頭に並ぶ原因を測る |
 | `233_probe_colosseum` | 闘技場の試合を録る |
 | `234_probe_busy_display` | 待機表示（選択肢の枠の「…」）を録る |
 | `235_probe_sound_effects` | 効果音を録る |
 | `236_probe_enemy_stats` | 敵と味方の強さの出どころを録る |
+| `237_probe_affinity` | NPC のプレイヤーへの好感度（`relationship.player.affinity`）がいつ・どれだけ動くかを録る |
+| `238_probe_prison` | 逮捕・裁判・服役・釈放の流れを録る |
+| `239_probe_game_flags` | ゲームの「〜の最中」の旗 7 つ（`in_battle` / `in_boss_battle` / `in_colosseum_battle` / `in_conversation` / `in_free_input` / `in_action_in_conversation` / `in_shopping`）を録る |
+| `240_probe_stamina` | 主人公と同行者のスタミナ（`physical_integrity` / `max_physical_integrity`）と疲労の旗（`exhausted`）が変わるたびに、呼び出し元の連鎖と、依頼や戦闘の最中かを録る |
 
 ---
 
 ## 提供を受けた MOD
 
-外部の MOD 作者から提供を受けて同梱している 17 本。
+外部の MOD 作者から提供を受けて同梱している 19 本。
 
 番号の帯では数えられない。
 いま提供を取り込む先は出どころの帯（`4xx`）だが、
@@ -216,12 +230,14 @@
 | [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | MoririnJP 様 | 提供者と共同 |
 | [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給表示特産品) | MoririnJP 様 | 提供者と共同 |
 | [`406_gemini_user_role_fix`](MODS.md#406_gemini_user_role_fix-クラウド-api-の-gemini-で-user-role-の無い依頼を補う) | MoririnJP 様 | そのまま取り込み |
+| [`407_npc_starting_equipment`](MODS.md#407_npc_starting_equipment-パーティーに加わった-npc-に初期装備を一度だけ持たせる) | MoririnJP 様 | そのまま取り込み |
+| [`408_visual_changes_based_on_equipment`](MODS.md#408_visual_changes_based_on_equipment-立ち絵を再生成すると装備の見た目が描き足される) | MoririnJP 様 | そのまま取り込み |
 
 ---
 
 ## 提案を取り込んだ MOD
 
-MOD 自体はこちらの著作物で、機能の一部を外部からの提案（PR）で取り込んだ 2 本。
+MOD 自体はこちらの著作物で、機能の一部を外部からの提案（PR）で取り込んだ 3 本。
 上の「提供を受けた MOD」とは分けてある（出どころが違う）。
 
 権利の所在は [NOTICE](../NOTICE) が持つ。
@@ -230,3 +246,4 @@ MOD 自体はこちらの著作物で、機能の一部を外部からの提案�
 |---|---|
 | [`130_currency_unit`](MODS.md#130_currency_unit-通貨の呼び名と所持金の表示を変える) | MoririnJP 様 |
 | [`314_area_move_custom`](MODS.md#314_area_move_custom-エリア移動の日数料金文言を変える) | MoririnJP 様 |
+| [`335_player_portrait_regenerate`](MODS.md#335_player_portrait_regenerate-人物欄から主人公の立ち絵を描き直せる) | MoririnJP 様 |

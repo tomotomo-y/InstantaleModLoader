@@ -251,7 +251,8 @@ app.refresh_choice_buttons(reset_page=True)
 （注入はプロセスと一緒に消えるので、これは必ず起きる）。
 
 自前ボタンの作り方は、無害な既存クラス（`JustSetButtonToNormalPhase`）を spec に持たせ、
-押下は `InstantaleApp.on_button_press` を包んでボタン辞書の独自キーで横取りする。
+押下は `InstantaleApp.on_button_press` を包んでボタン辞書の独自キーで横取りする
+（MOD は自分で包まず、ローダの窓口 `choices` に預ける。TECH.md §3.3.14）。
 **文字列ではなく印で見る**のは、同じ文字列のゲーム側ボタンを巻き込まないため。
 
 自前で組む `PhaseSpec` は、引数の値まで実測で確かめたものに限る。
@@ -266,7 +267,8 @@ app.refresh_choice_buttons(reset_page=True)
 しかも復元された方は spec が `JustSetButtonToNormalPhase` なので押しても無反応
 ＝ 見た目は同じなのに片方だけ効かないという、最も分かりにくい壊れ方になる。
 
-差し込む前に `ui.Screen.prune_stale(buttons, ラベル一覧)` を通す。
+ローダの窓口 `choices` は、保存の直前に印の付いたボタンを控え、ロードの後に同じ画面のボタンへ印を付け直す（TECH.md §3.3.14）。
+付け直せなかったとき（窓口の控えが無い・画面が違う）の備えとして、差し込む前に `ui.Screen.prune_stale(buttons, ラベル一覧)` を通す。
 「自分のラベル（前方一致）」かつ「どの MOD の印も無い」かつ「無害 spec」の
 3つが揃ったものだけを落とす。
 
@@ -276,6 +278,44 @@ app.refresh_choice_buttons(reset_page=True)
 > （`302_` の `やめておく` が `309_` の確認画面のキャンセルを消していた）。
 > 判定は「`mod_` で始まるキーが1つも無い」で行う（`ui.MARK_PREFIX` / `marked_by_a_mod`）。
 > 掃除に使うラベルも、その MOD にしか無い文言だけにすること。
+
+選択肢が左の4つに収まらないときは右の欄（`hud.right_button_layout`）が開く。
+戦闘の情報欄（`hud.top_info_layout_battle`）と同じ矩形で、開いたまま戦闘に入ると敵の HP の表示に重なる。
+戦闘に入った後で開いた右の欄は、戦闘の4つの選択肢を塗っても（`update_ui` → `update_button_texts`、`display_button_load(0)` でも）閉じず、
+戦闘の終わりまで重なったままだった（2026-10-05 の実機。閉じたのは、次の場面を起こしたときの待機表示（`process_choice` の点送り）の始まり）。
+戦闘の外で `display_button_load` が右の欄を閉じた記録はある（VERIFICATION_LOG.md §2.60）。
+
+閉じない理由は HUD 自身の旗（2026-10-08 の実機。VERIFICATION.md §3.91）:
+
+- 右の欄を開け閉めするのは HUD の `update_button_texts`（`new_hud.py:2126`。戦闘の後に閉じた回の呼び出し元）。
+  ただし HUD の `in_battle`（Kivy の BooleanProperty。見張りは付いていない。`app.in_battle` とは別物）が
+  立っている間は右の欄に触らない
+- 戦闘に入るときはこの旗が、前の画面の右の欄を閉じるより先に立つ。だから直前の選択肢が5つ以上だと、
+  MOD が起こしてもゲームが起こしても右の欄が残る（VERIFICATION_LOG.md §2.59 の「どちらでも起きる」）。
+  戦闘の1手（`攻撃`）では opacity は一度も動かず、閉じたのは戦闘が終わって旗が下りた後の `update_button_texts`
+- 戦闘中に `app.in_battle` を下ろして呼んでも閉じない。HUD の `in_battle` をその1回だけ下ろして
+  `update_button_texts(app, 今の選択肢)` を呼ぶと閉じ、敵の欄が元どおり見えた。ゲームが閉じるときも、
+  中のボタン（`right_buttons`）は opacity 1・有効のままで、欄の `opacity` だけが 0 になる
+- ローダの窓口 `choices` は、組み直しのたびに塗り終わりを待って、この形で畳み直す（TECH.md §3.3.14）
+
+場面の終わりの合図（`refresh_choice_buttons`）はワーカーのスレッドから来て、ゲームはその後のフレームで `update_ui` を通して選択肢を塗る。
+合図の直後に MOD が `process_choice` で次の場面を起こすと、遅れて来た塗りが前の場面の選択肢を描き、右の欄が開いたまま残る。
+起こす前に `ui.choices_painted(app)`（HUD の `button_texts` が `to_display_buttons` と揃ったか）を待つ。
+
+#### 組み直し（`refresh_choice_buttons`）はどこから来るか（2026-10-06 の実機）
+
+組み直しは、画面を組むゲームの関数の**内側**から呼ばれることがある。
+その関数を包んで `orig` の後で文言を書き換える MOD より、組み直しのほうが先に走る。
+
+| 場面 | 組み直しが来る所 | 分かったこと |
+|---|---|---|
+| 土地の移動の手段の画面 | `AreaMoveCofirmation.update_button_display` の中 | 「組み直しの前」の手当ては、文言付けの包みの後処理より先に走る（`314_`） |
+| 施設に着いたとき | `MovePhaseManager.move_phase` の中 | 着いたこと（`move_phase` の後処理）で決めたことは、その回の組み直しには間に合わず、次の組み直しで出る（`316_` の追手） |
+| ロードで戻った画面 | ロードの後の組み直しだけ | 文言はセーブに残っていたもののまま。`update_button_display` のような画面を組む関数は走らない。保存した後に設定を変えていると、古い額や日数が出る（`314_`） |
+
+自分が書いた文言を読んで素の値（運賃など）を取り出さない。
+ロードの後は、自分の書いた文言がゲームの文言の顔をして戻ってくる。
+素の値を読むのは、文言がゲームの書式どおりのとき（`馬車(1000G)`）だけにする。
 
 ### 2.3 選択肢を変える手順
 
@@ -300,6 +340,11 @@ app.refresh_choice_buttons(reset_page=True)
 `game_variables["buttons"]` に焼かれている選択肢をそのまま戻すだけなので、
 保存の瞬間に選択肢が空だった画面はロードしても空のままで、そこから動けない。
 立ち位置を書き換える MOD は、その場所の選択肢も一緒に置く（TECH.md §5.8）。
+
+ロードの途中にも組み直し（`refresh_choice_buttons`）は走るが、その時点では人物（`world.characters`）がまだ 0 人で、
+名簿もまだ空（2026-10-06、裏の事務所と死刑の判決の画面で保存したセーブで実測）。主人公の持ち物と依頼の一覧（`world.quests`）は揃っている。
+人物や同行者を見て出すボタンは、この組み直しでは出ない。揃った後に組み直すのはローダの窓口 `choices`（TECH.md §3.3.14）。
+MOD のボタンを押しても、ゲームは保存しない（押下の処理を横取りしているため）。
 
 仲間欄も同じ構図で、`app.party` を書き換えただけでは変わらない。
 塗るのは `InstantaleApp.update_party_member(dt)` と `InstanTaleHUD.update_party_display(*args)` の
@@ -374,6 +419,19 @@ display_button_load(dt)             True を見て今の一覧を塗り、予約
 - **`process_choice` は旗を下ろして、自分で点送りを1本始める**。
   別の点送りが回っているところで場面を起こすと2本になり、点が速く進む
   （実機 2026-09-25。締めの場面の間だけ 0.1 秒刻みになった）
+- **ゲーム自身も、1回の待機の中で点送りを何本も始める**（`234_probe_busy_display` 版4の実機、2026-10-08）。
+  点送りを始めているのは `scripts.functions.button_load` で、待機の段ごとに呼ばれ、そのたびに
+  `Clock.schedule_once(display_button_load, 0)` を1本足す。前の本が回っていても止めない。
+  2本目以降を始めた手は39件で、どれもゲーム本体の `button_load` だった（MOD から始めたものは0件）。
+  呼んでいた段は、会話の始まり（`conversation_start_method_0` の中から `_1` がもう1本）・
+  会話の続き（`conversation_continued`）・戦闘の始め（`start_battle` → `sb_1`）と終わり（`end_phase`）・
+  戦闘の手番（`battle`）・審判（`quest_referee_phase`）・依頼探し（`search_quest`）など。
+  戦闘の締めでは7本並び、点が1秒に約24コマ進んだ（1本なら約3.4コマ）。
+  MOD を当てない状態では測っていないが、呼んでいるのはゲームのコードなので同じはず。
+  `140_fix_busy_dots_speed` が余った本を止めて1本に戻す
+- Clock は1回きりの予約を、呼び出す前に一覧（`Clock.get_events()`）から外す
+  （Kivy 2.3.0 の `ClockEvent.tick`。`if not self.loop: self.cancel()` の後で呼ぶ）。
+  Clock から呼ばれた `display_button_load` の中で一覧に見える `display_button_load` は、ほかの本だけ
 - 待機を終えるときは、ワーカーで `is_button_enabled = True` → `refresh_choice_buttons` と進み、
   **次のフレーム**で今の一覧を塗る。
   そこを覆いたいなら、組んだその場（ワーカー）で旗を下ろし、一覧を点にしておく
@@ -467,6 +525,7 @@ Clock で見張り、手が空いてから実行する（`ui.Screen.when_idle`�
 戦闘・会話中かを見るフラグは6つ。
 `in_battle` / `in_boss_battle` / `in_colosseum_battle` /
 `in_conversation` / `in_free_input` / `in_action_in_conversation`。
+誰が立てて誰が下ろすかは、この節の末尾の「旗を誰が立てて誰が下ろすか」。
 
 **いま見えている背景も焼かれる**（`game_variables["location_image"]` に絵のフルパス。実セーブで確認）。
 `location_image` は画面の背景そのもので、ゲームの背景替え（`change_background_image_*`）はこれを書き、後から `update_ui` が HUD の `update_image_source` で塗る（`234_probe_busy_display` 版2 の実機。呼び出しから塗りまで約2秒）。保存のあいだだけ書き換えて戻すと、そのたびに背景が切り替わって見える（`330_` の滞在で実機）。
@@ -493,6 +552,26 @@ Clock で見張り、手が空いてから実行する（`ui.Screen.when_idle`�
 > `in_shopping` は店の外を往復しているだけの移動でも True のまま残る
 > （買い物窓が開いているかは `is_popup_window_opened` で見る）。
 > `in_battle` も経路によって下ろし忘れがある（§2.10）。
+
+#### 旗を誰が立てて誰が下ろすか
+
+`239_probe_game_flags` の実機（2026-10-06。店・会話・自由入力・移動・ロード・闘技場の勝ちと撤退・自由入力と会話からの戦闘・雇う。VERIFICATION_LOG.md §2.89）。
+旗はどれも `app` のインスタンス属性で（Kivy のプロパティではない）、7つともセーブの `game_variables` に焼かれ、ロードで `load_game_new` が書き戻す。
+
+| 旗 | 立てる | 下ろす | ゲームが条件に読む |
+|---|---|---|---|
+| `in_shopping` | 「売買する」（`ShoppingStartManagerRemake.shopping_start_method_1`。旗を False にしてから押すと False → True） | **どこも下ろさない**。窓を閉じる処理（窓の外側を押す → `close_shopping_window_process`）・店を出る・移動のどれも書き込まない（False から測った）。窓に閉じるボタンは無い。False なのは、その世界でまだ一度も売買の窓を開いていない間だけ | 読まない（読むのは `save_game` が焼くときだけ） |
+| `in_conversation` | 会話の開始（`ConversationStartManager.conversation_start_method_1`。相手の id） | 会話の終わり（`ConversationEndManager.finish_conversation`）。会話から戦闘に入ると、戦闘の後にゲームが自分で会話を終える。「雇う」の後は会話が続く | 会話の開始と終わり・自由入力の開始・売買の窓を閉じる処理・ロード・`update_ui` |
+| `in_action_in_conversation` | 会話の上の欄の「行動」（`toggle_to_action_in_conversation`）。この版ではその欄が大きさ 0 で画面に出ない | 会話の終わり（`finish_conversation` が毎回 False を書く） | 読まない |
+| `in_free_input` | 自由入力の開始（`FreeInputStart.method`） | 同じ処理の終わり（`FreeInputStart.end_process`。会話の中なら `end_process_in_conversation`）。自由行動から戦闘に入ると、戦闘の間は立ったままで、戦闘の後の続きが終わるときに下りる | 読まない |
+| `in_battle` | 戦闘の開始（`BattleStartManager.start_battle`。値は 'normal' のような種類） | 闘技場の勝ち（`BattleEndInColosseum`）・撤退（`BattleEndManager`）・自由行動の戦闘（`BattleEndInFreeAction`）のどれでもゲームが下ろす | ロードの曲の選び分けと `update_ui` |
+| `in_colosseum_battle` | 試合の開始（`ColosseumMatchStart.method`） | 勝ちはゲーム（`BattleEndInColosseum`）。**撤退では残る**（§2.10。`107_` が下ろす） | 戦闘の終わり方の選び分け（`BattlePhaseManager.check_battle_end`） |
+| `in_boss_battle` | 測っていない（§2.10） | 測っていない | 戦闘の外では読まない |
+
+ゲームが `in_shopping` を条件に使っていないので、立ちっぱなしでもゲームの動きは変わらない。
+変わるのはこれを読む MOD だけで、ローダは `ui.BUSY_FLAGS` に入れず、MOD が読むと `tools/check_mods.py` が落とす（TECH.md §2.3）。
+旗そのものは `107_fix_battle_flag_stuck` 版6が、窓を閉じた後・ロードの後・注入の時点で下ろす。
+ボス戦と、逮捕で会話や自由入力が終わる経路は測っていない（VERIFICATION.md §3.86）。
 
 ### 2.7 世界のデータ構造
 
@@ -700,16 +779,25 @@ MOD からの書き方はこうなる。
 - `quest_type` は `'settlement_quest'`。
   クエスト辞書の `quest_type` フィールド（`'normal_quest'` など）とは別の語彙で、
   セーブの値をそのまま渡すと `KeyError` で落ちる
+- `QuestChoiceManager.__init__` は `'settlement_quest'` なら `world.quests` を引き、
+  **それ以外の語はすべて `story_quests` を引く**（`206_` の総当たり。ストーリー依頼の id は12語とも通った）。
+  掲示板の物語の依頼は `'story_quest'` で来るとみられる（exe の定数の並びからの推定。実プレイの値は未測定）。
+  `story_quests` の id は 0〜4 で、`world.quests` の id と重なる。
+  id だけで `world.quests` を引くと別の依頼を取り違える（`318_` の版3までがそうだった）
 - 依頼生成の入口は `QuestSearchManager`。
   `DisplayQuestChoice.generate_random_quest()` はエリアの生成・採番・登録まで面倒を見る内側の入口。
   内容に手を入れたいならさらに内側の
   `llm_manager_world_generate:random_quest_generator` の `area_description` に足すだけでよい
   （出力スキーマは1バイトも変わらない）
+- 「クエストを探す」（`QuestSearchManager`）が並ぶのは、その街の未完了の依頼が2件より少ないときだけ（実測）。
+  探した後は掲示板の一覧に戻り、新しい依頼が並ぶ（`206_` の 2026-08-26 の記録）
 - 一覧はゲームに組ませるのが安全。
   `DisplayQuestChoice` を `process_choice` で開けば、組み立ても受け渡しもゲームがやる ＝ 語彙を知らなくてよい
 - 受注できる依頼の絞り込みは `neighboring_settlement_id == 現在エリアの id` かつ
   `config['status'] == 'incomplete'`。
   ゲーム自身の `get_quest_difficulties(area, world)` と突き合わせられる
+  （2026-10-06 の観察: この条件を満たす依頼が1件あるのに、掲示板の一覧に出ず「クエストを探す / やめる」だけだった。
+  その依頼を受けている途中だったからかどうかは確かめていない。「クエストを探す」を出すかの数にはその依頼も入っていた）
 - `config` の鍵は `status` と `level_of_detail` の2つ。
   `status` で観測できている値は `'incomplete'` と `'completed'` の2つだけ
   （`206_` の census。実データで `{'incomplete': 18, 'completed': 9}`）。
@@ -747,6 +835,18 @@ random.sample(range(lo, hi), k=3)          save_area_json.py:329
 
 エディタで後から足した街（id 9 以降）は枠が無く、全域 `range(1, 77)` から引かれる（id 33 で `[6, 34, 3]`、id 21 で `[13, 30, 40]`）。
 `133_ui_area_difficulty` はこの表で未訪問の街の帯を見積もる。
+
+#### 依頼の生成は、ローカル LLM で敵の一覧を書き続けて失敗することがある
+
+依頼の生成（`random_quest_generator`。返却型 `QuestStructure`）の型には、並びの件数の決まり（`maxItems`）が1つも無い。
+頼み文は「normal 2〜3種、miniboss 1種」と書くが、grammar はそれを縛らない。
+ローカル LLM が miniboss の後に normal を足し始めると止まらず、48〜54 体目でコンテキストの窓（`--ctx-size 16384`。出力の上限 `n_predict=16384` より先に窓が尽きる）を使い切り、JSON が途中で切れる。
+ゲームはそれを捨てて同じ頼みを送り直す（1回 115〜127 秒）。
+
+- 実プレイの `216_` の記録で約35回中15回、ゲーム抜きの再現で 12 回中 8 回
+- 時間切れではない（`chat` の `timeout` は None）
+- 別の形の頼み（型の説明 8,514 字。生成の別の入口）は約30回とも1回で通った
+- 型の写しに件数の上限を付ければ消える（`139_fix_quest_generation_runaway`。VERIFICATION.md §3.81）
 
 #### 進行ループ（1クエストを頭から終わりまで実測）
 
@@ -848,6 +948,7 @@ MOD 側でも「戦闘中は出さない」条件に使われるので、残骸�
 （`331_` の闘技場での試合。`322_` のログで2秒差）。
 **ただし戻るのは勝ったときだけで、撤退すると立ったまま残る**（`233_probe_colosseum` の実機。
 撤退は `BattleEndManager(end_type='escaped')` を通り、そこでは誰も下ろさない）。
+2026-10-06 の版でも同じだった（`239_` の実機。撤退で `in_battle` だけが下り、`in_colosseum_battle` は `107_` が下ろした。VERIFICATION_LOG.md §2.89）。
 `BattleEndManager(app, end_type)` の `end_type` で観測できている値は
 `'won'`（通常の戦闘・ボス戦に勝ったとき）と `'escaped'`（逃げたとき）の2つ。
 どちらも呼び出し元は `BattlePhaseManager.check_battle_end`。
@@ -893,6 +994,10 @@ MOD 側でも「戦闘中は出さない」条件に使われるので、残骸�
   その一撃で敵が倒れると、判定は逃走より先に全滅を見て `'won'` になり、勝ちの終わり方（`BattleEndInColosseum`）へ進む。
   勝ちの終わり方は預かりを一覧へ戻さないので、逃げた主人公は一覧に居ないまま画面から消え、そのままセーブに焼かれる
   （一覧 `['88']`・預かり `['player']`）。`107_fix_battle_flag_stuck` 版4 が戦闘の終わりとロードの直後に戻す。
+- 「逃げる」は主人公の手番の行動で、仲間はその後も同じ巡りで動く。
+  仲間が敵を倒し切ると、逃げるを押した戦闘でも `'won'` で終わる
+  （2026-10-06。`316_` の追手3体、仲間2人。押してから終わるまで約40秒、仲間の2人が3体を倒した）。
+  逃げた結果を確かめたいときは、仲間を一覧から外してから押す（闘技場では外して逃げると `'escaped'` で終わった）。
 
 MOD が負けを逃走扱いで終わらせるなら、判定の外から終わり方を起こす前にこの状態を揃える
 （敵の一覧を空にし、外された主人公を預かりに入れて、戻すのはゲームに任せる。`334_` の `prepare_escape`）。
@@ -923,6 +1028,11 @@ handle_battle_situation(character_key, character_side, battle_action)   1手ぶ�
 reduce_status_turns_and_log / check_character_death / check_team_annihilation
 check_battle_end / enemy_delete_animation / convert_llm_output_to_instruction_dict
 ```
+
+敵の手番を回す `enemy_turn_separate` はこの一覧に無い。
+スタックでは `BattlePhaseManager.battle` の下のフレームにクラス名なしで出て（`instantale.py:7720`、VERIFICATION_LOG.md §2.40）、
+`__main__:BattlePhaseManager.enemy_turn_separate` は `UNRESOLVED`（attribute not found）になる。
+`battle` の中で定義された関数と読んでいて、`ctx.wrap` では包めない。
 
 実測（`308_` のログ）:
 
@@ -1248,6 +1358,14 @@ NPC（敵・仲間）の魔法   2 × magic_power × k
 `BattlePhaseManager` は空の実体に `app` だけ持たせて呼べた。
 呼ぶ前後で全員の HP と状態異常を比べ、変わらなかった（`dry_abort` は出ていない）。
 
+素点には ±5% ほどの乱数が入るので、試し打ちはゲームの乱数を引く（どの乱数源かは測っていない）。
+版3の続きで、呼ぶ前に `random` の全体・numpy.random（読まれていれば）・`__main__` と
+`scripts.functions` が持つ `random.Random` の状態を控え、終わったら戻すようにした。
+あわせて、同じ相手（陣営・名前・レベル）は1プロセス1回だけ試し、
+この段に入らないと分かった倍率の2通りを外した（1人12通り → 10通り）。
+試し打ちの間は `sys._instantale_probe_dry_run_thread` にそのスレッドの id を置き、
+`222_probe_battle_mechanics` はその間の計算を記録しない。
+
 ##### 記録に残らないもの
 
 **自由入力の入力文そのものは残っていない**。
@@ -1473,6 +1591,23 @@ scripts.llm.llm_manager:*                                                    マ
 | 既定モデル | `gemini-3.5-flash` | `gpt-5.4-nano` / `claude-sonnet-5` |
 | 特徴 | ストリーミング収集（`_stream_and_collect`）、pydantic 検証に失敗した部分木だけを修復するループ（最大3周）、**`SCHEMA_IN_PROMPT = True` でスキーマ文を `send_request` の中で足す** | 修復ループもスキーマ埋め込みも無い（構造化出力を API に任せる） |
 
+- **Claude では依頼の生成（`random_quest_generator`）が通らない**（2026-10-08 の実機。anthropic 0.105.2）。
+  型（`QuestStructure`）は `output_config.format` に約 9000 字の JSON Schema として載り、
+  API が `400 The compiled grammar is too large` で断る。
+  ゲームの既定の `claude-sonnet-5`（`136_` の差し替えを切った状態）でも、`claude-haiku-5-5` でも同じ。
+  ゲームは1回の頼みで約30回送り直し、その後「リクエストを再実行」のボタンを出して待機のまま止まる。
+  型は世界に依らず（`$defs` 17個。`ItemData.item_category` の6択と `Skill.effects` の3択の `anyOf`、上限の無い配列の入れ子）、
+  掲示板の「クエストを探す」も同じ関数なので同じく止まるはず（掲示板からは試していない）。
+  OpenAI（Luna）では通っている。
+  中身を決めない object（`{"type": "object"}`）は API が断り（`additionalProperties` を false にせよ）、
+  3択を1つの object にまとめる形と深い選択肢を外す形も文法が大きすぎた。
+  効果の3択（`$defs/Skill/properties/effects/items`）を文字列の欄にすると通る。
+  `136_` がこの形で送り直し、応答をゲームの型で読む前（SDK の `post_parser` の前）に object へ戻す
+- **SDK の資源は、作られたときのクライアントの送りの手を掴む**（Stainless 製の openai / anthropic 共通）。
+  `client.messages` は `SyncAPIResource.__init__` で `self._post = client.post` を持つので、
+  後からクラスの `post` を包み直しても、作られた後の資源は前の関数を呼び続ける。
+  ゲームはクライアントを使い回すので、ローダは注入の終わりに掴み直させる（TECH.md §5.3）
+
 #### プロバイダに依存しない仕掛け方（`111_` v4 のパターン）
 
 送信モジュールを名指しせず、`llm_manager:send_request` /
@@ -1536,6 +1671,29 @@ alias_scan が同じ関数を持つ全モジュールを張り替え、どのプ
 
 - `ast.literal_eval` は使えない（式1個しか受け取れず終端位置を返さないので、
   プロンプトの途中から読み始めて置換範囲を決められない）。再帰下降パーサが要る
+
+#### 送信と待ち（実測。2026-10-09、Claude）
+
+`send_request` / `send_request_with_no_structure` はどのプロバイダの送信モジュールでも同じ形で、送信を別スレッドに出して自分は待つ。
+入れ子の関数の閉包は、gc から引いた関数の `__closure__` で読めた（生きたフレームの `f_locals` は空。TECH.md §6.3）。
+
+| 入れ子の関数 | 閉包 | 役目 |
+|---|---|---|
+| `send_request_on_id` | `abandoned` / `finished_event` / `hide_llm_regenerate_button` / `on_invalid_api_key` / `send_request_on_id_main_body` | 送信スレッドの target（スレッド名 `Thread-N (send_request_on_id)`）。本体を呼ぶ |
+| `send_request_on_id_main_body`（`backoff` の包み） | `target` / `giveup` / `max_tries` / `wait_gen` / `wait_gen_kwargs` ほか | `backoff.on_exception(expo, Exception, max_tries=32, giveup=should_give_up, base=1, factor=1.1)`。`giveup` は送信モジュールの `should_give_up` を頼みのたびに引く |
+| `send_request_on_id_main_body`（素の本体） | `current_request_id` / `message` / `response_from_llm` | SDK を呼び、答えを `response_from_llm` に書く |
+| `count_request_wait` | `current_request_id` / `finished_event` / `show_llm_regenerate_button` | 時間内に `finished_event` が立たなければ「リクエストを再実行」を出す |
+| `show_llm_regenerate_button` | `raise_regenerate_flag` | ボタンを出す。押すと `raise_regenerate_flag` |
+| `raise_regenerate_flag` | `regenerate_flag` | 送り直しの旗を立てる |
+
+- **待っている側が見ているのは `response_from_llm`**。
+  外からセルに値を書くと、待ちはすぐ返った。
+  `finished_event` は再実行のボタンの時計の旗で、立てても待ちは返らず、ボタンが出なくなるだけだった
+- 待っている側は、答えを添字で引いてから返す（`request_llm_inference_claude.py:220`。答えの代わりの物を書くと `TypeError`）
+- 送信スレッドが例外で死ぬと `response_from_llm` は空のままで、待ちは再実行のボタンを押すまで続く。
+  ボタンは同じ文章を送り直すので、直らない誤りでは同じ所で止まる
+- `should_give_up` は 4xx でも偽を返す（404 の `model: ...` を32回まで送り直す作り）。
+  ローダの `stalls` が 4xx を3回目で打ち切り、待ちを起こして行動を中断させる（TECH.md §5.12）
 
 #### クエスト1件に関わるマネージャ
 
@@ -1644,6 +1802,9 @@ InstantaleApp.normalize_shop_inventory_prices(shop_obtainer, player_obtainer)
   `execute` の戻り際に主の持ち物の辞書へ触ると、`normalize_shop_inventory_prices`（`instantale.py:2660`。辞書を直に回す）と競合して
   `RuntimeError: dictionary changed size during iteration` でゲームごと落ちる（実機。VERIFICATION.md §3.52）。
   持ち物を触るなら `toggle_twin_inventory_window` の手前（同じスレッド、辞書を回す前）で
+- 「売買する」を押してから売買の窓が開くまでに、店主の台詞の生成（LLM）を待つことがある。
+  その間の選択肢は `.` が4つ並ぶ待機表示で、窓が開いてから選択肢が戻る（2026-10-06 に1回。数秒〜十数秒）。
+  スクリプトで窓を操作するときは、時間で待たずに窓が開いたこと（`toggle_twin_inventory_window` の後の状態）を見てから触る
 - 主の持ち物はセーブの `npcs[<id>].inventory`。
   実セーブでは51人中8人だけが中身を持っていた（**中身を持っているのは店として開いた施設の主だけ**）
 - つまり品揃えは「初めて開いたときに作られて、そのまま残る」。
@@ -1732,6 +1893,35 @@ generate_item_in_shopping(item_data, shop_owner_instance, item_stock_tier=2)
 
 - 作るのも採番もゲーム自身（`index['item']` が進む）。鍵は `item_` の付かない裸の数字
 - 走るのは開いたとき。買う操作は `InventoryItem.change_inventory` が売り手から買い手へ移すだけで、品は生まれない。
+  お金が動くのは品を落とした瞬間ではなく、出てくる承認のボタンを押したとき（`227_` 版4。2026-10-04 に買い1回・売り1回）:
+  `buy_item`（`new_hud.py:1017`。`InstantaleApp.buy_item` ではない）→ `Item.buy`（所持金が減る）→ `change_inventory`。
+  売りは `sell_item`（`new_hud.py:1055`）→ `Item.sell` → `change_inventory`。どちらもボタンの `on_touch_down` から呼ばれる。
+  店の品を右クリックしても本体は `ItemPopupMenu`（ボタンは「捨てる」だけ）を作るが親を付けず、画面には出ない（§2.13.3）
+- 確認の窓は品を落とした瞬間（`InventoryItem.on_touch_up`）に、品と同じ親（窓の `FloatLayout`）へ出る。
+  中身は `Label`「品名:額G」と `Button`「売る」（買うときは買う側の文言）・「キャンセル」（2回目の実機。売り1回）。
+  売買まわりの名前（`227_` 版4 の一覧。中身は読めない）:
+
+  ```text
+  InventoryItem(Button): buy_item(self, instance) / sell_item(self, instance) / cancel_buy_item(self, instance)
+                         _has_pending_trade() / _remove_trade_window() / _clear_trade_state()
+                         cancel_trade_confirmation() / cancel_active_trade_confirmation()（引数なし）
+  ConfirmationWindow(FloatLayout)(title_text, button_1_text, button_2_text)
+  ConfirmationModalView(ModalView)(title_text, button_1_text, button_2_text)
+  InstanTaleHUD: popup_confirmation_modalview(*args) / toggle_confirm_window_visibility(instance, value, target_window)
+  Item: buy(self) / sell(self)
+  ```
+
+  売買の確認の窓は、品を落とした後のフレームでゲームが作る `ConfirmationWindow`（直下に `FloatLayout` と `Label`「品名:額G」、`FloatLayout` の下に `Button`「買う」「キャンセル」。ボタンは `on_press` で動く）。落とした呼び出しの中ではまだ出ていない。同じクラスを MOD が自分で作って品と同じ親へ足しても、中のボタンが 40×24 のまま並ばず画面に出ない（`336_` の実機。ゲームはこの窓を別の手順で出していると見られるが測っていない）。`ConfirmationModalView` は開けるが、ボタンが売買の確認より大きく、ModalView の覆いで後ろが暗くなる。ゲームが出した窓の文言を差し替えて借りることはできる（`336_` の盗む確認）
+- 窓の外側を押したときの閉じ方（2026-10-04 に実機で引数を写した）: `InstanTaleHUD._on_backdrop_touch(instance, touch)` が `turnoff_window_visibility(instance, 窓の表示の辞書)`（売買の窓は `hud.visible_twin_inventory_data` そのもの。`{'TorF': True, 'situation': 'shop', …}`）を呼び、続けて `hud.on_backdrop_callback()`（= `app.on_close_window`）で後始末する。後始末を呼ばないと窓は消えるが `is_popup_window_opened` が残る。後始末は `app.buttons_backup_for_shopping`（窓を開いたときの選択肢）を戻すので、窓を開いたまま戦闘を始めて後から閉じると、戦闘のボタンが店の選択肢に置き換わる
+- 店でない施設でも、`toggle_twin_inventory_window(相手, 主人公, 見出し, 'shop')` で売買の窓が開く（2026-10-05、`336_` の盗品買取商。相手は裏の事務所の主で、持ち物は空）。
+  ドラッグ・確認の窓・`Item.sell` の支払い・「〈品〉を売却した。」はゲームのまま動き、売った品は相手の持ち物へ積まれる。
+  値段は開く前に `normalize_shop_inventory_prices(相手, 主人公)` で付ける。
+  見出しは短い語しか出ない（主の名前を渡すと末尾の2字だけが出た）。
+  この開き方では、閉じたときの後始末が選択肢を戻さなかった（`buttons_backup_for_shopping` に事務所の6つを置き、選択肢を2つに絞って開いた回、閉じた後も2つのまま）。
+  戻すにはゲームの `set_buttons_to_normal` が効いた（居る施設の選択肢を組み直し、MOD の選択肢を組み直す合図も通る）。
+  窓を開いている間でも、売るとゲームは選択肢を塗り直す。開く前に右の欄（§2.2）が開いていると、塗り直しで右の欄だけが窓の上に戻る（左の欄は隠れたまま）。
+  画面へ塗る一覧（`to_display_buttons`）は `refresh_choice_buttons` を通すまで組み直されず、`app.buttons` だけを減らすと、塗り直しは前の一覧の位置のまま描いた
+- 戦闘のボタンの形: `攻撃` = `PhaseSpec('BattlePhaseManager', ('攻撃',))`、`スキル・防御` = `SkillChoicePhaseManager()`、`発言する` = `UtteranceChoiceInBattleManager()`、`逃げる` = `BattlePhaseManager('逃げる')`（`206_` の記録と、上の取り違えから戻したときの実機）
   雛形は買っても減らず、`stock_update_date` も動かない
 - 装備は作り直されない。実測7品:
 
@@ -1889,6 +2079,10 @@ ItemPopupMenu.on_consume_item          右クリックの「消費」
 - 本体が読む装備は `equipments` の `weapon` と `wearable` の2つだけ。セーブの形は
   `{"wearable": "item_2", "weapon": "item_0"}`（id の文字列）で、実行時は `Item` オブジェクト。
   書いているのは `ItemPopupMenu` 側で、`Item.equip()` は書かない
+- 仲間の `equipments` は、何を入れてもセーブでは `{}` になる。id の文字列でも実体（`Item`）でも同じで、
+  持ち物（`inventory`）の品はセーブに残る（`407_` の実機で両方を測った。保存の後も実行時の
+  `equipments` は残っていて、`408_` が読めていた）。`333_` が文字列で書く仲間も、セーブは `{}` だった。
+  ロードをまたいで仲間の装備が残るのは、`333_` が自分の控え（`state\equipment_slots\`）から組み直すときだけ
 - 装備の種類は `attributes['item_detail']`（`weapon`: `small_weapon` / `medium_weapon` /
   `long_weapon` / `large_weapon` / `throwable`、`wearable`: `shield` / `clothing` /
   `body_armor` / `accessory` / `legwear` / `leg_armor` / `gauntlets` / `headgear`）。
@@ -2217,7 +2411,7 @@ process_choice(TrainingPhaseManager, '新たな技を学ぶ(3年)')
   （2回目の実測）。段を終えると `remaining_years` が減り（3 → 2）、
   **残り年数に収まる活動だけが並ぶ**（残り2年では 1年・2年の2つ）。`training_log` には前の段の文
   （`一年間、ひたすら鍛錬した。0の経験値を得た。`）が渡る
-- 代金は **300 で固定**。年数は修行内容の選択肢で決まる（1年・2年・3年。本人の知識）。
+- 代金は **300 で固定**。年数は修行内容の選択肢で決まる（1年・2年・3年。ログでは測っていない）。
   `TrainingStartManager` の args の 3 は開始時の残り年数（`remaining_years`）で、
   施設は `331_facility_investment` の `training_facility`（道場）。331 は年数も代金も書いていない。
   開始時の年数が施設や等級で変わるかは未計測（観測は 331 の道場2軒、どちらも3年。素の施設は未観測）
@@ -2305,6 +2499,23 @@ process_choice(AreaMoveManager,       '馬車(1000G)' / '徒歩(3ヵ月)')
 | 0 | 1170 | `True` |
 
 - 土地の移動やクエストで減る。回復は医療施設（`MedicalTreatmentManager(app, treatment_price)`）
+- 依頼のクリアで引くのは `QuestEndManager.method_1`（instantale.py:6617）。
+  新しい値は `round(今の値 − 上限/2)`（Python の丸め。.5 は偶数へ）で、依頼の難易度は効かない。
+  同じ行で同行者も引かれ、次の行（:6618）で主人公と同行者の `exhausted` を True にする。
+  引いた後に最大 HP も下がる（Lv72 で 1848 → 1612）。
+  `240_probe_stamina` の実機（2026-10-08、テストワールド Lv72）: 難易度76 でも難易度1 でも 49→24、同行者は 100→50。
+  セーブの控え（ゲームが `backups\` に残す zip）の前後でも同じ式に合う:
+  Lv4・難易度5で 11→6、Lv49・難易度2で 39→20、Lv59・難易度66で 43→22、Lv85・難易度28で 41→18（上限46）。
+  控えで半分より多く減った組（Lv66 で 46→18、Lv80 で 53→17）は道中で HP が大きく減っていた。
+  道中で体力を使うものは実機ではまだ起きていない（休むの選択肢が出なかった）
+- **依頼を受けられるのは体力が上限の半分より多いときだけ**。ギルドの掲示板で「疲労が酷い。クエストを受けられるような状態ではない...」と断られる。
+  判定は体力の値を読み、`exhausted` の旗は読まない（旗を True にして体力を満タンにすると受けられた。上限49で 24 は断られ 25 は受けられた）。
+  満タンから1件クリアすると必ず半分以下になるので、素のゲームでは休むまで次の依頼を受けられない。
+  `142_balance_quest_stamina` はクリアで引く量を難易度と被弾で決め直す
+- 主人公の体力を戻すのは宿の休養（`VacationRestManager.method`、instantale.py:8994。全快）。
+  `exhausted` もこのとき False に戻るが、属性の代入を通らない（見張りに掛からない）
+- 同行者の体力は日数の送り（`InstantaleApp.elapse_days`、instantale.py:2728）で全快する。主人公の体力は戻らない。
+  馬車の移動（7日）では主人公の体力は減らなかった
 - **体力が減ると最大HPが下がる**（`original_max_hp` は動かない）。
   式は特定していないが、`physical_integrity` が上限を削る側
 - `exhausted`（bool）は 50/100 の時点で既に `True`。閾値・減る量・回復量は未特定
@@ -2332,7 +2543,7 @@ player_data["area_history"] = {
 | --- | --- |
 | 在り処 | `Character.__init__` の引数（`area_history=None`）。プレイヤーもNPCも同じ `Character` |
 | 鍵 | エリア id（`player.current_area` と同じ語彙。文字列） |
-| `lawfulness` | 素の平常値は `10`（40エリア全てが 10 の実セーブで確認）。小さいほど手配が重く、0 未満で犯罪者。実プレイで `-40` を観測。上限は未特定 |
+| `lawfulness` | 素の平常値は `10`（40エリア全てが 10 の実セーブで確認）。小さいほど手配が重く、0 未満で犯罪者。実プレイで `-170` まで観測（`317_` の素材ログ）し、下限には当たっていない。上限は未特定 |
 | `residency` | その土地に滞在した日数の累計と、最後に発った日 |
 | `achievements` | その土地で成した事の文章（LLM が書いたもの）の配列 |
 
@@ -2345,10 +2556,48 @@ player_data["area_history"] = {
 - **読み書きするヘルパは無い**（`lawfulness` を名前に含む関数が存在しない）。値を直接触るしかない
 - 減らしているのは LLM の判定側（プロンプトのスキーマに `lawfulness_loss` がある）。
   どの行為でいくつ減るかは未特定
-- 関連しそうなクラス（`ImprisonmentStartManager` / `DisplayCitizenshipChoice` /
-  `GetCitizenshipManager` / `DieFromOldAgePrison` ほか）との繋がりは未確認
+  （2026-10-06 に1回: ギルドで冒険者を殴り倒す自由行動で、要約が `lawfulness_loss` 5 を出し、その土地の手配度は 10 → -10 の 20 下がった。
+  5 と 20 の食い違いは追っていない。その後のギルドに、殴った相手と同じ呼び名の冒険者が居た（世界でいちばん新しい id）。
+  行動の前のギルドの顔ぶれは取っていないので、行動のせいで作られたのかは分からない）
+- 市民権のクラス（`DisplayCitizenshipChoice` / `GetCitizenshipManager` ほか）との繋がりは未確認。
+  投獄との繋がりは下の「逮捕・裁判・服役」
 - **手配度を直接書き換えてもゲーム側の帳尻は崩れない**
   （`-10` → `10` に書き換えたあと普通に遊び、ゲーム自身のセーブに両方そのまま残った）
+
+#### 逮捕・裁判・服役（実測）
+
+`238_probe_prison` の記録（衛兵に見つかって「大人しく捕まる」を選んだ3回）。
+
+```text
+衛兵の呼び止め  「大人しく捕まる」→ TrialStartManager(app, '指名手配者としての逮捕', '周辺地域で罪を重ね、指名手配されていた。')
+                「抵抗する！」    → BattleStartManager（衛兵戦）
+TrialStartManager     LLM が検察の求刑を書く → ボタン「わかりました」「濡れ衣だ」
+                      args = [{'prosecutor_statement': '<台詞>', 'sentencing_request': {'type': 'imprisonment', 'years': 15}}, 罪状, 出来事]
+TrialPhaseManager     LLM が判事の判決を書く（押した文言が釈明として渡る。自由入力も通る）
+   懲役 → 「はい」「嫌だ...」どちらも ImprisonmentStartManager(app, 年数, 罪状, 出来事)
+   死刑 → 「嫌だ！」→ ExecutionPhaseManager →「あなたの処刑は当日中に執行された...」→ GameOverManager
+ImprisonmentStartManager   「こうなってはもう、どうしようもない。」→「服役する」
+ImprisonmentPhaseManager(app, 残り年数, 罪状, 出来事, 刑期)   1押し＝1年
+   「1年を牢獄で過ごした...」、残りが0なら「釈放の時だ。」→「出る」
+ImprisonmentEndManager(app, 刑期)
+   「出口まで同行した看守が、あなたの足元にかつての所持品を投げてよこした。」「自由の身だ...」
+```
+
+| 項目 | 分かっていること |
+| --- | --- |
+| 釈明 | 裁判の画面では自由入力の行き先（`function_correspond_to_input`）が `TrialPhaseManager` で、送った文はボタンの文言と同じく `get_sentence` に渡り、判事の頼みに「'〈主人公〉'の釈明は'〈文〉'です」として載る（2026-10-05。`output_data\unknown\unknown\sentence_generator\N.json`）。画面にはそのことが出ない |
+| 判事の頼みの欠け | 頼みの「人生ログの全体象」に、文ではなく `<scripts.characters.Character object at 0x…>`（人物の実体の表記）が入っている。人生の記録は判事に渡っていない（ゲームの不具合。プロフィールと特質は渡る）。検察の頼み（`get_sentence_sought`）も同じ。`336_` が `context_manager.get_life_log_text` の文に置き換える |
+| 判決 | 求刑は3回とも懲役15年。判決は3回のうち2回が死刑、1回が懲役15年（主人公の経歴「軍を脱走」を判事が重く見た）。判事の頼み文は、ふざけていれば「懲役300年」や「死刑」にし、反省していれば情状酌量してよいと指示している |
+| 判決の型 | `sentence_generator` の型は `Verdict {statement: 文字列, sentence: PrisonSentence | DeathSentence}`。`PrisonSentence` は `{type: "imprisonment", years: 整数}` で、年数に下限が無い。`DeathSentence` は `{type: "death"}`。無罪の型は無い（2026-10-08。動いているゲームで判事の頼みを組ませ、送る直前で止めて型を写した）。懲役0年が返ると、ゲームは0年の服役に進む。`336_` は無罪の道を開いた回に限り、0年を無罪として扱う |
+| 死刑 | 「嫌だ！」の画面で釈明を打ち込んでも処刑される。ゲームオーバーで `savedata.json` が消える |
+| 1年の進み | `服役する` 1回で `elapse_days(365)` が1回、年齢 +1。段ごとに `save_game` が1回（裁判の段も） |
+| 寿命 | 獄中死は `DieFromOldAgePrison`。語りの頼み文は「60歳で寿命を迎えた」（自由の身は65歳）。実際の閾値は未計測 |
+| 服役中 | 居場所は捕まった場所のまま。所持金・持ち物・装備は動かない（釈放の「かつての所持品」は文だけ）。同行者がいるときは未計測 |
+| 釈放 | その土地の入口へ移り、その土地の手配度が平常（10）へ戻る。他の土地の手配度はそのまま（2026-10-05、-5 と -20 の土地が残った） |
+| 年齢の独り言 | 服役中に「冒険者としてはもう高齢だ...」が混ざる（49歳） |
+| 背景 | 服役中も居場所が動かないので、牢の外へ出てもゲームは背景を描き直さず、牢の絵が残る（2026-10-05、`336_` の脱獄の実機）。ゲーム自身の `change_background_image_to_current_location` を呼べば描き直る |
+| 服役中の会話 | `ConversationStartManager(app, 人物の id)` を `process_choice` に渡せば、毎年の画面からでも会話になる。終えるとゲームは会話の前の画面（`buttons_backup`）を戻すので、毎年の画面に戻る（2026-10-05、`336_` の同房の囚人の実機） |
+| 服役中の死刑 | 服役中に裁判は起きないので、牢に居る間に死刑の判決は出ない |
 
 #### 役場（`administrative_office`）の選択肢（実測）
 
@@ -2365,7 +2614,7 @@ app.buttons      = ['労働の募集をみる', '市民権の発行', '出る', 
   同じ記録で店は `売買する / 出る / 会話する`、鍛冶屋は `装備の強化 / 出る / 会話する`、
   役場は上のとおりだが、宿屋は `出る / 宿泊する(Nヵ月) / 会話する` になる。
   残っている宿屋の記録は5軒・全件がこの並びで、例外が無い。
-  **MOD を1つも当てない状態でも同じ**（本人が実機で確認。ゲームを入れ直しても同じ）ので、原因はゲームの側にある。
+  **MOD を1つも当てない状態でも同じ**（実機で確認。ゲームを入れ直しても同じ）ので、原因はゲームの側にある。
   `Facility.choices` を触っている MOD は1本も無く、画面を組むときに生まれる `PhaseSpec` は
   `DisplayVacationChoice` と `DisplayTalkChoice` の2つだけで `MovePhaseManager` は含まれない
   （出るは施設が元から持っている選択肢）。
@@ -2394,6 +2643,20 @@ app.buttons      = ['労働の募集をみる', '市民権の発行', '出る', 
   描く直前に並べ直すのが `135_fix_inn_button_order`（`出る` より前に `宿泊する` が無いときだけ動かす）
 - 会話を挟むと抜けた後に施設の選択肢が組み直されるので、
   足した自前のボタンは組み直しのたびに入れ直す必要がある
+
+#### 裏の事務所の選択肢（実測）
+
+`232_probe_facility_choices` の記録。
+
+| 選択肢 | spec |
+| --- | --- |
+| 裏の依頼掲示板 | `NotImplementedManager`（公式の未実装の枠） |
+| 闇労働の募集をみる | `DisplayIllegalLaborChoice`（実装済み。中身は未計測） |
+| 情報屋 | `NotImplementedManager` |
+| 出る / 会話する | `MovePhaseManager` / `DisplayTalkChoice` |
+
+- 「裏の依頼掲示板」の枠は、`336_crime_overhaul` が公式の未実装のあいだだけ裏の仕事の入口に使う
+- 選択肢が左の4つに収まらないので、右の欄が開く
 
 #### 衛兵との戦闘（`enemy_type='guard'`。全段を実測）
 
@@ -2655,7 +2918,7 @@ npc_id = npcs.make_npc(app, fields, area_id, facility_id, write=write)   # 作�
 > スキルが空のまま敵ターンを迎えると空の `Literal[]` が組まれて落ち
 > （VERIFICATION_LOG.md §2.40）、`image_src` が `None` のままだと
 > `StringProperty` への代入で落ちる（同 §2.42）。
-> 実測で落ちた相手は `make_npc` で作った詳細生成前の NPC（`902_` の容疑者の1件）で、
+> 実測で落ちた相手は `make_npc` で作った詳細生成前の NPC（開発中の MOD が作った容疑者の1件）で、
 > 素の住人が落ちた記録は無い（素の住人は会話の直前に埋まる）。
 > 本体が空を守っていない穴を塞ぐなら VERIFICATION.md §3.6 の1位と2位（どちらも未着手）で、
 > 作る側は先に会話を通させるか `skills` と `image_src` を持たせる。
@@ -2925,6 +3188,19 @@ retrieval を待たず第一声から載る。
 `resolve_conversation` は相手の id を引数で受け取るので、
 「いま誰との会話か」はここから取れる（ゲームのフレームは実行中 `f_locals` が空で、
 呼び出し元を遡っても何も読めない。TECH.md §6.3）。
+
+**好感度（数）が動くのは依頼のクリアで、会話ではほぼ動かない**（`237_probe_affinity` と `213_` の記録）。
+
+- 依頼のクリアで、同行者の全員が一律 **+20**（1回・同行者16人の全員。同行していない人は動かない）。
+  `QuestEndManager.method_1` の中で足し、その場で上の関数を呼んで感情の文も作り直す
+  （呼ばれたときの引数は足した後の値）
+- 会話を閉じた192回のうち、好感度が動いたのは1回（0 → 4。原因は未特定）。
+  会話の LLM の返答（`conversation_facilitator`）にも要約（`conversation_resolver`）にも好感度の欄は無い
+- 日数の送り（`elapse_days`）では動かない（1回・122人）
+- 会話の終わりの感情の文の作り直しは、要約（`conversation_resolver`）が返った**後**（同じ `resolve_conversation` の中）。
+  要約の関数を包んで返った直後に好感度を書くと、その会話の終わりにもう新しい値の文になる（`337_` の実機。書き込みの2ミリ秒後に作り直した）
+- 要約の頼みの返却型は `Result{summary: str}` の1項目。スキーマ文は `llm_manager:send_request` の中で型から作られる
+  （入口の本文は4件、`output_data` の記録は5件）ので、型を差し替えると足した項目もスキーマ文と grammar に出る（`337_` が使う）
 
 ### 2.26 クエストの外の判定（マスターAI の `roll_the_dice`）
 
@@ -3292,7 +3568,15 @@ Epic 版の `instantale.exe` の隣に `saves` も `worlds` も無かった。
 `image_src` は**書いた機械の絶対パス**で入っている。
 別の機械で作られた世界を持ってくると、他人のユーザー名を指したまま存在しない
 （ある世界では 95人中 93人が `C:\Users\<ユーザー名>\...` だった）。
-`worlds` から後ろだけを残して手元のデータの場所へ繋ぎ直せば当たる。
+`worlds` から後ろだけを残して手元のデータの場所へ繋ぎ直せば当たる（`323_` の `carryover.local_path`）。
+
+ゲーム自身も、その人物に話しかけたとき（会話の始まり）に経路を手元の場所へ繋ぎ直し、それを保存する。
+読み込みのときにまとめて直すことはしない（2026-10-06。別の機械で作られた世界で2回。向こうの経路のままの人物に話しかけると、会話の画面が出た時点で手元の経路になっていた。画像は作り直していない。世界の 98 人のうち手元の経路は 11 人で、ほかは向こうのユーザーフォルダのままだった。11 人がみな会話した人物かは数えていない）。
+仲間に入るのは会話の中（「雇いたい」）なので、素のゲームの仲間は加わる前に必ず直っている。
+向こうの経路のまま仲間に居るのは、会話を経ずに名簿へ入れた人物だけで、同梱の MOD にその経路は無い
+（`add_party_member` を呼ぶのは `336_` の同房の囚人だけで、こちらで新しく作る人物なので経路は最初から手元のもの）。
+スクリプトで名簿へ入れて試したときに、ゲーム自身のパーティー欄の顔が白い枠になり、`404_` の立ち絵が場面を覆う白い板になった（VERIFICATION_LOG.md §2.90）。
+発生が限られるので、`404_` は手当てしていない（2026-10-06 の判断）。
 
 `face_image.png` の大きさは揃っていない。
 実データ194件のうち 144件が 165×165、**40件は 32×64**、残り10件はまちまち。

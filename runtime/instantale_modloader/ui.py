@@ -217,6 +217,25 @@ def find_spec_button(buttons, cls_name):
     return None
 
 
+#: 戦闘の画面のボタンが呼ぶクラス（`攻撃` / `スキル・防御` / `発言する` と、スキルを選んでいる最中の `やめる`）。
+BATTLE_BUTTON_CLASSES = ("BattlePhaseManager", "SkillChoicePhaseManager",
+                         "UtteranceChoiceInBattleManager", "UtteranceInBattleManager",
+                         "CancelBattleActionManager")
+
+
+def battle_on_screen(app):
+    """いま並んでいるボタンが戦闘のものか。
+
+    ロードの直後に「戦闘の続きに戻った」かを見分けるのに使う。戦闘の最中のセーブを読むと、
+    戦闘のボタンが戻る回と場所のボタンが出る回がある。ゲームはどちらの回でもセーブの敵を
+    `current_enemy_dict` に持つので、敵の有無では見分けられない（GAME.md §2.10「戦闘の最中のセーブ」）。
+    """
+    buttons = getattr(app, "buttons", None) if app is not None else None
+    if not isinstance(buttons, list):
+        return False
+    return any(spec_cls_name(entry) in BATTLE_BUTTON_CLASSES for entry in buttons)
+
+
 def conversation_partner(buttons):
     """会話画面なら `(相手の id, 「会話を終了する」ボタン)` を返す。
 
@@ -485,13 +504,15 @@ def close_enough(value, wanted):
 # プレイヤーの所持金と、画面を出してはいけない状態
 # --------------------------------------------------------------------------
 #: ゲームが「別のこと」をしている最中を表す旗。
-#: ここが真の間は施設の選択肢を足さない（`309_` / `902_` が共有）。
-#: `300_` は **`in_shopping` を外した** ものを使う
-#: ― 店の外を往復しているだけでも真のままなので、
-#: イベントの抑止条件に使うと店系の施設でほとんど出なくなる（あちらの註を参照）。
+#: ここが真の間は施設の選択肢を足さない（`309_` / `404_` / `902_` / ModFacility が使う）。
+#:
+#: **`in_shopping` は入れない。** 店を出ても下りず、セーブにも焼かれる（GAME.md §2.6 / §2.7）。
+#: 入れていた頃は、これを写した MOD が店に寄った後ずっと黙る不具合を
+#: `300_` / `404_` / `309_` / `336_` / ModFacility で1本ずつ踏んでいた。
+#: 売買の窓が開いているかは `is_popup_window_opened`（`busy_signals`）で見る。
+#: MOD が旗を読むと `tools/check_mods.py` が落とす（`check_flag_reads`）。
 BUSY_FLAGS = ("in_battle", "in_boss_battle", "in_colosseum_battle",
-              "in_conversation", "in_free_input", "in_action_in_conversation",
-              "in_shopping")
+              "in_conversation", "in_free_input", "in_action_in_conversation")
 
 
 def money(value):
@@ -753,10 +774,12 @@ def quest_of(app, quest_id):
     return None
 
 
-def world_overview(app, limit=600):
+def world_overview(app, limit=None):
     """世界観の文（`world_data.overview`）。LLM への頼み文に入れる。無ければ空。
 
-    `save_data_dict` → `world_dict` の順に見て、先に読めた方を `limit` 字で切る。
+    `save_data_dict` → `world_dict` の順に見て、先に読めた方を返す。
+    既定では切らない。ゲーム自身の頼み文も長さに関わらず全文を載せるので、
+    MOD の側だけ設定の後ろを落とさない。`limit` に数を渡せばその字数で切る。
     `330_` / `331_` に同じ本体が写されていた。
     `405_` は別の読み方（遊んでいる世界の控えと `app.world` まで見る）なので寄せていない。
     """
@@ -765,7 +788,8 @@ def world_overview(app, limit=600):
         data = holder.get("world_data") if isinstance(holder, dict) else None
         text = data.get("overview") if isinstance(data, dict) else None
         if isinstance(text, str) and text.strip():
-            return frames.short(text.strip(), limit)
+            text = text.strip()
+            return text if limit is None else frames.short(text, limit)
     return ""
 
 
@@ -887,6 +911,206 @@ def clamp_into_window(widget):
         pass          # 座標を持たない相手。置けないだけで害は無い
 
 
+# --------------------------------------------------------------------------
+# タイトル画面の隅に出す1行（`126_` / `136_` が共有する）
+# --------------------------------------------------------------------------
+#: タイトル画面。`StartScreen.__init__` で組み上がる。
+TITLE_MODULE = "scripts.hud.hud_start"
+TITLE_CLASS = "StartScreen"
+TITLE_INIT = TITLE_MODULE + ":" + TITLE_CLASS + ".__init__"
+
+#: 隅のラベルを縦に積む箱の印。値は隅の名前（`CORNERS` の鍵）。
+CORNER_STACK_ATTR = MOD_WIDGET_PREFIX + "corner_stack"
+
+#: 積んだラベルの並び順の印（小さいほど縁に近い）。
+CORNER_ORDER_ATTR = MOD_WIDGET_PREFIX + "corner_order"
+
+#: Kivy の既定フォント。日本語を持たないので、写す相手には選ばない。
+KIVY_DEFAULT_FONT = "Roboto"
+
+
+def title_screens(max_depth=12):
+    """今出ているタイトル画面。型で見分ける（まだ import されていなければ空）。"""
+    module = sys.modules.get(TITLE_MODULE)
+    cls = frames.attr(module, TITLE_CLASS, None) if module is not None else None
+    if not isinstance(cls, type):
+        return []
+    try:
+        from kivy.core.window import Window
+
+        roots = list(Window.children)
+    except Exception:
+        return []          # Kivy が引けない環境（オフライン検証）
+    found = []
+    for root in roots:
+        found.extend(widget for widget in walk_widgets(root, max_depth=max_depth)
+                     if isinstance(widget, cls))
+    return found
+
+
+def font_from(screen, max_depth=4):
+    """画面のウィジェットからフォント名を写す。日本語を出すため（既定の Roboto は豆腐になる）。
+
+    取れなければ None（既定のままにする）。
+    """
+    import os
+
+    for widget in walk_widgets(screen, max_depth=max_depth):
+        name = frames.text_of(widget, "font_name")
+        if name and os.path.basename(name).split(".")[0] != KIVY_DEFAULT_FONT:
+            return name
+    return None
+
+
+def on_title_screen(ctx, decorate, *, key):
+    """タイトル画面に飾りを付ける。`decorate(画面)` を、今出ている画面と、後で組まれる画面の両方へ呼ぶ。
+
+    注入はウィンドウが出てから行われるので、注入した時点のタイトル画面はもう組み上がっている
+    （TECH.md §1.4）。`StartScreen.__init__` を包むだけでは目の前の画面に出ないので、
+    `on_ready` で開いている画面も探して呼ぶ。
+    `key` は MOD ごとに違う名前にする。世代を混ぜて `on_ready` の鍵にするので、
+    注入し直すと目の前の飾りも新しい版へ置き直される（TECH.md §3.6.1）。
+    `decorate` は何度呼ばれても1枚に置き直す作りにすること（`corner_label` はそうなっている）。
+    戻りは `on_ready` に積めたか（同じ世代で2回目なら False）。
+    """
+    @ctx.wrap(TITLE_INIT, safe=True)
+    def title_init(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
+        decorate(self)      # ここで壊れても safe=True が画面を守る
+        return result
+
+    def decorate_open():
+        screens = title_screens()
+        for screen in screens:
+            decorate(screen)
+        ctx.log("{}: {} title screen(s) already open".format(key, len(screens)))
+
+    return ctx.on_ready(decorate_open, key="{}:title:{}".format(key, ctx.generation))
+
+
+def _corner_stack(screen, corner, BoxLayout):
+    """画面のその隅の箱。無ければ作って足す。"""
+    for child in children_of(screen):
+        if frames.attr(child, CORNER_STACK_ATTR, None) == corner:
+            return child
+    stack = BoxLayout(orientation="vertical", size_hint=(None, None),
+                      pos_hint=dict(CORNERS.get(corner, CORNERS["右上"])))
+    setattr(stack, CORNER_STACK_ATTR, corner)
+    screen.add_widget(stack)
+    return stack
+
+
+def _refit_stack(stack, *_args):
+    """箱の大きさを、積んだラベルの文字の箱に合わせる（隅からはみ出させない）。"""
+    width = height = 0.0
+    for label in children_of(stack):
+        size = frames.attr(label, "texture_size", None) or (0, 0)
+        try:
+            label.size = size
+        except Exception:
+            pass
+        width = max(width, float(size[0]))
+        height += float(size[1])
+    try:
+        stack.size = (width, height)
+    except Exception:
+        pass
+
+
+def remove_corner_label(screen, attr):
+    """自分が前に置いたラベル（`attr` の印が付いたもの）を外す。画面の直下と隅の箱の中の両方から。"""
+    for holder in [screen] + [child for child in children_of(screen)
+                              if frames.attr(child, CORNER_STACK_ATTR, None) is not None]:
+        for child in list(children_of(holder)):
+            if frames.attr(child, attr, None) is None:
+                continue
+            try:
+                holder.remove_widget(child)
+            except Exception:
+                pass
+        if holder is not screen:
+            _refit_stack(holder)
+
+
+def corner_label(screen, attr, text, *, corner="右上", order=0, font_size=14, alpha=0.55):
+    """画面の隅に1行のラベルを置く。前に置いた同じ印のラベルは外してから置く（重ね置きしない）。
+
+    同じ隅に置いたラベルは縦に積み、`order` の小さいものほど縁に近くなる
+    （右上なら上、右下なら下）。右の隅は右寄せ、左の隅は左寄せ。
+    Kivy が引けない環境では何もしない（None を返す）。
+    """
+    try:
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+    except Exception:
+        return None
+    remove_corner_label(screen, attr)
+    corner = corner if corner in CORNERS else "右上"
+    label = Label(text=text, size_hint=(None, None), color=(1.0, 1.0, 1.0, float(alpha)),
+                  pos_hint={"right": 1} if "右" in corner else {"x": 0})
+    font = font_from(screen)
+    if font:
+        label.font_name = font
+    label.font_size = upx(font_size)
+    setattr(label, attr, True)
+    setattr(label, CORNER_ORDER_ATTR, order)
+    stack = _corner_stack(screen, corner, BoxLayout)
+    # 縦の BoxLayout は先に足したものほど上に置く。下の隅は縁（下）に近い方を後に足す。
+    from_edge = "上" in corner
+    labels = sorted(children_of(stack) + [label],
+                    key=lambda widget: frames.attr(widget, CORNER_ORDER_ATTR, 0) or 0,
+                    reverse=not from_edge)
+    for child in list(children_of(stack)):
+        stack.remove_widget(child)
+    for child in labels:
+        stack.add_widget(child)
+    # 文字が描き直されたら箱を合わせ直す。前から居たラベルは置いたときに結んである。
+    label.bind(texture_size=lambda *_a, box=stack: _refit_stack(box))
+    label.texture_update()
+    _refit_stack(stack)
+    return label
+
+
+def popup_button(text, template=None):
+    """品の右クリックの popup と同じ見た目のボタン（`402_` で実機から写した描き方）。
+
+    75×37、背景は黒 70%、文字は白 20、下地に暗い矩形、四辺に明るい 2px の縁。
+    `template`（ゲームの `ItemPopupMenu` の中の `Button`）があれば、その大きさと文字・背景を写す。
+    ゲームは店の品や仲間の品に popup を出さない（GAME.md §2.13.3）ので、MOD が同じ形のボタンを置くときに使う。
+    """
+    from kivy.uix.button import Button
+    kwargs = {"size_hint": (None, None), "size": (75, 37), "background_normal": "",
+              "background_color": (0, 0, 0, 0.7), "color": (1, 1, 1, 1), "font_size": 20}
+    if template is not None:
+        kwargs["size"] = tuple(template.size)
+        for name in ("font_size", "font_name", "background_normal", "background_down",
+                     "background_color", "color", "border"):
+            value = getattr(template, name, None)
+            if value is not None:
+                kwargs[name] = value
+    button = Button(text=text, **kwargs)
+    try:
+        from kivy.graphics import Color, Rectangle
+        with button.canvas.before:
+            Color(0.07, 0.06, 0.05, 0.5)
+            shade = Rectangle(pos=button.pos, size=button.size)
+        with button.canvas.after:
+            Color(0.8, 0.78, 0.76, 1.0)
+            edges = [Rectangle() for _ in range(4)]
+
+        def redraw(*_):
+            x, y, w, h = button.x, button.y, button.width, button.height
+            shade.pos, shade.size = (x, y), (w, h)
+            for edge, (pos, size) in zip(edges, (((x, y + h - 2), (w, 2)), ((x, y), (w, 2)),
+                                                ((x, y), (2, h)), ((x + w - 2, y), (2, h)))):
+                edge.pos, edge.size = pos, size
+        redraw()
+        button.bind(pos=redraw, size=redraw)
+    except Exception:
+        pass          # 縁が描けないだけ。ボタンとしては使える
+    return button
+
+
 def icon_strokes(icon, flipped=False):
     """共有の絵柄を **0〜1 の座標**で返す。知らない名前なら空。
 
@@ -1002,13 +1226,53 @@ def paint_icon(button, strokes, *, attr, key=(), width=2.0, alpha=0.85,
             log_exc("could not draw the icon")
 
 
-def show_widget(widget, visible):
-    """見せる／隠す。隠すときは**押せなくもする**（見えない当たり判定を残さない）。"""
+def _never_hit(*_args, **_kwargs):
+    return False
+
+
+#: 差し替えた当たり判定の印。注入し直すと ui ごと読み直されて `_never_hit` が別の関数になるので、
+#: 同一性ではなく印で見分ける（同一性で見ていたころは、前の世代で隠したウィジェットを見せても押せなかった）。
+_NEVER_HIT_MARK = "_instantale_never_hit"
+setattr(_never_hit, _NEVER_HIT_MARK, True)
+
+
+def _is_never_hit(fn):
+    return getattr(fn, _NEVER_HIT_MARK, False) is True
+
+
+def show_widget(widget, visible, *, block_touch=False):
+    """見せる／隠す。隠すときは**押せなくもし、触りを下へ通す**。
+
+    `opacity=0` と `disabled=True` だけでは、見えない当たり判定が残る。
+    Kivy（2.3.0）の `Widget.on_touch_down` は先頭で
+    `if self.disabled and self.collide_point(*touch.pos): return True` とするので、
+    無効なウィジェットは自分の矩形で触りを止め、下にある選択肢や立ち絵へ届かなくする。
+    そこで隠している間だけ `collide_point` をウィジェット自身の属性で「どこにも当たらない」に差し替える。
+    外したり縮めたりしないので、並び・置き場所・入れ物の組み立ては変わらない。
+
+    `block_touch=True` は差し替えず、隠したものの矩形で触りを止める（隠す前の版の挙動）。
+    下に在るのが自分の入れ物だけで、止めても困らないところで使う。
+    """
     try:
         widget.opacity = 1.0 if visible else 0.0
         widget.disabled = not visible
     except Exception:
         pass
+    try:
+        own = vars(widget)
+    except TypeError:
+        return            # 属性を足せない相手。見た目と無効だけで済ませる
+    if not visible and not block_touch:
+        if not _is_never_hit(own.get("collide_point")):
+            try:
+                widget.collide_point = _never_hit
+            except Exception:
+                pass
+    elif _is_never_hit(own.get("collide_point")):
+        try:
+            del widget.collide_point      # クラスの当たり判定に戻す
+        except Exception:
+            pass
 
 
 def busy_signals(app):
@@ -1025,6 +1289,25 @@ def busy_signals(app):
 
 def is_idle(app):
     return not busy_signals(app)
+
+
+def choices_painted(app):
+    """いまの選択肢（`app.to_display_buttons`）が HUD に塗り終わっているか。読めなければ True。
+
+    場面の終わりの合図（`refresh_choice_buttons`）はワーカーのスレッドから来て、
+    ゲームはその後のフレームで `update_ui` を通して選択肢を塗る。
+    その前に `process_choice` で次の場面を起こすと、遅れて来た塗りが前の場面の選択肢を描き、
+    5つ以上なら右の欄が開いたまま次の場面（戦闘の情報欄）に重なった（`316_` の実機。VERIFICATION.md §3.83）。
+    """
+    hud = find_hud(app)
+    shown = getattr(hud, "button_texts", None) if hud is not None else None
+    wanted = getattr(app, "to_display_buttons", None)
+    if shown is None or wanted is None:
+        return True
+    try:
+        return list(shown) == list(wanted)
+    except Exception:
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -1120,7 +1403,7 @@ def area_id_of(area):
 #     area_history = {"0": {"residency": {...}, "achievements": [...],
 #                           "lawfulness": 10}, ...}
 #
-# 平常値は 10 で、小さいほど手配が重く、0 未満で犯罪者（実プレイで -40 を観測）。
+# 平常値は 10 で、小さいほど手配が重く、0 未満で犯罪者（実プレイで -170 まで観測。下限には当たっていない）。
 # ゲーム側に読み書きのヘルパは無いので値を直に触る。
 # ここに置いてあるのは読み方だけで、**いくつから手配とみなすかは MOD の判断**。
 LAWFULNESS_KEY = "lawfulness"
@@ -1198,6 +1481,37 @@ def lawfulness_by_area(character):
         if value is not None:
             values[str(key)] = value
     return values
+
+
+# --------------------------------------------------------------------------
+# 能力値（GAME.md §2.17）
+# --------------------------------------------------------------------------
+#: 能力値の鍵。セーブの `ability_scores` と同じ6つ。
+ABILITY_KEYS = ("strength", "constitution", "dexterity",
+                "intelligence", "wisdom", "charisma")
+
+
+def ability_score(character, name):
+    """その人物の能力値（素の値）。読めなければ `None`。
+
+    実行時の持ち方は1つに決まっていない（`ability_scores` / セーブ由来の
+    `original_ability_scores` / キャラクタシートの `attribute_<名前>`）ので、順に当たる。
+    1つだけ見ると、読めなかったのか 0 だったのかが区別できなくなる。
+    `313_event_ability_check` の `score_of`（素の値の側）と同じ当たり方。
+    """
+    if character is None or name not in ABILITY_KEYS:
+        return None
+    raw = None
+    for holder in ("ability_scores", "original_ability_scores"):
+        table = getattr(character, holder, None)
+        if isinstance(table, dict) and table.get(name) is not None:
+            raw = table.get(name)
+            break
+    if raw is None:
+        raw = getattr(character, "attribute_" + name, None)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return raw
 
 
 # --------------------------------------------------------------------------
@@ -1448,6 +1762,50 @@ def party_member_ids(app):
             if member_id and member_id != PLAYER_ID]
 
 
+def right_panel_left_open(app):
+    """右の欄（溢れた選択肢を出す欄）が、選択肢が左の欄に収まるのに開いたままか。
+
+    右の欄 `right_button_layout` は戦闘の情報欄 `top_info_layout_battle` と同じ矩形で、
+    開いたまま戦闘に入ると情報欄に空の枠が重なる。開け閉めするのは HUD の `update_button_texts` だが、
+    HUD 自身の `in_battle` が立っている間は右の欄に触らない。戦闘に入るときはこの旗が、前の画面の
+    右の欄を閉じるより先に立つので、直前の選択肢が5つ以上だと、誰が戦闘を起こしても取り残される
+    （VERIFICATION.md §3.91。§2.59 の「MOD かゲームかでは割れない」もこれ）。
+    読めなければ False（触らない）。
+    """
+    hud = find_hud(app)
+    panel = getattr(hud, "right_button_layout", None) if hud is not None else None
+    left = getattr(hud, "buttons", None) if hud is not None else None
+    texts = getattr(app, "to_display_buttons", None) if app is not None else None
+    opacity = getattr(panel, "opacity", None)
+    if not isinstance(opacity, (int, float)) or not isinstance(left, list) or not left \
+            or not isinstance(texts, list):
+        return False
+    return opacity > 0 and len(texts) <= len(left)
+
+
+def fold_right_panel(app):
+    """取り残された右の欄を、ゲーム自身の `update_button_texts` で畳み直す。呼んだら True。
+
+    HUD の `in_battle` をその1回の呼び出しの間だけ下ろし、今の選択肢を渡す（ゲームが戦闘の外で
+    するのと同じ開け閉めが走る）。座標も `opacity` も MOD からは触らない。`in_battle` は Kivy の
+    BooleanProperty で、見張りは付いていない（実機）。待機中（点送りの最中）は呼ばない
+    （枠は点で塗られている。`paint_choices` と同じ）。
+    """
+    if not right_panel_left_open(app) or getattr(app, "is_button_enabled", None) is False:
+        return False
+    hud = find_hud(app)
+    update = getattr(hud, "update_button_texts", None)
+    if not callable(update):
+        return False
+    flag = getattr(hud, "in_battle", False)
+    try:
+        hud.in_battle = False
+        update(app, list(app.to_display_buttons))
+    finally:
+        hud.in_battle = flag
+    return True
+
+
 def paint_choices(app, texts, oops=None):
     """選択肢の文字列を実際に画面へ塗る。効いた手段の一覧を返す（`Screen.paint` の中身）。
 
@@ -1545,19 +1903,49 @@ def button_load_pending(app):
 
 
 _AFTER_LOAD_ATTR = "_instantale_after_load"
+AFTER_LOAD_DEPRECATED = (
+    "ui.refresh_choices_after_load is kept only for backward compatibility (called by {mod}). "
+    "Register the choices with the loader window `choices` instead "
+    "(choices.provide(ctx, screen, refresh=..., presses=...); TECH.md §3.3.14). "
+    "The window refreshes once the characters have arrived after a load, "
+    "and does not rely on the load_game_new wrap, which may miss a load that began before it was installed.")
+
+
+def _warn_after_load_deprecated(ctx):
+    """`refresh_choices_after_load` を呼んだ MOD に、窓口 `choices` への移行を促す（WARN は毎回書かれる）。"""
+    log = getattr(ctx, "log", None)
+    if not callable(log):
+        return
+    message = AFTER_LOAD_DEPRECATED.format(mod=getattr(ctx, "_mod", None) or "a mod")
+    try:
+        log(message, level="WARN")
+    except TypeError:
+        log("WARN " + message)        # level を受けない ctx（検査の偽物など）
 
 
 def refresh_choices_after_load(ctx, write=None, tries=12, interval=0.25):
     """ロードのあと、名簿（party）が復元されてから選択肢を 1 度組み直す。
+
+    **後方互換のために残している口**（公開している I/F なので外さない）。
+    v2.0.0（API を上げる版）で外す。TECH.md §3.9「次の API（v2.0.0）で外すもの」。
+    同梱の MOD はもう使っていない。新しく書く MOD はローダの窓口 `choices`（TECH.md §3.3.14）を使うこと。
+    窓口は人物が揃うのも待ち、ロードの包みに頼らない（この口は、包みが付く前に始まったロードでは走らないことがあった）。
+    両方が同じロードで走っても、組み直しが2回になるだけで害は無い。
 
     ロード中に本体が選択肢を組む時点では `app.party` がまだ `['player']` で、同行者との会話を
     復元しても相手が仲間だと分からない（`302_` が「ここで別れる」を落とし、`301_` が依頼の
     選択肢を足した。実機）。名簿に同行者が入るまで（上限 `tries` 回、`interval` 秒おき）待ってから
     `refresh_choice_buttons()` を 1 度呼び、画面にも塗る（`paint_choices`。組み直すだけでは文字が
     古いままで、押される処理と食い違った。実機）。同行者が居ないセーブでは上限で 1 度呼ぶ（害は無い）。
+    待っている間に待機（`is_button_enabled` が False）に入ったら、組み直さずに降りる。
+    プレイヤーが既に押した後で、ここで組み直すと点の上に一覧が塗られ、点送りも `.` からやり直しになる
+    （GAME.md §2.4）。待機の終わりにゲーム自身が `refresh_choice_buttons` して塗るので、組み直しはそこで済む。
     何本の MOD が呼んでも、1 回のロードで組み直すのは 1 度（後から入った層の見張りが勝つ）。
     Kivy の Clock が無ければ（ゲームの外）何もしない。
+
+    呼ばれるたびに `modloader.log` へ WARN で移行を促す（呼んだ MOD の名前つき）。
     """
+    _warn_after_load_deprecated(ctx)
     shared = getattr(sys, _AFTER_LOAD_ATTR, None)
     if not isinstance(shared, dict):
         shared = {"token": None}
@@ -1577,6 +1965,12 @@ def refresh_choices_after_load(ctx, write=None, tries=12, interval=0.25):
         def check(_dt):
             if shared.get("token") is not token:
                 return False                          # 別の層（または次のロード）が引き継いだ
+            if getattr(self, "is_button_enabled", None) is False:
+                shared["token"] = None                # 待機中。終わりにゲームが組み直す
+                if write:
+                    write("skipped the refresh after the load (waiting, party={})".format(
+                        party_ids(self)))
+                return False
             left[0] -= 1
             if not party_member_ids(self) and left[0] > 0:
                 return True

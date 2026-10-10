@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""この MOD が作った NPC の台帳。セーブの外に、世界ごとに持つ。
+"""この MOD が作った NPC の台帳。セーブの外に、周回（世界×主人公）ごとに持つ。
 
 ##### なぜ外部ファイルなのか
 
@@ -23,9 +23,10 @@
 [{"id": "76", "name": "流れ者のミレイユ"}, ...]
 ```
 
-ファイルは1世界に1つで、出し入れはローダの `state.WorldStore` が持つ
-（`state/city_case/<世界>.cast.json`）。
-**世界の区別をこのファイルの中に持たない。**
+ファイルは1周回に1つで、出し入れはローダの `state.WorldStore` が持つ
+（`state/city_case/<世界>×<主人公>.cast.json`）。
+台帳に載る NPC はその周回のセーブにしか居ないので、同じ世界で主人公を作り直したら引き継がない。
+**世界や周回の区別をこのファイルの中に持たない。**
 以前は `{"worlds": {...}}` で1ファイルにまとめていたが、
 置き場所の決め方はローダの語彙で、MOD ごとに別の形を持つ理由が無い
 （TECH.md §3.2.3。`WorldStore` の docstring に、写された9本で既にずれていた経緯がある）。
@@ -76,13 +77,25 @@ def add(rows, npc_id, name):
     """作った1体を控える。作った直後に呼ぶこと。
 
     事件の控えに書く前に落ちても掃除できるように、`make_npc` が通ったその場で足す。
-    二重に足さない。
+    二重に足さない。同じ id で名前が違えば、作り直した別人として名前を合わせる。
     """
-    if any(isinstance(row, dict) and str(row.get("id")) == str(npc_id)
-           for row in rows):
-        return False
+    for index, row in enumerate(rows):
+        if isinstance(row, dict) and str(row.get("id")) == str(npc_id):
+            if name and row.get("name") != name:
+                # 同じ id で作り直した別人。名前を合わせないと、決着で別人と見て消し損ねる（`same_person`）
+                rows[index] = {"id": str(npc_id), "name": name}
+                return True
+            return False
     rows.append({"id": str(npc_id), "name": name})
     return True
+
+
+def name_of(rows, npc_id):
+    """控えた名前。台帳に無いか、名前を控えていなければ None。"""
+    for row in rows or ():
+        if isinstance(row, dict) and str(row.get("id")) == str(npc_id):
+            return row.get("name") or None
+    return None
 
 
 def drop(rows, npc_id):

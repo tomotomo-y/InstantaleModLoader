@@ -44,7 +44,7 @@ import os
 import sys
 from typing import Any, Callable
 
-from . import GAME_TOPLEVEL, log, log_exc
+from . import GAME_TOPLEVEL, log, log_exc, log_unrepeated
 from . import patch_registry as _registry
 
 # 元に戻すための記録。
@@ -176,6 +176,39 @@ def _defer_if_not_imported(target: str, kind: str) -> bool:
     _registry.record(_registry.DEFERRED, target, detail=mod_name)
     log("defer {} {} ({} is not imported yet)".format(kind, target, mod_name))
     return True
+
+
+def await_module(mod_name: str, *needs: str):
+    """`apply()` の中でモジュールの中身を使う MOD のための入口。揃っていればモジュール、まだなら None。
+
+        functions = patch.await_module("scripts.functions", "get_npc_employ_price")
+        if functions is None:
+            return          # 来たらローダが当て直す
+
+    まだ import されていない・読み込みの途中で `needs` の属性が揃っていないときは、
+    `wrap` がモジュールの不在で積むのと同じ保留に積む（TECH.md §3.4）。モジュールが現れたら
+    ローダが当て直すので、MOD は None なら降りるだけでよい。
+    `sys.modules` を見て自分で降りると保留に載らず、ほかに保留が無い構成では
+    その起動で一度も当たらなかった（`100_` / `101_` / `103_` / `108_` / `123_` / `128_`）。
+    読み込みを終えていて属性が無いのは本物の欠け（打ち間違い・ゲームの更新）なので、積まずに返す。
+    """
+    module = sys.modules.get(mod_name)
+    if module is None:
+        _pending_modules.add(mod_name)
+        _registry.record(_registry.DEFERRED, mod_name + ":", detail=mod_name)
+        log("defer {} (not imported yet)".format(mod_name))
+        return None
+    if _still_loading(mod_name):
+        missing = [name for name in needs if getattr(module, name, None) is None]
+        if missing:
+            for name in missing:
+                _pending_owners.add("{}:{}".format(mod_name, name))
+            _registry.record(_registry.DEFERRED, "{}:{}".format(mod_name, missing[0]),
+                             detail=mod_name)
+            log("defer {} ({} still being imported; waiting for {})".format(
+                mod_name, mod_name, ", ".join(missing)))
+            return None
+    return module
 
 
 def _still_loading(mod_name: str) -> bool:
@@ -516,7 +549,10 @@ def set_attr(target: str, value: Any, *, alias_scan: Any = True,
     current, descriptor = _current(owner, name)
     original = unwrap_ours(current)
     if original is not current:
-        log("  replacing a previous patch layer on {}".format(target))
+        # 同じ注入の前の boot の層なら数えるだけ。前の注入の層なら対象ごとに書く（`note_replaced`）。
+        from . import note_replaced
+        if not note_replaced(getattr(current, GENERATION_MARK, None)):
+            log_unrepeated("  replacing a previous patch layer on {}".format(target))
 
     # 元々その属性が存在したかどうかも記録しておく。
     # 存在しなかったものは、戻すときに
@@ -543,8 +579,12 @@ def set_attr(target: str, value: Any, *, alias_scan: Any = True,
                 rebound += rebind_aliases(stale, value, skip=skip, scope=scope)
         if rebound:
             unique = list(dict.fromkeys(rebound))
-            log("  rebound {} alias(es): {}".format(
-                len(unique), ", ".join(unique[:8]) + (" ..." if len(unique) > 8 else "")))
+            # 対象の名前を行に入れる。前は直後の `wrapped <対象>` の行で読んでいたが、
+            # 遅れて当て直す boot ではその行を省く（`log_unrepeated`）ので、
+            # 張り替えが次の別の対象の行に付いて見えていた。
+            log_unrepeated("  rebound {} alias(es) of {}: {}".format(
+                len(unique), target,
+                ", ".join(unique[:8]) + (" ..." if len(unique) > 8 else "")))
     return original
 
 
@@ -606,6 +646,14 @@ def patch(target: str, *, alias_scan: Any = True, required: bool = True,
         # update_wrapper は元の関数の __dict__ をコピーするので、
         # 先に設定すると上書きされて消える。
         installed.__original__ = old
+        if installed is not func:
+            # `safe=True` では差し込むのは `_guard` のラッパで、MOD の関数本体には印が付かない。
+            # しかも `update_wrapper` が下の層の `__original__` を写しているので、置換関数の中の
+            # `__original__`（TECH.md §3.1.3）が1段飛ばすか、層が無ければ AttributeError になっていた。
+            try:
+                func.__original__ = old
+            except Exception:
+                pass
         setattr(installed, PATCH_MARK, target)
         setattr(installed, GENERATION_MARK, _generation)
         setattr(installed, HOOK_MODULE_MARK, hook_module)
@@ -833,7 +881,7 @@ def wrap(target: str, *, alias_scan: Any = True, required: bool = True,
         set_attr(target, wrapper, alias_scan=alias_scan)
         _registry.record(_registry.APPLIED, target,
                          detail="wrap safe" if safe else "wrap")
-        log("wrapped {} ({!r}){}".format(target, _short(old), " [safe]" if safe else ""))
+        log_unrepeated("wrapped {} ({!r}){}".format(target, _short(old), " [safe]" if safe else ""))
         # ゲームに差し込むのは wrapper だが、返すのは func 自身。
         # こうしておくと、デコレートした名前で mod の中から直接呼べる。
         return func
@@ -924,8 +972,13 @@ def drop_stale_layers() -> list[str]:
                 value = getattr(value, "__original__", None)
             if value is current:
                 continue
-            if value is None and not existed:
-                delattr(owner, name)        # 前の世代が新設した名前
+            bottom = value is None or not any(hasattr(value, mark) for mark in _LEGACY_MARKS)
+            if bottom and not existed:
+                # 前の世代が新設した名前か、継承しただけの属性に置いた層。持ち主の辞書から消す
+                # （基底の写しを置くと、基底に今の世代が当てた層をサブクラスだけ素通りする）
+                if _had_own(owner, name):
+                    delattr(owner, name)
+                value = _current(owner, name)[0]
             elif descriptor is None:
                 setattr(owner, name, value)
             else:
@@ -943,6 +996,37 @@ def drop_stale_layers() -> list[str]:
         log("dropped {} layer(s) left by earlier injections: {}".format(
             len(dropped), ", ".join(dropped[:8]) + (" ..." if len(dropped) > 8 else "")))
     return dropped
+
+
+# 保存の関所（`modnpc` / `modfacility` / `prices`）の書き手。部品の名前 → MOD が渡した `write`。
+# 関所の包みは立てたときの `write` を閉じ込める。ローダが前の世代の関所を MOD より先に立て直すと
+# （`__init__._keep_save_gates`）、関所の行が MOD のログからローダのログへ移ってしまうので、
+# ローダは `gate_writer` の中継を渡し、部品の `install` は呼ばれるたびに `note_gate_writer` で書き手を置く。
+_GATE_WRITERS_ATTR = "__instantale_gate_writers__"
+
+
+def _gate_writers() -> dict:
+    found = getattr(sys, _GATE_WRITERS_ATTR, None)
+    if not isinstance(found, dict):
+        found = {}
+        setattr(sys, _GATE_WRITERS_ATTR, found)
+    return found
+
+
+def note_gate_writer(name: str, write) -> None:
+    """関所の部品 `name` の行を、これからは `write` へ書く（`install` が呼ぶ）。中継そのものは置かない。"""
+    if write is not None and not getattr(write, "_iml_gate_forward", False):
+        _gate_writers()[name] = write
+
+
+def gate_writer(name: str, fallback):
+    """関所の部品 `name` の行を、その時に置かれている書き手へ渡す関数。無ければ `fallback`。"""
+    def forward(msg):
+        target = _gate_writers().get(name) or fallback
+        if target is not None and target is not forward:
+            target(msg)
+    forward._iml_gate_forward = True
+    return forward
 
 
 def active() -> list[str]:

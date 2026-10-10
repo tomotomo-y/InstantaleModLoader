@@ -50,7 +50,7 @@
   **読むだけ**で使う（`WorldStore(own=False)`。TECH.md §3.2.3）。
   いまの接続で BFS し直さないのは、開いた道自体が辺になっていて必ず「隣」に
   なってしまうため。`325_` が無ければ挟む街の数は常に 0 ＝ 素の移動は不変。
-  距離補正で日数が**増える**方向（90 → 270）は、こちらが決める側に回った回に効く。
+  距離補正で日数が**増える**方向（上限を上げたときの 90 → 270）は、こちらが決める側に回った回に効く。
   他の MOD が起こした移動（`307_` の危険な道）では決める側にならないので、
   そこでは頭打ちだけになる
 
@@ -71,7 +71,7 @@ import os
 import sys
 import time
 
-from instantale_modloader import durations, ui
+from instantale_modloader import choices, durations, ui
 from instantale_modloader.state import UNKNOWN_WORLD, WorldStore, playthrough_key, world_key
 
 LOG_BASENAME = "area_move_custom.log"
@@ -408,9 +408,11 @@ def apply(ctx):
         """
         origin = ui.area_id_of(ui.current_area(app)) if app is not None else ""
         hops = road_hops(app, origin, target_area_id) if target_area_id else 0
+        # 0 日も答えの1つ（設定の下限は 0）。`or` で素の値へ倒すと、0 日の移動を素の日数と答えた
+        walk, coach = days_limit("walk", hops), days_limit("coach", hops)
         return {
-            "walk_days": days_limit("walk", hops) or GAME_WALK_DAYS,
-            "coach_days": days_limit("coach", hops) or GAME_COACH_DAYS,
+            "walk_days": GAME_WALK_DAYS if walk is None else walk,
+            "coach_days": GAME_COACH_DAYS if coach is None else coach,
             "coach_fare": fare_for(hops),
         }
 
@@ -529,8 +531,7 @@ def apply(ctx):
         return result
 
     # ============================================================ 手持ちの確認
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
+    def on_button_press(self, entry, button_index):
         """設定した運賃に手持ちが満たないときは、押された時点で断る。
 
         ゲームのボタンは触らず押下だけ握る。
@@ -555,10 +556,56 @@ def apply(ctx):
                                 fare, hops, gold))
                             screen.say(self, fmt(REFUSE_TEXT, name=COACH_NAME,
                                                  price=fare, gold=gold))
-                            return None
+                            return True
         except Exception:
             ctx.log_exc("area move custom: fare check failed")
-        return orig(self, button_index, *args, **kwargs)
+        return False
+
+    def game_label(kind):
+        """素のゲームが確認画面に書く文言（実測: `徒歩(3ヵ月)` / `馬車(1000G)`）。"""
+        if kind == "walk":
+            return "徒歩({}ヵ月)".format(GAME_WALK_DAYS // 30)
+        return ui.rewrite_coins("馬車({}G)".format(state["game_price"] or GAME_COACH_PRICE))
+
+    def relabel_restored(app, buttons):
+        """組み直しの前。確認画面の徒歩・馬車の文言を、今の設定で付け直す。
+
+        セーブに残るのは文言そのもので、ロードの後は `update_button_display` が走らない。
+        設定を変えてから、確認画面で保存したセーブを読むと、保存した時の運賃・日数が出ていた
+        （引かれるのは今の設定の額）。素のゲームの文言から `relabel` し直すので、
+        どの画面でも `confirmation_buttons` と同じ文言になる。
+        ふだんの確認画面ではゲームが `update_button_display` の中で組み直すので、こちらが先に付ける。
+        素の運賃は、文言がゲームの書式（`馬車(1000G)`）のときだけ読む。
+        自分の書いた文言から読むと、保存した時の運賃を素の運賃と取り違える。
+        """
+        try:
+            options = move_options(buttons)
+            if not options:
+                return
+            refresh_world(app)
+            origin_id = ui.area_id_of(ui.current_area(app))
+            hops = road_hops(app, origin_id, str(options[0][1][0]))
+            for entry, argv in options:
+                kind = kind_of_mode(argv[1])
+                if kind is None:
+                    continue
+                old = entry.get("text") or ""
+                if kind == "coach":
+                    price = ui.parse_coin(old)
+                    if price is not None                             and old == ui.rewrite_coins("馬車({}G)".format(price)):
+                        state["game_price"] = price
+                base = game_label(kind)
+                new = relabel(kind, base, hops) or base
+                if new != old:
+                    entry["text"] = new
+                    if kind == "coach":
+                        state["our_coach_label"] = new
+                    write("label: {!r} -> {!r} ({}; before the repaint)".format(old, new, kind))
+        except Exception:
+            ctx.log_exc("area move custom: cannot relabel the restored buttons")
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, refresh=relabel_restored, intercept=on_button_press)
 
     # ============================================================ 移動の窓
     @ctx.wrap("__main__:AreaMoveManager.__init__", required=False, safe=True)

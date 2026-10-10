@@ -41,6 +41,7 @@
 """
 
 import sys
+import threading
 
 from instantale_modloader import ui
 
@@ -205,12 +206,16 @@ def apply(ctx):
             # 一覧を開き直したとき「自分の書いたラベルを素の名前と取り違えない」ため、
             # そして押された文字列を素の名前へ戻すため。
             "labels": {},
-            # いま `AreaMoveCofirmation.execute` の中に居るかの窓。
-            "confirm": None,
+            # いま `AreaMoveCofirmation.execute` の中に居るかの窓。スレッドの id → 窓。
+            # 開いたスレッドの `add_text` だけに効かせる
+            # （1枠だと、同じ間に別のスレッドが書いた無関係な本文にも帯が付きうる。`125_` と同じ）。
+            "confirm": {},
             # 落とし所（自前走査）へ下がったことを一度だけ書く印。
             "scan_warned": False,
         }
         setattr(sys, STATE_STORE_ATTR, state)
+    if not isinstance(state.get("confirm"), dict):
+        state["confirm"] = {}       # 1枠だった前の版が残した控え（注入し直したとき）
 
     # ============================================================ 帯を引く
     def difficulties_of(app, area):
@@ -360,9 +365,11 @@ def apply(ctx):
                 if target_id is not None else None
             if SHOW and area is not None:
                 name = getattr(area, "name", None) or ""
-                if isinstance(choice_text, str) and name \
-                        and choice_text == state["labels"].get(str(target_id)) \
-                        and choice_text != name:
+                # ロードで戻った一覧はセーブの文言のままで、控え（`labels`）は起動し直すと空になる。
+                # この spec でゲームが書く文言は土地の名前そのものなので、名前を含む別の文字列は自分の帯付きとみなす
+                if isinstance(choice_text, str) and name and choice_text != name \
+                        and (choice_text == state["labels"].get(str(target_id))
+                             or name in choice_text):
                     write("choice text {!r} -> {!r} (our label, restored)".format(
                         choice_text, name))
                     choice_text = name
@@ -370,14 +377,14 @@ def apply(ctx):
                 if label is not None:
                     window = {"name": name, "label": label, "values": values,
                               "seen": 0}
-                    state["confirm"] = window
+                    state["confirm"][threading.get_ident()] = window
         except Exception:
             ctx.log_exc("area difficulty label: cannot open the confirmation window")
             window = None
         try:
             return orig(self, choice_text, *args, **kwargs)
         finally:
-            state["confirm"] = None
+            state["confirm"].pop(threading.get_ident(), None)
             if window is not None and CONFIRM_TEXT and not window["seen"]:
                 try:
                     line = fmt(CONFIRM_TEXT, **window["values"])
@@ -392,7 +399,7 @@ def apply(ctx):
     def add_text(orig, self, context=None, *args, **kwargs):
         """確認画面の窓の間だけ、土地の名前を含む文言に帯を添える。"""
         try:
-            window = state["confirm"]
+            window = state["confirm"].get(threading.get_ident())
             if window is not None and isinstance(context, str) and context.strip():
                 name = window["name"]
                 label = window["label"]
@@ -415,7 +422,10 @@ def apply(ctx):
     empty = band_text(band_values([], 1))
     guess = band_text(estimate_values("8", 1))
     survives = fmt("{name}と{typo}", name="砦")
-    if ranged == "21〜30" and single == "8" and empty == (BAND_UNKNOWN or None) \
+    # 期待値も設定の表記から組む（固定の文字列で比べると、帯の表記を変えた人に毎回 ERROR が出た）
+    if ranged == fmt(BAND, lv_min=21, lv_max=30, min=20, max=29, count=3) \
+            and single == fmt(BAND_SINGLE, lv_min=8, lv_max=8, min=7, max=7, count=1) \
+            and empty == (BAND_UNKNOWN or None) \
             and guess == fmt(BAND_ESTIMATE, lv_min=68, lv_max=77, min=67, max=76,
                              count=0) \
             and survives == "砦と{typo}":

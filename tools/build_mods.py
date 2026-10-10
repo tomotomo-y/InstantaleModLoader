@@ -79,7 +79,7 @@ CONTRIB_HEAD = "## 提供（4xx）"
 #: **末尾の名乗りは `mod.json` の `author` から組む**（`contrib_credit`）。
 #: 以前ここは「この節の3本は MoririnJP 様の提供」という固定の文字列で、
 #: 4本目（`404_party_talk`）が入った時点で嘘になっていた。
-CONTRIB_INTRO = r"""ユーザから提供を受けて取り込んだ MOD。
+CONTRIB_INTRO = r"""外部の MOD 作者から提供を受けて取り込んだ MOD。
 `4xx` の番号は出どころを表すもので、中身の種別は他の帯と同じく
 `mod.json` の `"kind"` が名乗る（提供された計測 MOD は 2xx に入る。`223_` がそれ）。
 取り込みの際にこちらの環境へ合わせて調整しており、経緯は各 MOD の説明にある。"""
@@ -108,6 +108,7 @@ BANDS = (
         "103_fix_eventlog_trim",
         "104_balance_area_bgm",
         "105_fix_schema_compact",
+        "139_fix_quest_generation_runaway",
         "106_fix_battle_bgm_restore",
         "107_fix_battle_flag_stuck",
         "108_fix_shop_inventory_overflow",
@@ -119,8 +120,11 @@ BANDS = (
         "128_item_image_variety",
         "129_balance_item_price",
         "134_balance_item_effects",
+        "142_balance_quest_stamina",
         "135_fix_inn_button_order",
         "137_fix_npc_skill_uses",
+        "138_fix_character_image_refresh",
+        "140_fix_busy_dots_speed",
         "130_currency_unit",
         "131_sharp_portrait",
         "132_npc_variety",
@@ -142,6 +146,7 @@ BANDS = (
         "121_ui_character_sheet",
         "118_batch_message_render",
         "122_ui_conversation_log",
+        "141_ui_free_input_echo",
         "133_ui_area_difficulty",
         "119_fix_crime_attribution",
     )),
@@ -181,6 +186,9 @@ BANDS = (
         "332_training_custom",
         "333_equipment_slots",
         "334_colosseum_custom",
+        "335_player_portrait_regenerate",
+        "336_crime_overhaul",
+        "337_conversation_affinity",
     )),
     #: 提供（4xx）は出どころの帯なので kind を固定しない（TECH.md §3.2.2）。
     (None, CONTRIB_HEAD, (
@@ -190,6 +198,8 @@ BANDS = (
         "404_party_talk",
         "405_regional_economy",
         "406_gemini_user_role_fix",
+        "407_npc_starting_equipment",
+        "408_visual_changes_based_on_equipment",
     )),
 )
 

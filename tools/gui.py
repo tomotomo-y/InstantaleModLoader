@@ -75,7 +75,7 @@ OUT_DIR = os.path.join(ROOT, "out")
 STATUS_PATH = os.path.join(OUT_DIR, ml.STATUS_NAME)
 # 取った Release の本文の控え（`fetch_notes`）。
 # 一度取れたら、次からはネットに出ずに読める。
-# out/ に置くのは、消しても次に読むときに取り直すだけだから（ログの世代送りは *.log しか触らない）。
+# out/ に置くのは、消しても次に読むときに取り直すだけだから（ログの世代送りは *.log と *.jsonl しか触らない）。
 NOTES_CACHE = os.path.join(OUT_DIR, "release_notes.json")
 
 # MOD が持つ永続データ（進行中の道中、依頼の出所、NPC の控え）。
@@ -119,6 +119,7 @@ SHIPPED_DEFAULTS = {
         "eed09e88fadb113baf3e96b795c53a0b00c1e447",     # v1.4.0
         "91d670b9ca9f81c0fdd453ba2b1007a1afcca6cb",     # v1.6.0
         "cab6170e4b537e29014cbe171703bf047c2f9b36",     # v1.7.1
+        "2f67004e1b1fba4541ab38608e29847f5c8c07e7",     # v1.15.0
         # personal 取り込み時に default へ載っていた履歴（本家に無い版）
         "5442073051b3c7b305624697bf4638086a76d088",
         "f05e2814b84ba9487a87e9671e6d2210a3ad4d6d",
@@ -335,20 +336,91 @@ def extract_release(zip_path: str, dest: str = ROOT) -> int:
     # 書き先は絶対パスにして dest の中かを確かめる（`install_from_zip` と同じ）。
     # `..` を見るだけでは、Windows でドライブ名（`C:`）や `\` を含む名前が dest の外を指す。
     base = os.path.abspath(dest)
+    # 比べる頭は区切りで終わる形にする（`base + os.sep` は、ドライブ直下では区切りが2つ続いて何にも当たらず、全部を飛ばした）。
+    prefix = os.path.join(base, "")
+    # 配布物の `load_order.json` は上書きされるので、手元の入切と足した MOD を先に控える。
+    # 控えはファイルにも置く。展開が途中で落ちると `load_order.json` は新しい版に替わっているので、
+    # やり直したときにそれを「前の版」と読むと、入切と足した MOD が戻らない。
+    order_file = os.path.join(base, "runtime", "mods", ml.ORDER_NAME)
+    carried = os.path.join(base, "out", UPDATE_ORDER_NAME)
+    old_order = _read_order(carried)
+    if old_order is None:
+        old_order = _read_order(order_file)
     with zipfile.ZipFile(zip_path) as z:
+        # 壊れた要素は書き始める前に見つける（途中で落ちると新旧が混ざる）。
+        broken = z.testzip()
+        if broken is not None:
+            raise RuntimeError("zip の中身が壊れています: {}".format(broken))
+        if old_order is not None and not os.path.isfile(carried):
+            os.makedirs(os.path.dirname(carried), exist_ok=True)
+            if not ml.write_json(carried, old_order, indent=2):
+                raise OSError("cannot write {}".format(carried))
         for info in z.infolist():
             parts = info.filename.split("/")[1:]
             if info.is_dir() or not parts or ".." in parts:
                 continue
             path = os.path.abspath(os.path.join(base, *parts))
-            if not path.startswith(base + os.sep):
+            if not path.startswith(prefix):
                 continue
             os.makedirs(os.path.dirname(path), exist_ok=True)
             keep_edited_default(path)
             with z.open(info) as src, open(path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             count += 1
+    if old_order is not None:
+        carry_order(order_file, old_order)
+    try:
+        os.remove(carried)
+    except OSError:
+        pass
     return count
+
+
+#: 更新の展開の前に控える順序ファイルの写し（`out\` の下）。展開を終えたら消す。
+UPDATE_ORDER_NAME = "update_order.json"
+
+
+def _read_order(path: str):
+    """順序ファイルを `{"order", "disabled"}` で読む。無い・読めなければ None。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {key: [name for name in data.get(key) or [] if isinstance(name, str)]
+            for key in ("order", "disabled")}
+
+
+def carry_order(path: str, old: dict) -> bool:
+    """展開し直した `load_order.json` へ、前のファイルの入切と手元で足した MOD を書き戻す。書いたら真。
+
+    `"disabled"` は前に切っていて今も在る MOD を足す（新しい版で配る側が切ったものはそのまま）。
+    前の `"order"` にだけ在る名前（手で入れた MOD。9xx は順序ファイルに載らないと読まれない）は、
+    フォルダが在れば末尾へ足す。
+    並べ替えは戻さない。配る側が順序を直した版では、前の並びが新しい `after` の宣言とぶつかる。
+    """
+    new = _read_order(path)
+    if new is None:
+        return False
+    mods_dir = os.path.dirname(path)
+    # `local\` の MOD も順序ファイルに載らないと読まれない（`discover`）。
+    homes = (mods_dir, ml._local_mods_dir(mods_dir))
+
+    def present(name):
+        return name in new["order"] or any(
+            os.path.isfile(os.path.join(home, name, ml.MANIFEST_NAME)) for home in homes)
+
+    order = list(new["order"])
+    order += [name for name in old["order"] if name not in order and present(name)]
+    off = set(new["disabled"]) | {name for name in old["disabled"] if present(name)}
+    # `write_order` と同じく、無効一覧は順序の並びで書く（順序に無い名前は後ろ）。
+    disabled = [name for name in order if name in off]
+    disabled += sorted(off - set(disabled))
+    if order == new["order"] and set(disabled) == set(new["disabled"]):
+        return False
+    return ml.write_json(path, {"order": order, "disabled": disabled}, indent=2)
 
 
 FIND_POLL = 1.0      # ゲームのプロセスを探す間隔（秒）
@@ -903,6 +975,10 @@ def update_config(**values) -> None:
 # 1000x620 では、選んだ瞬間に説明が伸びて一覧が潰れ、窓の下が詰まっていた。
 GEOMETRY_DEFAULT = "1180x760"
 
+#: 設定ダイアログの高さを決めるときに、画面の高さとして見る上限。
+#: ダイアログの高さはこれと画面の高さの低いほうの 85% まで。超える分は巻き取りで見せる。
+DIALOG_SCREEN_CAP = 1080
+
 
 def _on_screen(root: tk.Misc, geom: str) -> bool:
     """`WxH+X+Y` が画面の中に居るか。
@@ -1006,6 +1082,7 @@ def install_from_zip(zip_path: str) -> list[str]:
                 if not target.startswith(dest + os.sep) and target != dest:
                     continue
                 os.makedirs(os.path.dirname(target), exist_ok=True)
+                keep_edited_default(target)     # 書き換えた同梱の既定を手元の名前へ逃がす（更新と同じ）
                 with zf.open(member) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
             installed.append(folder)
@@ -1022,7 +1099,10 @@ def install_from_folder(src: str) -> str:
     dest = os.path.join(MODS_DIR, folder)
     if os.path.abspath(dest) == src:
         return folder      # もう mods/ の中にある
-    shutil.copytree(src, dest, dirs_exist_ok=True)
+    def copy(source, target, *, follow_symlinks=True):
+        keep_edited_default(target)     # 書き換えた同梱の既定を手元の名前へ逃がす（更新と同じ）
+        return shutil.copy2(source, target, follow_symlinks=follow_symlinks)
+    shutil.copytree(src, dest, dirs_exist_ok=True, copy_function=copy)
     return folder
 
 
@@ -1095,7 +1175,20 @@ class SettingsDialog(tk.Toplevel):
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         row = 1
+        group = ""
         for name, decl in mod["settings"].items():
+            # 見出し（`"group"`）が変わる所で区切る。同じ見出しは並んでいる間だけまとまる。
+            heading = decl.get("group", {}).get("ja", "")
+            if heading and heading != group:
+                # 2つ目からは線も引く。見出しの字は控えめなので、字だけだと境目が弱い。
+                if row > 1:
+                    ttk.Separator(frame).grid(row=row, column=0, columnspan=2,
+                                              sticky="ew", pady=(12, 6))
+                    row += 1
+                ttk.Label(frame, text=heading, style="Group.TLabel").grid(
+                    row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+                row += 1
+            group = heading
             value = chosen.get(name, decl["default"])
             ttk.Label(frame, text=decl["label"]["ja"]).grid(
                 row=row, column=0, sticky="w", padx=(0, 10), pady=3)
@@ -1111,7 +1204,12 @@ class SettingsDialog(tk.Toplevel):
                 row += 1
             # 既定値を必ず見せる。
             # 「元に戻したい」ときに何に戻すのかが分かるように。
-            ttk.Label(frame, text="既定: {!r}".format(decl["default"]),
+            # 表示名のある選択肢は、欄と同じ表示名で見せる（値の綴りと見比べさせない）。
+            default_text = repr(decl["default"])
+            if decl["type"] == "choice" and \
+                    C.choice_text(decl, decl["default"]) != str(decl["default"]):
+                default_text = C.choice_text(decl, decl["default"])
+            ttk.Label(frame, text="既定: " + default_text,
                       style="Faint.TLabel").grid(row=row, column=1, sticky="w")
             row += 1
 
@@ -1170,7 +1268,10 @@ class SettingsDialog(tk.Toplevel):
         self.update_idletasks()
 
         natural = self.winfo_reqheight()        # 余白 + 中身 + ボタンの列
-        limit = int(self.winfo_screenheight() * 0.85)
+        # 画面が高くても、縦 1080 の画面と同じ高さで止める。
+        # 画面の高さだけで決めていたので、縦 1440 の画面では 1224 まで伸び、
+        # 設定の多い MOD は窓が縦 1080 を超えていた。
+        limit = int(min(self.winfo_screenheight(), DIALOG_SCREEN_CAP) * 0.85)
         if natural <= limit:
             self.scroll.grid_remove()
             return natural
@@ -1195,9 +1296,10 @@ class SettingsDialog(tk.Toplevel):
             var = tk.BooleanVar(value=bool(value))
             return ttk.Checkbutton(parent, variable=var), var
         if kind == "choice":
-            var = tk.StringVar(value="" if value is None else str(value))
+            # 欄には表示名（`value_labels`）を出す。値へ戻すのは `_ok` の `choice_value`。
+            var = tk.StringVar(value=C.choice_text(decl, value))
             box = ttk.Combobox(parent, textvariable=var, state="readonly",
-                               values=[str(v) for v in decl["values"]])
+                               values=[C.choice_text(decl, v) for v in decl["values"]])
             return box, var
         # int / float / str。
         # int / float の空欄は「未指定」（allow_null の設定で許される）。
@@ -1210,6 +1312,8 @@ class SettingsDialog(tk.Toplevel):
             default = decl["default"]
             if decl["type"] == "bool":
                 var.set(bool(default))
+            elif decl["type"] == "choice":
+                var.set(C.choice_text(decl, default))
             else:
                 var.set("" if default is None else str(default))
 
@@ -1217,6 +1321,8 @@ class SettingsDialog(tk.Toplevel):
         chosen, bad = {}, []
         for name, (decl, var) in self.vars.items():
             raw = var.get()
+            if decl["type"] == "choice":
+                raw = C.choice_value(decl, raw)
             if isinstance(raw, str) and raw.strip() == "" \
                     and decl["type"] != "str":
                 # 空欄 = 未指定。
@@ -1227,7 +1333,7 @@ class SettingsDialog(tk.Toplevel):
                 raw = None
             ok, value, why = C.coerce(decl, raw)
             if not ok:
-                bad.append("{}: {}".format(decl["label"]["ja"], why))
+                bad.append("{}: {}".format(C.full_label(decl), why))
                 continue
             # 既定と同じなら書かない（上記の docstring 参照）。
             if value != decl["default"]:
@@ -2546,7 +2652,7 @@ class App(ttk.Frame):
                              "（計測用・取込済・開発中の MOD は読み込まれません）")
 
     def _toggle_log_rotate(self) -> None:
-        """out/*.log を注入のたびに新しくするかを切り替える。
+        """out/*.log と *.jsonl を注入のたびに新しくするかを切り替える。
 
         書き先はデバッグモードと同じ `settings/loader.json`。
         読むのは `tools/logrotate.py` で、優先順位はコマンドライン → 環境変数 → このファイル →
@@ -2840,7 +2946,10 @@ class App(ttk.Frame):
         try:
             if game_path:
                 report("ゲームを起動中…")
-                subprocess.Popen([game_path], cwd=os.path.dirname(game_path))
+                # `InstantaleModLoader.bat` が GUI のために立てる `PYTHONUTF8` はゲームへ渡さない
+                # （Epic から起動したときと同じ環境で動かす）。
+                env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONUTF8"}
+                subprocess.Popen([game_path], cwd=os.path.dirname(game_path), env=env)
 
             report("ゲームのプロセスを検索中…")
             pid = None
@@ -2891,8 +3000,12 @@ class App(ttk.Frame):
             payload = injector.make_bootstrap(
                 injector.RUNTIME_DIR, injector.OUT_DIR, injector.BOOT_LOG,
                 action="unload")
+            mark = injector.boot_log_size()
             rc = injector.inject(pid, payload)
-            if rc == 0:
+            if rc == 0 and injector.boot_failed_since(mark):
+                self.events.put(("error", f"pid {pid}: 解除に失敗しました"
+                                          "（out/bootstrap.log を確認してください）"))
+            elif rc == 0:
                 self.events.put(("done", f"pid {pid}: MOD を外しました"))
             elif rc == injector.INJECT_PENDING:
                 self.events.put(("pending", f"pid {pid}: 解除の完了待ちです"
@@ -3081,7 +3194,8 @@ class App(ttk.Frame):
                     open(path, "wb") as f:
                 shutil.copyfileobj(r, f)
             self.events.put(("status", "展開中…"))
-            extract_release(path)
+            if extract_release(path) == 0:
+                raise RuntimeError("zip に展開できるファイルがありません")
             os.remove(path)
         except Exception as e:
             self.events.put(("error", "更新に失敗しました: {}".format(e)))

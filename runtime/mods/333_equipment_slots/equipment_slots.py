@@ -24,7 +24,7 @@ import os
 import re
 import sys
 
-from instantale_modloader import combat, frames, state, ui
+from instantale_modloader import combat, equipment, frames, state, ui
 
 from . import slots as rules
 
@@ -307,6 +307,10 @@ def apply(ctx):
         """
         if not sc["player"]:
             sync_npc(app, sc)
+            return
+        if equipment.loan(app, sc["owner"]) is not None:
+            # 貸しの間（`336_` の脱獄の決行）は貸した品で戦う。組み直すのは貸しが終わった後
+            # （窓口が呼ぶ本体の Manager の後の `resync_after_native`）
             return
         if not container_ready(app, sc):
             return
@@ -726,7 +730,9 @@ def apply(ctx):
             for x, y in rules.UNUSED_CELLS:
                 index = y * rules.COLS + x
                 if index < len(slots):
-                    ui.show_widget(slots[index], False)
+                    # 下に在るのは装備欄そのものなので、隠したマスで触りを止めたままにする
+                    # （実機で成立している挙動を変えない）。
+                    ui.show_widget(slots[index], False, block_touch=True)
 
         panel = FloatLayout(size_hint=(None, None), size=(width + 2 * pad, height + 2 * pad))
         panel.add_widget(mine)
@@ -1022,8 +1028,8 @@ def apply(ctx):
         窓を開いていなくても引けるよう、控えの位置と持ち物＋装備欄の辞書から組む
         （ロード直後は装備欄の品も持ち物の辞書に居る）。
         """
-        if not COMBINE_SLOTS or sc is None:
-            return None
+        if not COMBINE_SLOTS or sc is None or equipment.loan(app, sc["owner"]) is not None:
+            return None                                   # 貸しの間は合算しない（貸した品の値だけ）
         items = dict(inventory_of(sc["owner"]) or {})
         items.update(sc["container"])
         _key, positions = positions_of(app, sc)
@@ -1084,6 +1090,27 @@ def apply(ctx):
                 defense = found[1]
         return orig(attack, defense, *args, **kwargs)
 
+    def stored_scope(app, holder):
+        """ロードの後で窓をまだ開いていない仲間の、読むだけの scope。控えに位置が無ければ None。
+
+        ロードは仲間の scope を捨て、組み直すのは窓を開くときだけなので、それまで `gear_value` は
+        本体の `equipments`（本体が仲間の分を保存しないので空）を読み、装備が無いと答えていた
+        （実機。ロードの前に装備させた仲間3人の手に `weapon=` が付かず、同じプロセスで装備させた仲間には付いた）。
+        組まずに読むだけにするのは、戦闘の計算の中から呼ばれ、持ち物の辞書を書き換えたくないため
+        （`worn_of` と同じ読み方）。`scopes` には載せない。
+        """
+        if app is None or holder is None or holder is player_of(app):
+            return None
+        cid = getattr(holder, "id", None)
+        if cid is None:
+            return None
+        key = "npc:" + str(cid)
+        _key, bucket = bucket_of(app)
+        if not isinstance(bucket, dict) or not bucket.get(key):
+            return None
+        return {"owner": holder, "key": key, "container": npc_containers.get(key) or {},
+                "situation": SITUATION_TWIN, "player": False}
+
     def gear_value(app, holder, game_key):
         """この人物の装備の値（窓口 `combat` への答え）。装備が無ければ None。
 
@@ -1091,12 +1118,16 @@ def apply(ctx):
         使っていない仲間は本体の `equipments[weapon|wearable]`（402_ が書く id か実体）を持ち物から引いた 1 品。
         """
         stat = dict(rules.GAME_KEYS)[game_key]
-        sc = scope_for(app, holder, create=False)
+        sc = scope_for(app, holder, create=False) or stored_scope(app, holder)
         if sc is not None and (sc["player"] or positions_of(app, sc)[1]):
             found = combined_of(app, sc, game_key)
             if found is not None:
                 return found[1]
-            chosen = rules.best(current_slots(app, sc), sc["container"], game_key)
+            # 品は持ち物の辞書を含めて引く（窓をまだ開いていない仲間の品は持ち物の辞書に居る）
+            items = dict(inventory_of(sc["owner"]) or {})
+            items.update(sc["container"])
+            chosen = rules.best(rules.slots_from_positions(positions_of(app, sc)[1], items),
+                                items, game_key)
             return rules.stat_of(chosen, stat) if chosen is not None else None
         eq = getattr(holder, "equipments", None)
         ref = eq.get(game_key) if isinstance(eq, dict) else None
@@ -1145,6 +1176,10 @@ def apply(ctx):
         `dictionary changed size during iteration` で落ちた（VERIFICATION.md §3.70）。
         """
         if not isinstance(data, dict):
+            return 0
+        if not isinstance(data.get("player_data"), dict):
+            # セーブ以外の書き出し（世界の骨格 world_data.json。`player_data` を持たない。GAME.md）には足さない。
+            # 足すと仲間の装備欄の品が骨格に焼かれ、同じ世界で作り直した周回の NPC に出た
             return 0
         held = getattr(sys, CONTAINER_ATTR + "_world", None)
         if held is not None and state.world_key_of_dict(data, held) != held:
@@ -1401,6 +1436,12 @@ def apply(ctx):
                     held = current_slots(app, sc).get(name)
                     old = next((w for w in item_widgets(app, sc["owner"]) if key_of(w) == held), None)
                     if old is not None:
+                        if not main_has_room(main, instance_of(old)):
+                            # 外した品の置き場が所持品に無い（置換・外す・捨てると同じく、空きが無ければ何もしない）。
+                            # 見ずに戻すと範囲の外の座標のまま所持品に入り、開き直すと置けずに落ちうる
+                            write("popup equip {!r} ignored: no room in the inventory for {!r}".format(
+                                item_key, held))
+                            return "no room"
                         try:
                             move_back(app, old, main)
                             write("popup equip: {!r} leaves {} for {!r}".format(held, name, item_key))
@@ -1608,7 +1649,7 @@ def apply(ctx):
 
     # 402_ の「装備／外す」はローダの窓口を通してここへ来る（書く役を 1 本にする。TECH.md §3.3.5）。
     def npc_toggle(app, holder, item):
-        """仲間の品を装備欄へ入れる／戻す。窓口 `combat.toggle` の答え。装備欄が無ければ None（402_ の直書きに任せる）。"""
+        """仲間の品を装備欄へ入れる／戻す。窓口 `equipment.toggle` の答え。装備欄が無ければ None（402_ は何も書かない）。"""
         sc = scope_for(app, holder, create=False)
         if sc is None or sc["player"]:
             return None
@@ -1626,8 +1667,42 @@ def apply(ctx):
             move_back(app, widget, main)
             write("{}: unequipped {!r} via the window".format(sc["key"], key))
             return "unequipped"
-        do_equip(app, sc, widget)
+        if do_equip(app, sc, widget) == "no room":
+            return "no room"
         return "equipped" if is_mine(frames.attr(widget, "inventory", None)) else "not equipment"
+
+    def npc_equip(app, holder, item):
+        """仲間の品を、窓を開かずに装備欄へ入れる。窓口 `equipment.equip` の答え（`407_` の初期装備が呼ぶ）。
+
+        窓を開くときと同じ道を通す: 控えに空いている部位の位置を書き、`refresh_container` で
+        装備欄の辞書を組み直し（控えもそこで保存する）、`sync_npc` で `equipments` を合わせる。
+        先に主人公の装備欄を組むのは、仲間の分だけ組むと「今の周回で組んだ」印が立ち、
+        主人公の空の辞書を装備なしと読んで本体の武器と防具を外すため（`container_ready` の版22）。
+        """
+        if app is None or holder is None or item is None or holder is player_of(app):
+            return None
+        inv = inventory_of(holder)
+        if not isinstance(inv, dict):
+            return "no inventory"
+        sc = scope_for(app, holder)
+        if sc is None:
+            return None
+        item_key = next((str(k) for k, v in inv.items() if v is item), None)
+        if item_key is None:
+            return "equipped" if item in sc["container"].values() else "not in the inventory"
+        if not container_ready(app, player_scope(app)):
+            return "not ready"
+        _key, positions = positions_of(app, sc)
+        if item_key not in positions:
+            found = free_region(app, sc, item, item_key)
+            if found is None:
+                return "not equipment" if rules.kind_of(item) is None else "no free slot"
+            name, rx, ry = found
+            positions[item_key] = [rx, ry]
+            write("{}: equipped {!r} into {} without the window".format(sc["key"], item_key, name))
+        refresh_container(app, sc)
+        sync_npc(app, sc)
+        return "equipped" if item_key in sc["container"] else "not placed"
 
     def npc_equipped(app, holder, item):
         sc = scope_for(app, holder, create=False)
@@ -1638,7 +1713,7 @@ def apply(ctx):
         return str(getattr(item, "id", "")) in sc["container"]
 
     def worn_of(app, holder):
-        """身に着けている品 `[(部位, 品), ...]`（部位の並び順）。窓口 `combat.gear` の答え。
+        """身に着けている品 `[(部位, 品), ...]`（部位の並び順）。窓口 `equipment.gear` の答え。
 
         控え（周回ごとの位置の控え。DOC.md「仲間の装備欄」）から組む。品は持ち物の辞書を先に、
         無ければ装備欄の辞書から引く（ロード直後で窓をまだ開いていないとき、品は持ち物の辞書に居る。
@@ -1670,9 +1745,10 @@ def apply(ctx):
         slots = rules.slots_from_positions(positions, items)
         return [(name, items[slots[name]]) for name in rules.REGIONS if name in slots]
 
-    combat.declare(combat.TOGGLE, npc_toggle, owner=owner, write=write)
-    combat.declare(combat.EQUIPPED, npc_equipped, owner=owner, write=write)
-    combat.declare(combat.GEAR, worn_of, owner=owner, write=write)
+    equipment.declare(equipment.TOGGLE, npc_toggle, owner=owner, write=write)
+    equipment.declare(equipment.EQUIP, npc_equip, owner=owner, write=write)
+    equipment.declare(equipment.EQUIPPED, npc_equipped, owner=owner, write=write)
+    equipment.declare(equipment.GEAR, worn_of, owner=owner, write=write)
 
     def restore_buttons_after(orig, self, *args, **kwargs):
         """選択肢の組み直し・ロード・タイトルへ戻るの後で、隠した選択肢を戻す。"""

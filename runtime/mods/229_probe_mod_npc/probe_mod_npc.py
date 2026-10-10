@@ -34,6 +34,22 @@ r"""MOD が持つ NPC と、正規 NPC への被せがどこまで通るかを�
 200 番台は読み取り専用が原則（TECH.md §3.2.2）だが、
 ここは**置いてみないと何も分からない**（素のままの観測はどの見込みにも等しく一致する）。
 変えたものは保存の直前に全部戻り、`debug` の旗が立っている間だけ動く。
+
+##### 版の記録
+
+- 版4: 見直しで挙がった4点を直した。あわせて来訪者（`PRESENT`）の既定を切にした。
+  - `save_game` の包みに `safe=True` を付けた
+  - 施設の名簿の読みの数（`ReadCountingList`）をクラスではなく写しごとに持つようにした。
+    `talk_choice` の窓の中で `update_button_display` の窓が開くと、内側がクラスの数を
+    0 に戻し、外側の `roster_reads` を壊していた
+  - 保存ごとの記録（`save:` の3行と `at=save`）に注入1回あたりの上限（`SAVE_LINES`）を置いた。
+    版3 では jsonl の 4 割、log の 2 割強がこの行だった
+  - 設定の `LIFT_ROSTER` はローダ全体の旗（`modnpc.LIFT_ROSTER`）を書き換えていて、
+    229 を入れている間は ModNPC を使う全 MOD に効いていた。
+    旗はローダの設定（`settings/loader.json` の `"modnpc_lift_roster"`）へ移し、229 の設定から外した。
+    229 は旗を読んで記録するだけ
+- 版5: 施設の主への被せを、注入し直し・`OVERRIDE` / `FOLLOW` の切り替え・別のセーブの読み込みでも外すようにした。
+  前の相手を `seen["owner"]` だけで覚えていたので、前の世代や前の世界で載せた層が登録簿に残っていた
 """
 
 import json
@@ -68,7 +84,9 @@ NPC_FIELDS = {
 
 # -- 設定（GUI から変えられる。TECH.md §3.8）--------------------------------
 #: 来訪者を居させるか。切って注入し直すと `unregister` で片付け、その結果を録る（片付けの測定用）。
-PRESENT = True
+#: 既定は切（版4）。来訪者は遊びの施設に居座り、主への被せも頼み文を変えるので、
+#: 測るときだけ入れる。切っている間は連れて回る・被せる（`FOLLOW` / `OVERRIDE`）も走らない。
+PRESENT = False
 #: プレイヤーの入った施設へ連れて回るか。
 FOLLOW = True
 #: その施設の主に被せを載せるか。
@@ -87,9 +105,10 @@ AUTO_LOAD_WORLD = ""
 #: （ロードの3秒後に起こして `conversation_starter` が `'NoneType' object is not callable`
 #: で落ち、画面が「…」のまま止まった。実機）。
 AUTO_TALK_DELAY = 45
-#: 保存の間、来訪者を名簿から外す（ローダの `modnpc.LIFT_ROSTER`）。
-#: 切って `leaked` が空のままなら、保存は名簿を読んでいない。
-LIFT_ROSTER = True
+
+#: 保存ごとの記録（`save:` の行と `at=save`）を書く、注入1回あたりの保存の回数。
+#: 保存は行動のたびに走る（版4 で上限を置いた）。
+SAVE_LINES = 20
 
 
 def apply(ctx):
@@ -97,7 +116,7 @@ def apply(ctx):
     record = ctx.jsonl(RECORD_BASENAME)
     warn = ctx.warner("mod npc")
     seen = {"npc_id": None, "spot": None, "owner": None, "disk": 0,
-            "sites": set(), "auto": None}
+            "sites": set(), "auto": None, "saves": 0}
     screen = ui.Screen(ctx, write, tag="mod npc")
 
     def note(at, **fields):
@@ -105,7 +124,14 @@ def apply(ctx):
 
     # -- 層のフック ---------------------------------------------------------
     def on_world(info):
-        """セーブを読んだ直後。実体は捨てられているので、次の到着で建て直す。"""
+        """セーブを読んだ直後。実体は捨てられているので、次の到着で建て直す。
+
+        被せの層は世界をまたいで残る（`modnpc.forget` は実体だけ捨てる）。
+        別の世界では同じ id が別人なので、ここで外す。
+        `app` は渡さない。被せは層だけで置いても控えてもおらず、
+        この時点の `app` はまだ前の世界を指していることがある。
+        """
+        undress(None)
         seen["spot"] = None
         seen["owner"] = None
         note("world", npc=info["npc_id"])
@@ -177,6 +203,10 @@ def apply(ctx):
         return None
 
     def on_save(info):
+        # 版4: 関所の前後で1件ずつ出るので、`save_game` の行と同じ枠で抑える
+        # （前は上限が無く、jsonl の 4 割がこの行だった）。
+        if seen["saves"] > SAVE_LINES:
+            return
         note("save", npc=info["npc_id"],
              phase=(info.get("args") or {}).get("phase"))
 
@@ -206,7 +236,8 @@ def apply(ctx):
 
     # -- 登録 ---------------------------------------------------------------
     # 関所はローダが1つだけ立てる。何本の MOD が呼んでも増えない。
-    modnpc.LIFT_ROSTER = bool(LIFT_ROSTER)
+    # 保存の間に名簿から隠すかはローダの設定（`settings/loader.json` の `"modnpc_lift_roster"`）。
+    # `install` がそれを読むので、229 は読んだ結果を記録するだけ（版4）。
     targets = modnpc.install(ctx, write=write)
     write("the gate covers {} target(s)".format(len(targets)))
 
@@ -259,7 +290,11 @@ def apply(ctx):
 
     def follow(app):
         """居る施設へ連れて回り、その施設の主に被せを載せる。"""
-        if not FOLLOW or not PRESENT:
+        if not PRESENT:
+            return
+        if not FOLLOW:
+            # 連れて回らない間は被せも載せない。前の世代が載せた層は登録簿に残るので外す。
+            undress(app)
             return
         area_id, facility_id = where(app)
         if area_id is None:
@@ -302,13 +337,13 @@ def apply(ctx):
         複製の末尾に1行足せば「被せが読む側まで届いたか」が `output_data` で分かる。
         """
         if not OVERRIDE:
+            undress(app)
             return
         facility = modnpc.facility_of(app, area_id, facility_id)
         owner_id = str(getattr(facility, "owner", "") or "")
         if owner_id == seen["owner"]:
             return
-        if seen["owner"]:
-            modnpc.unregister(OWNER, seen["owner"], app=app, write=write)
+        undress(app, keep=owner_id)
         seen["owner"] = owner_id or None
         if not owner_id or modnpc.is_mod_npc(owner_id):
             return
@@ -326,25 +361,47 @@ def apply(ctx):
         write("the owner {} {!r} wears the mark".format(
             owner_id, frames.short(frames.text_of(character, "name"), 20)))
 
+    def undress(app, keep=None):
+        """正規 NPC に載せた被せを `keep` 以外すべて外す。
+
+        前の相手は `seen["owner"]` では足りない。`seen` は注入ごとに作り直すが、
+        登録簿は注入をまたいで残るので、前の世代が載せた層を今の世代は知らない。
+        登録簿から自分の層を引いて外す。
+        """
+        for npc_id in modnpc.entries(OWNER):
+            if npc_id != keep and not modnpc.is_mod_npc(npc_id):
+                modnpc.unregister(OWNER, npc_id, app=app, write=write)
+
     # -- 話し相手の一覧は何から組まれるか -----------------------------------
     class ReadCountingList(list):
-        """`Facility.characters` の代役。読まれた回数だけ数える（`228_` の手口）。"""
-        reads = 0
+        """`Facility.characters` の代役。読まれた回数だけ数える（`228_` の手口）。
+
+        版4: 数はクラスではなく写しごとに持つ。`talk_choice` の窓の中で
+        `update_button_display` の窓が開くと、内側がクラスの数を 0 に戻して
+        外側の数を壊していた。
+        """
+
+        def __init__(self, source=()):
+            # 外側の写しから写すときは、その読みに数えない（`list.__getitem__` を直に呼ぶ）。
+            if isinstance(source, list):
+                source = list.__getitem__(source, slice(None))
+            list.__init__(self, source)
+            self.reads = 0
 
         def __iter__(self):
-            type(self).reads += 1
+            self.reads += 1
             return list.__iter__(self)
 
         def __contains__(self, item):
-            type(self).reads += 1
+            self.reads += 1
             return list.__contains__(self, item)
 
         def __getitem__(self, index):
-            type(self).reads += 1
+            self.reads += 1
             return list.__getitem__(self, index)
 
         def __len__(self):
-            type(self).reads += 1
+            self.reads += 1
             return list.__len__(self)
 
     def swap_in(owner, name, make):
@@ -395,7 +452,6 @@ def apply(ctx):
         listed = [str(k) for k in (roster or [])]
         swapped = None
         if isinstance(roster, list):
-            ReadCountingList.reads = 0
             swapped = swap_in(facility, "characters", ReadCountingList)
         try:
             return orig(self, *args, **kwargs)
@@ -403,6 +459,7 @@ def apply(ctx):
             try:
                 if swapped:
                     put_back(facility, "characters", *swapped)
+                reads_seen = swapped[1].reads if swapped else None
                 offered = [str(ui.spec_args(entry)[0])
                            for entry in (getattr(app, "buttons", None) or [])
                            if ui.spec_cls_name(entry) == "ConversationStartManager"
@@ -410,11 +467,10 @@ def apply(ctx):
                 note("talk_choice", offered=offered,
                      facility_characters=listed,
                      owner=str(getattr(facility, "owner", None)),
-                     roster_reads=ReadCountingList.reads if swapped else None,
+                     roster_reads=reads_seen,
                      visitor_offered=seen["npc_id"] in offered)
                 write("talk choice: offered={} roster={} reads={}".format(
-                    offered, listed,
-                    ReadCountingList.reads if swapped else "?"))
+                    offered, listed, "?" if reads_seen is None else reads_seen))
             except Exception:
                 ctx.log_exc("mod npc: cannot record the talk choice")
 
@@ -522,7 +578,6 @@ def apply(ctx):
                 swapped["npcs"] = swap_in(save, "npcs", NpcsSpy)
             roster = getattr(facility, "characters", None)
             if isinstance(roster, list):
-                ReadCountingList.reads = 0
                 swapped["facility"] = swap_in(facility, "characters", ReadCountingList)
             if visitor is not None:
                 swapped["visitor_cls"] = spy_visitor(visitor)
@@ -541,15 +596,17 @@ def apply(ctx):
                 if swapped.get("visitor_cls") is not None:
                     visitor.__class__ = swapped["visitor_cls"]
                 offered = offered_ids(app)
+                facility_reads = (swapped["facility"][1].reads
+                                  if "facility" in swapped else None)
                 folded = []
                 for entry in reads:           # 連続する同じ読みは畳む
                     if not folded or folded[-1] != entry:
                         folded.append(entry)
                 note("talk_reads", offered=offered, visitor_offered=seen["npc_id"] in offered,
-                     facility_reads=ReadCountingList.reads if "facility" in swapped else None,
+                     facility_reads=facility_reads,
                      reads=["{} {}".format(tag, what) for tag, what in folded[:200]])
                 write("talk list: offered={} facility roster reads={} reads={}".format(
-                    offered, ReadCountingList.reads if "facility" in swapped else "?",
+                    offered, "?" if facility_reads is None else facility_reads,
                     ["{} {}".format(tag, what) for tag, what in folded[:60]]))
             except Exception:
                 ctx.log_exc("mod npc: cannot record the talk reads")
@@ -648,23 +705,33 @@ def apply(ctx):
         return result
 
     # -- 保存に漏れていないか -----------------------------------------------
-    @ctx.wrap("__main__:InstantaleApp.save_game", required=False)
+    # 版4: `safe=True` を付けた（前は無く、`orig` の前の記録が投げるとゲームへ抜けた）。
+    @ctx.wrap("__main__:InstantaleApp.save_game", required=False, safe=True)
     def save_game(orig, self, *args, **kwargs):
         """保存の直後にディスクのセーブを読む。関所の外側から数える。
 
         途中から、包みは呼ばれるのに読み直しが1度も走らなかった（実機）。
         `orig` が投げてここを素通りしている可能性があるので、入り・戻り・投げを1行ずつ残す。
+        版4: 保存は行動のたびに走るので、この3行は注入1回につき `SAVE_LINES` 回ぶんまで。
+        投げた行は枠に関わらず書く。
         """
-        write("save: entering (in_conversation={} thread={})".format(
-            getattr(self, "in_conversation", None),
-            __import__("threading").current_thread().name))
+        seen["saves"] += 1
+        loud = seen["saves"] <= SAVE_LINES
+        try:
+            if loud:
+                write("save: entering (in_conversation={} thread={})".format(
+                    getattr(self, "in_conversation", None),
+                    threading.current_thread().name))
+        except Exception:
+            ctx.log_exc("mod npc: cannot record the save entry")
         try:
             result = orig(self, *args, **kwargs)
         except BaseException as exc:
             write("save: the game's save_game raised {}: {}".format(
                 type(exc).__name__, frames.short(str(exc), 120)))
             raise
-        write("save: returned {!r}".format(frames.short(repr(result), 60)))
+        if loud:
+            write("save: returned {!r}".format(frames.short(repr(result), 60)))
         try:
             check_disk(self)
         except Exception:
@@ -807,7 +874,7 @@ def apply(ctx):
 
     write("ready: visitor={} present={} follow={} override={} try_detail={} auto_talk={} "
           "lift_roster={}".format(seen["npc_id"], PRESENT, FOLLOW, OVERRIDE, TRY_DETAIL,
-                                  AUTO_TALK, LIFT_ROSTER))
+                                  AUTO_TALK, modnpc.LIFT_ROSTER))
 
 
 def _where_prefix(data, path="", found=None):

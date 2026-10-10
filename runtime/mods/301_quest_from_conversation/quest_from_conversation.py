@@ -97,10 +97,12 @@ mod を import はしない。
 import copy
 import os
 import sys
+import threading
 import time
 
-from instantale_modloader import frames, ui
-from instantale_modloader.state import world_filename, world_key
+from instantale_modloader import choices, confinement, frames, ui
+from instantale_modloader.state import (PLAYTHROUGH_SEP, UNKNOWN_WORLD, other_playthroughs,
+                                        playthrough_key, world_filename, world_key)
 
 LOG_BASENAME = "quest_offer.log"
 
@@ -113,6 +115,10 @@ LOG_BASENAME = "quest_offer.log"
 # 再読み込み後に
 # `Quest` インスタンスがそのキーを持つ保証が無い（`Quest.__init__` が何を写すかは読めない）。
 # mod 側に持てば、ゲームのデータを一切汚さずに済む。
+# 中身の鍵は周回の鍵（世界×主人公。`state.playthrough_key`。TECH.md §5.4）。
+# 依頼の id はセーブと同じ寿命で、同じ世界で主人公を作り直すと振り直される。
+# 世界名だけの鍵だと、前の主人公の依頼の出所が新しい主人公の同じ id の依頼に付く。
+# 世界名だけの鍵の分は `adopt_clients` が移す。
 CLIENTS_BASENAME = "quest_clients.json"
 
 # 会話から開いた掲示板を、その NPC 発の依頼だけに絞る。
@@ -175,7 +181,7 @@ ENABLE_GENERATION = True
 # "mod" は既定では使わない。`QuestChoiceManager` の `quest_type` 引数は、
 # クエスト辞書の `quest_type` フィールド（`'normal_quest'` / `'random_quest'`）
 # とは別の語彙で、セーブのフィールド値をそのまま渡すと `KeyError` になり
-# ゲームが落ちる（GAME.md §2.2）。正しい値が `206_` の総当たりで判明するまで封じる。
+# ゲームが落ちる（GAME.md §2.9）。正しい値が `206_` の総当たりで判明するまで封じる。
 LIST_MODE = "game"
 
 # "mod" モードで使う quest_type。
@@ -183,7 +189,7 @@ LIST_MODE = "game"
 # None のままなら "mod" を指定しても "game" に落ちる。
 QUEST_TYPE_FOR_CHOICE = None
 
-# 一覧に並べる既存依頼の上限。
+# 一覧に並べる既存依頼の上限。読むのは LIST_MODE が "mod" のときだけなので、設定画面には出さない。
 # 実データでは1つの集落につき3件なので通常これに当たることは無い。
 # ページ送りの挙動を実測できていない間は、1ページへ収まる範囲に抑えておく。
 MAX_LISTED = 8
@@ -276,12 +282,13 @@ def apply(ctx):
     clients_path = ctx.state_path(CLIENTS_BASENAME)
     state = {
         "saved_buttons": None,   # 一覧を出す前のボタン。やめる で戻す
-        "npc_id": None,          # いま会話している相手
+        "npc_id": None,          # 会話の開始で控えた相手。相手の引き方は talking_partner
         "generating": False,
         "inject": None,          # random_quest_generator に渡す会話の書き起こし
         "inject_at": 0.0,
         # 会話が終わった後も「この話から依頼を作る」を使えるようにするための控え。
-        # {"text": 書き起こし, "npc_id": ..., "npc_name": ..., "moves": 残り手数}
+        # {"text": 書き起こし, "npc_id": ..., "npc_name": ..., "moves": 残り手数,
+        #  "world": world_key}
         "last_talk": None,
         # 会話から開いた掲示板を絞り込む相手。
         # {"npc_id":..., "npc_name":...} ゲーム本来の「クエスト掲示板」から開いたときは
@@ -291,6 +298,8 @@ def apply(ctx):
         # 依頼が0件だと依頼ボタンの有無では掲示板だと判定できないので、印で持つ。
         # 何か押されたら降りる（押せばその画面からは離れる）。
         "board_open": False,
+        # 直前の押下が依頼ボタンだったか。次の画面（受ける / やめとく）の押下では絞り込みを残す。
+        "quest_pressed": False,
         # 会話への注入の結末。同じ結末が続く間はログに書かない。
         # 会話の LLM は1ターンに何度も回るので、
         # 毎回書くとこのログが会話で埋まる（`311_` の `note_inject` と同じ手）。
@@ -306,7 +315,6 @@ def apply(ctx):
     # 特に **画面を塗るのは `refresh_choice_buttons` ではなく HUD 側**という
     # `302_` の実測結果は、この mod にも要る（下の `apply_buttons`）。
     screen = ui.Screen(ctx, write, tag="quest offer", mark=MARK)
-    ui.refresh_choices_after_load(ctx, write)      # ロード直後は名簿が空。復元されてから組み直す
 
     find_app = ui.find_app
     cls_of = ui.cls_of
@@ -473,20 +481,45 @@ def apply(ctx):
             lines.append("{}: {}".format(speaker, frames.short(message.get("content"), 400)))
         return "\n".join(lines)[:CONVERSATION_CHARS]
 
+    def talking_partner(app):
+        """いま会話している相手の id。引けなければ None。
+
+        ロードで会話の途中から再開すると `ConversationStartManager.__init__` は通らない。
+        そのとき `state["npc_id"]` は空か、タイトルへ戻る前の別の相手のまま残っている。
+        だからゲームが持っている方を先に見る。
+        `app.in_conversation` は相手の id の文字列で（GAME.md §2.6）、
+        次が画面の「会話を終了する」の `args[0]`（`ui.conversation_partner`）。
+        控えは最後の後ろ盾にとどめる。
+        """
+        in_conversation = getattr(app, "in_conversation", None)
+        if isinstance(in_conversation, str) and in_conversation:
+            return in_conversation
+        partner, _entry = ui.conversation_partner(getattr(app, "buttons", None))
+        return partner or state["npc_id"]
+
     def current_talk(app):
         """「この話」として使える会話を (書き起こし, npc_id, NPC名) で返す。
 
         会話中ならその場の履歴。
         会話を抜けた後なら終了時に控えた分（施設の選択肢から入ったときはこちら）。
         どちらも無ければ空。
+
+        会話中は控えた分に落とさない。
+        控えは前の会話のもので、相手が今と同じとは限らない。
+        落とすと、いま話している相手の画面に別人の書き起こしと名前が出て、
+        依頼人もその別人になる。
+        控えは別の世界でも使わない（id は世界ごとに振られるので、同じ id でも別人）。
         """
-        if getattr(app, "in_conversation", False) and state["npc_id"] is not None:
-            text = transcribe(app, state["npc_id"])
+        if getattr(app, "in_conversation", False):
+            npc_id = talking_partner(app)
+            text = transcribe(app, npc_id) if npc_id else ""
             if text:
-                npc = npc_of(app, state["npc_id"])
-                return text, state["npc_id"], frames.short(getattr(npc, "name", ""), 40)
+                npc = npc_of(app, npc_id)
+                return text, npc_id, frames.short(getattr(npc, "name", ""), 40)
+            return "", None, ""
         last = state["last_talk"]
-        if last is not None and last.get("moves", 0) > 0:
+        if last is not None and last.get("moves", 0) > 0 \
+                and last.get("world") == world_key(app):
             return last["text"], last["npc_id"], last["npc_name"]
         return "", None, ""
 
@@ -497,7 +530,7 @@ def apply(ctx):
         `current_conversation_history` が片付けられている可能性がある。
         だから必ず元の処理より前に取る。
         """
-        npc_id = state["npc_id"]
+        npc_id = talking_partner(app)
         if npc_id is None:
             return
         # 同行している相手の話は控えない。
@@ -517,6 +550,7 @@ def apply(ctx):
             "npc_id": npc_id,
             "npc_name": frames.short(getattr(npc, "name", ""), 40),
             "moves": KEEP_TRANSCRIPT_MOVES,
+            "world": world_key(app),
         }
         write("remembered talk with {!r} ({} chars, valid for {} moves)".format(
             state["last_talk"]["npc_name"], len(text), KEEP_TRANSCRIPT_MOVES))
@@ -585,7 +619,11 @@ def apply(ctx):
     # 触るのは1件ずつの `.get()` だけで、走査はしない。
     # 書くのは行動のスレッド、読むのは LLM のスレッドなので、
     # 走査していると「読んでいる最中に大きさが変わった」に当たりうる。
-    clients = {"data": None}
+    # "checked" は世界名だけの鍵の分を移すかを確かめた周回の鍵（プロセスで1度）。
+    clients = {"data": None, "checked": set()}
+    # 移すのは会話への注入（LLM のスレッド）からも、依頼の控え（行動のスレッド）からも起こる。
+    # 移し終えるまで片方を待たせ、移す前の写しへ書き足させない。
+    clients_lock = threading.Lock()
 
     def load_clients():
         """「どの依頼がどの NPC 発か」の控え。一度読んだら覚えておく。
@@ -596,8 +634,8 @@ def apply(ctx):
         **このファイルを書くのはこの mod だけ**なので、
         書いた内容をそのまま持てば足りる（`311_` の `load_bucket` が同じ理由で同じことをしている）。
 
-        このファイルは全世界ぶんが1つなので、読めない1回を黙って {} に倒すと、
-        次の remember_client が全世界の出所を空で書き直してしまう。
+        このファイルは全周回ぶんが1つなので、読めない1回を黙って {} に倒すと、
+        次の remember_client が全周回の出所を空で書き直してしまう。
         「無い（初回）」だけを黙って倒し、
         「在るのに読めない」は記録に残す（ctx.read_json）。
         """
@@ -610,10 +648,64 @@ def apply(ctx):
         clients["data"] = data
         return data
 
+    def adopt_clients(key, world):
+        """世界名だけの鍵 `world` の分を、周回の鍵 `key` へ移す。
+
+        決まりはローダの `WorldStore.adopt` と同じ（TECH.md §5.4）。
+        あちらはファイルごとに移すが、この控えは1つのファイルの中の鍵なので、ここで写す。
+        見つかった時点で遊んでいる主人公のものとみなし、元の鍵は消す
+        （残すと同じ世界で作り直した次の主人公にもう一度渡る）。
+        その世界に別の主人公の周回が在れば移さない。
+        `state/` のどこかの周回のファイル（`state.other_playthroughs`）と、
+        この控えの中の同じ世界の別の周回の鍵の両方を見る。
+        持ち主が移し損ねても依頼の出所が分からなくなるだけで、
+        他の主人公の依頼の出所を渡すより損が小さい。
+        移すのは `key` の分がまだ無いときだけ。確かめるのは1つの鍵につき1度。
+        書き直すときは鍵の並びを保つ（`world` の位置に `key` を置く）。
+        """
+        if not key or not world or key == world or UNKNOWN_WORLD in (key, world):
+            return
+        # 確かめ終えた鍵でも錠は取る。移している最中に素通りすると、
+        # 呼び側が移す前の写しへ書き足し、元の鍵ごと書き戻してしまう。
+        with clients_lock:
+            if key in clients["checked"]:
+                return
+            clients["checked"].add(key)
+            data = load_clients()
+            old = data.get(world)
+            if key in data or not isinstance(old, dict) or not old:
+                return
+            prefix = world + PLAYTHROUGH_SEP
+            others = sorted(set(other_playthroughs(ctx.state_dir, key))
+                            | {k for k in data if k != key and k.startswith(prefix)})
+            if others:
+                write("left the clients of the world-only key {!r}: another protagonist "
+                      "played this world ({})".format(world, ", ".join(others)))
+                return
+            moved = {(key if k == world else k): value for k, value in data.items()}
+            # 写しを差し替える。書き換えると、LLM のスレッドが読んでいる最中の辞書が動く。
+            if not ctx.write_json(clients_path, moved):
+                write("WARN could not move the clients of the world-only key {!r} to {!r}"
+                      .format(world, key))
+                return
+            clients["data"] = moved
+            write("moved {} client(s) of the world-only key {!r} to {!r}".format(
+                len(old), world, key))
+
+    def clients_key(app):
+        """控えの中の鍵（周回の鍵）。世界名だけの鍵の分が残っていれば先に移す。
+
+        301 は `World.__init__` を包まないので、`app` から引いてよい。
+        """
+        key = playthrough_key(app)
+        adopt_clients(key, world_key(app))
+        return key
+
     def remember_client(app, quest_id, npc_id, npc_name):
         """この依頼はこの NPC 発、と控える。セーブには触らない。"""
+        key = clients_key(app)
         data = load_clients()
-        bucket = data.setdefault(world_key(app), {})
+        bucket = data.setdefault(key, {})
         bucket[str(quest_id)] = {"npc_id": str(npc_id) if npc_id else "",
                                  "npc_name": npc_name or ""}
         # 途中で落ちても控えが壊れない書き方（`ctx.write_json`）。
@@ -646,7 +738,8 @@ def apply(ctx):
            ゲームが生成する依頼人名は実在 NPC と結びついていないことが多いので、
            あくまで補助
         """
-        record = load_clients().get(world_key(app), {}).get(str(quest_id))
+        key = clients_key(app)
+        record = load_clients().get(key, {}).get(str(quest_id))
         if isinstance(record, dict):
             if npc_id and record.get("npc_id") == str(npc_id):
                 return True
@@ -696,7 +789,7 @@ def apply(ctx):
                                       say(app, "（今は依頼の話を切り出せない）")),
             poll=END_POLL, timeout=END_TIMEOUT)
 
-    def open_quest_board(app, choice_text=OFFER_LABEL):
+    def open_quest_board(app, choice_text=OFFER_LABEL, client=None):
         """「依頼を受ける」が押されたとき。ゲーム自身の掲示板を開く。
 
         自前で `PhaseSpec('QuestChoiceManager', [quest_type, id])` を並べる実装はゲームを落とした（冒頭の
@@ -718,8 +811,13 @@ def apply(ctx):
             # 待機表示を出したまま繋いで隠す。
             # 出すのはゲーム自身と同じ点のアニメーションなので、
             # 割り込みが挟まったようには見えない。
+            # 絞り込む相手は閉じる前に決める。閉じた後の控えは、書き起こしが空のときや
+            # 控えを残さない設定（KEEP_TRANSCRIPT_MOVES=0）では前の会話の相手か空になる
+            partner = talking_partner(app)
+            client = ((partner, frames.short(getattr(npc_of(app, partner), "name", ""), 40))
+                      if partner else None)
             show_busy(app)
-            end_conversation_then(app, lambda a: open_quest_board(a, choice_text))
+            end_conversation_then(app, lambda a: open_quest_board(a, choice_text, client))
             return
 
         if LIST_MODE == "mod" and QUEST_TYPE_FOR_CHOICE is None:
@@ -739,7 +837,10 @@ def apply(ctx):
         # ゲーム本来の「クエスト掲示板」から開いたときは None のままなので、
         # そちらは全件のまま何も変わらない。
         if FILTER_BY_NPC:
-            _t, filter_id, filter_name = current_talk(app)
+            if client is not None:
+                filter_id, filter_name = client
+            else:
+                _t, filter_id, filter_name = current_talk(app)
             if filter_id or filter_name:
                 state["filter_npc"] = {"npc_id": filter_id, "npc_name": filter_name}
                 write("open board: filtering for {!r} (id={!r})".format(
@@ -1315,9 +1416,8 @@ def apply(ctx):
         buttons.insert(max(0, min(at, len(buttons))), entry)
         return True
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False)
-    def refresh_choice_buttons(orig, self, reset_page=False, *args, **kwargs):
-        """施設の選択肢に「依頼を受ける」を「会話する」の隣へ足す。
+    def refresh_choice_buttons(self, _buttons):
+        """施設の選択肢に「依頼を受ける」を「会話する」の隣へ足す（ローダの窓口 `choices` から、組み直しの前に呼ばれる）。
 
         会話中の「行動」への切り替えが画面のどこにあるか未確認なので、
         必ず見える経路をもう1本用意する。
@@ -1356,14 +1456,24 @@ def apply(ctx):
                 # 相手は画面の「会話を終了する」から読む（`302_` の手。`ui.conversation_partner`）。
                 # `state["npc_id"]` でも引けるが、
                 # いま並んでいるボタンから読む方が画面と食い違わない。
-                if where == "conversation":
+                confined, by = confinement.why(self)
+                if confined:
+                    # 主人公が閉じ込められている（牢の中の会話など。ローダの窓口 `confinement`）。
+                    # 依頼を受ければ牢から出られてしまうので、どちらも出さない。
+                    at = None
+                    stale = [b for b in buttons
+                             if isinstance(b, dict) and b.get(MARK) in ("offer", "generate")]
+                    if stale:
+                        buttons[:] = [b for b in buttons if not any(b is d for d in stale)]
+                    note_skip("confined by {} ({}): no quest offer".format(by, confined))
+                elif where == "conversation":
                     partner, _entry = ui.conversation_partner(buttons)
                     if is_party_member(self, partner):
                         note_skip("party member {!r} ({}): not a client".format(
                             ui.character_name(self, partner), partner))
                         at = None
                         # ロード直後は名簿が空で相手を仲間と見なせず、依頼の選択肢を足してしまう。
-                        # 名簿が復元されて組み直されたとき（`ui.refresh_choices_after_load`）に落とす
+                        # 名簿が復元されて組み直されたとき（窓口 `choices` のロードの後の組み直し）に落とす
                         stale = [b for b in buttons
                                  if isinstance(b, dict) and b.get(MARK) in ("offer", "generate")]
                         if stale:
@@ -1385,28 +1495,34 @@ def apply(ctx):
                             buttons[at].get("text"), where, len(buttons)))
         except Exception:
             ctx.log_exc("quest offer: cannot add offer button")
-        return orig(self, reset_page, *args, **kwargs)
 
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
-        """自前のボタンだけ横取りする。
-
-        判定に使うのは文字列ではなくボタン辞書に付けた印。
-        同じ文字列のゲーム側ボタンを巻き込まないため。
-        印が無ければ必ず素通しする。
-        """
+    def look_at_press(self, entry, _button_index):
+        """どのボタンが押されても先に通る（窓口の `intercept`）。押下は握らない。"""
         # 何を押してもその画面からは離れる。
         # 掲示板の印はここで降ろす（受注画面まで間引きを持ち込まないため）。
         state["board_open"] = False
-        entry = pressed_entry(self, button_index)
         action = entry.get(MARK) if isinstance(entry, dict) else None
+        after_quest = state["quest_pressed"]
+        state["quest_pressed"] = False
         if action is None:
             # ゲーム本来の「クエスト掲示板」が押されたら絞り込みを解く。
             # そちらは全件が出るべきで、こちらの都合を持ち込まない。
             if spec_cls_name(entry) == "DisplayQuestChoice" and state["filter_npc"]:
                 write("filter cleared: the game's own quest board was opened")
                 state["filter_npc"] = None
-            return orig(self, button_index, *args, **kwargs)
+            elif quest_id_of_button(entry) is not None:
+                # 一覧の依頼を押した。次の受注画面の押下までは同じ一覧の中に居る。
+                state["quest_pressed"] = True
+            elif not after_quest and state["filter_npc"]:
+                # 一覧の外（「やめる」で戻った先など）の押下。残すと、後で開いた別の掲示板
+                # （`336_` の裏の依頼掲示板など）まで会話の相手で絞られ、「やめる」だけになる。
+                write("filter cleared: pressed outside the board")
+                state["filter_npc"] = None
+        return False
+
+    def on_button_press(self, action):
+        """自前のボタンが押された（窓口の `presses`）。判定は文字列ではなくボタン辞書に付けた印。"""
+        entry = choices.pressed() or {}
         if action == "busy":
             # 待機表示の「…」。
             # 押されても何もしない ＝ 生成中は操作させない。
@@ -1419,6 +1535,10 @@ def apply(ctx):
         # OfferPhase の説明を参照。
         start_phase(self, action, text)
         return None
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press},
+                    intercept=look_at_press)
 
     @ctx.wrap("__main__:InstantaleApp.toggle_to_action_in_conversation", required=False)
     def toggle_to_action(orig, self, *args, **kwargs):

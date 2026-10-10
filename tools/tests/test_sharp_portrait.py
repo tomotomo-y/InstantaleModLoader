@@ -12,7 +12,7 @@
              呼び直し、ゲームの関数が返した値をそのまま返す。**本物の cv2 と
              ゲームのカスケードと、実際に外れた絵で通す**（無ければ飛ばす）。
              呼び直すのは包みを剥がした素の関数で、`orig` は本番の1回だけ。
-             素の関数が投げても None で返す
+             素の関数が投げても None で返す。anime の回の None では呼び直さない
   設置     … `safe=True` / `alias_scan=False`。対象名はリコンのダンプに在る
 """
 import importlib.util
@@ -134,6 +134,9 @@ def game_module(module, detect):
 
 def fresh_mod(**overrides):
     # 既定は「立ち絵を荒くしない」が切（版15）。検査は入れた側で通し、切は明示して確かめる。
+    # 手元の config.json が vulkan 等でも、検査は cuda 名を含む全方式を包む。
+    from instantale_modloader import imagegen
+    imagegen.backend = lambda path=None: None
     overrides.setdefault("SHARP_PORTRAIT", True)
     spec = importlib.util.spec_from_file_location(
         "mod_sharp_portrait", MOD, submodule_search_locations=[MOD_DIR])
@@ -217,10 +220,22 @@ def main():
     check("ゲームが見つけた回はそのまま返す（呼び直さない）",
           got == (100, 40, 120, 120) and len(calls) == 1, (got, len(calls)))
     sys.modules.pop(module.CREATURE, None)
-    got = face(lambda image, *a, **k: None, FakeImage(512, 1024), "lbpcascade_animeface.xml")
+    got = face(lambda image, *a, **k: None, FakeImage(512, 1024), "haarcascade_frontalface_alt.xml")
     check("素の関数が引けなければやり直さない",
           got is None and any("素の関数が引けない" in line for line in log_lines(module, ctx)),
           (got, log_lines(module, ctx)))
+    # anime の回で拾って返すと、ゲームの haar の回が来ない。やり直しは haar の回まで待つ。
+    probed = []
+    game_module(module, lambda image, *a, **k: probed.append(image) or (1, 2, 3, 4))
+    lbp_full = os.path.join("runtime", "models", "face_recognition", "lbpcascade_animeface.xml")
+    got = face(lambda image, *a, **k: None, FakeImage(512, 1024), lbp_full, 0.25, 256)
+    check("anime の回の None はそのまま返し、呼び直さない（ゲームの haar の回に任せる）",
+          got is None and not probed
+          and any("ゲームの次の試行に任せる" in line for line in log_lines(module, ctx)),
+          (got, len(probed), log_lines(module, ctx)))
+    got = face(lambda image, *a, **k: None, FakeImage(512, 1024), cascade_path=lbp_full)
+    check("キーワードで来ても anime の回は呼び直さない", got is None and not probed, (got, len(probed)))
+    sys.modules.pop(module.CREATURE, None)
 
     try:
         import cv2
@@ -283,7 +298,7 @@ def main():
             del calls[:]
             check(label + ": 再現した検出は素の絵では外す（前提）", game_like(picture) is None)
             del calls[:]
-            got = face(game_like, picture, "lbpcascade_animeface.xml", 0.25, 256)
+            got = face(game_like, picture, "haarcascade_frontalface_alt.xml", 0.25, 256)
             check(label + ": 外れた絵でも前処理で拾える", got is not None, got)
             check(label + ": 拾った箱は上寄り",
                   got is not None and (got[1] + got[3] / 2.0) / picture.size[1] < module.faces.FACE_TOP, got)
@@ -301,7 +316,7 @@ def main():
         # ゲームがフォルダ付きで渡して来たら、呼び直しも同じフォルダの haar にする。
         del calls[:]
         picture = PIL.Image.open(samples["haarcascade_frontalface_alt.xml"]).convert("RGBA")
-        full = os.path.join(cascade_dir, "lbpcascade_animeface.xml")
+        full = os.path.join(cascade_dir, "haarcascade_frontalface_alt.xml")
         got = face(game_like, picture, full, 0.25, 256)
         check("フォルダ付きで来たら同じフォルダの haar で呼び直す",
               got is not None and calls[-1][1] == os.path.join(cascade_dir, "haarcascade_frontalface_alt.xml"),
@@ -314,13 +329,13 @@ def main():
         module, ctx, pixel, reduce_ = fresh_mod()
         face = ctx.hooks[module.CREATURE + ":detect_face_coordinates"]
         game_module(module, game_blind)
-        check("ゲームの関数が拒み続ければ None", face(game_blind, picture, "lbpcascade_animeface.xml") is None)
+        check("ゲームの関数が拒み続ければ None", face(game_blind, picture, "haarcascade_frontalface_alt.xml") is None)
         check("そのとき、こちらが見た箱を記録に残す",
               any("こちらは見えたがゲームの関数は None" in line for line in log_lines(module, ctx)),
               log_lines(module, ctx))
         game_module(module, game_like)
         blank = PIL.Image.new("RGBA", (512, 1024), (40, 40, 40, 255))
-        check("何も無い絵は None のまま", face(game_like, blank, "lbpcascade_animeface.xml") is None)
+        check("何も無い絵は None のまま", face(game_like, blank, "haarcascade_frontalface_alt.xml") is None)
 
         # safe=True の包みは最後に呼んだ orig の結果を本番の答えとして覚える。探りで orig を呼ばない。
         production = []
@@ -329,7 +344,7 @@ def main():
             production.append(image)
             return None
 
-        got = face(game_orig, picture, "lbpcascade_animeface.xml")
+        got = face(game_orig, picture, "haarcascade_frontalface_alt.xml")
         check("呼び直しは剥がした素の関数で、orig は本番の1回だけ",
               got is not None and len(production) == 1, (got, len(production)))
 
@@ -338,7 +353,7 @@ def main():
 
         game_module(module, game_throws)
         try:
-            got = face(game_orig, picture, "lbpcascade_animeface.xml")
+            got = face(game_orig, picture, "haarcascade_frontalface_alt.xml")
             leaked = None
         except Exception as exc:
             got, leaked = None, exc

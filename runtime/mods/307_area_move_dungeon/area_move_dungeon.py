@@ -105,7 +105,7 @@ import os
 import random
 import time
 
-from instantale_modloader import durations, ui
+from instantale_modloader import choices, durations, ui
 
 from . import world
 from .journey import Journey
@@ -325,9 +325,18 @@ def apply(ctx):
     }
 
     def road_of(app, *stages):
-        """いま有効な控え。段階が合わなければ None。"""
-        return journey.current(world.world_key(app) if app is not None else None,
-                               stages)
+        """いま有効な控え。段階か周回が合わなければ None。
+
+        鍵は周回（世界×主人公）。同じ世界で主人公を作り直すと依頼の id が振り直され、
+        前の周回の控えが別の依頼を道として扱う。
+        世界名だけの鍵は v1.15.0 より前の版が書いた控えで、同じ世界なら受ける。
+        """
+        record = journey.current(None, stages)
+        if record is None or app is None or not record.get("world"):
+            return record
+        if record.get("world") in (world.playthrough_key(app), world.world_key(app)):
+            return record
+        return None
 
     def drop_road(app, why, clear_note=True):
         """道の紐付けを外す。依頼概要に足した一文もここで消す。
@@ -459,7 +468,7 @@ def apply(ctx):
                 "origin_area_id": origin_id,
                 "origin_area_name": origin_name,
                 "difficulty": difficulty,
-                "world": world.world_key(app),
+                "world": world.playthrough_key(app),
                 "at": time.time(),
                 # 最後の移動でゲームへ渡した日数。0 のまま着いたら
                 # `elapse_days` を通らなかった合図（`arrived_check` が WARN に出す）。
@@ -645,7 +654,7 @@ def apply(ctx):
             return False
         write("arrived: {!r} reached; the road took {} day(s) (set to {})".format(
             record.get("target_area_name"), journey.days_spent(), TRAVEL_DAYS))
-        if not journey.days_spent():
+        if not record.get("days_noted") and not journey.days_spent():
             # 日数の差し替えが効いていない可能性そのもの。
             # ここは黙って通さない。
             write("WARN arrived: elapse_days was never seen; "
@@ -750,22 +759,17 @@ def apply(ctx):
             ctx.log_exc("road travel: cannot add the road button")
         return result
 
-    @ctx.wrap("__main__:InstantaleApp.on_button_press", required=False)
-    def on_button_press(orig, self, button_index, *args, **kwargs):
-        """自前のボタンだけ横取りする。印が無ければ必ず素通し。"""
-        entry = ui.pressed_entry(self, button_index)
-        action = screen.mark_of(entry)
-        if action is None:
-            return orig(self, button_index, *args, **kwargs)
+    def on_button_press(self, action):
+        """自前のボタンが押された（窓口 `choices` の `presses`）。"""
+        entry = choices.pressed()
         text = (entry.get("text") if isinstance(entry, dict) else None) or ROAD_LABEL
         write("pressed {!r} ({})".format(text, action))
         screen.start_phase(self, RoadPhase(self), text,
                            fallback=lambda: start_road(self, text))
         return None
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False)
-    def refresh_choice_buttons(orig, self, reset_page=False, *args, **kwargs):
-        """集落の選択肢に戻ったら、待っている移動を起こす（保険の経路）。
+    def refresh_choice_buttons(self, _buttons):
+        """集落の選択肢に戻ったら、待っている移動を起こす（保険の経路。窓口 `choices` から、組み直しの前に）。
 
         本来は完了した瞬間に動く（`quest_end`）。
         ここが働くのは、完了の瞬間を捉えられなかったとき。
@@ -794,7 +798,9 @@ def apply(ctx):
                                  tag="arrive")
         except Exception:
             ctx.log_exc("road travel: cannot start the pending move")
-        return orig(self, reset_page, *args, **kwargs)
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press})
 
     @ctx.wrap("__main__:QuestStartManager.__init__", required=False)
     def quest_start(orig, self, app, quest_type, quest_id, *args, **kwargs):
@@ -811,7 +817,8 @@ def apply(ctx):
             journey.sync()
             record = road_of(app, "offered", "armed")
             if record is not None:
-                if str(quest_id) == record.get("quest_id"):
+                # 物語の依頼（`story_quests`）の id は `world.quests` の id と重なる（GAME.md §2.9.1）。種類も見る
+                if str(quest_id) == record.get("quest_id") and quest_type == QUEST_TYPE:
                     journey.advance("armed", at=time.time())
                     write("armed: quest {!r} started; {!r} is waiting at the end"
                           .format(quest_id, record.get("target_area_name")))
@@ -947,8 +954,8 @@ def apply(ctx):
         if record is None:
             return None
         spent = journey.days_spent()
-        if spent > 0:
-            # この道ではもう渡している
+        if record.get("days_noted") or spent > 0:
+            # この道ではもう渡している（0 日を渡した回も含む。日数だけでは「まだ」と見分けられない）
             # ＝これはエリア移動の日数送りではない。素通しする。
             write("days: {} left alone (the road to {!r} already took "
                   "{} day(s))".format(
@@ -960,9 +967,9 @@ def apply(ctx):
     def days_note(app, days, granted):
         """道が実際に取った日数を控える（`arrived_check` が読む）。"""
         record = road_of(app, "moving")
-        if record is None or journey.days_spent() > 0:
+        if record is None or record.get("days_noted") or journey.days_spent() > 0:
             return
-        journey.advance("moving", days_spent=max(0, int(granted)))
+        journey.advance("moving", days_spent=max(0, int(granted)), days_noted=True)
         write("road: the road to {!r} takes {} day(s)".format(
             record.get("target_area_name"), granted))
 

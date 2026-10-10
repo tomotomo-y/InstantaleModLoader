@@ -11,31 +11,27 @@ MOD どうしは import しない（TECH.md §3.2.3）ので、両者はここ�
 答えは**装備の側の値だけ**（武器の攻撃力・防具の防御力。合算するならその結果）。
 本人の能力や体力と組み合わせて 1 発の数にするのは聞く側の仕事。
 `None` は「誰も置いていない」か「その人物は何も装備していない」で、聞く側はゲームのままにする。
+その人物に品を貸している間（`equipment.lend`）は、置いた MOD に聞かず貸した品の値を答える。
 
 素のゲームでは、プレイヤーの武器・防具だけが数に入る（GAME.md §2.10.2）。仲間の装備を
 数に入れるのは MOD の判断（VERIFICATION.md §3.70）で、公式が NPC に武器を参照させない理由は
 審判 LLM の文脈の肥大であり、数の側の理由ではない。
 
+装備欄の出し入れと身に着けている品の一覧は `equipment` の窓口が持つ。ここは数だけ。
+
 同じ種類を 2 本の MOD が置いたら後から置いたほうが勝ち、その旨をログに残す（`durations` と同じ）。
 置き場は `sys` の属性で、注入し直しをまたいで残る。
+そのため切った MOD のぶんは、ローダの `boot()` と `unload` が `durations.forget` の片付けとして外す。
 """
 import sys
 
+from . import durations, equipment
 from . import log_exc
 
 #: 装備の攻撃力。答えは float。
 ATTACK = "attack"
 #: 装備の防御力。答えは float。
 DEFENSE = "defense"
-#: 仲間の品を装備欄へ入れる／戻す。`fn(app, holder, item)` → "equipped" / "unequipped" / 断りの文字列、
-#: 装備欄が無ければ None（聞く側が自分で `equipments` を書く）。
-TOGGLE = "toggle"
-#: 仲間の品が装備欄に居るか。`fn(app, holder, item)` → bool、装備欄が無ければ None。
-EQUIPPED = "equipped"
-#: 身に着けている品の一覧。`fn(app, holder)` → `[(部位, 品), ...]`（部位は装備欄の MOD の名前、並びが優先順）。
-#: 装備欄を使っていなければ None（聞く側は `equipments` の weapon / wearable を読む）。
-#: 聞くのは戦闘の審判へ装備を見せる側（`401_`）。主人公にも答える。
-GEAR = "gear"
 
 _ATTR = "_instantale_combat"
 
@@ -76,6 +72,19 @@ def forget(owner, write=None):
     return gone
 
 
+# 片付けの入口は `durations.forget` の1本に保つ（`prices` と同じ）。
+durations.on_forget(forget)
+
+
+def owners():
+    """何かを置いている持ち主の名前。
+
+    ローダの `boot()` が、今回適用されなかった MOD のぶんを外すのに使う
+    （登録簿は注入をまたいで残るので、切った MOD の旧い関数に聞き続けないように）。
+    """
+    return sorted({who for who, _fn in _registry().values()})
+
+
 def source_of(kind):
     """その種類を決めている MOD の名前。誰も置いていなければ `""`。"""
     entry = _registry().get(str(kind))
@@ -83,8 +92,14 @@ def source_of(kind):
 
 
 def _ask(kind, app, holder):
+    if holder is None:
+        return None
+    # 貸しの間は貸した品の値（窓口 `equipment` の貸し。装備欄の MOD の答えより先）
+    lent = equipment.loan_value(app, holder, "weapon" if kind == ATTACK else "wearable")
+    if lent is not None:
+        return lent if lent > 0 else None
     entry = _registry().get(str(kind))
-    if entry is None or holder is None:
+    if entry is None:
         return None
     owner, fn = entry
     try:
@@ -99,42 +114,6 @@ def _ask(kind, app, holder):
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
-
-
-def _call(kind, app, *args):
-    entry = _registry().get(str(kind))
-    if entry is None:
-        return None
-    owner, fn = entry
-    try:
-        return fn(app, *args)
-    except Exception:
-        log_exc("combat: {!r} by {!r} failed; treated as not handled".format(kind, owner))
-        return None
-
-
-def toggle(app, holder, item):
-    """仲間の品を装備欄へ入れる／戻す。装備欄の MOD が無ければ None（聞く側が自分で書く）。"""
-    return _call(TOGGLE, app, holder, item)
-
-
-def equipped(app, holder, item):
-    """仲間の品が装備欄に居るか。装備欄の MOD が無ければ None。"""
-    return _call(EQUIPPED, app, holder, item)
-
-
-def gear(app, holder):
-    """身に着けている品 `[(部位, 品), ...]`。装備欄の MOD が無い／その人物が装備欄を使っていなければ None。
-
-    形の崩れた答え（並びでない、組が 2 つでない）は None にする（聞く側は素の読み方に戻る）。
-    """
-    answer = _call(GEAR, app, holder)
-    if answer is None:
-        return None
-    try:
-        return [(str(name), item) for name, item in answer if item is not None]
-    except (TypeError, ValueError):
-        return None
 
 
 def attack(app, holder):

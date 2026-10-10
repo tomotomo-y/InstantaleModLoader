@@ -88,7 +88,8 @@ def wait_until_ready(pid: int, timeout: float = READY_TIMEOUT) -> bool:
     deadline = time.monotonic() + timeout
     reported_interp = False
     while time.monotonic() < deadline:
-        if not injector.find_processes(injector.TARGET_EXE):
+        # 待っている pid そのものを見る（どれか1つが生きているかでは、再起動で替わった後も待ち続けた）。
+        if pid not in {p for p, _name in injector.find_processes(injector.TARGET_EXE)}:
             return False  # 待っている間にゲームが終了した
         if injector.interpreter_ready(pid):
             # 段階が進んだことは1回だけ知らせる。
@@ -117,10 +118,15 @@ def inject_pid(pid: int) -> str:
     戻り値は `INJECTED` / `PENDING` / `FAILED`。
     """
     payload = injector.make_bootstrap(injector.RUNTIME_DIR, injector.OUT_DIR, injector.BOOT_LOG)
+    mark = injector.boot_log_size()
     try:
         rc = injector.inject(pid, payload)
     except Exception as exc:
         log(f"  pid {pid}: injection error: {type(exc).__name__}: {exc}")
+        return FAILED
+    if rc == 0 and injector.boot_failed_since(mark):
+        # ブートストラップは例外を握るので、PyRun_SimpleString は 0 を返す。成否はログで読む
+        log(f"  pid {pid}: the bootstrap raised; see {injector.BOOT_LOG}")
         return FAILED
     if rc == 0:
         log(f"  pid {pid}: injected, mods applied (see modloader.log)")
@@ -148,7 +154,7 @@ def main() -> int:
     os.makedirs(injector.OUT_DIR, exist_ok=True)
     log("watcher started; polling every {}s for {}".format(args.interval, injector.TARGET_EXE))
     if not logrotate.enabled(args.log_rotate):
-        log("log rotate: disabled; out/*.log will keep growing")
+        log("log rotate: disabled; out/*.log and *.jsonl will keep growing")
 
     handled: set[int] = set()
     # 監視を始めた時点で既に動いていたゲーム。

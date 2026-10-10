@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""最上位エリアの地域経済プロフィールを作り、下流へ渡すMOD。
+"""最上位エリアの地域経済プロフィールを作り、店の値段と品揃えに使うMOD。
 
 ## 倍率の軸は売買画面ごとの一括商品照合
 
@@ -8,8 +8,8 @@
 設定の倍率へ変換して、129が付けた買価・売価へ掛ける。
 
 商品ごとに別々のLLM呼び出しをしない。売買画面を開く前に、全商品を1つのJSONへ
-まとめて裏で検品し、完了してから元の売買画面を開く。結果は実行中のメモリだけに
-保持し、商品分類をstateへ保存しない。
+まとめて裏で検品し、完了してから元の売買画面を開く。結果は世界の控え（state）にも
+書き足し、起動をまたいで使い回す（`_save_classifications`）。
 
 ゲーム側の補助分類は参考資料として渡すが、自由生成される商品に対応するため、
 名前と説明文を最重視する。ゲーム側に存在する `herb` や専用画像の有無に関する
@@ -21,13 +21,12 @@
 同時に渡す。`major_product`は関連の強さだけを示し価格は動かさず、
 `unclassified`は3（等倍）にする。
 
-## 下流エリアへの引き継ぎ
+## 街の施設・NPC の生成には渡さない
 
-`create_settlement_detail` の `settlement_overview` が子エリアの概要として
-ゲームのLLMへ渡る。世界構造から直上のエリアを特定し、そのエリアの405保存済み
-プロフィールがある場合だけ、要約・スコア1の供給過多品・スコア5の需要過多品・
-特産品を概要へ一時追記する。親を一段だけ見るため、孫へは直接渡さない。
-ゲームの `Area` や `world_data`、セーブ、405の保存プロフィールは変更しない。
+街の施設と NPC はゲームが初訪問で作り（`create_settlement_detail`）、その材料には
+街の概要と世界の概要がすでに入っている。プロフィールの材料も同じ2つなので、
+足しても言い換えが加わるだけになる。街ごとの独自の施設は、ゲームが自由施設として
+概要に沿って作る（GAME.md §2.21）。
 
 売買の左右とプレイヤー自身の所持品では、同じスコアを商品名末尾の表示へ使う。
 既定の上下表示はゲーム側の名前ラベルと同じ文字表示で、商品データそのものは書き換えない。
@@ -57,7 +56,8 @@ stateファイルは読まない。読み書きは全部ワーカーの中で行
 （自前のスレッドは `revert_all()` では止まらない。TECH.md §3.6.1）。
 降りたワーカーが残した仕事は、次に積みに来た新しい世代が（同じ地点でも）ワーカーを立て直して片付ける。
 
-例外は `profile_for()` の1回だけで、そこは意図して同期に読む（理由はその場に書いた）。
+例外は `profile_for()` の1回（意図して同期に読む。理由はその場に書いた）と、
+検品結果の書き足し（`_save_classifications`。売買画面を開く手前と、ワーカーの検品の後）。
 
 ## 値段
 
@@ -73,6 +73,20 @@ stateファイルは読まない。読み書きは全部ワーカーの中で行
 最終額はいつでも式から組み直せるので、このMODは自分が書いた額を控えない
 （控えていた頃は、保存中に売買画面が先に掛け直すと倍率が積み上がった
  ― 並行テストで 100 が 168万まで伸びた。組み直す形にしてその経路ごと無くなった）。
+
+## 版の記録
+
+版4: apply のたびに同じ中身で出ていた2行（`installed: ...` と、関所が書く
+`prices: '...' adjusts item prices (temporary)`）を、前に書いた中身と同じなら書かないようにした。
+遅れて当て直す boot を含めて約40日で `installed:` が約870行、`prices:` が415行だった。
+控えは `sys` の器に置き（1プロセス）、注入のときにログが世代送りされたら新しいログに書き直す。
+
+版5: 注入し直しの直後に、降りる途中の前の世代のワーカーが次の世代の積んだ仕事を取ると、
+処理せずに捨てていた（品揃えが特産品を見送る）。取った仕事は待ち行列へ戻して降りる。
+待ちから戻って降りるときも、次の世代のワーカーの登録を消さない。
+街の施設・NPC の生成（`create_settlement_detail`）へ親エリアの経済を追記する処理を外した。
+ゲームが渡す世界の構造は説明文の文字列で親を引けず、一度も追記していなかった。
+施設の生成は初訪問の1回で、その時点ではプロフィールもまだ無い（上の「街の施設・NPC の生成には渡さない」）。
 """
 
 import json
@@ -120,16 +134,9 @@ MANAGER_NAME = "mod_regional_economy"
 SPECIALTY_MANAGER_NAME = MANAGER_NAME
 STATE_STORE_ATTR = "__instantale_regional_economy_store__"
 
-# ゲーム本体の町詳細生成。`settlement_overview` が生成対象エリアの
-# 概要としてプロンプトへ渡るため、親エリアの経済情報はここへだけ足す。
-SETTLEMENT_DETAIL_TARGET = (
-    "scripts.llm.llm_manager_world_generate:create_settlement_detail"
-)
-ECONOMY_CONTEXT_HEADER = "【この土地の産業と経済】"
-STRUCTURE_NAME_KEYS = ("settlement_name", "area_name", "name")
-STRUCTURE_ID_KEYS = ("area_id", "id")
-WORLD_OVERVIEW_CHARS = 2400
-AREA_OVERVIEW_CHARS = 2400
+# None は切らない。ゲーム自身の頼み文も世界とエリアの概要を全文で載せる。
+WORLD_OVERVIEW_CHARS = None
+AREA_OVERVIEW_CHARS = None
 LIST_ITEM_CHARS = 240
 ITEM_DESCRIPTION_CHARS = 1200
 # 売買の窓だけに掛ける。所持品は None、402の受け渡しは "party_transfer"
@@ -294,7 +301,9 @@ def _short(value, limit):
     if not isinstance(value, str):
         value = str(value)
     value = value.strip()
-    return frames.short(value, limit) if value else ""
+    if not value or limit is None:
+        return value
+    return frames.short(value, limit)
 
 
 def _overview_only(value, limit):
@@ -327,98 +336,6 @@ def _area_overview(area):
     if text:
         return text
     return _overview_only(_get(area, "overview"), AREA_OVERVIEW_CHARS)
-
-
-def _structure_identity(node):
-    """世界構造の1ノードから、保存照合用の `(id, name)` を読む。"""
-    if isinstance(node, str):
-        return "", node.strip()
-    if not isinstance(node, dict):
-        return "", ""
-    node_id = next((node.get(key) for key in STRUCTURE_ID_KEYS
-                    if node.get(key) not in (None, "")), "")
-    node_name = next((node.get(key) for key in STRUCTURE_NAME_KEYS
-                      if node.get(key) not in (None, "")), "")
-    return (str(node_id) if node_id not in (None, "") else "",
-            node_name.strip() if isinstance(node_name, str) else "")
-
-
-def _structure_parent(structure, target_name, target_id=None):
-    """対象ノードの直上だけを `(親ID, 親名)` として返す。"""
-    wanted_name = target_name.strip() if isinstance(target_name, str) else ""
-    wanted_id = str(target_id) if target_id not in (None, "") else ""
-    if not wanted_name and not wanted_id:
-        return None
-    visited = set()
-
-    def visit(node, parent):
-        if isinstance(node, (dict, list, tuple)):
-            marker = id(node)
-            if marker in visited:
-                return None
-            visited.add(marker)
-        node_id, node_name = _structure_identity(node)
-        matches = (wanted_id and node_id == wanted_id) if node_id else \
-            (wanted_name and node_name == wanted_name)
-        if matches:
-            return parent
-        next_parent = (node_id, node_name) if (node_id or node_name) else parent
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key in STRUCTURE_ID_KEYS + STRUCTURE_NAME_KEYS:
-                    continue
-                found = visit(value, next_parent)
-                if found is not None:
-                    return found
-        elif isinstance(node, (list, tuple)):
-            for value in node:
-                found = visit(value, parent)
-                if found is not None:
-                    return found
-        return None
-
-    return visit(structure, None)
-
-
-def _economy_context(record):
-    """親エリアから子エリアへ渡す短い経済ブロックを作る。"""
-    if not isinstance(record, dict):
-        return ""
-    summary = _short(record.get("regional_economy_summary"),
-                     REGIONAL_ECONOMY_SUMMARY_CHARS)
-    if not summary:
-        return ""
-
-    def goods(key):
-        values = record.get(key)
-        if isinstance(values, str):
-            values = [values]
-        if not isinstance(values, (list, tuple)):
-            return ""
-        result = [_clean_item_text(value) for value in values]
-        return "、".join(value for value in result if value)
-
-    lines = [ECONOMY_CONTEXT_HEADER, summary]
-    surplus = goods("surplus_goods")
-    shortage = goods("shortage_goods")
-    products = goods("major_products")
-    if surplus:
-        lines.append("供給過多の製品: " + surplus)
-    if shortage:
-        lines.append("需要過多の製品: " + shortage)
-    if products:
-        lines.append("特産品: " + products)
-    return "\n".join(lines)
-
-
-def _area_id_by_name(app, area_name):
-    """構造側にIDが無い版だけ、実行中のArea一覧で名前をIDへ戻す。"""
-    if app is None or not isinstance(area_name, str) or not area_name.strip():
-        return ""
-    for area_id, area in (ui.world_areas(app) or {}).items():
-        if _short(_get(area, "name", ""), 120).strip() == area_name.strip():
-            return str(area_id)
-    return ""
 
 
 def _snapshot(app):
@@ -498,6 +415,9 @@ def _store():
         # world_dict と現在セーブの名前が一時的に食い違ったことを、
         # 同じロード中に何度も書かないための控え。
         "world_identity_mismatches": set(),
+        # apply のたびに同じ中身で出る行を、最後に書いた中身で覚える控え（版4）。
+        # `{"file": ログのファイルの身元, "last": {行の種類: 最後に書いた中身}}`。
+        "logged": {"file": None, "last": {}},
     }
     for key, value in defaults.items():
         if key not in found:
@@ -510,7 +430,41 @@ def _store():
         found["classification_pending"] = set()
     if not isinstance(found.get("world_identity_mismatches"), set):
         found["world_identity_mismatches"] = set()
+    logged = found.get("logged")
+    if not isinstance(logged, dict) or not isinstance(logged.get("last"), dict):
+        found["logged"] = {"file": None, "last": {}}
     return found
+
+
+def _file_id(path):
+    """ログのファイルの身元。無ければ None（世代送りで名前を変えられた直後など）。"""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _forget_if_log_replaced(state, path):
+    """前の apply の後でログが入れ替わった（世代送り・削除）なら、書いた中身の控えを捨てる。
+
+    世代送りは注入のとき（apply より前）にしか起きないので、apply の頭で見れば足りる。
+    MOD のモジュールは遅れて当て直す boot のたびに読み直されるので、控えは `sys` の器に置く。
+    """
+    logged = state["logged"]
+    now = _file_id(path)
+    before = logged.get("file")
+    logged["file"] = now
+    if before is not None and before != now:
+        logged["last"].clear()
+
+
+def _write_changed(state, write, kind, text):
+    """`kind` の行を、前に書いた中身と違うときだけ書く。"""
+    last = state["logged"]["last"]
+    if last.get(kind) != text:
+        last[kind] = text
+        write(text)
 
 
 def _state_path(ctx, world):
@@ -1607,6 +1561,8 @@ def apply(ctx):
     write = ctx.logger(LOG_BASENAME)
     note = ctx.logger(LOG_BASENAME, cap=2000)
     state = _store()
+    # 注入のときにログが世代送りされたら、`installed:` などを新しいログに書き直す（版4）。
+    _forget_if_log_replaced(state, ctx.out_path(LOG_BASENAME))
     jobs = state["jobs"]
     schedule = ui.scheduler(ctx, "regional economy")
     screen = ui.Screen(ctx, write, tag="regional economy",
@@ -1641,7 +1597,7 @@ def apply(ctx):
             write("skip: current area has no id")
             return None
         # 405のプロフィールは**街**（村・町・都市）だけが持つ。
-        # ダンジョンや小地点は自分の経済を持たず、親の街の要約を使う。
+        # ダンジョンや小地点は自分の経済を持たない。
         #
         # **世界構造（`World.structure`）では判定できない。**
         # 構造は世界生成時の `World` にしか無く、保存される `world_data` の5項目
@@ -1716,13 +1672,22 @@ def apply(ctx):
                 with state["worker_lock"]:
                     if not jobs.empty():
                         continue
-                    state["worker"] = None
+                    # 前の世代が待ちから戻ったときは、次の世代の登録を消さない
+                    # （消すと次の enqueue で同じ世代のワーカーが2本立つ）。
+                    if state.get("worker") is threading.current_thread():
+                        state["worker"] = None
                 return
             world = snapshot.get("world_key")
             area_id = snapshot.get("area_id")
             scope = (world, area_id)
+            handed_back = False
             try:
                 if ctx.superseded():
+                    # 待っている間に注入し直しが来て、次の世代が積んだ仕事を取った形。
+                    # 待ち行列へ戻して次の世代のワーカーに任せる。pending と Event は
+                    # その仕事のものなので触らない（片付けると品揃えが特産品を見送る）。
+                    jobs.put((snapshot, reason))
+                    handed_back = True
                     continue
                 # stateの読み込みはこのスレッドで行う。
                 bucket = _load_bucket(ctx, state, world, write)
@@ -1751,11 +1716,12 @@ def apply(ctx):
             except Exception:
                 ctx.log_exc("regional economy: profile background job failed")
             finally:
-                with state["data_lock"]:
-                    state["pending"].discard(scope)
-                    event = state["profile_events"].pop(scope, None)
-                    if event is not None:
-                        event.set()
+                if not handed_back:
+                    with state["data_lock"]:
+                        state["pending"].discard(scope)
+                        event = state["profile_events"].pop(scope, None)
+                        if event is not None:
+                            event.set()
                 jobs.task_done()
         with state["worker_lock"]:
             if state.get("worker") is threading.current_thread():
@@ -1814,40 +1780,6 @@ def apply(ctx):
         if ctx.superseded():
             return scope, None
         return profile_for(app)
-
-    def downstream_economy_context(settlement_name, world_structure):
-        """子エリアの概要へ渡す、直上エリアの経済情報を探す。
-
-        親プロフィールの保存済みデータだけを読む。見つからない場合は
-        生成を待ったり新しいLLMを呼んだりせず、ゲーム本来の概要を使う。
-        """
-        app = ui.find_app()
-        if app is None:
-            return None, None
-        note_world_identity(app)
-        world = str(_short(_active_world_key(app), 240) or "_")
-        # 構造はゲームが `create_settlement_detail` の引数で渡してくる。
-        # ここは世界生成の最中なので、保存されない構造がそのまま手に入る
-        # （素データから引き直す必要も、引ける当ても無い）。
-        structure = world_structure
-        target_id = None
-        current_area = ui.current_area(app)
-        if current_area is not None:
-            target_id = ui.area_id_of(current_area) or None
-        parent = _structure_parent(structure, settlement_name, target_id)
-        if parent is None:
-            return None, None
-        parent_id, parent_name = parent
-        if not parent_id:
-            parent_id = _area_id_by_name(app, parent_name)
-        if not parent_id:
-            return None, None
-        bucket = _load_bucket(ctx, state, world, write)
-        record = _record_of(bucket, parent_id)
-        context = _economy_context(record)
-        if not context:
-            return None, None
-        return context, (world, parent_id, settlement_name)
 
     def clear_item_markers(box):
         """箱の名前ラベルから、スコアや特産品印を消す。"""
@@ -1935,7 +1867,7 @@ def apply(ctx):
             setattr(label, "_instantale_regional_text", text)
             setattr(label, "_instantale_regional_plain", base_name)
             # 属性を読むことで、ゲーム側の実際の書体・サイズを経由していることを
-            # 明示する。値は変更せず、ユーザー環境の設定をそのまま使う。
+            # 明示する。値は変更せず、手元の環境の設定をそのまま使う。
             frames.text_of(label, "font_name")
             frames.attr(label, "font_size", None)
         except Exception:
@@ -2121,41 +2053,19 @@ def apply(ctx):
         multiplier = _regional_multiplier(score)
         return None if multiplier == 1.0 else price * multiplier
 
+    def write_adjust(text):
+        """関所が段を置いたときの1行。前に書いた中身と同じなら書かない（版4）。
+
+        `prices.adjust` は段を置くたびに `prices: '...' adjusts item prices (...)` を書き、
+        遅れて当て直す boot のたびに同じ行が並んでいた（約40日で415行）。
+        関所が `adjust` に渡した書き手を使うのはその1行だけ。
+        """
+        _write_changed(state, write, "prices.adjust", text)
+
     prices.install(ctx, write)
     prices.adjust(os.path.basename(getattr(ctx, "mod_dir", "") or
                                    "405_regional_economy"),
-                  regional_for, temporary=True, write=write)
-
-    @ctx.wrap(SETTLEMENT_DETAIL_TARGET, required=False, safe=True)
-    def create_settlement_detail(orig, world_overview, world_structure,
-                                 settlement_name, settlement_overview,
-                                 settlement_size, area_description,
-                                 include_free_facility=False,
-                                 *args, **kwargs):
-        """親エリアの地域経済を、子エリアの概要へ一時的に渡す。
-
-        変更するのはゲーム関数へ渡すローカル引数だけ。ゲームのArea、
-        world_data、セーブデータ、405のプロフィール保存内容は変更しない。
-        """
-        try:
-            context, source = downstream_economy_context(
-                settlement_name, world_structure)
-            if context:
-                base = settlement_overview or ""
-                settlement_overview = (base.rstrip() + "\n\n" + context
-                                       if base.strip() else context)
-                parent_name = ""
-                if isinstance(source, (tuple, list)) and len(source) > 1:
-                    parent_name = _short(source[1], 120)
-                elif isinstance(source, dict):
-                    parent_name = _short(source.get("name", source.get("area_name")), 120)
-                write("downstream economy injected: parent={!r} -> child={!r}"
-                      .format(parent_name or "?", settlement_name))
-        except Exception:
-            ctx.log_exc("regional economy: downstream overview injection failed")
-        return orig(world_overview, world_structure, settlement_name,
-                    settlement_overview, settlement_size, area_description,
-                    include_free_facility, *args, **kwargs)
+                  regional_for, temporary=True, write=write_adjust)
 
     @ctx.wrap("__main__:MovePhaseManager.move_phase",
               required=False, safe=True)
@@ -2425,10 +2335,13 @@ def apply(ctx):
             ctx.log_exc("regional economy: item marker display failed")
         return result
 
-    ctx.log("regional economy: installed profile, downstream economy context, "
+    ctx.log("regional economy: installed profile, "
             "batch classification, prices, markers, and specialty stock")
-    write("installed: profile + one batch item classification + price overlay + markers"
-          " + one specialty per native stock generation + downstream overview context"
-          " (strong={:g} weak={:g} style={!r})".format(
-              float(STRONG_FLUCTUATION_MULTIPLIER),
-              float(WEAK_FLUCTUATION_MULTIPLIER), MARK_STYLE))
+    installed = ("installed: profile + one batch item classification + price overlay + markers"
+                 " + one specialty per native stock generation"
+                 " (strong={:g} weak={:g} style={!r})".format(
+                     float(STRONG_FLUCTUATION_MULTIPLIER),
+                     float(WEAK_FLUCTUATION_MULTIPLIER), MARK_STYLE))
+    # 版4: apply のたびに書いていた（遅れて当て直す boot を含めて約40日で約870行）。
+    # 前に書いた中身と同じなら書かない。
+    _write_changed(state, write, "installed", installed)

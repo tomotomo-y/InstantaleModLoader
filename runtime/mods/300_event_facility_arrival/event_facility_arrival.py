@@ -84,16 +84,37 @@ NPC ごとに数える。
 プレイヤーが自分から話しかける分には何も変わらない。
 数えた結果は `state/` に世界ごと置く
 （`out/` はログで消してよいもの、`state/` は遊びの続き）。
+
+## ほかの MOD に譲る
+
+施設に着いた直後に会話を始める MOD は、これ1本とは限らない。
+同じ到着で2本が会話を始めると噛み合わないので、ローダの窓口 `arrivals` で分け合う。
+話しかけると決めたら申し出（優先度 `ARRIVAL_PRIORITY`）、会話を始める直前に
+自分より優先度の高い申し出があれば譲る。譲った回は間引きの回数（`COOLDOWN_VISITS`）に数えない。
+
+分け合うのは conversation モードだけ。
+narration モードのセリフは `move_phase` の内側（入れ子の narrator）で足すので、
+ほかの MOD が申し出るより先に画面へ出ていて、譲りようがない。
+そこで narration モードは申し出も勝者の確認もしない。
+このため narration モードでは、足した1行とほかの MOD が始める到着の会話
+（`911_` のライバルの声かけなど）が同じ到着で重なることがある。
+申し出だけ出すと、同じ優先度で後から申し出たほかの MOD が、会話を始めないこちらに譲って黙ってしまう。
+
+版3: ローダの窓口 `arrivals` で、同じ到着で会話を始めるほかの MOD に譲るようにした（conversation モードのみ）。
 """
 
 import random
 import sys
 import time
 
-from instantale_modloader import frames, llm, modfacility, ui
+from instantale_modloader import arrivals, frames, llm, modfacility, ui
 from instantale_modloader.state import WorldStore, world_key
 
 LOG_BASENAME = "player_events.log"
+
+#: ローダの窓口 `arrivals` に名乗る名前と優先度。0 は「ほかに話しかける MOD が居れば譲る」。
+ARRIVAL_OWNER = "300_event_facility_arrival"
+ARRIVAL_PRIORITY = 0
 
 # "conversation"（立ち絵つきの会話フェーズ） / "narration"（1行だけ足す）
 EVENT_MODE = "conversation"
@@ -194,6 +215,9 @@ STATE_DIRNAME = "arrival_event"
 # 会話の終わりを見届けられなかったときに、見届けの控えを捨てるまでの時間（秒）。
 # 途中でゲームを閉じた場合などに、次の会話へ持ち越さないための保険。
 WATCH_TTL = 1800.0
+
+#: MOD のボタンで閉じた会話に付ける印（`ConversationEndManager` の実体に）。無視と数えない。
+MOD_CLOSE_ATTR = "_instantale_300_mod_close"
 
 # 注入した瞬間に、今いる施設で narration モードのセリフを1本作ってログにだけ出す。
 # 画面には出さないし状態も変えない（会話フェーズは開始しない）。
@@ -401,6 +425,9 @@ def apply(ctx):
             getattr(facility, "name", ""), facility_type, roll, chance,
             getattr(npc, "name", ""), npc_id))
         state["fired_at"][facility_id] = visits
+        if EVENT_MODE == "conversation":
+            # narration モードは分け合いに加わらない（モジュール冒頭「ほかの MOD に譲る」）。
+            arrivals.offer(app, ARRIVAL_OWNER, ARRIVAL_PRIORITY)
         return facility, npc_id, npc
 
     # ================================================================
@@ -419,10 +446,12 @@ def apply(ctx):
         manager_cls = getattr(main, "ConversationStartManager", None) if main else None
         if manager_cls is None:
             write("launch: ConversationStartManager not found")
+            arrivals.withdraw(app, ARRIVAL_OWNER)       # 始めない申し出は下げる（残すと後から申し出た MOD が譲って黙る）
             return
         npc_name = getattr(npc, "name", None)
         if not npc_name:
             write("launch: speaker has no name")
+            arrivals.withdraw(app, ARRIVAL_OWNER)
             return
 
         def gone():
@@ -443,6 +472,13 @@ def apply(ctx):
             reason = gone()
             if reason:
                 write("launch: {}; cancelled".format(reason))
+                arrivals.withdraw(app, ARRIVAL_OWNER)
+                return
+            top = arrivals.winner(app)
+            if top not in (None, ARRIVAL_OWNER):
+                # 同じ到着でほかの MOD が先に話しかける。譲った回は間引きに数えない。
+                write("launch: yielded to {} ({!r} does not speak)".format(top, npc_name))
+                state["fired_at"].pop(str(getattr(facility, "id", "")), None)
                 return
             if REPHRASE_OPENING:
                 # 第一声を「NPC の方から声をかけた」に読み替える印。
@@ -453,6 +489,7 @@ def apply(ctx):
             except Exception:
                 ctx.log_exc("launch: cannot build ConversationStartManager")
                 state["rephrase"] = None
+                arrivals.withdraw(app, ARRIVAL_OWNER)
                 return
             write("launch: process_choice(ConversationStartManager, {!r}) npc_id={!r}"
                   .format(npc_name, npc_id))
@@ -461,6 +498,7 @@ def apply(ctx):
             except Exception:
                 ctx.log_exc("launch: process_choice failed")
                 state["rephrase"] = None
+                arrivals.withdraw(app, ARRIVAL_OWNER)
                 return
             # ここから会話の終わりまでを見届ける。
             # 返事が1つも無いまま終わったら、その相手の控えを1つ進める。
@@ -609,6 +647,8 @@ def apply(ctx):
         return result
 
     # ------------------------------------------------------------------ フック
+    arrivals.install(ctx, write)
+
     @ctx.wrap("__main__:MovePhaseManager.move_phase", required=False)
     def move_phase(orig, self, *args, **kwargs):
         state["move_count"] += 1
@@ -713,13 +753,20 @@ def apply(ctx):
             return
         mark["responded"] = True
 
-    def settle_watch(app):
-        """会話が終わった。返事の有無で控えを進めるか、0 に戻す。"""
+    def settle_watch(app, partner=None):
+        """会話が終わった。返事の有無で控えを進めるか、0 に戻す。
+
+        `partner` は終わった会話の相手。見届けている相手と違えば、その見届けは捨てる
+        （声をかけた会話がロードなどで消え、別の人との会話の終わりを無視と数えないため）。
+        """
         mark = watching_now()
         if mark is None:
             return
         state["watching"] = None
         npc_id, name = mark["npc_id"], mark["name"]
+        if isinstance(partner, str) and partner and partner != npc_id:
+            write("watch: the talk that ended was with {!r}, not {!r}; forgotten".format(partner, name))
+            return
         store = ignores(app)
         if mark["responded"]:
             if store.pop(npc_id, None) is not None:
@@ -746,12 +793,41 @@ def apply(ctx):
             ctx.log_exc("watch: cannot note the response")
         return orig(self, choice_text, *args, **kwargs)
 
+    @ctx.wrap("__main__:ConversationEndManager.__init__", required=False)
+    def conversation_end_init(orig, self, *args, **kwargs):
+        """MOD のボタンで閉じる会話か（`end_text` が画面の「会話を終了する」と違うか）を控える。値には触らない。
+
+        MOD が会話を閉じるときは、画面のボタンの args を写して `end_text` だけ差し替える（GAME.md §2.5）。
+        組み立てる時点では、画面にゲーム自身の「会話を終了する」がまだ並んでいる。
+        言語で変わる文言を決め打ちしないよう、そのボタンの `end_text` と比べる。
+        """
+        result = orig(self, *args, **kwargs)
+        try:
+            # `self` の後ろは app, in_conversation_id, finisher, end_text の順。
+            end_text = frames.arg(args, kwargs, "end_text", 3)
+            app = frames.arg(args, kwargs, "app", 0) or find_app()
+            _partner, entry = ui.conversation_partner(getattr(app, "buttons", None))
+            native = ui.spec_args(entry) if entry is not None else None
+            if isinstance(end_text, str) and native and len(native) >= 3                     and end_text != native[2]:
+                setattr(self, MOD_CLOSE_ATTR, True)
+        except Exception:
+            pass
+        return result
+
     @ctx.wrap("__main__:ConversationEndManager.finish_conversation", required=False)
     def finish_conversation(orig, self, *args, **kwargs):
         """会話の終わり。ここで数える。"""
+        app = getattr(self, "app", None) or find_app()
+        partner = getattr(app, "in_conversation", None)     # 終わると下りるので先に読む
+        # 「会話を終了する」以外の閉じ方は、MOD のボタン（依頼の話・別れ話など）を押した＝返事をした。
+        if getattr(self, MOD_CLOSE_ATTR, False):
+            try:
+                note_response(partner)
+            except Exception:
+                ctx.log_exc("watch: cannot note the response")
         result = orig(self, *args, **kwargs)
         try:
-            settle_watch(getattr(self, "app", None) or find_app())
+            settle_watch(app, partner)
         except Exception:
             ctx.log_exc("watch: cannot settle")
         return result

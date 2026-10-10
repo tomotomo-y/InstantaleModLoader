@@ -74,7 +74,7 @@ def test_world_key():
 
 def test_playthrough_key():
     """周回の鍵は 世界×主人公。主人公が死んで同じ世界で作り直したとき、
-    前の主人公の建物や契約を新しい主人公に引き継がないため（本人の指定）。"""
+    前の主人公の建物や契約を新しい主人公に引き継がないため。"""
     print("=== playthrough_key: 世界×主人公 ===")
     sep = st.PLAYTHROUGH_SEP
     save = {"world_data": {"name": "灰の街"}, "player_data": {"name": "ミツバ"}}
@@ -420,6 +420,15 @@ def test_adopt_world_file():
               "鍵が世界名だけなら空")
         check(st.other_playthroughs(os.path.join(sandbox, "state"), "岩" + sep + "ミツバ") == [],
               "世界名の頭が同じだけの別の世界は数えない")
+        side = os.path.join(sandbox, "state", "side_files")
+        os.makedirs(side, exist_ok=True)
+        for suffix in (".cast.json", ".reroll.json"):
+            with open(os.path.join(side, "岩の里" + sep + "ミツバ" + suffix), "w",
+                      encoding="utf-8") as handle:
+                handle.write("{}")
+        check(st.other_playthroughs(os.path.join(sandbox, "state"), "岩の里" + sep + "ミツバ")
+              == ["岩の里" + sep + "ムツハ"],
+              "同じ周回の副ファイル（.cast.json / .reroll.json）は別の主人公と読まない")
 
         old = fresh_store()
         old.save("灰の街", {})
@@ -445,6 +454,14 @@ def test_adopt_world_file():
         old.save("霧の谷", {"y": 2})
         check(not worlds.adopt("霧の谷" + sep + "ミツバ", "霧の谷") and exists("霧の谷"),
               "同じ鍵を確かめるのはプロセスで1度だけ")
+
+        # どちらの控えもまだ無い間は「確かめた」にしない（後から現れた世界名だけの控えも移す）。
+        worlds = fresh_store()
+        check(not worlds.adopt("星の丘" + sep + "ミツバ", "星の丘"), "（前提）どちらも無ければ移さない")
+        old = fresh_store()
+        old.save("星の丘", {"z": 3})
+        check(worlds.adopt("星の丘" + sep + "ミツバ", "星の丘") and not exists("星の丘"),
+              "どちらも無かった鍵は、後から現れた世界名だけの控えを移す")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
 

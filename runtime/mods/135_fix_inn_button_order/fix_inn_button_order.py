@@ -24,7 +24,7 @@ MOD を1つも当てない状態でも同じで、原因はゲームの側にあ
 
 ##### 直し方
 
-`InstantaleApp.refresh_choice_buttons` を包み、**描く前に** `app.buttons` を並べ直す。
+ローダの窓口 `choices`（TECH.md §3.3.14）の組み直しの前（`refresh`）で、**描く前に** `app.buttons` を並べ直す。
 `出る`（`MovePhaseManager`）より前に `宿泊する`（`DisplayVacationChoice`）が無いときだけ、
 `宿泊する` を `出る` の前へ動かす。
 それ以外の画面（部屋選び・活動の選択肢・よその施設）は spec の辞書引きだけで素通りする。
@@ -44,7 +44,7 @@ GAME.md §2.2）。
   この MOD を外しても、焼かれた並びは次に施設へ入り直すまで残るだけで害は無い
 """
 
-from instantale_modloader import ui
+from instantale_modloader import choices, ui
 
 LOG_BASENAME = "inn_button_order.log"
 
@@ -97,9 +97,7 @@ def apply(ctx):
         return [entry.get("text") if isinstance(entry, dict) else str(entry)
                 for entry in buttons]
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False,
-              safe=True)
-    def refresh_buttons(orig, self, *args, **kwargs):
+    def refresh_buttons(self, _buttons):
         """描かれる直前に、宿屋の `宿泊する` を `出る` の前へ動かす。"""
         try:
             buttons = getattr(self, "buttons", None)
@@ -111,6 +109,8 @@ def apply(ctx):
                     write("reordered: {} -> {}".format(before, after))
         except Exception:
             ctx.log_exc("inn button order: cannot reorder the buttons")
-        return orig(self, *args, **kwargs)
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, None, refresh=refresh_buttons)
 
     ctx.log("inn button order: {} goes before {} at inns".format(STAY_CLS, MOVE_CLS))

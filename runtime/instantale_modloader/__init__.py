@@ -68,7 +68,7 @@ import time
 import traceback
 import uuid
 
-__version__ = "1.13.2"
+__version__ = "1.15.0"
 
 # mod との契約。`mod.json` の "api" がこれと突き合わされる。
 #
@@ -317,6 +317,20 @@ _state: dict = {
     # boot() では数え直さない（上限の判定に使う）。
     # 手で注入し直すとローダごと読み直されるので、そこで 0 に戻る。
     "deferred_boots": 0,
+    # 前の boot までに書いた定型の行（`log_unrepeated`）。この注入の中だけで持つ。
+    # 手で注入し直すとローダごと読み直され、ログも世代送りされるので、そこで空に戻る。
+    "logged_before": set(),
+    # この boot で書いた定型の行。boot の頭で `logged_before` へ移す。
+    "logged_now": set(),
+    # この boot で書かずに済ませた定型の行の数。
+    "repeats": 0,
+    # `log()` が書いた行の数。MOD の適用中に何か書いたかを見るのに使う。
+    "lines_written": 0,
+    # この注入で振った世代（boot ごとに1つ。遅れて当て直す boot の分も並ぶ）。
+    # 手で注入し直すとローダごと読み直されるので、そこで空に戻る。
+    "generations": [],
+    # この boot で置き換えた「同じ注入の前の boot の層」の数（`note_replaced`）。
+    "replaced_own": 0,
 }
 
 # on_ready の「もう実行した」印を置く場所。
@@ -333,6 +347,21 @@ def _once_store() -> set:
     if not isinstance(store, set):
         store = set()
         setattr(sys, _ONCE_ATTR, store)
+    return store
+
+
+# 積んだがまだ走っていない on_ready（キー → 積んだ世代）。印と同じ理由で sys に置く。
+# 印は積んだ時点で立つので、`delay` の間に注入し直すと、新しい世代は「済み」として積まず、
+# 古い世代の関数（読み直す前のコード）だけが後から走っていた。キーに世代を混ぜる MOD では両方が走った。
+# 走る時点で世代が替わっていたら捨て、新しい世代はここを見て積み直す（`on_ready` / `_dispatch_ready`）。
+_PENDING_ATTR = "__instantale_ready_pending__"
+
+
+def _pending_store() -> dict:
+    store = getattr(sys, _PENDING_ATTR, None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(sys, _PENDING_ATTR, store)
     return store
 
 
@@ -366,6 +395,7 @@ def log(msg: str, *, level: str = "INFO") -> None:
     # 別々に握り潰す。
     # ログのせいでゲームを落とすのは本末転倒なので。
     path = _state.get("log_path")
+    _state["lines_written"] = _state.get("lines_written", 0) + 1
     if path:
         try:
             with open(path, "a", encoding="utf-8") as fh:
@@ -376,6 +406,68 @@ def log(msg: str, *, level: str = "INFO") -> None:
         sys.stderr.write("[modloader] " + line + "\n")
     except Exception:
         pass
+
+
+def log_unrepeated(msg: str, *, level: str = "INFO") -> bool:
+    """定型の行（包んだ・層を置き換えた・別名を張り替えた・設定・適用した・重なり・MOD の INFO 行）を書く。書いたかを返す。
+
+    **前の boot で同じ行を書いていれば書かない。**
+    1回の注入で、遅れて当て直す boot が何度か走る（モジュールや `__main__` のクラスが
+    後から揃うたび）。そのたびに全 MOD が当て直され、`wrapped` / `replacing` などが
+    同じ文面で並び直していた（実測。1回の起動で boot 4回・約7,600行・約940KB、
+    2回目以降の boot の行の多くが前の boot と同じ文面）。
+
+    同じ boot の中の重複は書く。`wrapped` の行には MOD の名前が無く、どの MOD の包みかは
+    後ろに続く `applied: <MOD>` の並びで読むので、2本の MOD が同じ対象を包んだ行を
+    1つに潰すと読めなくなる。
+    ERROR と WARN はここを通さない（`log` で毎回書く）。
+    先送り（`defer ...`）も通さない。どの boot でも、その boot で待っているフックを1件ずつ書く。
+    """
+    before = _state.setdefault("logged_before", set())
+    now = _state.setdefault("logged_now", set())
+    if msg in before:
+        _state["repeats"] = _state.get("repeats", 0) + 1
+        return False
+    now.add(msg)
+    log(msg, level=level)
+    return True
+
+
+def mod_log(msg, *, level: str = "INFO") -> None:
+    """MOD の `ctx.log`。INFO の行は `log_unrepeated` を通す（WARN と ERROR は毎回書く）。
+
+    MOD の多くは apply のたびに設定の要約を1行書く（`… installed; …` / `… state=…`）。
+    遅れて当て直す boot でも同じ文面が並び直していた（実測。2回目の boot で168行中136行、
+    3回目で171行中155行が前の boot と同じ文面。modloader.log の MOD の行は9日で約5.7MB）。
+    """
+    if level == "INFO":
+        log_unrepeated(str(msg))
+    else:
+        log(msg, level=level)
+
+
+def _roll_logged_lines() -> None:
+    """boot の頭で呼ぶ。前の boot で書いた定型の行を控えへ移し、数えを0に戻す。"""
+    _state.setdefault("logged_before", set()).update(_state.get("logged_now") or ())
+    _state["logged_now"] = set()
+    _state["repeats"] = 0
+    _state["replaced_own"] = 0
+
+
+def note_replaced(generation) -> bool:
+    """置き換えた層が**この注入の前の boot** のものなら数えて True。
+
+    遅れて当て直す boot は、前の boot で自分が当てた層を全部置き換える。
+    これは当て直しの定義どおりで、対象ごとに書いても読むことが無い
+    （実測。1回の起動で `replacing` が約400行、全部この形だった）。
+    boot の終わりに件数だけ書く。
+    前の注入（手で注入し直す前）の層なら False を返し、呼び側が対象ごとに書く。
+    """
+    earlier = (_state.get("generations") or [])[:-1]
+    if generation is not None and generation in earlier:
+        _state["replaced_own"] = _state.get("replaced_own", 0) + 1
+        return True
+    return False
 
 
 def log_exc(msg: str) -> None:
@@ -424,7 +516,7 @@ class ModContext:
         # 引数名を `state_dir` にしないのは、
         # 場所を決める関数 `state_dir()` を中で呼べなくなるため。
         self.state_dir = state_root or state_dir(runtime_dir)
-        self.log = log
+        self.log = mod_log
         self.log_exc = log_exc
         self.api = API
         self.version = __version__
@@ -436,6 +528,9 @@ class ModContext:
         # boot() が出し入れする。
         # on_ready の既定のキーに使う。
         self._mod: str | None = None
+        # その mod の在り処（`runtime/mods` か `local/`）。boot() が `_mod` と一緒に出し入れする。
+        # 無ければ `runtime/mods` とみなす。
+        self._mod_root: str | None = None
 
     # -- patch モジュールへの入口 -------------------------------------------
     # ここで遅延 import しているのは循環 import を避けるため。
@@ -521,15 +616,22 @@ class ModContext:
             self._mod or "<loader>",
             getattr(fn, "__qualname__", None) or getattr(fn, "__name__", repr(fn)))
         store = _once_store()
+        pending = _pending_store()
+        generation = _state.get("generation")
         # 印を「積んだ時点」で付ける。
         # 実行時に付けると、実行前にもう一度
         # boot() が走ったときに二重に積まれる（Clock はまだ流していない）。
+        # ただし前の世代が積んでまだ走っていないものは、その世代が捨てるので積み直す。
+        waiting = pending.get(name)
         if name in store and not force:
-            log("on_ready: {} already done in this process; skipped".format(name))
-            return False
-        if force and name in store:
+            if waiting is None or waiting == generation:
+                log("on_ready: {} already done in this process; skipped".format(name))
+                return False
+            log("on_ready: {} was still waiting from an earlier boot; queued again".format(name))
+        elif force and name in store:
             log("on_ready: {} forced (the once-mark was set)".format(name), level="WARN")
         store.add(name)
+        pending[name] = generation
         _state["ready"].append((name, fn, delay))
         return True
 
@@ -595,7 +697,7 @@ class ModContext:
 
         **消してよいもの**の置き場。
         ログ・調査の出力・status.json。
-        注入のたびに `tools/logrotate.py` が直下の `*.log` を1世代送る。
+        注入のたびに `tools/logrotate.py` が直下の `*.log` と `*.jsonl` を1世代送る。
         遊びの続きに要るものは `state_path()` へ。
         """
         path = os.path.join(self.out_dir, *parts)
@@ -695,6 +797,8 @@ class ModContext:
 
         `logger()` と同じく、書けなくても**例外にしない**し、
         tmp→replace も通さない（1行ずつ足すだけで、壊れても捨てられる）。
+        注入のたびに `tools/logrotate.py` が1世代送るのも `logger()` と同じ。
+        注入をまたいで数えたいときは世代送りを切る。
 
         以前はこの5行が**8本の probe に写されていた**（差はログ文だけ）。
         probe を1本書くたびに写しが1つ増える形になっていたので、ここへ集めた
@@ -830,7 +934,9 @@ class ModContext:
         """
         if self._mod is None:
             return None
-        return os.path.join(self.runtime_dir, "mods", self._mod)
+        # `runtime/mods` を決め打つと、`local/` の mod だけ同梱データが見つからない。
+        root = self._mod_root or os.path.join(self.runtime_dir, "mods")
+        return os.path.join(root, self._mod)
 
     # -- 実行環境の情報 -----------------------------------------------------
     @property
@@ -1241,17 +1347,19 @@ def _order(mods_dir: str, found: list[str],
     return ordered + extra, listed, skipped, problems, notes
 
 
-def _load_mod_file(path: str):
+def _load_mod_file(path: str, folder: str | None = None):
     """mod をパス指定で読み込む。ゲームのモジュール名とは隔離する。
 
-    `path` は `mod.json` の "entry" が指すファイル。
+    `path` は `mod.json` の "entry" が指すファイル、`folder` は MOD のフォルダ名。
     **パッケージとして**読み込むので、入口の名前が何であれ、
     mod の中から `from . import prompts` で隣を引ける。
     """
     # 専用の接頭辞を付けた名前で sys.modules に登録する。
     # ゲーム側のモジュール名とぶつかると、どちらかが壊れるため。
     mod_dir = os.path.dirname(path)
-    name = "instantale_mod_" + os.path.basename(mod_dir)
+    # 名前は MOD のフォルダ名から作る（`instantale_mod_<フォルダ名>`。`state.py` と各 MOD が前提にしている形）。
+    # 入口のあるフォルダから作ると、"entry" が `src/main.py` の MOD が2本あったとき同じ名前を奪い合った。
+    name = "instantale_mod_" + (folder or os.path.basename(mod_dir))
     # submodule_search_locations を渡すとパッケージ扱いになる。
     # これが無いと mod の中の相対 import が「親パッケージが無い」で落ちる。
     spec = importlib.util.spec_from_file_location(
@@ -1582,11 +1690,24 @@ def _dispatch_ready() -> None:
     log("on_ready: {} task(s){}".format(
         len(entries), "" if Clock else " (no kivy Clock; running inline)"))
 
+    generation = _state.get("generation")
     for name, fn, delay in entries:
         # 既定引数で束縛する。
         # ループ変数のまま閉じ込めると、
         # Clock が呼ぶ頃には最後の1件を全員が指している。
         def call(_dt=None, name=name, fn=fn):
+            pending = _pending_store()
+            if _superseded(generation):
+                # 待っている間に別の boot（注入し直し・遅れた当て直し）が走った。
+                # 古い世代のコードは走らせない。新しい世代が積み直していなければ（MOD を切った・
+                # 条件が外れた・外した）、印も外して次の boot で積めるようにする。
+                if pending.get(name) == generation:
+                    pending.pop(name, None)
+                    _once_store().discard(name)
+                log("on_ready: {} from an earlier boot skipped (gen {})".format(name, generation))
+                return
+            if pending.get(name) == generation:
+                pending.pop(name, None)
             try:
                 fn()
                 log("on_ready: {} done".format(name))
@@ -1605,6 +1726,7 @@ def _dispatch_ready() -> None:
             # 印は「実行した」ではなく「実行したか、Clock に渡ってもう走る」の意。
             # ここで残すと、走らないまま二度と積まれない一件が生まれる。
             _once_store().discard(name)
+            _pending_store().pop(name, None)
             log_exc("on_ready: could not schedule {} (will retry next boot)".format(name))
 
 
@@ -1815,9 +1937,9 @@ def boot(out_dir: str) -> dict:
 
 
 def _forget_unapplied(results: dict, manifests: dict) -> list[str]:
-    """今回 "ok" にならなかった MOD が置いた期間・日数の望み・値段を外す。外した持ち主を返す。
+    """今回 "ok" にならなかった MOD が置いた期間・日数の望み・値段・装備の窓口を外す。外した持ち主を返す。
 
-    登録簿（`durations` / `prices`）は sys に在って注入をまたぐ。
+    登録簿（`durations` / `prices` / `combat` / `equipment`）は sys に在って注入をまたぐ。
     切った MOD や今回 apply に失敗した MOD の旧い関数が残ると、
     関所がそれに聞き続ける（古いモジュールの設定値を握ったまま）。
     持ち主はフォルダ名（MOD が `ctx.mod_dir` から名乗る）。
@@ -1826,11 +1948,14 @@ def _forget_unapplied(results: dict, manifests: dict) -> list[str]:
     from . import durations as _durations
     # `on_forget` の片付けを、この世代の durations に登録させる。
     # durations は注入のたびに読み直されるので、prices がまだ読まれていない世代では
-    # 値段の片付けが繋がっていない。
+    # 値段の片付けが繋がっていない。combat と equipment も同じ。
     from . import prices as _prices
+    from . import combat as _combat
+    from . import equipment as _equipment
     ok = {name for name, verdict in results.items() if verdict == "ok"}
     base, layers = _prices.item_price_sources()
-    owners = set(manifests) | set(_durations.owners()) | {base} | set(layers)
+    owners = (set(manifests) | set(_durations.owners()) | {base} | set(layers)
+              | set(_combat.owners()) | set(_equipment.owners()))
     gone = []
     for owner in sorted(owners - ok - {""}):
         if _durations.forget(owner, write=log):
@@ -1838,10 +1963,71 @@ def _forget_unapplied(results: dict, manifests: dict) -> list[str]:
     return gone
 
 
+def _rebind_cloud_resources() -> None:
+    """クラウドの SDK の資源に、クライアントの今の送りの手を掴み直させる（`llm.rebind_cloud_resources`）。
+
+    注入の終わり（前の世代の層を剥がした後）とローダを外した後に呼ぶ。
+    呼ばないと、資源が作られた時の世代の包みが、ゲームを閉じるまで使われ続ける。
+    """
+    try:
+        from . import llm as _llm
+        count = _llm.rebind_cloud_resources()
+        if count:
+            log("rebound {} cloud SDK call(s) to the current hooks".format(count))
+    except BaseException:
+        log_exc("cannot rebind the cloud SDK resources")
+
+
+def _keep_save_gates(ctx) -> list[str]:
+    """前の世代で立っていて、今の世代でどの MOD も立てなかった保存の関所を立て直す。立て直した部品を返す。
+
+    `modnpc` / `modfacility` / `prices` の関所は、使う MOD を全部切った世代でも残す
+    （世界に置いた持ち物は残るので。`patch._KEEP_ACROSS_GENERATIONS`）。
+    `drop_stale_layers` はその層を剥がさないが、今の世代の別の MOD が同じ関数
+    （`save_game` など）を包むと、`wrap` が前の世代の層をまとめて剥がすので関所も消える。
+    ローダが今の世代の層として立て直せば、誰に包まれても剥がれない。
+    中身は前の世代で残していた層と同じ（同じ部品の `install`）。
+
+    `boot()` は MOD の適用の**前**に呼ぶ。適用の後だと、最初に `save_game` を包む MOD（`129_`）から
+    関所を立てる MOD（`336_` / `330_`）までの約1秒、関所の無い時間ができ、その間の保存に
+    MOD の人物・施設が混ざりえた（遅れて当て直す boot はメインスレッドの外で走る）。
+    立て直した後に MOD が呼ぶ `install` は、同じ世代なので何もしない（関所は1つのまま）。
+    適用の後にもう一度呼ぶのは念のため（その時点では何もしない）。
+    """
+    from . import modfacility as _modfacility
+    from . import modnpc as _modnpc
+    from . import patch as _patch
+    from . import patch_registry as _registry
+    from . import prices as _prices
+    generation = _state.get("generation")
+    rebuilt = []
+    # 並びは同梱の適用順で関所を立てる順（129 の prices → 336 の modnpc → 330 の modfacility）。
+    for name, done, install in (("prices", _prices.item_gate, _prices.install),
+                                ("modnpc", _modnpc.installed, _modnpc.install),
+                                ("modfacility", _modfacility.installed, _modfacility.install)):
+        try:
+            record = done()
+            if record is None or record.get("generation") == generation:
+                continue
+            _registry.begin_mod("(loader)")
+            try:
+                # 書き手は中継にする（関所の行は、その世代で `install` を呼んだ MOD のログへ）。
+                install(ctx, write=_patch.gate_writer(name, log))
+            finally:
+                _registry.end_mod()
+            rebuilt.append(name)
+        except BaseException:
+            log_exc("cannot keep the save gate of {}".format(name))
+    if rebuilt:
+        log_unrepeated("raised the save gate(s) of the earlier boot again: {}".format(", ".join(rebuilt)))
+    return rebuilt
+
+
 def _boot(out_dir: str) -> dict:
     _state["out_dir"] = out_dir
     _state["log_path"] = os.path.join(out_dir, "modloader.log")
     _state["boot_count"] += 1
+    _roll_logged_lines()
 
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -1855,6 +2041,7 @@ def _boot(out_dir: str) -> dict:
     # これが無いと、注入のたびにラッパが入れ子で積み上がってしまう。
     generation = uuid.uuid4().hex[:12]
     _state["generation"] = generation
+    _state.setdefault("generations", []).append(generation)
     from . import patch as _patch
     _patch.set_generation(generation)
 
@@ -1921,6 +2108,11 @@ def _boot(out_dir: str) -> dict:
         if from_local:
             log("{} of them from {}: {}".format(
                 len(from_local), _local_mods_dir(mods_dir), ", ".join(from_local)))
+        # 前の世代の保存の関所を、MOD が `save_game` を包み始める前に今の世代で立て直す。
+        try:
+            _keep_save_gates(ctx)
+        except BaseException:
+            log_exc("cannot keep the save gates")
         for fname in names:
             manifest = manifests[fname]
 
@@ -1947,7 +2139,7 @@ def _boot(out_dir: str) -> dict:
                 results[fname] = "no-entry"
                 continue
             try:
-                module = _load_mod_file(path)
+                module = _load_mod_file(path, fname)
             except BaseException:
                 log_exc("load failed: {}".format(fname))
                 results[fname] = "load-error"
@@ -1958,6 +2150,9 @@ def _boot(out_dir: str) -> dict:
                 log("{} has no apply(), skipped".format(fname), level="WARN")
                 results[fname] = "no-apply"
                 continue
+
+            # この mod の区切りで何か書いたか（`applied:` を省けるかの判定）。
+            written_at_start = _state.get("lines_written", 0)
 
             # 設定は**読み込んだ後・apply() の前**に書き込む。
             # apply() の中で作られる入れ子の関数は定数をモジュールのグローバルとして読むので、
@@ -1978,6 +2173,7 @@ def _boot(out_dir: str) -> dict:
             # 戻し忘れると、次に記録されたパッチが前の mod のものとして残る。
             _registry.begin_mod(fname)
             ctx._mod = fname
+            ctx._mod_root = dirs.get(fname, mods_dir)
             try:
                 apply_fn(ctx)
             except BaseException:
@@ -1987,7 +2183,14 @@ def _boot(out_dir: str) -> dict:
             finally:
                 _registry.end_mod()
                 ctx._mod = None
-            log("applied: {}".format(fname))
+                ctx._mod_root = None
+            # 前の boot と同じで、この mod が今回1行も書いていなければ省く。
+            # 何か書いたなら、その行がどの mod のものかを読めるよう必ず書く。
+            if _state.get("lines_written", 0) != written_at_start:
+                _state.setdefault("logged_now", set()).add("applied: {}".format(fname))
+                log("applied: {}".format(fname))
+            else:
+                log_unrepeated("applied: {}".format(fname))
             results[fname] = "ok"
 
     _state["mods"] = results
@@ -1997,10 +2200,26 @@ def _boot(out_dir: str) -> dict:
     # 今回当て直されなかった前の世代のフックと、登録簿に残った前の世代の関数を片付ける。
     # 「切ったのに効いている」を残さない（`config.debug_mode` の「切り替えが効くのは
     # 次の注入から」もこれで成り立つ）。
+    # 剥がす前に、残すはずの保存の関所を今の世代で立て直す（別の MOD の包みが剥がしていることがある）。
+    try:
+        _keep_save_gates(ctx)
+    except BaseException:
+        log_exc("cannot keep the save gates")
+    # 作業スレッドが死んだときに待機のまま止めない（stalls.py）。MOD の層より後に当てる。
+    try:
+        from . import stalls as _stalls
+        _registry.begin_mod("(loader)")
+        try:
+            _stalls.install(ctx)
+        finally:
+            _registry.end_mod()
+    except BaseException:
+        log_exc("cannot install the stall guard")
     try:
         _patch.drop_stale_layers()
     except BaseException:
         log_exc("cannot drop the stale patch layers")
+    _rebind_cloud_resources()
     try:
         _forget_unapplied(results, manifests)
     except BaseException:
@@ -2021,8 +2240,26 @@ def _boot(out_dir: str) -> dict:
 
     # どの mod がどこへ当てたか、重なりはどこか、解決できなかった対象は何か。
     # ゲーム更新で関数が消えた場合はここの UNRESOLVED に出る。
+    # 重なりの節の各行（`対象 <- MOD, ...`）は前の boot と同じなら書かない（`log_unrepeated`）。
+    # 遅れて当て直す boot では大半が同じ行だった（実測。180行ほどのうち9割以上）。
+    # 今の全体は `status.json` の `patches.conflicts` にある。
+    # 見出しと、保留・見送り・UNRESOLVED の節は毎回書く。
+    section = None
     for line in _registry.format_report():
-        log(line)
+        if not line.startswith("  "):
+            section = line.split(" ", 1)[0]
+            log(line)
+        elif section == "overlapping":
+            log_unrepeated(line)
+        else:
+            log(line)
+    if _state.get("replaced_own"):
+        log("replaced {} patch layer(s) left by the earlier boot(s) of this injection".format(
+            _state["replaced_own"]))
+    if _state.get("repeats"):
+        log("{} line(s) same as an earlier boot of this injection were not repeated "
+            "(wrapped / replacing / rebound / setting / applied / overlapping / mod info)"
+            .format(_state["repeats"]))
     log("-" * 70)
 
     # ここまでの結果をファイルへ落とす。
@@ -2056,7 +2293,7 @@ def write_status(out_dir: str | None = None) -> str | None:
     1方向で済み、ゲームが終了した後でも読める。
 
     遅延当て直し（`_arm_deferred`）のたびに上書きされるので、中身は常に最新の boot。
-    ログ（`*.log`）とは別扱いなので世代管理の対象にしない。
+    ログ（`*.log` / `*.jsonl`）とは別扱いなので世代管理の対象にしない。
     常に「今の状態」を表すファイルで、履歴に意味が無い。
     """
     out_dir = out_dir or _state.get("out_dir")
@@ -2084,9 +2321,10 @@ def unload(out_dir: str | None = None) -> dict:
         mod がゲームの状態そのものに書いた値（パーティの名簿・依頼）
         mod が立てたスレッドや Clock の予約
 
-    例外が1つある。`modnpc` の NPC は**剥がす前に世界から降ろす**（`modnpc.purge`）。
+    例外が1つある。`modnpc` の NPC と `modfacility` の施設は**剥がす前に世界から降ろす**
+    （`modnpc.purge` / `modfacility.purge`）。
     あれは「セーブに残さない」ことを保存の関所1箇所で守っているので、
-    関所だけ消して名簿に残すと、次の保存でセーブに焼かれてしまう。
+    関所だけ消して世界に残すと、次の保存でセーブに焼かれてしまう。
 
     そのため「入れ忘れた状態に戻す」用途ではなく、**mod を疑うときの切り分け**に使うもの。
     素のゲームで確かめたいなら、注入せずに起動し直すのが確実。
@@ -2098,15 +2336,48 @@ def unload(out_dir: str | None = None) -> dict:
 #: `unload` が、NPC を降ろしてパッチを剥がすのをメインスレッドで待つ上限（秒）。
 UNLOAD_WAIT = 10.0
 
+#: `unload` がメインスレッドの手が空くのを待つ上限（秒）。超えたら何も剥がさずに諦める。
+UNLOAD_GIVE_UP = 300.0
 
-def _run_on_main_thread(fn, timeout: float):
-    """`fn()` をメインスレッド（Kivy の Clock）で走らせ、終わるまで待って戻り値を返す。
+
+def _main_loop_state():
+    """メインループの様子。`(回っているか, 人が読む説明)`。
+
+    Kivy の `EventLoop.mainloop` は `not quit and status == 'started'` の間だけ回る（Kivy 2.3.0 の
+    `kivy/base.py`）。回っていて手が空かないなら、メインスレッドは Clock の1つの呼び出しの中で
+    処理を続けている（止まってはいない）。そのときはメインスレッドが今いる関数を添える。
+    """
+    main = threading.main_thread()
+    if not main.is_alive():
+        return False, "the main thread has ended"
+    try:
+        from kivy.base import EventLoop
+        status = getattr(EventLoop, "status", None)
+        if getattr(EventLoop, "quit", False) or status != "started":
+            return False, "the kivy event loop is not running (status {!r})".format(status)
+    except BaseException:
+        pass
+    frame = sys._current_frames().get(main.ident)
+    if frame is None:
+        return True, "the main thread is busy"
+    return True, "the main thread is busy in {} ({}:{})".format(
+        frame.f_code.co_name, os.path.basename(frame.f_code.co_filename), frame.f_lineno)
+
+
+def _run_on_main_thread(fn, timeout: float, give_up: float | None = None):
+    """`fn()` をメインスレッド（Kivy の Clock）で走らせ、終わるまで待つ。`(走ったか, 戻り値)` を返す。
 
     注入のリモートスレッドからゲームの状態を書き換えると、メインスレッドが
     同じ辞書を反復している最中に "dictionary changed size" が起こりうる（TECH.md §6.2）。
-    Clock が無い（ゲームの外）・既にメインスレッドに居る・`timeout` 秒待っても
-    走らない（メインループが止まっている）ときは、この場で走らせる。
-    どちらで走っても1回だけ（先に始めた側が取る）。
+    Clock が無い（ゲームの外）・既にメインスレッドに居るときは、この場で走らせる。
+
+    待ちが長いときは、`timeout` 秒ごとにメインループの様子を見る（`_main_loop_state`）。
+    回っていれば、メインスレッドは別の処理の中に居て、終われば Clock がこの仕事を取る。
+    そのときはこの場で走らせない（メインスレッドと同時に世界を書き換えることになる）。
+    前は `timeout` 秒で「止まっている」とみなしてこの場で走らせていたが、手が空かないだけなのか、
+    本当に止まっているのかを見分けていなかった。
+    メインループが止まっていたら（ゲームが終わる途中）、Clock はもう回らないので走らせずに諦める。
+    `give_up` 秒（既定 `timeout` の 30 倍）待っても取られなければ諦める。諦めたら、後から Clock が呼んでも走らない。
     """
     claim = threading.Lock()
     done = threading.Event()
@@ -2116,6 +2387,7 @@ def _run_on_main_thread(fn, timeout: float):
         if not claim.acquire(False):
             return
         try:
+            box["ran"] = True
             box["result"] = fn()
         except BaseException:
             # Clock の中で投げるとゲームが落ちる。
@@ -2130,14 +2402,26 @@ def _run_on_main_thread(fn, timeout: float):
             clock.schedule_once(run, 0)
         except BaseException:
             clock = None
-    if clock is not None and done.wait(timeout):
-        return box.get("result")
-    if clock is not None:
-        log("the main thread did not take the job in {:.0f}s; running it here"
-            .format(timeout), level="WARN")
-    run()
-    done.wait()       # Clock の側が先に取って走っている最中なら、終わるのを待つ
-    return box.get("result")
+    if clock is None:
+        run()
+        return bool(box.get("ran")), box.get("result")
+    limit = give_up if give_up is not None else timeout * 30
+    waited = 0.0
+    while not done.wait(timeout):
+        waited += timeout
+        running, why = _main_loop_state()
+        if running and waited < limit:
+            log("the main thread has not taken the job in {:.0f}s; waiting ({})".format(
+                waited, why), level="WARN")
+            continue
+        if claim.acquire(False):
+            # まだ誰も取っていない。後から Clock が呼んでも走らないよう、ここで取って捨てる。
+            log("gave up the job after {:.0f}s without running it ({})".format(waited, why),
+                level="ERROR")
+            return False, None
+        done.wait()   # ちょうど Clock の側が取って走っている。終わるのを待つ
+        break
+    return bool(box.get("ran")), box.get("result")
 
 
 def _unload(out_dir: str | None) -> dict:
@@ -2154,9 +2438,9 @@ def _unload(out_dir: str | None) -> dict:
     log("unload: reverting patches (gen={})".format(_state.get("generation")))
 
     def take_down():
-        # パッチを剥がす前に MOD の NPC を世界から降ろす。
-        # 剥がした後だと保存の関所が無くなり、名簿に残った `mod:` の id が
-        # 次の保存でセーブに焼かれる（`modnpc` の約束はそこが守っている）。
+        # パッチを剥がす前に MOD の NPC と施設を世界から降ろす。
+        # 剥がした後だと保存の関所が無くなり、名簿や街に残った `mod:` の id が
+        # 次の保存でセーブ（施設は世界の骨格にも）に焼かれる（`modnpc` / `modfacility` の約束はそこが守っている）。
         # どちらもゲームの状態を書き換えるので、メインスレッドで続けて行う
         # （間に保存が挟まらない）。
         try:
@@ -2166,15 +2450,41 @@ def _unload(out_dir: str | None) -> dict:
                 _modnpc.purge(_ui.find_app())
         except Exception:
             log_exc("unload: cannot take the mod npcs off the world")
-        return _patch.revert_all()
+        try:
+            from . import modfacility as _modfacility
+            if _modfacility.registry():
+                from . import ui as _ui
+                _modfacility.purge(_ui.find_app())
+        except Exception:
+            log_exc("unload: cannot take the mod facilities off the towns")
+        reverted = _patch.revert_all()
+        _rebind_cloud_resources()
+        return reverted
 
-    count = _run_on_main_thread(take_down, UNLOAD_WAIT) or 0
-    # 期間・日数の望み・値段の登録簿も空にする（関所が剥がれた後も sys に残るため）。
+    ran, count = _run_on_main_thread(take_down, UNLOAD_WAIT, UNLOAD_GIVE_UP)
+    if not ran:
+        # 何も剥がしていない（メインループが止まっている・手が空かないまま上限を過ぎた）。
+        # 窓口の登録簿や台帳も今のまま残す。投げて `bootstrap.log` に失敗を残す（GUI はそれを読む）。
+        log("unload: nothing was reverted; try again when the game is idle", level="ERROR")
+        raise RuntimeError("unload gave up: the main thread did not take the job")
+    count = count or 0
+    # 積んだまま走っていない on_ready は、古い世代として走らずに捨てられる（`_dispatch_ready`）。
+    # 印も外して、次の注入で積めるようにする。
+    pending = _pending_store()
+    if pending:
+        _once_store().difference_update(pending)
+        log("unload: {} on_ready task(s) still waiting were dropped".format(len(pending)))
+        pending.clear()
+    # 期間・日数の望み・値段・装備の窓口の登録簿も空にする（関所が剥がれた後も sys に残るため）。
     try:
         from . import durations as _durations
         from . import prices as _prices
+        from . import combat as _combat
+        from . import equipment as _equipment
         base, layers = _prices.item_price_sources()
-        for owner in sorted((set(_durations.owners()) | {base} | set(layers)) - {""}):
+        owners = (set(_durations.owners()) | {base} | set(layers)
+                  | set(_combat.owners()) | set(_equipment.owners()))
+        for owner in sorted(owners - {""}):
             _durations.forget(owner, write=log)
     except Exception:
         log_exc("unload: cannot forget the durations")
@@ -2212,7 +2522,9 @@ def status() -> dict:
     """
     from . import patch_registry as _registry
     snapshot = dict(_state)
-    snapshot.pop("ready", None)
+    # 内部の控え（定型の行の集合）は読む側が無く、文字列にすると数百 KB になる
+    for key in ("ready", "logged_before", "logged_now"):
+        snapshot.pop(key, None)
     snapshot["ready_pending"] = len(_state.get("ready") or [])
     snapshot["patches"] = _registry.summary()
     snapshot["written_at"] = datetime.datetime.now().isoformat(timespec="seconds")

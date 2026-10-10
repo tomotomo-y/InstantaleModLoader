@@ -63,10 +63,48 @@ skill, obtainer, id, ...)` を受け取るので、
 `safe=True` と握り潰しで、記録に失敗しても本体は必ず1回呼ぶ。
 
 出力は `out/shop_stock.log`（読む用）と `out/shop_stock.jsonl`（1件1行）。
+
+##### 版の記録
+
+- 版3: 問いは決着していた（棚に並ぶのは `shopping_start_method_1` が店を開いたときに
+  雛形から作り直した別の現物。GAME.md §2.13.1.3）が、デバッグモードで毎回動き続け、
+  1か月で log と jsonl を合わせて約 28MB 書いていた。その 8 割超が店の外の品の誕生
+  （大半は NPC 生成の持ち物）で、1行の 7 割が呼び出し元の完全パスだった。
+  次のように直した。
+  - 店の外の誕生は既定で録らない（`ITEM_SAMPLES` の既定を 0 に）。窓の外の
+    `Item.__init__` は判定だけで素通しする
+  - 生成の3入口と `generate_item_in_shopping` / `set_item_from_world_data` の境目は、
+    店の場面の中だけ録る（ロードのたびに手持ちの品の数だけ出ていた）
+  - 境目の jsonl は前後の持ち物の丸写しをやめ、差分の文と雛形の要約だけにした
+  - 呼び出し元はファイル名と行だけにし、段数の既定を 8 から 5 に減らした
+  - 境目の上限を使い切った後は、持ち物を写す前に素通しする
+  - 受け取った引数をキーワードのまま `orig` へ渡す。位置に直して渡していたので、
+    内側の MOD が受け取る呼び方が素と変わり、引数名の食い違いが
+    デバッグモードでだけ隠れていた（VERIFICATION.md §3.76 の `333_` 版21）
+- 版4: 買うときにお金がいつ・どこで動くかを録る（`336_` の売買画面の中の盗みと購入のため）。
+  境目は持ち物が動いたときしか書いていなかったので、お金だけ動く `buy_item` は
+  呼ばれても1行も残らなかった（`change_inventory` 296件に対して `buy_item` 0件）。
+  - 境目の比較に主人公と店主の所持金を足した。`buy_item` / `sell_item` / `Item.buy` /
+    `Item.sell` の行には、ゲーム側の呼び出し元も出す（承認のボタンから呼ばれるのかを見る）
+  - 品を落とした後（`change_inventory`）と右クリックの後（`show_popup_menu`）に、
+    画面に出た文字と消えた文字を録る。新しく出たボタンには押された記録を付ける
+    （押した文字と、押す前と0.5秒後の所持金。押下の処理には手を出さない）
+  - 右クリックの行に、どちらの側の品か・本体の popup に親が付いたか・その中のボタンの文字を出す
+  - 1回目の実機（2026-10-04）: お金は承認のボタンを押したときに動く（`new_hud.py:1017` の `buy_item`
+    → `Item.buy` → `change_inventory`）。承認のボタンは品を落とした瞬間（`on_touch_up`）に出るので、
+    `change_inventory` の後の出入りには映らなかった。そこで次を足した
+  - `InventoryItem.on_touch_up` の後の画面の出入り（承認のボタンが出るところ）。押された記録は
+    `on_press` にも付ける（承認は `on_touch_down` → `on_press` で動く）
+  - `scripts.hud.new_hud` の売買まわりのクラスとメソッドの一覧（1プロセス1回）。`buy_item` を
+    持つクラスを特定するため
 """
 
 import datetime
-import json
+import inspect
+import re
+import sys
+import threading
+import weakref
 
 from instantale_modloader import frames, ui
 
@@ -74,9 +112,26 @@ LOG_BASENAME = "shop_stock.log"
 RECORD_BASENAME = "shop_stock.jsonl"
 
 # GUI から変えられる値（同じ名前と既定値が mod.json にもある。TECH.md §3.8）。
-ITEM_SAMPLES = 200
+# 版3: 店の外の誕生は既定で録らない（200 から 0 へ）。段数も 8 から 5 へ。
+ITEM_SAMPLES = 0
 BOUNDARY_SAMPLES = 400
-CALLER_DEPTH = 8
+CALLER_DEPTH = 5
+# 版4: 画面の文字の出入りを写す件数（品を落とした後・右クリックの後）。
+SCREEN_SAMPLES = 200
+
+# 版4: 画面の文字を拾う深さ（Window から数えた段数）。
+SCREEN_DEPTH = 40
+# 押した後の所持金を読むまでの秒数と、出入りを見るまでの秒数。
+PRESS_AFTER = 0.5
+SCREEN_AFTER = 0.3
+# 版4: 売買まわりのクラスの一覧。1プロセス1回（注入し直しても出直さない）。
+HUD_MODULE = "scripts.hud.new_hud"
+SURVEY_MARK = "_probe_shop_stock_survey_done"
+SURVEY_WORDS = re.compile(r"buy|sell|trade|shop|price|confirm|approv|cancel|popup|accept|deal",
+                          re.IGNORECASE)
+
+# 呼び出し元の `(フォルダ\ファイル:行)` から、フォルダを落とす。
+_CALLER_DIR = re.compile(r"\((?:[^()]*[\\/])?([^\\/()]+:\d+)\)")
 
 # 売買画面の場面名（`405_` と同じ）。
 TRADE_SITUATION = "shop"
@@ -89,26 +144,40 @@ def now():
     return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
+def caller_brief():
+    """ゲーム側の呼び出し元を、ファイル名と行だけで並べる（版3。完全パスが1行の 7 割だった）。"""
+    return _CALLER_DIR.sub(r"(\1)", frames.caller(CALLER_DEPTH))
+
+
+def arg_of(args, kwargs, index, name):
+    """包みが受け取った引数から1つ引く。位置でもキーワードでも同じ値を返す。
+
+    版3: 引数を名前付きで受けて位置に直して `orig` へ渡していたのをやめ、
+    受け取った形のまま渡すようにした。記録に要る値はここで引く。
+    """
+    if name in kwargs:
+        return kwargs[name]
+    return args[index] if len(args) > index else None
+
+
 def apply(ctx):
     write = ctx.logger(LOG_BASENAME)
-    seen = {"items": 0, "boundaries": 0}
+    seen = {"items": 0, "boundaries": 0, "screens": 0, "presses": 0}
+    #: 観測者を付けたボタン。ゲームのウィジェットには印を付けない（読み取りだけの約束）。
+    watched = weakref.WeakSet()
     state = {"in_shop": 0}
 
-    def plain(value):
-        """記録に出せる形にする。`_` で始まる鍵（現物への参照）は落とす。"""
-        if isinstance(value, dict):
-            return {key: plain(item) for key, item in value.items()
-                    if not str(key).startswith("_")}
-        return value
+    # 1件1行の JSON。読む用のログとは別に、後から数えるために残す。
+    # 版3: 境目の前後の丸写し（現物への参照を `_` の鍵で落としていた）をやめたので、
+    # 写す前に鍵を落とす手間も要らなくなった。
+    record = ctx.jsonl(RECORD_BASENAME)
 
-    _record = ctx.jsonl(RECORD_BASENAME)
-
-    def record(row):
-        """1件1行の JSON。読む用のログとは別に、後から数えるために残す。"""
-        _record(plain(row))
+    def has_room(bucket, limit):
+        """枠が残っているか。数えはしない（重い写しの前に見る）。"""
+        return limit > 0 and seen[bucket] < limit
 
     def take(bucket, limit):
-        if limit <= 0 or seen[bucket] >= limit:
+        if not has_room(bucket, limit):
             return False
         seen[bucket] += 1
         return True
@@ -215,12 +284,26 @@ def apply(ctx):
             return None
         owner = shop_owner(app)
         shop_names, shop_refs = listing(owner)
-        player_names, player_refs = listing(frames.attr(app, "player", None))
+        player = frames.attr(app, "player", None)
+        player_names, player_refs = listing(player)
         return {"shop_who": who(owner), "shop": shop_names,
                 "player": player_names,
+                # 版4: お金だけ動く呼び出し（buy_item）も境目に出す。
+                "gold": frames.attr(player, "gold", None),
+                "shop_gold": frames.attr(owner, "gold", None) if owner is not None else None,
                 "index": index_item(app), "goods": goods_brief(app),
-                # 記録には出さない（現物への参照。`record` が `_` で始まる鍵を落とす）。
+                # 同じ鍵の入れ替えを見分けるための現物への参照。記録には出さない。
                 "_refs": {"shop": shop_refs, "player": player_refs}}
+
+    def goods_summary(goods):
+        """雛形の要約。品名の並びは `売買画面` の行に出るので、記録には件数だけ。"""
+        if not isinstance(goods, dict):
+            return None
+        out = dict(goods)
+        names = out.get("goods")
+        if isinstance(names, list):
+            out["goods"] = len(names)
+        return out
 
     # ------------------------------------------------------------ 差分
     def side_diff(before, after, before_refs, after_refs):
@@ -255,6 +338,9 @@ def apply(ctx):
                 if swapped:
                     bits.append("!" + ",".join(swapped))
                 parts.append("{} {}".format(label, " ".join(bits)))
+        for key, label in (("gold", "所持金"), ("shop_gold", "店主の所持金")):
+            if before.get(key) != after.get(key):
+                parts.append("{} {} -> {}".format(label, before.get(key), after.get(key)))
         if before.get("index") != after.get("index"):
             parts.append("index {} -> {}".format(before.get("index"),
                                                  after.get("index")))
@@ -270,21 +356,39 @@ def apply(ctx):
             parts.append("stock_update_date {} -> {}".format(old_date, new_date))
         return "  ".join(parts)
 
-    def around(label, app, call):
-        """`orig` を1回だけ呼び、その間の増減を録る。例外は素通しする。"""
-        before = snap(app)
+    def around(label, app, call, shop_only=False):
+        """`orig` を1回だけ呼び、その間の増減を録る。例外は素通しする。
+
+        `label` と `app` は関数でもよい（写すと決めてから作る）。
+        版3: 枠を使い切った後と、`shop_only` の境目を店の場面の外で呼ばれたときは、
+        持ち物を写す前に素通しする（前は写して比べてから捨てていた）。
+        """
+        before = None
+        if has_room("boundaries", BOUNDARY_SAMPLES) and (
+                not shop_only or state["in_shop"] > 0):
+            try:
+                if callable(app):
+                    app = app()
+                before = snap(app)
+            except Exception:
+                before = None
+                ctx.log_exc("shop stock probe: cannot read the state before")
+        if before is None:
+            return call()
         try:
             return call()
         finally:
             try:
                 after = snap(app)
-                if before is not None and after is not None:
+                if after is not None:
                     changed = describe(before, after)
                     if changed and take("boundaries", BOUNDARY_SAMPLES):
-                        write("境目 {}: {}".format(label, changed))
-                        record({"at": now(), "phase": "境目", "where": label,
-                                "changed": changed, "before": before,
-                                "after": after})
+                        where = label() if callable(label) else label
+                        write("境目 {}: {}".format(where, changed))
+                        # 版3: 前後の持ち物の丸写しをやめ、差分の文と雛形の要約だけにした。
+                        record({"at": now(), "phase": "境目", "where": where,
+                                "changed": changed, "shop_who": after.get("shop_who"),
+                                "goods": goods_summary(after.get("goods"))})
             except Exception:
                 ctx.log_exc("shop stock probe: cannot record a boundary")
 
@@ -292,8 +396,11 @@ def apply(ctx):
     @ctx.wrap("scripts.items:Item.__init__", required=False, safe=True)
     def item_init(orig, self, *args, **kwargs):
         result = orig(self, *args, **kwargs)
+        # 店の場面の中は全部録る。外は枠の中だけ（既定 0。ロードで何百も生まれる）。
+        # 窓の外は、この判定だけで素通しする。
+        if state["in_shop"] <= 0 and not has_room("items", ITEM_SAMPLES):
+            return result
         try:
-            # 店の場面の中は全部録る。外は枠の中だけ（ロードで何百も生まれる）。
             if state["in_shop"] > 0 or take("items", ITEM_SAMPLES):
                 attributes = frames.attr(self, "attributes", None)
                 row = {"at": now(), "phase": "品の誕生",
@@ -303,7 +410,7 @@ def apply(ctx):
                        "attributes": attributes if isinstance(attributes, dict)
                        else frames.repr_value(attributes),
                        "in_shop": state["in_shop"] > 0,
-                       "caller": frames.caller(CALLER_DEPTH)}
+                       "caller": caller_brief()}
                 record(row)
                 write("品の誕生: id={!r} {!r} 主={} {} 呼び出し元: {}".format(
                     row["id"], row["name"], row["obtainer"],
@@ -313,6 +420,7 @@ def apply(ctx):
         return result
 
     # ------------------------------------------------------------ 店の場面
+    # 版3: どの包みも受け取った引数をそのまま `orig` へ渡す。記録に要る値は `arg_of` で引く。
     @ctx.wrap("__main__:ShoppingStartManagerRemake.execute", safe=True)
     def shopping_execute(orig, self, *args, **kwargs):
         app = app_of(self)
@@ -336,64 +444,67 @@ def apply(ctx):
 
     @ctx.wrap("__main__:ShoppingStartManagerRemake.set_item_from_world_data",
               required=False, safe=True)
-    def set_item_from_world_data(orig, self, shop_owner_instance=None,
-                                 next_tier=None, *args, **kwargs):
-        app = app_of(self)
-        return around("set_item_from_world_data(tier={!r})".format(next_tier), app,
-                      lambda: orig(self, shop_owner_instance, next_tier,
-                                   *args, **kwargs))
+    def set_item_from_world_data(orig, self, *args, **kwargs):
+        return around(
+            lambda: "set_item_from_world_data(tier={!r})".format(
+                arg_of(args, kwargs, 1, "next_tier")),
+            lambda: app_of(self), lambda: orig(self, *args, **kwargs),
+            shop_only=True)
 
     @ctx.wrap("__main__:ShoppingStartManagerRemake.generate_item_in_shopping",
               required=False, safe=True)
-    def generate_item_in_shopping(orig, self, item_data=None,
-                                  shop_owner_instance=None,
-                                  item_stock_tier=None, *args, **kwargs):
-        app = app_of(self)
-        return around("generate_item_in_shopping(tier={!r})".format(item_stock_tier),
-                      app, lambda: orig(self, item_data, shop_owner_instance,
-                                        item_stock_tier, *args, **kwargs))
+    def generate_item_in_shopping(orig, self, *args, **kwargs):
+        return around(
+            lambda: "generate_item_in_shopping(tier={!r})".format(
+                arg_of(args, kwargs, 2, "item_stock_tier")),
+            lambda: app_of(self), lambda: orig(self, *args, **kwargs),
+            shop_only=True)
 
+    # 生成の3入口は、ロード・敵の生成・クラフトでも呼ばれる。版3 から店の場面の中だけ録る。
     @ctx.wrap("__main__:InstantaleApp.generate_item_from_dict", safe=True)
     def generate_item_from_dict(orig, self, *args, **kwargs):
         return around("generate_item_from_dict", self,
-                      lambda: orig(self, *args, **kwargs))
+                      lambda: orig(self, *args, **kwargs), shop_only=True)
 
     @ctx.wrap("__main__:InstantaleApp.generate_item_from_item_data", safe=True)
     def generate_item_from_item_data(orig, self, *args, **kwargs):
         return around("generate_item_from_item_data", self,
-                      lambda: orig(self, *args, **kwargs))
+                      lambda: orig(self, *args, **kwargs), shop_only=True)
 
     @ctx.wrap("__main__:InstantaleApp.generate_item_from_ready_made_data",
               required=False, safe=True)
     def generate_item_from_ready_made_data(orig, self, *args, **kwargs):
         return around("generate_item_from_ready_made_data", self,
-                      lambda: orig(self, *args, **kwargs))
+                      lambda: orig(self, *args, **kwargs), shop_only=True)
 
     @ctx.wrap("__main__:InstantaleApp.toggle_twin_inventory_window", safe=True)
-    def twin_window(orig, self, left_inventory_obtainer=None,
-                    right_inventory_obtainer=None, left_label_text=None,
-                    situation=None, *args, **kwargs):
+    def twin_window(orig, self, *args, **kwargs):
+        situation = arg_of(args, kwargs, 3, "situation")
         try:
             if situation == TRADE_SITUATION:
                 write("売買画面: 左={} 右={} 雛形={}".format(
-                    who(left_inventory_obtainer), who(right_inventory_obtainer),
+                    who(arg_of(args, kwargs, 0, "left_inventory_obtainer")),
+                    who(arg_of(args, kwargs, 1, "right_inventory_obtainer")),
                     goods_brief(self)))
         except Exception:
             ctx.log_exc("shop stock probe: cannot record the trade window")
         return around("toggle_twin_inventory_window({!r})".format(situation), self,
-                      lambda: orig(self, left_inventory_obtainer,
-                                   right_inventory_obtainer, left_label_text,
-                                   situation, *args, **kwargs))
+                      lambda: orig(self, *args, **kwargs))
 
+    # 版4: お金の口は呼び出し元も出す（承認のボタンから来るのか、落とした瞬間に来るのか）。
     @ctx.wrap("__main__:InstantaleApp.buy_item", safe=True)
-    def buy_item(orig, self, item_instance=None, *args, **kwargs):
-        return around("buy_item({!r})".format(frames.short(name_of(item_instance), 24)),
-                      self, lambda: orig(self, item_instance, *args, **kwargs))
+    def buy_item(orig, self, *args, **kwargs):
+        return around(
+            lambda: "buy_item({!r}) 呼び出し元: {}".format(frames.short(
+                name_of(arg_of(args, kwargs, 0, "item_instance")), 24), caller_brief()),
+            self, lambda: orig(self, *args, **kwargs))
 
     @ctx.wrap("__main__:InstantaleApp.sell_item", safe=True)
-    def sell_item(orig, self, item_instance=None, *args, **kwargs):
-        return around("sell_item({!r})".format(frames.short(name_of(item_instance), 24)),
-                      self, lambda: orig(self, item_instance, *args, **kwargs))
+    def sell_item(orig, self, *args, **kwargs):
+        return around(
+            lambda: "sell_item({!r}) 呼び出し元: {}".format(frames.short(
+                name_of(arg_of(args, kwargs, 0, "item_instance")), 24), caller_brief()),
+            self, lambda: orig(self, *args, **kwargs))
 
     @ctx.wrap("__main__:InstantaleApp.close_shopping_window_process",
               required=False, safe=True)
@@ -403,22 +514,236 @@ def apply(ctx):
 
     @ctx.wrap("scripts.items:Item.buy", required=False, safe=True)
     def item_buy(orig, self, *args, **kwargs):
-        return around("Item.buy({!r})".format(frames.short(name_of(self), 24)),
-                      ui.find_app(), lambda: orig(self, *args, **kwargs))
+        return around(lambda: "Item.buy({!r}) 呼び出し元: {}".format(
+                          frames.short(name_of(self), 24), caller_brief()),
+                      ui.find_app, lambda: orig(self, *args, **kwargs))
 
     @ctx.wrap("scripts.items:Item.sell", required=False, safe=True)
     def item_sell(orig, self, *args, **kwargs):
-        return around("Item.sell({!r})".format(frames.short(name_of(self), 24)),
-                      ui.find_app(), lambda: orig(self, *args, **kwargs))
+        return around(lambda: "Item.sell({!r}) 呼び出し元: {}".format(
+                          frames.short(name_of(self), 24), caller_brief()),
+                      ui.find_app, lambda: orig(self, *args, **kwargs))
+
+    # ------------------------------------------------------------ 画面の文字（版4）
+    # 承認のボタンがどこに出るのか・押すと何が呼ばれるのかを、ゲームの中身を読まずに見る
+    # （Nuitka のビルドで関数の中身は読めない。232_ の註）。画面に載っている文字の出入りと、
+    # 新しく出たボタンが押された時刻・所持金だけを録る。押下の処理には手を出さない。
+    schedule = ui.scheduler(ctx, "shop stock probe")
+
+    def gold_of(app):
+        return frames.attr(frames.attr(app, "player", None), "gold", None)
+
+    def is_button(widget):
+        try:
+            from kivy.uix.behaviors import ButtonBehavior
+        except Exception:
+            return False
+        return isinstance(widget, ButtonBehavior)
+
+    def screen_widgets():
+        """画面に見えている文字。`{id: (ウィジェット, 種類, 文字)}`（透明な枝は飛ばす）。
+
+        控えはウィジェットそのものを握るので、比べ終わるまで `id` が別の物に使い回されない。
+        """
+        try:
+            from kivy.core.window import Window
+        except Exception:
+            return {}
+        out = {}
+        stack = [(Window, 0, 1.0)]
+        while stack:
+            widget, depth, shade = stack.pop()
+            try:
+                shade *= float(getattr(widget, "opacity", 1.0))
+            except (TypeError, ValueError):
+                pass
+            if shade <= 0 or depth > SCREEN_DEPTH:
+                continue
+            text = getattr(widget, "text", None)
+            if isinstance(text, str) and text.strip():
+                out[id(widget)] = (widget, type(widget).__name__, text)
+            for child in list(getattr(widget, "children", None) or []):
+                stack.append((child, depth + 1, shade))
+        return out
+
+    def brief(rows):
+        return [("{}:{}".format(cls, frames.short(text, 40))) for _widget, cls, text in rows]
+
+    def watch_press(widget, where):
+        """新しく出たボタンに、押された記録だけを付ける（同じボタンへは1回）。
+
+        Kivy は後から付けた観測者を先に呼ぶので、押す前の所持金はゲームの処理より先に読める。
+        戻り値は None（押下を止めない）。
+        """
+        try:
+            if widget in watched:
+                return
+            watched.add(widget)
+        except TypeError:
+            return
+
+        def pressed(event):
+            # 外した・注入し直した後の古い観測者は書かない。件数にも上限を置く。
+            if ctx.superseded() or not take("presses", SCREEN_SAMPLES):
+                return
+            try:
+                app = ui.find_app()
+                text = frames.short(getattr(widget, "text", ""), 40)
+                before = gold_of(app)
+                write("押された({}): {}:{!r}（{} の後に出たボタン） 所持金 {} 親={}".format(
+                    event, type(widget).__name__, text, where, before,
+                    type(getattr(widget, "parent", None)).__name__))
+                schedule(lambda: write("押された {}秒後: {!r} 所持金 {} -> {}".format(
+                    PRESS_AFTER, text, before, gold_of(app))), PRESS_AFTER)
+            except Exception:
+                ctx.log_exc("shop stock probe: cannot record a press")
+
+        for event in ("on_press", "on_release"):
+            try:
+                widget.fbind(event, lambda *_a, event=event: pressed(event))
+            except Exception:
+                ctx.log_exc("shop stock probe: cannot watch a button")
+
+    def screen_before():
+        """出入りを比べる前の控え。メインスレッドの外では読まない（木が動いている最中に回さない）。"""
+        if not has_room("screens", SCREEN_SAMPLES):
+            return None
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        try:
+            return screen_widgets()
+        except Exception:
+            ctx.log_exc("shop stock probe: cannot read the screen")
+            return None
+
+    def screen_after(before, where):
+        def check():
+            after = screen_widgets()
+            appeared = [row for key, row in after.items()
+                        if key not in before or before[key][0] is not row[0]
+                        or before[key][2] != row[2]]
+            gone = [row for key, row in before.items() if key not in after]
+            if not (appeared or gone) or not take("screens", SCREEN_SAMPLES):
+                return
+            write("画面 {}: 出た={} 消えた={}".format(where, brief(appeared), brief(gone)))
+            for widget, _cls, _text in appeared:
+                if is_button(widget):
+                    watch_press(widget, where)
+        schedule(check, SCREEN_AFTER)
 
     @ctx.wrap("scripts.hud.new_hud:InventoryItem.change_inventory",
               required=False, safe=True)
-    def change_inventory(orig, self, new_inventory=None, *args, **kwargs):
-        item = frames.attr(self, "item_instance", None)
-        return around("change_inventory({!r} -> {})".format(
-            frames.short(name_of(item), 24),
-            who(frames.attr(new_inventory, "obtainer", None))),
-            ui.find_app(), lambda: orig(self, new_inventory, *args, **kwargs))
+    def change_inventory(orig, self, *args, **kwargs):
+        def label():
+            return "change_inventory({!r} -> {})".format(
+                frames.short(name_of(frames.attr(self, "item_instance", None)), 24),
+                who(frames.attr(arg_of(args, kwargs, 0, "new_inventory"),
+                                "obtainer", None)))
+        shown = screen_before()
+        try:
+            return around(label, ui.find_app, lambda: orig(self, *args, **kwargs))
+        finally:
+            if shown is not None:
+                try:
+                    screen_after(shown, label())
+                except Exception:
+                    ctx.log_exc("shop stock probe: cannot watch the screen after a drop")
+
+    def signature_of(fn):
+        try:
+            return str(inspect.signature(fn))
+        except (TypeError, ValueError):
+            return "(?)"
+
+    def survey_hud():
+        """売買まわりのクラスとメソッド（名前と引数）。1プロセス1回。中身は読めないので名前だけ。"""
+        if getattr(sys, SURVEY_MARK, False):
+            return
+        module = sys.modules.get(HUD_MODULE)
+        if module is None:
+            return
+        setattr(sys, SURVEY_MARK, True)
+        for name, obj in sorted(vars(module).items()):
+            if not isinstance(obj, type) or getattr(obj, "__module__", None) != HUD_MODULE:
+                continue
+            own = sorted(key for key, value in vars(obj).items()
+                         if callable(value) or isinstance(value, (staticmethod, classmethod)))
+            hits = [key for key in own if SURVEY_WORDS.search(key)]
+            if not hits and not SURVEY_WORDS.search(name):
+                continue
+            bases = [base.__name__ for base in obj.__mro__[1:4]]
+            write("一覧 {}({}): {}".format(name, ", ".join(bases), ", ".join(
+                key + signature_of(getattr(obj, key, None)) for key in (hits or own))))
+        functions = sorted(key for key, value in vars(module).items()
+                           if callable(value) and not isinstance(value, type)
+                           and SURVEY_WORDS.search(key))
+        write("一覧 {} の関数: {}".format(HUD_MODULE, functions))
+        item_cls = getattr(sys.modules.get("scripts.items"), "Item", None)
+        if item_cls is not None:
+            write("一覧 Item: {}".format(", ".join(
+                key + signature_of(getattr(item_cls, key)) for key in ("buy", "sell")
+                if hasattr(item_cls, key))))
+
+    @ctx.wrap("scripts.hud.new_hud:InventoryItem.on_touch_up", required=False, safe=True)
+    def on_touch_up(orig, self, *args, **kwargs):
+        """品を落とした瞬間。承認のボタンはここで出る（1回目の実機）。
+
+        Kivy は指を離すと画面の品すべてに `on_touch_up` を配る。写すのは指の下の品だけ
+        （掴んでいる品か、指の位置に重なる品）。
+        """
+        touch = args[0] if args else kwargs.get("touch")
+        mine = False
+        try:
+            mine = (getattr(touch, "grab_current", None) is self
+                    or bool(self.collide_point(*touch.pos)))
+        except Exception:
+            mine = False
+        shown = (screen_before()
+                 if mine and frames.attr(self, "item_instance", None) is not None else None)
+        result = orig(self, *args, **kwargs)
+        if shown is not None:
+            try:
+                survey_hud()
+                where = "落とした({!r})".format(
+                    frames.short(name_of(frames.attr(self, "item_instance", None)), 24))
+                screen_after(shown, where)
+            except Exception:
+                ctx.log_exc("shop stock probe: cannot watch the screen after a touch up")
+        return result
+
+    @ctx.wrap("scripts.hud.new_hud:InventoryItem.show_popup_menu",
+              required=False, safe=True)
+    def show_popup_menu(orig, self, *args, **kwargs):
+        """右クリック。どちらの側の品か・本体の popup に親が付いたか・中のボタンの文字。"""
+        shown = screen_before()
+        result = orig(self, *args, **kwargs)
+        try:
+            app = ui.find_app()
+            item = frames.attr(self, "item_instance", None)
+            owner = frames.attr(item, "obtainer", None)
+            if owner is not None and owner is frames.attr(app, "player", None):
+                side = "手持ち"
+            elif owner is not None and owner is shop_owner(app):
+                side = "店"
+            else:
+                side = "他"
+            where = "右クリック({!r} {} {})".format(
+                frames.short(name_of(item), 24), side, who(owner))
+
+            def popup_line():
+                menu = frames.attr(self, "popup_menu", None)
+                parent = frames.attr(menu, "parent", None) if menu is not None else None
+                texts = [getattr(child, "text", None)
+                         for child in list(getattr(menu, "children", None) or [])]
+                write("{}: popup={} 親={} ボタン={}".format(
+                    where, type(menu).__name__ if menu is not None else None,
+                    type(parent).__name__ if parent is not None else None, texts))
+            schedule(popup_line)
+            if shown is not None:
+                screen_after(shown, where)
+        except Exception:
+            ctx.log_exc("shop stock probe: cannot record a right click")
+        return result
 
     def watch_generator(name):
         """ゲームの LLM 生成が呼ばれた瞬間の、ゲーム側の呼び出し元と引数の形を録る。"""
@@ -427,7 +752,7 @@ def apply(ctx):
             try:
                 write("LLM生成 {}: args=({}) kwargs={} 呼び出し元: {}".format(
                     name, ", ".join(type(a).__name__ for a in args),
-                    sorted(kwargs) or "-", frames.caller(CALLER_DEPTH)))
+                    sorted(kwargs) or "-", caller_brief()))
             except Exception:
                 ctx.log_exc("shop stock probe: cannot record the generator call")
             result = orig(*args, **kwargs)

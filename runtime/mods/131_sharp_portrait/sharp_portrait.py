@@ -60,6 +60,8 @@
 暗い絵・コントラストの低い絵で外れる。
 
 包んで、**ゲームが `None` を返した回だけ**、前処理を変えた絵で同じ関数を呼び直す。
+anime の回の `None` では呼び直さない。ここで拾って返すとゲームの haar の回が来なくなり、
+素の haar で取れた顔を前処理の拾いで置き換える。やり直すのは haar の回（ゲームの最後の試行）が外れた後。
 呼び直すのは包みを全部剥がした素の関数（`patch.unwrap`）で、フックが受け取った `orig` ではない。
 `safe=True` の包みは最後に呼んだ `orig` の結果を本番の答えとして覚えるので、
 探りの呼び出しで投げるとその例外がゲームへ素通しになる（TECH.md §6.1）。
@@ -97,10 +99,9 @@
 """
 
 import os
-import sys
 import threading
 
-from instantale_modloader import patch
+from instantale_modloader import imagegen, patch
 
 from . import faces
 
@@ -117,8 +118,12 @@ FACE_RETRY = True
 #: この MOD の記録。
 LOG_BASENAME = "sharp_portrait.log"
 
-#: 荒くする工程の写しを持つモジュール（キャラクタ・敵・モンスター）。
-CREATURE = "image_generation.sdcppcuda.image_generation_creature"
+#: 荒くする工程の写しを持つモジュール（キャラクタ・敵・モンスター）。画像生成の方式ごとに別のモジュールに
+#: 居るが、どの方式かはローダの `imagegen` が吸収する（GAME.md §2.33）。これは cuda のもの（後方互換の名前）。
+CREATURE = imagegen.CREATURE_FORMAT.format(imagegen.FAMILIES["sdcpp_cuda"])
+
+#: ゲームが選んでいる画像生成の方式。読めなければ None（ローダの `imagegen.backend`）。
+config_backend = imagegen.backend
 
 #: スレッドごとの控え。`source` は縮小に入って来た絵、`detect_width` はその幅、
 #: `after_reduce` は「次の縮小は顔の代わりを作る回」の旗。
@@ -143,12 +148,18 @@ def apply(ctx):
     cascade_dir = os.path.join(ctx.game_dir, faces.CASCADE_DIR)
     cascades = {}
     seen_args = []          # ゲームの呼び方を1度だけ記録するための印
+    backend = config_backend()
+    creatures = imagegen.creature_modules(backend)
+
+    def hook(name, **options):
+        """選ばれた方式（分からなければ4つ）の同じ関数を、同じ手で包む（ローダの `imagegen`）。"""
+        return imagegen.wrap_creature(ctx, name, backend, **options)
 
     def enemy():
         return getattr(_LOCAL, "enemy", False)
 
     def make_enemy_entry(name):
-        @ctx.wrap(CREATURE + ":" + name, required=False)
+        @hook(name, required=False)
         def enemy_entry(orig, *args, **kwargs):
             _LOCAL.enemy = True
             try:
@@ -161,7 +172,7 @@ def apply(ctx):
     for entry in ENEMY_ENTRIES:
         make_enemy_entry(entry)
 
-    @ctx.wrap(CREATURE + ":pixel_art_process", safe=True, alias_scan=False)
+    @hook("pixel_art_process", safe=True, alias_scan=False)
     def pixel_art_process(orig, image, *args, **kwargs):
         if enemy():
             return orig(image, *args, **kwargs)
@@ -180,7 +191,7 @@ def apply(ctx):
         note("縮小: {} をそのまま通す".format(dims(image)))
         return image, image.copy()
 
-    @ctx.wrap(CREATURE + ":reduce_image_colors", safe=True, alias_scan=False)
+    @hook("reduce_image_colors", safe=True, alias_scan=False)
     def reduce_image_colors(orig, image, *args, **kwargs):
         if enemy():
             return orig(image, *args, **kwargs)
@@ -206,14 +217,13 @@ def apply(ctx):
 
     def raw_detector():
         """呼び直しに使うゲームの素の検出関数（包みを全部剥がしたもの）。引けなければ None。"""
-        module = sys.modules.get(CREATURE)
+        module = imagegen.creature_module(backend)
         current = vars(module).get("detect_face_coordinates") if module is not None else None
         if not callable(current):
             return None
         return patch.unwrap(current)[0]
 
-    @ctx.wrap(CREATURE + ":detect_face_coordinates",
-              required=False, safe=True, alias_scan=False)
+    @hook("detect_face_coordinates", required=False, safe=True, alias_scan=False)
     def detect_face_coordinates(orig, image, *args, **kwargs):
         found = orig(image, *args, **kwargs)
         if enemy():
@@ -224,6 +234,15 @@ def apply(ctx):
         if not FACE_RETRY:
             note("顔: ゲームは見つけられず、やり直しは切")
             return None
+        rest = dict(zip(ARG_NAMES, args))
+        rest.update(kwargs)
+        given = str(rest.get("cascade_path") or faces.CASCADES[0])
+        if os.path.basename(given) == faces.CASCADES[0]:
+            # ゲームは1回目（anime）が None なら2回目（haar）を素の絵で呼ぶ（GAME.md §2.30）。
+            # ここで拾って返すと2回目が来ず、素の haar で取れた顔を前処理の拾いで置き換える。
+            # やり直しはゲームの試行が全部外れた後に限る。
+            note("顔: ゲームは {} で見つけられず、ゲームの次の試行に任せる".format(faces.short_name(given)))
+            return None
         raw = raw_detector()
         if raw is None:
             note("顔: ゲームは見つけられず、呼び直す素の関数が引けないのでやり直さない")
@@ -231,16 +250,13 @@ def apply(ctx):
         import cv2
         import numpy as np
         import PIL.Image
-        rest = dict(zip(ARG_NAMES, args))
-        rest.update(kwargs)
         # ゲームがカスケードをどう渡しているか（素の名前か、フォルダ付きか）は
         # ここでしか分からない。1度だけ記録する。
         if not seen_args:
             seen_args.append(True)
             note("顔: ゲームの呼び方 {}".format(rest or "（引数なし。既定のまま）"))
-        # 呼び直しに渡すカスケードは、ゲームが渡して来た形に合わせる。
-        # フォルダ付きで来ていれば同じフォルダの haar、素の名前なら素の名前。
-        given = str(rest.get("cascade_path") or faces.CASCADES[0])
+        # 呼び直しに渡すカスケードは、ゲームが渡して来た形（`given`）に合わせる。
+        # フォルダ付きで来ていれば同じフォルダ、素の名前なら素の名前。
         gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
         tried = []
         for prep in faces.FACE_PREPS:
@@ -274,8 +290,7 @@ def apply(ctx):
             "。こちらは見えたがゲームの関数は None: " + " / ".join(tried) if tried else ""))
         return None
 
-    @ctx.wrap(CREATURE + ":extract_and_save_face",
-              required=False, safe=True, alias_scan=False)
+    @hook("extract_and_save_face", required=False, safe=True, alias_scan=False)
     def extract_and_save_face(orig, pixelated_image, coordinates, output_path, *args, **kwargs):
         # 引数名は本体と同じにする（キーワードで渡されても二重にならない。版17）。
         result = orig(pixelated_image, coordinates, output_path, *args, **kwargs)
@@ -307,4 +322,4 @@ def apply(ctx):
             tuple(int(v) for v in (left, top, right, bottom)), box))
         return result
 
-    ctx.log("sharp portrait: installed")
+    ctx.log("sharp portrait: installed (backend {!r}; wraps {})".format(backend, ", ".join(creatures)))

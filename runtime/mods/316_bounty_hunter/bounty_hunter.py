@@ -17,6 +17,7 @@
 
 強さも同じで、`create_guard_enemies` の中から呼ばれる2箇所に届く**難易度の数1つ**を
 差し替えるだけ。式は発明しない（レベルも能力値もゲームがそこから決める）。
+組むのと差し替えはローダの窓口 `guards`（TECH.md §3.3.10。脱獄の決行を起こす `336_` と共有）。
 
 ##### 契機は「決める」だけ。起こすのは画面が整った合図の中
 
@@ -44,11 +45,14 @@
 | 多段の場面（宿泊・訓練・賭博ほか） | 並んでいる選択肢のクラス名（`SEQUENCE_MARKS`）。旗でも手待ちでも捕まらない。`Display...Choice` は品書きなので数えない |
 | 戦闘 | 旗と `current_enemy_dict`。戦闘中は控えすら置かない（置くと戦闘の直後に次の戦闘が始まる） |
 | ゲーム自身の衛兵 | `BattleStartManager.__init__` を包み、自分が組んだぶん（`memo["building"]`）以外で `enemy_type='guard'` のものを数える。出たら控えを落とし、1回の遭遇として数える。依頼中の戦闘と闘技場は数えない（数えるとクエスト1回で追手が止まる） |
+| 服役中 | 刑が始まったら（`ImprisonmentStartManager.execute`）決まっていた追手を落とし、牢を出るまで抽選も起こすこともしない。牢の中は、服役の選択肢が並んでいるか、ほかの MOD がローダの窓口 `confinement` で知らせているか（`336_` の脱獄の一覧）で見る。服役の年は暦が進むので、見ないとその間に追手が決まり、脱獄の一覧を開いた画面で起きた |
+| 服役明け | `ImprisonmentEndManager.execute`（釈放）の後に追手の間を数え直す。釈放を通らずに牢の外へ出たとき（`336_` の脱獄）は、牢の外の画面に戻ったところで服役中の印を下ろす |
+| 決まった後に軽くなった | 起こす直前に手配を測り直し、出す条件を割っていたら出さない（釈放でその土地が平常に戻った・罰金を納めた など） |
 
 ##### 作り替えるのは自分の戦闘の中だけ
 
 難易度の差し替えも改名も、**自分が組んだマネージャの `start_battle` の中**でしか開かない
-（`memo["phase"]` と同一のインスタンスか）。
+（改名は `memo["phase"]` と同一のインスタンスか、難易度は `guards` が組んだマネージャに付けた印で見る）。
 以前は時間で開けていて、その窓の中でゲームが出した衛兵まで強くして改名していた。
 
 改名は敵が揃った直後（最初の1手より前）。
@@ -63,6 +67,7 @@
 戻すのは**下がった側だけ**、**追手を出した土地だけ**。
 下がる時機は一定ではない（戦闘の終わりの回と、それより後の回がある）ので、
 戦闘の終わりと、その後に画面が整うたびに見る。逃げて終わった回もここで拾われる。
+見張る回数は戦闘の外の合図だけで数える（手番ごとの合図で尽きないように）。
 
 ##### 押されていないぶんを補う
 
@@ -70,10 +75,7 @@
 こちらは押さずに起こすのでその1手が抜け、
 選択肢の多い画面から入ると**右の欄（溢れたぶんを出す欄）が開いたまま**残り、
 戦闘の情報欄と重なる。
-
-`app.display_button_load(0)` を1回通す（座標も `opacity` も触らない）。
-通すのは**選択肢が戦闘のものになった最初の合図**。
-敵が揃った時点では早すぎて、読み込みが延びた回はまだ戦闘前の選択肢が並んでいる。
+版4から、取り残された右の欄はローダの窓口 `choices` がどの場面でも畳み直す（TECH.md §3.3.14）。
 
 ##### 時計を見ない
 
@@ -81,7 +83,16 @@
 秒で区切ると、待っている間にゲームが何をしていたかと無関係に時間だけが過ぎる
 （実機で踏んだ不具合はどれも「秒は経ったが場面は終わっていない」形だった）。
 
-`Clock.schedule_once(..., 0)` を1回だけ使うが、これは待ちではなく次のフレームまで譲るもの。
+`Clock.schedule_once(..., 0)` を使うが、これは待ちではなく次のフレームまで譲るもの。
+追手を起こす前に、ゲームが選択肢を塗り終えるまでフレームを譲ることがある（上限は `PAINT_WAIT_FRAMES`）。
+
+##### 倒すと前金（`336_` から移した）
+
+追手に勝つと、追手の難易度での依頼1件の報酬（ゲームの `get_quest_reward`）× 割合の前金が入る。
+勝ったかどうかはゲームの `end_type`（`'won'`）で見る。逃げた回（`'escaped'`）は何も無い。
+もとは `336_crime_overhaul` が窓口 `wanted.hunt_ended` で受けて払っていたが、
+追手が来なければ働かない機能なので、追手を出すこの MOD が持つ（2026-10-06）。
+窓口へ知らせるのはそのまま続ける（ほかの MOD が追手の戦闘に何かを足せる）。
 
 ##### 記録
 
@@ -89,8 +100,9 @@
 """
 
 import random
+import sys
 
-from instantale_modloader import ui
+from instantale_modloader import choices, confinement, guards, ui, wanted
 from instantale_modloader.state import WorldStore, world_key
 
 from . import hunt
@@ -100,6 +112,9 @@ LOG_BASENAME = "bounty_hunter_send.log"
 # 通算日数と最後に追手が来た日の控え。世界ごとに1つ。
 # セーブには書かない（`state/` は遊びの続きの置き場。TECH.md §3.11）。
 STATE_DIRNAME = "bounty_hunter"
+
+# ローダの窓口（`wanted`）での持ち主の名前（フォルダ名）。
+OWNER = "316_bounty_hunter"
 
 # ゲーム自身の衛兵の戦闘を指す語（実測。GAME.md §2.20）。
 # 依頼中の遭遇・ボス（'in_quest'）と闘技場（'colosseum'）は衛兵ではないので数えない。
@@ -112,6 +127,7 @@ _RNG = random.Random()
 DUE_MAX_SIGNALS = 20        # 決めたのに出せないまま過ぎたら捨てる
 ARM_MAX_SIGNALS = 20        # 出したのに戦闘が始まらないまま過ぎたら控えを降ろす
 PROTECT_MAX_SIGNALS = 10    # 倒したぶんの手配度を見張る間（長いと戦闘の外の罪まで戻す）
+PAINT_WAIT_FRAMES = 60      # 追手を起こす前に、選択肢が塗り終わるのを待つフレームの数
 
 # `process_choice` に渡す文字列（押されたボタンの文字の代わり）。
 # 画面のボタンとしては使わない（TECH.md §6.2）。
@@ -132,7 +148,16 @@ ON_FREE_ACTION = False
 ANNOUNCE = "首にかけられた賞金を目当てに、追手が行く手を塞いだ。"
 HUNTER_NAME = "賞金稼ぎ"
 KEEP_WANTED = True
+BOUNTY_ENABLED = True
+BOUNTY_PURSE_PCT = 30
 YIELD_TO_GUARDS = True
+
+#: 追手に勝ったときの1行。
+BOUNTY_TEXT = "倒した追手の懐から、賞金の前金{amount}ゴールドを抜き取った。"
+#: ゲームの `BattleEndManager(app, end_type)` で勝ったときの `end_type`（GAME.md §2.10）。
+WON_END_TYPE = "won"
+#: 依頼の報酬を引くゲームのヘルパの置き場（`get_quest_reward(難易度)`）。
+FUNCTIONS_MODULE = "scripts.functions"
 
 # 追手を出せない状態。ゲーム自身の旗で、既に別の場面が進んでいることの合図。
 # 全部は見ない（`in_shopping` はロード後に立ちっぱなしのことがある。GAME.md §2.7）。
@@ -142,6 +167,9 @@ BLOCKING_FLAGS = ("in_battle", "in_boss_battle", "in_colosseum_battle",
 # そのうち戦闘の旗。**戦闘中は控えすら置かない**
 # （置くと、その戦闘が終わった瞬間に次の戦闘が始まる）。
 BATTLE_FLAGS = ("in_battle", "in_boss_battle", "in_colosseum_battle")
+
+# 服役の選択肢の目印（`ImprisonmentStartManager` / `ImprisonmentPhaseManager` / `ImprisonmentEndManager`。GAME.md §2.20）。
+IMPRISONMENT_MARK = "Imprisonment"
 
 
 # **多段の場面**の目印（選択肢のクラス名に含まれる語。GAME.md §2.2）。
@@ -233,17 +261,6 @@ def fighting(app):
     return reasons
 
 
-def battle_screen(app):
-    """今並んでいるのが戦闘の選択肢か。
-
-    敵が揃っていても選択肢がまだ戦闘のものでないことがある（読み込みが延びた回）。
-    その時点で塗り直すと、戦闘前の選択肢の数で右の欄が決まってしまう。
-    """
-    names = [ui.spec_cls_name(entry)
-             for entry in (getattr(app, "buttons", None) or [])]
-    return any(name and "Battle" in name for name in names)
-
-
 def blocked_by(app):
     """追手を出せない理由。空なら出せる。"""
     reasons = [name for name in BLOCKING_FLAGS if getattr(app, name, False)]
@@ -266,15 +283,18 @@ def apply(ctx):
     memo = {"world": None, "days": 0.0, "last": None,
             # 追手の1回ぶん。`phase` は自分が組んだマネージャそのもので、
             # ゲーム自身の衛兵と取り違えないための唯一の手がかり。
-            "phase": None, "armed": None, "arm_signals": 0,
-            "building": False, "inside": None,
+            "phase": None, "arm_signals": 0, "building": False,
             "protect": None,
+            # 出した追手1回ぶんの中身（難易度と重さ）。戦闘が始まったら `hunting` へ移す。
+            "hunt_plan": None,
+            # いま追手の戦闘の最中か。終わりで窓口（`wanted.hunt_ended`）へ知らせて捨てる。
+            "hunting": None,
             # 「出すと決まった」控え。起こすのは画面が整った合図の中。
             "due": None,
-            # 戦闘の選択肢が並んだら1回だけ塗り直す、の印。
-            "repaint": False,
             # この画面で抽選を1回済ませたか（1つの行動で何度も回さない）。
-            "rolled": False}
+            "rolled": False,
+            # 刑が始まってから牢を出るまで。立っている間は抽選も起こすこともしない。
+            "jailed": False}
 
     # ------------------------------------------------------------ 控えの出し入れ
     # 控えの出し入れ（場所・読み・キャッシュ・書き）は `state.WorldStore` に
@@ -288,20 +308,44 @@ def apply(ctx):
             return
         saved = memo_store.load(key)
         memo["world"] = key
+        memo["jailed"] = False          # 別の世界・読み直した世界。牢の中なら画面から拾い直す（`imprisoned`）
+        memo["due"] = None              # 前の世界で決まった追手を持ち越さない
+        memo["protect"] = None          # 前の世界の手配度の見張りを持ち越さない（同じ id の土地へ書き戻しうる）
         memo["days"] = saved.get("days", 0.0) or 0.0
         memo["last"] = saved.get("last")
         write("控えを読んだ: 世界={} 通算={}日 前回={}".format(
             key, memo["days"], memo["last"]))
+
+    def jail_reason(app):
+        """いま牢の中だと画面か窓口から分かるなら、その理由。"""
+        names = [ui.spec_cls_name(entry) for entry in (getattr(app, "buttons", None) or [])]
+        if any(name and IMPRISONMENT_MARK in name and not name.startswith("Display") for name in names):
+            return "服役の選択肢が並んでいる"
+        why, by = confinement.why(app)
+        if why:
+            return "{}（{}）".format(why, by)
+        return None
+
+    def imprisoned(app):
+        """服役中なら理由。刑が始まってから牢を出るまで、追手は決めないし起こさない。"""
+        reason = jail_reason(app)
+        if reason:
+            memo["jailed"] = True       # ロードで戻った牢の中も、ここで拾い直す
+            return reason
+        return "服役中" if memo["jailed"] else None
 
     def save_memo(app):
         memo_store.save(world_key(app),
                         {"days": memo["days"], "last": memo["last"]})
 
     # ------------------------------------------------------ 難易度の差し替え
+    # 差し替えはローダの `guards`（組んだマネージャの `start_battle` の中だけ開く）。
+    guards.install(ctx)
+
     def arm(phase, difficulty):
         """この追手1回ぶんを開く。**目印は組んだマネージャそのもの**。"""
         memo["phase"] = phase
-        memo["armed"] = difficulty
+        guards.arm(phase, difficulty)
         memo["arm_signals"] = 0
 
     def in_flight():
@@ -320,19 +364,11 @@ def apply(ctx):
             return False
         return True
 
-    def armed():
-        """今この瞬間、差し替えてよい難易度。`None` なら触らない。
-
-        **開くのは自分が組んだマネージャの `start_battle` の中だけ**（`memo["inside"]`）。
-        時間で開けておくと、その間にゲーム自身が出した衛兵まで
-        強くして名前まで変えてしまう。
-        """
-        return memo["inside"]
-
     def disarm():
+        if memo["phase"] is not None:
+            guards.arm(memo["phase"], None)
         memo["phase"] = None
-        memo["armed"] = None
-        memo["inside"] = None
+        memo["hunt_plan"] = None
 
     # -------------------------------------------------- 倒したぶんを戻す
     def protect(app):
@@ -374,13 +410,19 @@ def apply(ctx):
             why, guard["area"], now_value))
         return False
 
-    def count_signal():
-        """合図が来たときに、控えの寿命を1つずつ進め、抽選の権利を戻す。"""
+    def count_signal(app):
+        """合図が来たときに、控えの寿命を1つずつ進め、抽選の権利を戻す。
+
+        手配度の見張りは**戦闘中の合図では進めない**。
+        合図は戦闘の手番ごとにも来るので、数えると長い戦闘の間に見張りが尽き、
+        手配度が下がる戦闘の後には何も戻らない。
+        """
         memo["rolled"] = False
-        for key, field in (("due", "signals"), ("protect", "signals")):
+        keys = ("due",) if fighting(app) else ("due", "protect")
+        for key in keys:
             record = memo[key]
             if isinstance(record, dict):
-                record[field] = record.get(field, 0) + 1
+                record["signals"] = record.get("signals", 0) + 1
         if memo["phase"] is not None:
             memo["arm_signals"] += 1
 
@@ -411,6 +453,12 @@ def apply(ctx):
         （`refresh_choice_buttons`）。
         契機の瞬間はまだ本文も場面も動いている最中でありうる。
         """
+        jailed = imprisoned(app)
+        if jailed:
+            if memo["due"] is not None:
+                memo["due"] = None
+                write("{}: {}。決まっていた追手を落とした".format(trigger, jailed))
+            return
         here, total = measure(app)
         if not hunt.should_send(here, total, START_WANTED, START_TOTAL):
             return
@@ -445,24 +493,6 @@ def apply(ctx):
         write("{}: 追手が決まった。手配 ここ{} 合計{} 難易度{}。"
               "画面が整うのを待つ".format(trigger, here, total, difficulty))
 
-    def repaint_buttons(app):
-        """選択肢をゲーム自身の手で塗り直す。**座標は触らない。**
-
-        右の欄（溢れた選択肢を出す欄）は戦闘の情報欄と同じ矩形を使っていて、
-        欄の出し入れを決めているのは `display_button_load` の系統
-        （VERIFICATION_LOG.md §2.59 / §2.60）。
-        """
-        loader = getattr(app, "display_button_load", None)
-        if not callable(loader):
-            write("display_button_load が無い。選択肢の塗り直しはできない")
-            return
-        try:
-            loader(0)
-        except Exception:
-            ctx.log_exc("bounty hunter: 選択肢を塗り直せなかった")
-            return
-        write("選択肢を塗り直した（右の欄の畳み直し）")
-
     def standing_down(app):
         """起こすのをやめる理由。無ければ `None`。"""
         reasons = blocked_by(app)
@@ -470,6 +500,7 @@ def apply(ctx):
 
     def launch(app):
         """ゲームの衛兵の戦闘を起こす。**画面が整った合図の中からだけ呼ぶ。**"""
+        load_memo(app)                  # 決まった後に別の世界を読んでいたら、ここで控えを落とす
         due = memo["due"]
         if due is None:
             return
@@ -478,25 +509,35 @@ def apply(ctx):
             write("{}: 画面が{}回変わっても出せなかった。今回は出さない".format(
                 due["trigger"], DUE_MAX_SIGNALS))
             return
+        jailed = imprisoned(app)
+        if jailed:
+            memo["due"] = None
+            write("{}: {}。追手は出さない".format(due["trigger"], jailed))
+            return
         reason = standing_down(app)
         if reason:
             # まだ場面の中。控えは残すので、次に画面が整ったときに出る。
             return
-        manager = ui.cls_of("BattleStartManager")
-        if manager is None:
-            memo["due"] = None
-            write("BattleStartManager が見つからない。追手は出せない")
-            return
         memo["due"] = None
+        # 決めてから起こすまでの間に手配が軽くなっていれば出さない。強さは今の重さで決め直す。
+        here, total = measure(app)
+        if not hunt.should_send(here, total, START_WANTED, START_TOTAL):
+            write("{}: 決まった後に手配が軽くなった（ここ{} 合計{}）。出さない".format(
+                due["trigger"], here, total))
+            return
+        due = dict(due, here=here, total=total, difficulty=hunt.difficulty_of(
+            total, DIFFICULTY_BASE, DIFFICULTY_PER_WANTED, DIFFICULTY_MAX))
         memo["building"] = True
         try:
-            phase = manager(app, GUARD_ENEMY_TYPE, None)
-        except Exception:
-            ctx.log_exc("bounty hunter: BattleStartManager を組めなかった")
-            return
+            phase = guards.build(app)
         finally:
             memo["building"] = False
+        if phase is None:
+            write("BattleStartManager を組めなかった。追手は出せない")
+            return
         arm(phase, due["difficulty"])
+        memo["hunt_plan"] = {"difficulty": due["difficulty"], "here": due["here"],
+                             "total": due["total"]}
         protect(app)
         if ANNOUNCE.strip():
             screen.say(app, ANNOUNCE)
@@ -509,33 +550,38 @@ def apply(ctx):
                       due["difficulty"], memo["days"]))
         else:
             disarm()
+            memo["protect"] = None      # 戦闘が無いので、手配度の見張りも閉じる（残すと後の罪を戻してしまう）
             write("{}: 戦闘を起こせなかった。控えを降ろした".format(due["trigger"]))
 
-    # ------------------------------------------------- 難易度を差し替える2箇所
-    @ctx.wrap("scripts.llm.llm_manager:guard_npc_generator", required=False,
-              safe=True)
-    def guard_npc_generator(orig, area=None, world=None, npc_difficulty_level=None,
-                            *args, **kwargs):
-        """敵の姿と説明。難易度は文章の強さ（プロンプト）に効く。"""
-        difficulty = armed()
-        if difficulty is not None and _is_number(npc_difficulty_level):
-            write("難易度 {} -> {}（姿と説明）".format(npc_difficulty_level, difficulty))
-            npc_difficulty_level = difficulty
-        return orig(area, world, npc_difficulty_level, *args, **kwargs)
+    @ctx.wrap("__main__:ImprisonmentStartManager.execute", required=False, safe=True)
+    def sentenced(orig, self, *args, **kwargs):
+        """刑が始まった。牢を出るまで追手は決めない。決まっていた追手も落とす。"""
+        result = orig(self, *args, **kwargs)
+        app = getattr(self, "app", None) or ui.find_app()
+        if app is not None:
+            load_memo(app)
+            dropped = memo["due"] is not None
+            memo["due"] = None
+            memo["jailed"] = True
+            write("刑が始まった。{}牢を出るまで追手は来ない".format(
+                "決まっていた追手を落とし、" if dropped else ""))
+        return result
 
-    @ctx.wrap("__main__:InstantaleApp.generate_enemy_instance_from_quest_dict",
-              required=False, safe=True)
-    def enemy_instance(orig, self, enemy_dict=None, *args, **kwargs):
-        """敵の実体。難易度からレベルと能力値が決まる。"""
-        difficulty = armed()
-        if difficulty is not None:
-            index = _difficulty_index(args)
-            if index is None:
-                write("難易度の位置が分からない（引数 {}件）。素のまま作らせる".format(
-                    len(args)))
-            else:
-                args = args[:index] + (difficulty,) + args[index + 1:]
-        return orig(self, enemy_dict, *args, **kwargs)
+    @ctx.wrap("__main__:ImprisonmentEndManager.execute", required=False, safe=True)
+    def released(orig, self, *args, **kwargs):
+        """釈放。刑を務めた区切りなので、決まっていた追手を落とし、追手の間を数え直す。"""
+        result = orig(self, *args, **kwargs)
+        app = getattr(self, "app", None) or ui.find_app()
+        if app is not None:
+            load_memo(app)
+            dropped = memo["due"] is not None
+            memo["due"] = None
+            memo["jailed"] = False
+            memo["last"] = memo["days"]
+            save_memo(app)
+            write("釈放された。{}追手の間を数え直す（次は{}日後から）".format(
+                "決まっていた追手を落とし、" if dropped else "", COOLDOWN_DAYS))
+        return result
 
     @ctx.wrap("__main__:BattleStartManager.__init__", required=False, safe=True)
     def battle_start_init(orig, self, app=None, enemy_type=None, enemy_content=None,
@@ -549,6 +595,10 @@ def apply(ctx):
         （クエスト中は暦が進まないので、そのまま日数ぶん追手が来なくなる）。
         """
         result = orig(self, app, enemy_type, enemy_content, *args, **kwargs)
+        if not memo["building"]:
+            # 別の戦闘が始まった。前の追手の戦闘が終わりを通らずに消えていても（負けた・ロードした）、
+            # 次の戦闘の終わりを追手の戦闘と取り違えない。
+            memo["hunting"] = None
         if not memo["building"] and YIELD_TO_GUARDS \
                 and enemy_type == GUARD_ENEMY_TYPE:
             # **1回の遭遇として数える。**
@@ -567,7 +617,7 @@ def apply(ctx):
 
     @ctx.wrap("__main__:BattleStartManager.start_battle", required=False, safe=True)
     def start_battle(orig, self, *args, **kwargs):
-        """敵が揃ったら名前を付け替える。**難易度を開くのはこの中だけ**。
+        """敵が揃ったら名前を付け替える（難易度は、この中で `guards` が差し替える）。
 
         ここが最初の1手より前の唯一の足場で、
         `create_guard_enemies` はこの中から呼ばれる（実測）。
@@ -577,11 +627,8 @@ def apply(ctx):
         ours = memo["phase"] is not None and self is memo["phase"]
         if not ours:
             return orig(self, *args, **kwargs)
-        memo["inside"] = memo["armed"]
-        try:
-            result = orig(self, *args, **kwargs)
-        finally:
-            memo["inside"] = None
+        memo["hunting"] = memo["hunt_plan"]
+        result = orig(self, *args, **kwargs)
         app = getattr(self, "app", None) or ui.find_app()
         enemies = getattr(app, "current_enemy_dict", None)
         renamed = rename_enemies(enemies, HUNTER_NAME.strip())
@@ -590,7 +637,6 @@ def apply(ctx):
             "（{}体を{}に改名）".format(renamed, HUNTER_NAME.strip())
             if renamed else ""))
         disarm()
-        memo["repaint"] = True      # 塗り直すのは選択肢が戦闘のものになってから
         return result
 
     @ctx.wrap("__main__:BattleEndManager.end_phase", required=False, safe=True)
@@ -602,32 +648,101 @@ def apply(ctx):
         後の段で下がるなら2回目で戻る）。
         """
         result = orig(self, *args, **kwargs)
-        memo["repaint"] = False
+        app = getattr(self, "app", None) or ui.find_app()
         if memo["protect"] is not None:
-            restore(getattr(self, "app", None) or ui.find_app(), "戦闘終了")
+            restore(app, "戦闘終了")
+        hunt, memo["hunting"] = memo["hunting"], None
+        if hunt is not None:
+            # 追手の戦闘の終わりを窓口へ知らせる（TECH.md §3.3.9）。勝ち負けはゲームの `end_type`。
+            outcome = getattr(self, "end_type", None)
+            reached = wanted.hunt_ended(app, dict(hunt, by=OWNER, outcome=outcome))
+            write("追手の戦闘が終わった: {!r} 難易度{} 知らせた先={}".format(
+                outcome, hunt["difficulty"], reached or "なし"))
+            try:
+                pay_purse(app, hunt, outcome)
+            except Exception:
+                ctx.log_exc("bounty hunter: 前金を渡せなかった")
         return result
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False,
-              safe=True)
-    def refresh_choice_buttons(orig, self, *args, **kwargs):
+    def quest_reward(difficulty):
+        """その難易度の依頼1件の報酬（ゲームのヘルパ）。引けなければ None。"""
+        reward = getattr(sys.modules.get(FUNCTIONS_MODULE), "get_quest_reward", None)
+        if not callable(reward) or isinstance(difficulty, bool)                 or not isinstance(difficulty, (int, float)):
+            return None
+        value = reward(max(1, int(round(difficulty))))
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return int(value)
+
+    def pay_purse(app, plan, outcome):
+        """追手に勝ったら前金を渡す。逃げた・負けた回は何もしない。"""
+        if not BOUNTY_ENABLED or app is None:
+            return
+        difficulty = plan.get("difficulty")
+        if outcome != WON_END_TYPE:
+            write("前金: {!r} で終わったので無し（難易度{}）".format(outcome, difficulty))
+            return
+        reward = quest_reward(difficulty)
+        amount = hunt.purse(reward, BOUNTY_PURSE_PCT)
+        if amount <= 0:
+            write("前金: 0G（難易度{} 依頼1件の報酬{} の {}%）".format(
+                difficulty, reward, BOUNTY_PURSE_PCT))
+            return
+        before = ui.gold_of(app)
+        after = ui.add_gold(app, amount)
+        if after is None:
+            write("前金: {}G を足せなかった".format(amount))
+            return
+        write("前金: 難易度{} 依頼1件の報酬{} の {}% = {}G。所持金 {} -> {}".format(
+            difficulty, reward, BOUNTY_PURSE_PCT, amount, before, after))
+
+        def show():
+            updater = getattr(app, "update_ui", None)
+            if callable(updater):
+                updater()
+            screen.say(app, ui.rewrite_coins(BOUNTY_TEXT.format(amount=ui.money(amount))))
+        schedule(show)
+
+    def refresh_choice_buttons(self):
         """**画面が整った合図**。追手を起こすのはここだけ（VERIFICATION_LOG.md §2.56）。
 
         `set_buttons_to_normal` は1〜2秒早く、まだ本文を流している最中なので使わない。
         """
-        result = orig(self, *args, **kwargs)
-        count_signal()
-        if memo["repaint"] and battle_screen(self):
-            memo["repaint"] = False
-            schedule(lambda: repaint_buttons(self))
+        count_signal(self)
+        if memo["jailed"] and getattr(self, "buttons", None) and not jail_reason(self) \
+                and not fighting(self) and not sequence_on_screen(self):
+            # 釈放を通らずに牢の外の普段の画面へ戻った（`336_` の脱獄）。ここから追手が来うる。
+            # 会話・戦闘などの場面の最中は下ろさない（牢の中の会話もここに入る）
+            memo["jailed"] = False
+            write("牢の外の画面に戻った。服役中の印を下ろす")
         if memo["protect"] is not None:
             # 戦闘の終わりで捕まえ損ねた手配度をここで拾う
             # （下がる時機が一定でないため。逃げて終わった回もここに来る）。
+            load_memo(self)
             restore(self, "画面が整った")
         if memo["due"] is not None:
             # 1フレーム置く。今はゲームが選択肢を描き終えた直後で、
             # ここから `process_choice` に入ると同じ流れの中で画面を2度触ることになる。
-            schedule(lambda: launch(self))
-        return result
+            # さらに、ゲームが選択肢を塗り終えるまで待つ（`launch_when_painted`）。
+            schedule(lambda: launch_when_painted(self, PAINT_WAIT_FRAMES))
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, after=refresh_choice_buttons)
+
+    def launch_when_painted(app, frames_left):
+        """ゲームがこの画面の選択肢を塗り終えてから追手を起こす。待つのはフレームの数だけ。
+
+        合図はワーカーのスレッドから来て、ゲームの塗り（`update_ui`）はその後のフレームで走る。
+        先に起こすと遅れた塗りが前の画面の選択肢を描き、5つ以上だと右の欄が開いたまま
+        戦闘の情報欄に最後まで重なった（実機。釈放の直後に追手が来た回。VERIFICATION.md §3.83）。
+        """
+        if ui.choices_painted(app) or frames_left <= 0:
+            if frames_left <= 0:
+                write("選択肢が塗り終わらないまま{}フレーム過ぎた。そのまま起こす".format(
+                    PAINT_WAIT_FRAMES))
+            launch(app)
+            return
+        schedule(lambda: launch_when_painted(app, frames_left - 1))
 
     # ------------------------------------------------------------ 出す場面（4つ）
     @ctx.wrap("__main__:AreaMoveManager.execute", required=False, safe=True)
@@ -727,6 +842,18 @@ def apply(ctx):
         ctx.log("verified: should_send / difficulty_of on {} cases / rename / "
                 "sequence on {} cases".format(len(cases), len(scenes)))
 
+    def hunted_line(_app):
+        """全域手配の線（ローダの窓口 `wanted`）。追手が来ない設定なら線は無い。
+
+        設定は呼ばれたときに読む（GUI で変えたら次の問い合わせから効く）。
+        """
+        triggers = (ON_AREA_ARRIVAL, ON_FACILITY_ARRIVAL, ON_DAYS, ON_FREE_ACTION)
+        if CHANCE_PERCENT <= 0 or not any(triggers):
+            return None
+        return max(1, int(START_TOTAL))
+
+    wanted.declare_hunted(OWNER, ctx, hunted_line)
+
     ctx.log("bounty hunter installed; 条件 ここ{}/合計{} 発生率{}% 難易度{}+{}×重さ"
             "(上限{}) 場面={} 名前={} 倒しても手配は増やさない={} log={}".format(
                 START_WANTED, START_TOTAL, CHANCE_PERCENT, DIFFICULTY_BASE,
@@ -742,17 +869,3 @@ def apply(ctx):
 def _is_number(value):
     """数として読める値か。`bool` は弾く（`True` を1日・難易度1にしない）。"""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _difficulty_index(args):
-    """残りの引数のうち難易度の位置。
-
-    実測の並びでは難易度だけが数なので、**数が1つだけならそれを採る**
-    （引数が増減しても追随する）。複数あるときだけ実測の位置（5番目）に戻る。
-    """
-    numbers = [index for index, value in enumerate(args) if _is_number(value)]
-    if len(numbers) == 1:
-        return numbers[0]
-    if 4 in numbers:
-        return 4
-    return None

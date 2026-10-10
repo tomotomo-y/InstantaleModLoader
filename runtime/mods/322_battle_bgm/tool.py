@@ -18,6 +18,7 @@
 どのタブも左右2段で、左が置いてある曲の全部（曲名・置き場）、右がその戦闘で使う曲（曲名・置き場・重み・確率）。
 左をダブルクリック（または「使う >>」）で右へ入り、右をダブルクリック（または「<< 外す」）で外れる。
 右で選んだ曲の重みは下の欄で変える。
+選んだ曲は「▶ 試聴」（または一覧で Space）で鳴らせる（`modtool.preview_bar`）。
 一覧の上の欄で列ごとに絞り込める（曲名は部分一致、置き場は選択、重みは下限）。
 絞り込みは表示だけを変え、値は変えない（「全て使う / 全て外す」は表示中の曲だけに効く）。
 
@@ -115,11 +116,18 @@ load_playlist = modtool.read_json
 
 
 def weight_of(entry, category):
+    value = (entry or {}).get(category, 0)
+    # 本体（`sounds.coerce_weight`）と同じく、小数と `true`（=100）も受ける。
+    # 整数に切り捨てていたころは、保存で 0.5 を 0（＝使わない）に、`true` を 1 に書き換えた
+    if isinstance(value, bool):
+        return 100 if value else 0
     try:
-        value = float((entry or {}).get(category, 0))
+        value = float(value)
     except (TypeError, ValueError):
         return 0
-    return int(value) if value > 0 else 0
+    if not value > 0:
+        return 0
+    return int(value) if value.is_integer() else value
 
 
 def matches(name, where, weight, name_filter, where_filter, min_weight):
@@ -202,6 +210,11 @@ class Model(object):
                 return False
             self.saved_settings = dict(self.settings)
         return True
+
+    def track_path(self, name):
+        """曲の絶対パス。置き場は一覧のもの（同名なら state 側）。"""
+        folder = self.state_dir if self.rows[name]["where"] == "state" else self.asset_dir
+        return os.path.join(folder, name)
 
     def shares(self, category):
         """{曲名: 確率(%)}。重みの合計に対する割合。"""
@@ -300,6 +313,21 @@ def build_window(model):
     footer = ttk.Frame(outer)
     footer.pack(side="bottom", fill="x")
     ttk.Separator(outer).pack(side="bottom", fill="x", pady=8)
+
+    # --- 試聴。タブごとに置かず1つにする（鳴る曲を1つに保つ）。
+    # 鳴らすのは開いているタブで最後に選んだ一覧の曲。
+    last_tree = {}
+
+    def preview_pick():
+        category = CATEGORIES[notebook.index(notebook.select())][0]
+        tree = last_tree.get(category)
+        name = tree.focus() if tree is not None else ""
+        if not name or name not in model.rows:
+            return None
+        return model.track_path(name), name
+
+    preview, toggle_preview = modtool.preview_bar(outer, preview_pick)
+    preview.pack(side="bottom", fill="x", pady=(8, 0))
 
     # --- タブ
     notebook = ttk.Notebook(outer)
@@ -413,11 +441,17 @@ def build_window(model):
                 model.rows[item][category] = value
                 refresh(category, keep=item)
 
+        for side in (pool, used):
+            side["tree"].bind("<<TreeviewSelect>>",
+                              lambda _e, tree=side["tree"]: last_tree.update({category: tree}), add="+")
+            side["tree"].bind("<space>", lambda _e, tree=side["tree"]: (
+                last_tree.update({category: tree}), toggle_preview(), "break")[-1])
         pool["tree"].bind("<Double-1>",
                           lambda e: move(category, pool["tree"].identify_row(e.y), True))
         used["tree"].bind("<Double-1>",
                           lambda e: move(category, used["tree"].identify_row(e.y), False))
-        used["tree"].bind("<<TreeviewSelect>>", on_select)
+        # add="+" が無いと、上で足した last_tree の更新が置き換わって試聴が右の選択を追わない。
+        used["tree"].bind("<<TreeviewSelect>>", on_select, add="+")
         weight_var.trace_add("write", on_weight)
         spin.bind("<Return>", on_weight)
 

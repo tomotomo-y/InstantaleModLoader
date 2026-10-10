@@ -18,7 +18,10 @@ Kivy（Button・Clock・Window・App）を差し込んで、次を確認する�
   枠線     … 足した枠にゲーム自身の `add_border` で枠線が付く（無ければ自前）
   見え方   … 幅の違う立ち絵も、元の枠と同じ位置・同じ大きさに収まる
   頭打ち   … 窓に入らない行数までは伸ばさない
-  隠す     … 伸びた帯に重なるボタンは見えなくなり押せなくなる。戻すと元に戻る
+  ページ   … 溢れた仲間は ◀ ▶ で送る。枠は全員ぶん作り、今のページ以外は窓の外へ出す
+             （隠さない・無効にしない）。最後のページは後ろへ詰める。畳むと中身ごと戻る
+  窓の高さ … 行数を窓の高さの割合で決める設定。元の3行を下回らない
+  隠す     … 伸びた帯に重なるボタンは見えなくなり押せなくなる（触りは下の枠へ通す）。戻すと元に戻る
   自分     … こちらのボタンは隠さない（隠すと戻す手段が無くなる）
   他人     … **ゲームの選択肢ボタンには触らない**（重なっていても）
   目隠し   … 新しく覆った場所は黒い板で塞ぐ（透けない・押しても抜けない）
@@ -84,6 +87,9 @@ PANEL_POS = (1996.8, 49.0)
 BASE_ROWS = 3
 CELL_HINT_Y = 0.33          # ゲームの実測値（1/3 ではない）
 GAME_FONT = "fonts/NotoSansJP.ttf"
+
+# ページ送りのボタンが持つ印（◀ は -1、▶ は +1）。
+PAGE_STEP = "_instantale_party_page_step"
 
 ROSTER = [
     ("player", "自分", "portraits/player.png"),
@@ -502,9 +508,28 @@ class FakeHUD(FakeWidget):
 
     def toggle_button(self):
         for child in self.root.children + self.children:
-            if isinstance(child, FakeButton) and child is not self.stray:
+            if (isinstance(child, FakeButton) and child is not self.stray
+                    and not hasattr(child, PAGE_STEP)):
                 return child
         return None
+
+    def pagers(self):
+        """ページ送りの ◀ ▶（◀ が先）。置かれていなければ空。"""
+        found = [c for c in self.root.children if hasattr(c, PAGE_STEP)]
+        return sorted(found, key=lambda c: getattr(c, PAGE_STEP))
+
+    def onstage(self):
+        """窓の中に置かれている枠（`party_cells` の添字の順）。"""
+        return [cell for cell in self.party_cells if cell.x >= 0 and cell.y >= 0]
+
+    def top_down(self):
+        """窓の中の枠を、見た目の上から並べた id。"""
+        return [cell.member_id for cell in
+                sorted(self.onstage(), key=lambda cell: -cell.y)]
+
+    def blocker(self):
+        found = [c for c in self.root.children if isinstance(c, FakeBlocker)]
+        return found[0] if found else None
 
     def extras(self):
         if self.panel is None:
@@ -678,6 +703,12 @@ def run():
     check("with room to spare the button is hidden and cannot be pressed",
           quiet is not None and quiet.opacity == 0 and quiet.disabled is True,
           quiet and (quiet.opacity, quiet.disabled))
+    # Kivy は無効なウィジェットに触れた時点で触りを止める（`Widget.on_touch_down` の先頭）。
+    # 隠したボタンは当たり判定ごと消えていないと、下の選択肢への押下を吸う。
+    check("the hidden button lets touches through to what lies beneath",
+          quiet is not None and callable(vars(quiet).get("collide_point"))
+          and quiet.collide_point(quiet.x + 1, quiet.y + 1) is False,
+          quiet and vars(quiet).get("collide_point"))
     check("a party that fits leaves the panel exactly as the game built it",
           hud.panel.size == PANEL_SIZE and len(hud.party_cells) == BASE_ROWS,
           (hud.panel.size, len(hud.party_cells)))
@@ -689,6 +720,18 @@ def run():
     check("a fourth member brings the button out",
           button is not None and button.opacity == 1 and button.disabled is False,
           button and (button.opacity, button.disabled))
+    hud.set_party(3)
+    hud.show()
+    hud.set_party(4)
+    hud.show()
+    check("showing it again gives the button back its own hit test",
+          "collide_point" not in vars(button), vars(button).get("collide_point"))
+    from instantale_modloader import ui as loader_ui
+    solid = FakeButton()
+    loader_ui.show_widget(solid, False, block_touch=True)
+    check("block_touch keeps a hidden widget stopping touches (disabled, hit test kept)",
+          solid.disabled is True and "collide_point" not in vars(solid),
+          (solid.disabled, vars(solid).get("collide_point")))
     for _ in range(5):
         hud.show()
         hud.update_button_texts(hud, ["会話する", "出る"])
@@ -740,22 +783,26 @@ def run():
     check("the panel width is left to the game",
           hud.panel.size_hint[0] == 0.2 and close(hud.panel.width, PANEL_SIZE[0]),
           (hud.panel.size_hint, hud.panel.width))
-    # 比率で割り直すと 0.33 と 1/4 の差で元の枠が数 px 動く（実機で確認）。
-    check("not one of the game's own rows moved by a single pixel",
-          [(cell.pos, cell.size) for cell in hud.party_cells[:BASE_ROWS]] == was,
-          (was, [(c.pos, c.size) for c in hud.party_cells[:BASE_ROWS]]))
-    check("the added row sits one pitch above the topmost row",
-          extras and close(extras[0].x, was[0][0][0])
-          and close(extras[0].y, was[0][0][1] + ROW_PITCH)
-          and extras[0].size == was[0][1],
-          extras and (extras[0].pos, extras[0].size)),
+    # 仲間は上の行から順に並ぶ。
+    # 下の3行は元の3枠が居た位置そのもの、その上は送り幅ぶん積む。
+    # 比率で割り直すと 0.33 と 1/4 の差で枠が数 px ずれる（実機で確認）。
+    rows4 = hud.party_cells[:BASE_ROWS] + extras
+    expected = [(was[0][0][0], was[0][0][1] + ROW_PITCH)] + [p for p, _s in was]
+    check("rows run top-down in party order on the measured positions",
+          [c.pos for c in rows4] == expected
+          and all(c.size == was[0][1] for c in rows4),
+          [(c.pos, c.size) for c in rows4])
     check("the added row is given the game's own border",
           extras and extras[0].bordered is True,
           extras and extras[0].bordered)
+    check("the game's portraits travel with their rows",
+          close(hud.party_cells[0].image().y, top_box[0][1] + ROW_PITCH),
+          (hud.party_cells[0].image().pos, top_box))
+    # 4人目は一番下（元の3人目が居た行）。
     check("a wider portrait is aligned to the same box as the game's rows",
           extras and extras[0].image().size == top_box[1]
           and close(extras[0].image().x, top_box[0][0])
-          and close(extras[0].image().y, top_box[0][1] + ROW_PITCH),
+          and close(extras[0].image().y, top_box[0][1] - 2 * ROW_PITCH),
           extras and (extras[0].image().pos, extras[0].image().size, top_box))
     check("the fourth member's portrait is in the added row",
           extras and extras[0].image().source == ROSTER[3][2],
@@ -780,6 +827,12 @@ def run():
     check("a button the grown panel covers is hidden",
           hud.stray.opacity == 0 and hud.stray.disabled is True,
           (hud.stray.opacity, hud.stray.disabled))
+    # 隠した相手は帯より手前に居て、その場所は足した行の枠の上になる。
+    # Kivy は無効なウィジェットの矩形で触りを止めるので、当たり判定が残ると枠への押下を吸う。
+    check("the hidden button lets touches through to the rows under it",
+          callable(vars(hud.stray).get("collide_point"))
+          and hud.stray.collide_point(hud.stray.x + 1, hud.stray.y + 1) is False,
+          vars(hud.stray).get("collide_point"))
     check("this mod's own button stays visible and pressable",
           button.opacity == 1 and button.disabled is False,
           (button.opacity, button.disabled))
@@ -848,6 +901,8 @@ def run():
     check("pressing again brings the covered button back",
           hud.stray.opacity == 1 and hud.stray.disabled is False,
           (hud.stray.opacity, hud.stray.disabled))
+    check("pressing again gives the covered button its own hit test back",
+          "collide_point" not in vars(hud.stray), vars(hud.stray).get("collide_point"))
     check("pressing again flips the icon back", (icon_apex(button) or 0) > 0,
           icon_apex(button))
     hud.show()
@@ -879,6 +934,20 @@ def run():
           hud.stray.opacity == 1 and hud.stray.disabled is False,
           (hud.stray.opacity, hud.stray.disabled))
 
+    # -- 持ち主が隠していた相手は、持ち主の差し替えを残して戻す --------------
+    install(mod, ctx)
+    hud = FakeHUD(members=4)
+    hud.show()
+    from instantale_modloader import ui as loader_ui
+    loader_ui.show_widget(hud.stray, False)        # 持ち主が自分で隠している
+    owners = vars(hud.stray).get("collide_point")
+    hud.toggle_button().press()
+    hud.toggle_button().press()
+    check("a button its owner had hidden stays hidden and touch-through after restoring",
+          hud.stray.opacity == 0 and hud.stray.disabled is True
+          and vars(hud.stray).get("collide_point") is owners,
+          (hud.stray.opacity, hud.stray.disabled, vars(hud.stray).get("collide_point")))
+
     # -- `party_cells` をなめて塗るビルド ------------------------------------
     install(mod, ctx)
     hud = FakeHUD(members=4, paints="cells")
@@ -896,7 +965,7 @@ def run():
     hud.show()
     hud.toggle_button().press()
     extras = hud.extras()
-    rows = extras + hud.party_cells[:BASE_ROWS]
+    rows = hud.party_cells[:BASE_ROWS] + extras      # 上から
     row_height = PANEL_SIZE[1] * CELL_HINT_Y
     check("rows without a pos_hint are stacked the same way",
           all(close(cell.height, row_height) for cell in rows)
@@ -910,16 +979,203 @@ def run():
           [c.pos for c in hud.party_cells])
 
     # -- 窓に入らない行数までは伸ばさない ------------------------------------
+    def crowd(hud, count):
+        """仲間を `count` 人にする（名前と立ち絵は1人ずつ違う）。"""
+        hud.party_members = dict(
+            ("m{}".format(i), {"name": "仲間{}".format(i),
+                               "image_src": "p{}.png".format(i)})
+            for i in range(count))
+
     install(mod, ctx)
     hud = FakeHUD(members=4)
-    hud.party_members = dict(("m{}".format(i), {"name": "x", "image_src": "y.png"})
-                             for i in range(20))
+    crowd(hud, 20)
     hud.show()
     hud.toggle_button().press()
     check("the panel never grows past what the window can hold",
-          hud.panel.height <= WIN_HEIGHT * mod.MAX_FILL + 0.01, hud.panel.size)
-    check("and never past the configured number of rows",
-          len(hud.party_cells) <= mod.MAX_ROWS, len(hud.party_cells))
+          hud.panel.y + hud.panel.height <= WIN_HEIGHT * mod.MAX_FILL + 0.01,
+          hud.panel.size)
+    check("and never shows more than the configured number of rows",
+          len(hud.onstage()) <= mod.MAX_ROWS, len(hud.onstage()))
+
+    # -- 溢れた仲間はページで送る --------------------------------------------
+    # 窓 1400 では 9 行まで入るので、MAX_ROWS=8 が効いて 8 行。
+    # 20 人なら 8 / 8 / 4 の 3 ページ。ページどうしは重ねず、最後のページは 4 行に縮む。
+    ids = list(hud.party_members)
+    shown = len(hud.onstage())
+    full_height = PANEL_SIZE[1] + (shown - BASE_ROWS) * ROW_PITCH
+    check("every member gets a cell, one page of them is on screen",
+          len(hud.party_cells) == 20 and shown == 8,
+          (len(hud.party_cells), shown))
+    check("the panel is exactly one page tall",
+          close(hud.panel.height, full_height), hud.panel.size)
+    check("the first page shows members 1 to 8 from the top down",
+          hud.top_down() == ids[:8], hud.top_down())
+    check("its bottom rows sit exactly where the game's rows were",
+          [c.pos for c in hud.party_cells[5:8]] == [p for p, _s in was],
+          [c.pos for c in hud.party_cells[5:8]])
+    page_one = [c.pos for c in hud.party_cells[:8]]
+    prev, nxt = (hud.pagers() + [None, None])[:2]
+    check("two page buttons appear once there is more than one page",
+          prev is not None and nxt is not None and len(hud.pagers()) == 2,
+          len(hud.pagers()))
+    toggle = hud.toggle_button()
+    check("the page buttons sit left of the toggle, on its line",
+          prev is not None and nxt is not None
+          and prev.x < nxt.x < toggle.x and prev.y == nxt.y == toggle.y,
+          prev and (prev.pos, nxt.pos, toggle.pos))
+    check("on the first page only the forward button can be pressed",
+          prev is not None and prev.disabled is True and nxt.disabled is False,
+          prev and (prev.disabled, nxt.disabled))
+    check("the page buttons are drawn as white lines",
+          nxt is not None and bool(nxt.canvas.after.lines()),
+          nxt and nxt.canvas.after.instructions)
+    nxt.press()
+    check("forward shows the next page (members 9 to 16) and nobody from page one",
+          hud.top_down() == ids[8:16], hud.top_down())
+    check("the page uses the same rows as the first page",
+          [c.pos for c in hud.party_cells[8:16]] == page_one,
+          [c.pos for c in hud.party_cells[8:16]])
+    check("the game's rows leave the window together with their portraits",
+          all(c.x < 0 for c in hud.party_cells[:BASE_ROWS])
+          and hud.party_cells[0].image().x < 0,
+          [(c.pos, c.image().pos) for c in hud.party_cells[:BASE_ROWS]])
+    # 隠すのに `disabled` を使うと、見えない当たり判定が残る（Kivy は無効な相手で触りを止める）。
+    check("rows off the page are moved away, not hidden or disabled",
+          all(c.opacity == 1 and c.disabled is False for c in hud.party_cells),
+          [(c.opacity, c.disabled) for c in hud.party_cells if c.x < 0])
+    check("a full page keeps the panel at full height",
+          close(hud.panel.height, full_height), hud.panel.size)
+    check("the game's own choice buttons are still never touched",
+          all(c.opacity == 1 and c.disabled is False for c in hud.right_buttons),
+          [(c.opacity, c.disabled) for c in hud.right_buttons])
+    RUNNING["app"].pressed = []
+    hud.party_cells[9].press()
+    check("a row on a later page still routes to its own member",
+          RUNNING["app"].pressed == [("index", 9, "m9")], RUNNING["app"].pressed)
+    nxt.press()
+    check("the last page shows only the rest (members 17 to 20), from the top",
+          hud.top_down() == ids[16:20], hud.top_down())
+    check("the panel shrinks to the rows that page needs",
+          close(hud.panel.height, PANEL_SIZE[1] + ROW_PITCH)
+          and hud.panel.pos == PANEL_POS,
+          (hud.panel.pos, hud.panel.size))
+    check("the blocker shrinks with it",
+          hud.blocker() is not None and close(hud.blocker().height, ROW_PITCH),
+          hud.blocker() and hud.blocker().size)
+    toggle = hud.toggle_button()
+    check("the toggle and the page buttons follow the panel down",
+          close(toggle.y, hud.panel.y + hud.panel.height + mod.PANEL_GAP)
+          and prev.y == nxt.y == toggle.y,
+          (toggle.pos, prev.pos, hud.panel.size))
+    check("on the last page only the back button can be pressed",
+          prev.disabled is False and nxt.disabled is True, (prev.disabled, nxt.disabled))
+    nxt.press()
+    check("forward on the last page does nothing",
+          hud.top_down() == ids[16:20], hud.top_down())
+    hud.show()
+    check("a repaint keeps the page", hud.top_down() == ids[16:20], hud.top_down())
+    install(mod, ctx)
+    hud.show()
+    check("re-injecting keeps the page", hud.top_down() == ids[16:20], hud.top_down())
+    hud.pagers()[0].press()
+    check("back goes to the previous page and grows the panel again",
+          hud.top_down() == ids[8:16] and close(hud.panel.height, full_height),
+          (hud.top_down(), hud.panel.size))
+    hud.toggle_button().press()
+    check("collapsing from a later page puts the game's rows back",
+          [c.pos for c in hud.party_cells] == [p for p, _s in was]
+          and len(hud.party_cells) == BASE_ROWS,
+          [c.pos for c in hud.party_cells])
+    # 窓の外（-100000）を往復するぶんの浮動小数の誤差（1e-11 px 程度）は許す。
+    back = hud.party_cells[0].image()
+    check("with their portraits",
+          close(back.x, top_box[0][0]) and close(back.y, top_box[0][1])
+          and back.size == top_box[1],
+          (back.pos, top_box))
+    check("collapsing takes the page buttons away (not just hides them)",
+          hud.pagers() == [], len(hud.pagers()))
+    hud.toggle_button().press()
+    check("expanding again starts from the first page",
+          hud.top_down() == ids[:8], hud.top_down())
+    hud.toggle_button().press()
+
+    # 人数が上限に収まれば送らない。
+    install(mod, ctx)
+    hud = FakeHUD(members=5)
+    hud.show()
+    hud.toggle_button().press()
+    check("no page buttons when everyone fits", hud.pagers() == [], len(hud.pagers()))
+
+    # ゲームが帯の子を足した順に塗るビルドでも、全員ぶんの枠が正しい相手で塗られる。
+    install(mod, ctx)
+    hud = FakeHUD(members=4, paints="cells")
+    crowd(hud, 12)
+    hud.show()
+    hud.toggle_button().press()
+    ids = list(hud.party_members)
+    check("the game paints every cell with its own member, on and off the page",
+          [c.member_id for c in hud.party_cells] == ids,
+          [c.member_id for c in hud.party_cells])
+    hud.pagers()[1].press()
+    hud.show()
+    check("and keeps doing so after paging",
+          [c.member_id for c in hud.party_cells] == ids
+          and hud.top_down() == ids[8:12],
+          hud.top_down())
+    hud.toggle_button().press()
+
+    # -- 窓の高さで行数を決める ----------------------------------------------
+    # 窓 1400 の 6 割（840）から帯の上端（480.2）を引いた残りに 2 行入る。
+    mod.ROWS_LIMIT = mod.BY_WINDOW
+    install(mod, ctx)
+    hud = FakeHUD(members=4)
+    crowd(hud, 7)
+    ids = list(hud.party_members)
+    hud.show()
+    hud.toggle_button().press()
+    check("the window setting grows the panel as far as the share allows",
+          len(hud.onstage()) == 5
+          and hud.panel.y + hud.panel.height <= WIN_HEIGHT * mod.MAX_HEIGHT + 0.01,
+          (len(hud.onstage()), hud.panel.size))
+    check("and pages the rest", len(hud.pagers()) == 2, len(hud.pagers()))
+    check("the button the grown panel covers is hidden meanwhile",
+          hud.stray.opacity == 0 and hud.stray.disabled is True,
+          (hud.stray.opacity, hud.stray.disabled))
+    hud.pagers()[1].press()
+    # 残りは 2 人。帯は元の 3 行まで縮み、3 行目は空く。
+    check("its last page shows the two left, from the top, over the original rows",
+          hud.top_down() == ids[5:7]
+          and [c.pos for c in hud.party_cells[5:7]] == [p for p, _s in was[:2]],
+          (hud.top_down(), [c.pos for c in hud.party_cells[5:7]]))
+    check("the panel goes back to the game's own height",
+          close(hud.panel.height, PANEL_SIZE[1]), hud.panel.size)
+    # 縮んで覆わなくなった場所に板や隠したボタンを残すと、そこの押下を止め続ける。
+    check("the blocker is taken away once nothing is covered",
+          hud.blocker() is None, hud.blocker() and hud.blocker().size)
+    check("the button it no longer covers comes back",
+          hud.stray.opacity == 1 and hud.stray.disabled is False,
+          (hud.stray.opacity, hud.stray.disabled))
+    hud.pagers()[0].press()
+    check("going back covers and hides it again",
+          hud.blocker() is not None
+          and hud.stray.opacity == 0 and hud.stray.disabled is True,
+          (hud.blocker(), hud.stray.opacity, hud.stray.disabled))
+    hud.toggle_button().press()
+    # 割合が小さくて元の3行しか入らなくても、ページ送りで全員に届く。
+    mod.MAX_HEIGHT = 0.3
+    install(mod, ctx)
+    hud = FakeHUD(members=4)
+    crowd(hud, 7)
+    hud.show()
+    hud.toggle_button().press()
+    check("a share below the original rows keeps the panel as the game built it",
+          close(hud.panel.height, PANEL_SIZE[1]) and len(hud.onstage()) == BASE_ROWS,
+          (hud.panel.size, len(hud.onstage())))
+    check("and still pages everyone through it", len(hud.pagers()) == 2,
+          len(hud.pagers()))
+    hud.toggle_button().press()
+    mod.MAX_HEIGHT = 0.6
+    mod.ROWS_LIMIT = mod.BY_COUNT
 
     # -- 窓の大きさが変わったとき --------------------------------------------
     install(mod, ctx)

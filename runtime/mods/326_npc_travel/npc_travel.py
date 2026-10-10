@@ -6,7 +6,7 @@
 このMODは、日数が進むたびに各街のギルドの冒険者から出発する者を引き、
 ゲーム自身の `move_npc_to_facility` で置き直す。
 **動かした者はこのMODが帰す**（同 §2.8 の「戻す責任」）。
-誰がどこへ何日まで、は `state\\npc_travel\\<世界>.json` の台帳に持つ。
+誰がどこへ何日まで、は `state\\npc_travel\\<世界×主人公>.json` の台帳に持つ。
 
 この版の対象は冒険者（`Area.adventurer_npcs` に載っている者）だけ。
 店主や住人へ広げる余地を名前に残してある。
@@ -70,7 +70,7 @@ import random
 import re
 import sys
 
-from instantale_modloader import state as loader_state, ui
+from instantale_modloader import choices, state as loader_state, ui
 from instantale_modloader.npcs import npc_stores, save_npcs
 
 from . import travel
@@ -308,21 +308,32 @@ def apply(ctx):
     worlds = store["worlds"].rebind(ctx, write)
     rng = store["rng"]
 
+    def bucket_of(app):
+        """この周回（世界×主人公）の `(鍵, 台帳)`。
+
+        旅の居場所はセーブに書かれ、同じ世界で主人公を作り直すとセーブは組み直される。
+        世界名だけの鍵だと、前の主人公の旅が新しいセーブの冒険者に当て直される。
+        世界名だけの台帳は `worlds.playthrough` が移す（TECH.md §5.4）。
+        `World.__init__` は包んでいないので、`app` から引いてよい。
+        """
+        key = worlds.playthrough(app)
+        return key, worlds.load(key)
+
     def ledger(app):
-        """この世界の `(鍵, 旅の表)`。"""
-        key, bucket = worlds.of(app)
+        """この周回の `(鍵, 旅の表)`。"""
+        key, bucket = bucket_of(app)
         return key, travel.trips_of(bucket)
 
     def hired_table(app):
-        _key, bucket = worlds.of(app)
+        _key, bucket = bucket_of(app)
         return travel.hired_of(bucket)
 
     def rest_table(app):
-        _key, bucket = worlds.of(app)
+        _key, bucket = bucket_of(app)
         return travel.rest_of(bucket)
 
     def seen_table(app):
-        _key, bucket = worlds.of(app)
+        _key, bucket = bucket_of(app)
         return travel.seen_of(bucket)
 
     def start_rest(app, npc_id, name, day):
@@ -640,9 +651,10 @@ def apply(ctx):
                 continue
             if day is None or not travel.is_due(trip, day):
                 continue
-            if player_at(app, trip["dest_area"], trip["dest_facility"]):
-                write("return: player is at {}/{}; {} waits".format(
-                    trip["dest_area"], trip["dest_facility"], npc_id))
+            if player_at(app, trip["dest_area"], trip["dest_facility"]) \
+                    or player_at(app, trip["origin_area"], trip.get("origin_facility")):
+                # 出発と同じく、行き先にも帰り先にもプレイヤーが居る間は動かさない（目の前で消えも湧きもしない）
+                write("return: player is at the destination or the origin of {}; it waits".format(npc_id))
                 continue
             if come_back(app, trips, npc_id, trip, reason):
                 changed = True
@@ -674,7 +686,6 @@ def apply(ctx):
         area_ids = (sorted(towns, key=ui.id_sort_key) if kind == travel.AWAY
                     else local_areas(app, towns))
         changed = False
-        deferred = False
         for area_id in area_ids:
             area = towns.get(area_id)
             if area is None:
@@ -700,6 +711,7 @@ def apply(ctx):
             write("roll[{}]: area {} present={} eligible={} chosen={} "
                   "(chance {:.3f} over {} day(s))".format(
                       kind, area_id, len(present), len(eligible), chosen, chance, window))
+            deferred = False
             for npc_id in chosen:
                 character = ui.character_of(app, npc_id)
                 here = facility_of_character(character) if character is not None else ""
@@ -721,12 +733,13 @@ def apply(ctx):
                     changed = True
                 elif result == "waits":
                     deferred = True
-        if kind == travel.LOCAL and not deferred:
-            # 引いた窓は消費する（当たり外れに関わらず、同じ日数を二度引かない）。
-            # 延期した人が居る間は消費しない ― プレイヤーがその場を離れたら
-            # 同じ窓でもう一度引けるように。
-            seen[str(area_id)] = int(day)
-            changed = True
+            if kind == travel.LOCAL and not deferred:
+                # 引いた窓は消費する（当たり外れに関わらず、同じ日数を二度引かない）。
+                # 延期した人が居る間は消費しない。プレイヤーがその場を離れたら
+                # 同じ窓でもう一度引けるように。延期の有無も控えも街ごとに見る
+                # （ループの外で見ると最後の街だけが控えられ、街が無いと area_id が無い）。
+                seen[str(area_id)] = int(day)
+                changed = True
         if changed:
             worlds.save(key)
         return changed
@@ -755,7 +768,7 @@ def apply(ctx):
         if not trips and not hired_table(app) and not rest_table(app):
             return
         day = ui.game_day(app)
-        write("reconcile: world {!r} day {} trips {}".format(key, day, len(trips)))
+        write("reconcile: playthrough {!r} day {} trips {}".format(key, day, len(trips)))
         changed = False
         for npc_id in sorted(trips, key=ui.id_sort_key):
             trip = trips[npc_id]
@@ -777,7 +790,9 @@ def apply(ctx):
             character = ui.character_of(app, npc_id)
             if character is None:
                 continue
-            if facility_of_character(character) != trip["dest_facility"]:
+            # 施設の id は土地の中でしか一意でない。別の街の同じ id の施設と取り違えないよう土地も見る
+            if facility_of_character(character) != trip["dest_facility"] \
+                    or id_of(getattr(character, "current_area", None)) != trip["dest_area"]:
                 dest_area = (ui.world_areas(app) or {}).get(trip["dest_area"])
                 if move(app, npc_id, character, dest_area, trip["dest_area"],
                         trip["dest_facility"]):
@@ -980,10 +995,19 @@ def apply(ctx):
 
     @ctx.wrap("__main__:InstantaleApp.elapse_days", required=False, safe=True)
     def elapse_days(orig, self, days, *args, **kwargs):
-        """日が進んだ後に見回る。日数の進め方には触らない。"""
+        """日が進んだ後に見回る。日数の進め方には触らない。
+
+        数えるのは暦の前後の差。この包みは日数送りの関所より外側に載るので、引数の `days` は
+        他の MOD（`307_` / `314_` / `315_` / `325_`）が差し替える前の素の値（`316_` と同じ理由）。
+        """
+        before = ui.game_day(self)
         result = orig(self, days, *args, **kwargs)
         try:
-            count = int(days) if isinstance(days, (int, float)) and not isinstance(days, bool) else 0
+            after = ui.game_day(self)
+            if before is not None and after is not None:
+                count = max(0, int(after) - int(before))
+            else:
+                count = int(days) if isinstance(days, (int, float)) and not isinstance(days, bool) else 0
             patrol(self, max(0, count), "days elapsed")
         except Exception:
             ctx.log_exc("npc travel: patrol after elapse_days failed")
@@ -1016,8 +1040,7 @@ def apply(ctx):
     for target in LOAD_TARGETS:
         make_load(target)
 
-    @ctx.wrap("__main__:InstantaleApp.refresh_choice_buttons", required=False, safe=True)
-    def refresh_choice_buttons(orig, self, *args, **kwargs):
+    def refresh_choice_buttons(self, _buttons):
         """ロードの後の突き合わせと、冒険者の一覧の手当て。"""
         try:
             buttons = getattr(self, "buttons", None)
@@ -1034,7 +1057,9 @@ def apply(ctx):
                         reconcile(self)
                 except Exception:
                     ctx.log_exc("npc travel: reconcile failed")
-        return orig(self, *args, **kwargs)
+
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons)
 
     def make_conversation(target, label):
         @ctx.wrap(target, required=False)
