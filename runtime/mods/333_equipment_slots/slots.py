@@ -16,7 +16,7 @@ COLS, ROWS = 6, 10
 #:     ［左手］［ 胴 ］［右手］
 #:     ［    ］［    ］［    ］
 #:     ［ 腕 ］［ 脚 ］［装飾］
-#:                     ［装飾］
+#:     ［自由］［自由］［装飾］
 REGIONS = {
     "head": (2, 0, 2, 2),
     "right_hand": (4, 2, 2, 4),
@@ -26,6 +26,8 @@ REGIONS = {
     "legs": (2, 6, 2, 2),
     "accessory1": (4, 6, 2, 2),
     "accessory2": (4, 8, 2, 2),
+    "free1": (0, 8, 2, 2),
+    "free2": (2, 8, 2, 2),
 }
 
 
@@ -42,14 +44,29 @@ UNUSED_CELLS = _unused_cells()
 LABELS = {
     "head": "頭", "left_hand": "左手", "right_hand": "右手", "body": "胴",
     "arms": "腕", "legs": "脚", "accessory1": "装飾", "accessory2": "装飾",
+    "free1": "自由", "free2": "自由",
 }
 
-#: 部位 -> 入る種類。
+#: 部位 -> 入る種類。`FREE` の部位は手（武器・盾）以外の防具なら何でも入る。
+FREE = "free"
 KIND_OF = {
     "head": "head", "body": "body", "arms": "arms", "legs": "legs",
     "left_hand": "hand", "right_hand": "hand",
     "accessory1": "accessory", "accessory2": "accessory",
+    "free1": FREE, "free2": FREE,
 }
+
+
+#: 能力値（本体に渡す1つ・合算・窓口 `combat`）に数える部位。自由枠は着けるだけで数えない。
+STAT_REGIONS = tuple(name for name in REGIONS if KIND_OF[name] != FREE)
+
+
+def takes(name, kind):
+    """部位 `name` に種類 `kind` の品が入るか。"""
+    region_kind = KIND_OF.get(name)
+    if region_kind == FREE:
+        return kind is not None and kind != "hand"
+    return kind is not None and region_kind == kind
 
 #: `attributes['item_detail']` → 種類。武器は種類を問わず手。盾も手。
 WEARABLE_KIND = {
@@ -149,7 +166,7 @@ def accepts(item, x, y, occupied):
     name = fits(item, x, y)
     if name is None:
         return "outside a region"
-    if KIND_OF[name] != kind:
+    if not takes(name, kind):
         return "wrong region {} for {}".format(name, kind)
     if occupied.get(name):
         return "region {} occupied".format(name)
@@ -167,7 +184,7 @@ def combined(slots, items, game_key, percent):
     if chosen is None:
         return None, 0.0
     rest = 0.0
-    for name in REGIONS:
+    for name in STAT_REGIONS:
         item = items.get(slots.get(name))
         if item is None or item is chosen or getattr(item, "item_type", None) != game_key:
             continue
@@ -199,12 +216,12 @@ def best(slots, items, game_key):
     """本体の `equipments[game_key]` に渡す1つ。合算せず最高値のみ。
 
     `weapon` は手にある武器の中で攻撃力が最高のもの。
-    `wearable` は全部位の防具（盾を含む）の中で防御力が最高のもの。
+    `wearable` は自由枠を除く全部位の防具（盾を含む）の中で防御力が最高のもの。
     候補が無ければ None。同点は REGIONS の並びで先のもの。
     """
     stat = dict(GAME_KEYS)[game_key]
     chosen, top = None, None
-    for name in REGIONS:
+    for name in STAT_REGIONS:
         item = items.get(slots.get(name))
         if item is None or getattr(item, "item_type", None) != game_key:
             continue

@@ -1,0 +1,750 @@
+{
+  "entry": "stable_diffusion.py",
+  "api": 1,
+  "kind": "feature",
+  "name": {
+    "en": "Override Stable Diffusion resolution, sampler, model and prompts",
+    "ja": "Stable Diffusionの各種差し替え"
+  },
+  "description": {
+    "en": "Raises the generation resolution and overrides the sampler at the single exit every backend goes through, separately for portraits, enemies and backgrounds, keeping the aspect ratio. The checkpoint, TAESD, VAE and LoRA folder can be pointed elsewhere (for an SDXL model) because they are written before the pipeline is built. Every default is the game's own value, and a setting left at its default is never written",
+    "ja": "どのバックエンドでも通る1つの出口で、生成解像度を上げ、サンプラーを上書きする。立ち絵・敵・背景で別々に指定でき、縦横比は保つ。チェックポイント・TAESD・VAE・LoRA の置き場も差し替えられる（パイプラインが建つ前に書くため。SDXL のモデルへ移る用）。既定値はすべてゲームの値で、既定のままの項目は書き換えない"
+  },
+  "version": "28",
+  "author": "R01/Flossian",
+  "state": ["stable_diffusion"],
+  "settings": {
+    "PORTRAIT_SHORT": {
+      "type": "int",
+      "default": 512,
+      "min": 256,
+      "max": 2048,
+      "label": {
+        "ja": "立ち絵の短辺の目標",
+        "en": "Portrait target short side"
+      },
+      "note": {
+        "ja": "立ち絵（キャラクタ）の生成解像度。ゲームの最終段は 512x1024 で、512 のままなら触らない。縦横比は保つので、先に長辺の上限へ当たればそこで止まる。1段目（256x512）も同じ比で上がる",
+        "en": "Generation resolution for character portraits. The game's final stage is 512x1024; leaving this at 512 changes nothing. The aspect ratio is kept, so the long-side cap can stop the enlargement first. The first stage (256x512) is scaled by the same factor"
+      }
+    },
+    "PORTRAIT_MAX_LONG": {
+      "type": "int",
+      "default": 1024,
+      "min": 256,
+      "max": 2048,
+      "label": {
+        "ja": "立ち絵の長辺の上限",
+        "en": "Portrait long-side cap"
+      },
+      "note": {
+        "ja": "ゲームのままは 1024。短辺の目標を上げてもここで止まるので、実際に短辺を伸ばすならこちらも比例して上げること",
+        "en": "1024 leaves the game as it is. Raising the short-side target alone stops here, so raise this proportionally when you want the short side to actually grow"
+      }
+    },
+    "ENEMY_SHORT": {
+      "type": "int",
+      "default": 512,
+      "min": 256,
+      "max": 2048,
+      "label": {
+        "ja": "敵・モンスターの短辺の目標",
+        "en": "Enemy target short side"
+      },
+      "note": {
+        "ja": "敵とモンスターの絵だけに効く（入口が立ち絵と別なので分けられる）。ゲームは正方形 512x512 を1段で描くので、512 のままなら触らない",
+        "en": "Applies only to enemies and monsters, which enter through their own functions. The game draws them as a single 512x512 square, so 512 leaves it as it is"
+      }
+    },
+    "ENEMY_MAX_LONG": {
+      "type": "int",
+      "default": 512,
+      "min": 256,
+      "max": 2048,
+      "label": {
+        "ja": "敵・モンスターの長辺の上限",
+        "en": "Enemy long-side cap"
+      },
+      "note": {
+        "ja": "ゲームのままは 512（敵は正方形なので短辺と同じ）",
+        "en": "512 leaves the game as it is (enemies are square, so this matches the short side)"
+      }
+    },
+    "BACKGROUND_SHORT": {
+      "type": "int",
+      "default": 512,
+      "min": 256,
+      "max": 2048,
+      "label": {
+        "ja": "背景の短辺の目標",
+        "en": "Background target short side"
+      },
+      "note": {
+        "ja": "背景はゲームでは 1024x512（短辺 512）。512 のままなら触らない",
+        "en": "Backgrounds are 1024x512 in the game (short side 512). Leaving this at 512 changes nothing"
+      }
+    },
+    "BACKGROUND_MAX_LONG": {
+      "type": "int",
+      "default": 1024,
+      "min": 256,
+      "max": 2048,
+      "label": {
+        "ja": "背景の長辺の上限",
+        "en": "Background long-side cap"
+      },
+      "note": {
+        "ja": "ゲームのままは 1024",
+        "en": "1024 leaves the game as it is"
+      }
+    },
+    "STAGE1_METHOD": {
+      "type": "choice",
+      "values": [
+        "euler_a",
+        "euler",
+        "heun",
+        "dpm2",
+        "dpmpp2s_a",
+        "dpmpp2m",
+        "dpmpp2mv2",
+        "ipndm",
+        "ipndm_v",
+        "lcm",
+        "ddim_trailing",
+        "tcd"
+      ],
+      "default": "euler_a",
+      "label": {
+        "ja": "1段目のサンプリング方法",
+        "en": "First stage sampling method"
+      },
+      "note": {
+        "ja": "立ち絵と敵の1段目（下描き）。ゲームのままは euler_a。立ち絵と敵は同じ関数を通るので、この段の設定は両方に効く",
+        "en": "The first (draft) stage for portraits and enemies. The game uses euler_a. Portraits and enemies go through the same function, so this applies to both"
+      }
+    },
+    "STAGE1_STEPS": {
+      "type": "int",
+      "default": 20,
+      "min": 1,
+      "max": 200,
+      "label": {
+        "ja": "1段目の steps",
+        "en": "First stage steps"
+      },
+      "note": {
+        "ja": "ゲームのままは 20",
+        "en": "The game uses 20"
+      }
+    },
+    "STAGE1_CFG": {
+      "type": "float",
+      "default": 8.0,
+      "min": 0.1,
+      "max": 50.0,
+      "label": {
+        "ja": "1段目の cfg",
+        "en": "First stage cfg"
+      },
+      "note": {
+        "ja": "ゲームのままは 8.0",
+        "en": "The game uses 8.0"
+      }
+    },
+    "STAGE1_SCHEDULER": {
+      "type": "choice",
+      "values": [
+        "default",
+        "discrete",
+        "karras",
+        "exponential",
+        "ays",
+        "gits",
+        "smoothstep"
+      ],
+      "default": "default",
+      "label": {
+        "ja": "1段目のスケジューラ",
+        "en": "First stage scheduler"
+      },
+      "note": {
+        "ja": "ゲームのままは default",
+        "en": "The game uses default"
+      }
+    },
+    "STAGE2_METHOD": {
+      "type": "choice",
+      "values": [
+        "euler_a",
+        "euler",
+        "heun",
+        "dpm2",
+        "dpmpp2s_a",
+        "dpmpp2m",
+        "dpmpp2mv2",
+        "ipndm",
+        "ipndm_v",
+        "lcm",
+        "ddim_trailing",
+        "tcd"
+      ],
+      "default": "dpmpp2m",
+      "label": {
+        "ja": "2段目のサンプリング方法",
+        "en": "Second stage sampling method"
+      },
+      "note": {
+        "ja": "立ち絵と敵の2段目（1段目の絵を描き直す段）。ゲームのままは dpmpp2m",
+        "en": "The second stage for portraits and enemies, which redraws the first stage image. The game uses dpmpp2m"
+      }
+    },
+    "STAGE2_STEPS": {
+      "type": "int",
+      "default": 15,
+      "min": 1,
+      "max": 200,
+      "label": {
+        "ja": "2段目の steps",
+        "en": "Second stage steps"
+      },
+      "note": {
+        "ja": "ゲームのままは 15",
+        "en": "The game uses 15"
+      }
+    },
+    "STAGE2_CFG": {
+      "type": "float",
+      "default": 7.0,
+      "min": 0.1,
+      "max": 50.0,
+      "label": {
+        "ja": "2段目の cfg",
+        "en": "Second stage cfg"
+      },
+      "note": {
+        "ja": "ゲームのままは 7.0",
+        "en": "The game uses 7.0"
+      }
+    },
+    "STAGE2_SCHEDULER": {
+      "type": "choice",
+      "values": [
+        "default",
+        "discrete",
+        "karras",
+        "exponential",
+        "ays",
+        "gits",
+        "smoothstep"
+      ],
+      "default": "karras",
+      "label": {
+        "ja": "2段目のスケジューラ",
+        "en": "Second stage scheduler"
+      },
+      "note": {
+        "ja": "ゲームのままは karras（この段だけ default ではない）",
+        "en": "The game uses karras here, unlike the other stages"
+      }
+    },
+    "CHECKPOINT_PATH": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "チェックポイントの差し替え",
+        "en": "Checkpoint override"
+      },
+      "note": {
+        "ja": "空でゲームのまま。SDXL のモデルへ移るときに指す。パスはゲームのフォルダからの相対（例: runtime/models/sd15/checkpoints/<名前>.safetensors）。TAESD と VAE の系統も一緒に揃えること",
+        "en": "Empty leaves the game as it is. Point this at an SDXL model to switch. The path is relative to the game folder. Keep the TAESD and VAE of the same family"
+      }
+    },
+    "TAESD_PATH": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "TAESD デコーダの差し替え",
+        "en": "TAESD decoder override"
+      },
+      "note": {
+        "ja": "空でゲームのまま。SDXL のチェックポイントには TAESDXL が要る（系統が違うと絵が崩れる）",
+        "en": "Empty leaves the game as it is. An SDXL checkpoint needs the TAESDXL decoder; mismatched families produce broken images"
+      }
+    },
+    "VAE_PATH": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "VAE の差し替え",
+        "en": "VAE override"
+      },
+      "note": {
+        "ja": "空でゲームのまま",
+        "en": "Empty leaves the game as it is"
+      }
+    },
+    "LORA_DIR": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "LoRA の置き場の差し替え",
+        "en": "LoRA folder override"
+      },
+      "note": {
+        "ja": "空でゲームのまま（runtime/models/sd15/lora）。SDXL 用の LoRA を別のフォルダに置くとき",
+        "en": "Empty leaves the game as it is (runtime/models/sd15/lora). Use this when SDXL LoRAs live in another folder"
+      }
+    },
+    "DISABLE_TAESD": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "TAESD を使わずに建てる",
+        "en": "Build the pipeline without TAESD"
+      },
+      "note": {
+        "ja": "パイプラインが建つ前に TAESD のパスを空にして、VAE で復号させる。遅くなるが絵は出る。書き込みが構築まで届くかを確かめるための項目で、普段は切でよい",
+        "en": "Empties the TAESD path before the pipeline is built so the VAE decodes instead. Slower, but images still come out. This exists to check that a write reaches construction; leave it off for normal play"
+      }
+    },
+    "DIFFUSERS_RESIZE": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "diffusers 系でも寸法を変える",
+        "en": "Resize on the diffusers family too"
+      },
+      "note": {
+        "ja": "diffusers_openvino のような変換済みモデルの一族では、既定で寸法を変えない。この一族は形を固定してあるので、寸法を変えるとモデルの作り直しが走り、64GB の RAM を使い切って SSD へページングを始める。sdcpp 系（cuda / vulkan / cpu）には関係しない設定",
+        "en": "On families that run converted, fixed-shape models such as diffusers_openvino, the size is left alone by default. Changing it forces the model to be rebuilt, which fills 64GB of RAM and starts paging to the SSD. This setting does not affect the sdcpp family"
+      }
+    },
+    "LCM_METHOD": {
+      "type": "choice",
+      "values": [
+        "euler_a",
+        "euler",
+        "heun",
+        "dpm2",
+        "dpmpp2s_a",
+        "dpmpp2m",
+        "dpmpp2mv2",
+        "ipndm",
+        "ipndm_v",
+        "lcm",
+        "ddim_trailing",
+        "tcd"
+      ],
+      "default": "lcm",
+      "label": {
+        "ja": "LCM の段のサンプリング方法",
+        "en": "LCM stage sampling method"
+      },
+      "note": {
+        "ja": "背景と敵・モンスターが通る段（どちらも generate_image_real_lcm を通る）。ゲームのままは lcm（5 steps・cfg 1.0 の速い設定）。別の方法にするなら steps と cfg も一緒に上げること",
+        "en": "The stage backgrounds, enemies and monsters go through (all via generate_image_real_lcm). The game uses lcm with 5 steps and cfg 1.0. Switching the method means raising steps and cfg to match"
+      }
+    },
+    "LCM_STEPS": {
+      "type": "int",
+      "default": 5,
+      "min": 1,
+      "max": 200,
+      "label": {
+        "ja": "LCM の段の steps",
+        "en": "LCM stage steps"
+      },
+      "note": {
+        "ja": "ゲームのままは 5",
+        "en": "The game uses 5"
+      }
+    },
+    "LCM_CFG": {
+      "type": "float",
+      "default": 1.0,
+      "min": 0.1,
+      "max": 50.0,
+      "label": {
+        "ja": "LCM の段の cfg",
+        "en": "LCM stage cfg"
+      },
+      "note": {
+        "ja": "ゲームのままは 1.0（LCM 用の低い値）",
+        "en": "The game uses 1.0, which suits LCM"
+      }
+    },
+    "LCM_SCHEDULER": {
+      "type": "choice",
+      "values": [
+        "default",
+        "discrete",
+        "karras",
+        "exponential",
+        "ays",
+        "gits",
+        "smoothstep"
+      ],
+      "default": "default",
+      "label": {
+        "ja": "LCM の段のスケジューラ",
+        "en": "LCM stage scheduler"
+      },
+      "note": {
+        "ja": "ゲームのままは default",
+        "en": "The game uses default"
+      }
+    },
+    "STRIP_LORA": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "プロンプトの LoRA タグを外す",
+        "en": "Strip LoRA tags from the prompt"
+      },
+      "note": {
+        "ja": "ゲームが背景・敵・（画質を下げたときの）立ち絵のプロンプトに入れる SD1.5 用の LCM LoRA のタグを外す。外すのはゲームが入れたタグだけで、規則で付け替えた先や足したタグは残る。系統の違うモデル（SDXL）に当たるとプロセスごと落ちるので、チェックポイントを差し替えるときはこれも入にする。既定は切（ゲームのまま）",
+        "en": "Strips the SD1.5 LCM LoRA tag the game inserts into the prompt for backgrounds, enemies and (at lower quality settings) portraits. Only tags the game inserted are removed; tags remapped or added by your rules stay. Applying an SD1.5 LoRA to a model of another family such as SDXL crashes the process, so turn this on whenever you point the checkpoint elsewhere. Off by default, which is the game's own behaviour"
+      }
+    },
+    "DISABLE_VAE": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "VAE を渡さずに建てる",
+        "en": "Build the pipeline without the VAE"
+      },
+      "note": {
+        "ja": "ゲームは SD1.5 用の VAE を必ず渡す。系統の違うモデル（SDXL）ではこれが残ると復号が合わず、絵がマゼンタへ潰れる。TAESD を差し替えても色が合わないときに切る。既定は切らない（ゲームのまま）",
+        "en": "The game always passes its SD1.5 VAE. With a model of another family such as SDXL this breaks the decode and images collapse into magenta. Turn it off when the colours stay wrong after replacing the TAESD decoder. Off by default, which is the game's own behaviour"
+      }
+    },
+    "MODEL_SAFETY": {
+      "type": "choice",
+      "values": [
+        "auto",
+        "off"
+      ],
+      "default": "auto",
+      "label": {
+        "ja": "モデルの系統に合わせて直す",
+        "en": "Fit the settings to the model family"
+      },
+      "note": {
+        "ja": "チェックポイントの中身（safetensors のヘッダに並ぶテンソルの名前）から SD1.5 か SDXL かを見分け、壊れると分かっている組み合わせだけを直す。名前でもファイルの大きさでも判定しない。SDXL のときに直すのは2つ。1つは、ゲームが入れる SD1.5 用の LoRA タグを外すこと（当たるとプロセスごと落ちる。規則で足したタグは残す）。もう1つは、素のままの LCM の段の設定を euler_a / 24 / cfg 5.0 にすること（そのままだとマゼンタに潰れる。1段目・2段目は触らない）。寸法は学習の寸法から離れていても警告を出すだけで、値は動かさない。off で何もしない",
+        "en": "Reads the tensor names in the checkpoint's safetensors header to tell SD1.5 from SDXL, then fixes only the combinations known to break. Neither the file name nor its size is used. With SDXL it strips the SD1.5 LoRA tags the game inserts (which crash the process; tags added by your rules stay) and replaces an untouched LCM-stage sampler with euler_a / 24 / cfg 5.0 (without which images collapse into magenta; the first and second stages are left alone). Sizes far from the family's training resolution only produce a warning and are left alone. off does nothing"
+      }
+    },
+    "KIND_PRESETS": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "種類ごとのプリセットを使う（上級者向け）",
+        "en": "Use presets per image kind (advanced)"
+      },
+      "note": {
+        "ja": "入にすると、下の3つで割り当てたプリセットで立ち絵・敵・背景を描き分ける。ゲームのモデルとは別にもう1つモデルを読み込むので VRAM を多く使い、足りないと絵の生成がとても遅くなるかゲームが落ちる。切なら割り当ては残したまま使わない",
+        "en": "When on, portraits, enemies and backgrounds are drawn with the presets assigned below. It loads another model next to the game's, so it uses much more VRAM; without enough, generation slows down badly or the game crashes. Off keeps the assignments but does not use them"
+      }
+    },
+    "PORTRAIT_PRESET": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "立ち絵に使うプリセット",
+        "en": "Preset for portraits"
+      },
+      "note": {
+        "ja": "空ならプリセットを使わずに描く（モデルの差し替えと、道具画面のほかのタブの値）。カスタムプリセットの名前を入れると、立ち絵だけそのプリセットのチェックポイント・TAESD・解像度・サンプラー・LoRA タグの除去で描く。ゲームのモデルとは別にもう1つモデルを読み込むので、そのぶん VRAM を使う",
+        "en": "Empty draws without a preset (the checkpoint replacement and the values on the other tabs). A custom preset name draws only portraits with that preset's checkpoint, TAESD, resolution, sampler and LoRA tag removal. It loads a second model besides the game's, which uses more VRAM."
+      }
+    },
+    "ENEMY_PRESET": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "敵・モンスターに使うプリセット",
+        "en": "Preset for enemies and monsters"
+      },
+      "note": {
+        "ja": "空ならプリセットを使わずに描く（モデルの差し替えと、道具画面のほかのタブの値）。カスタムプリセットの名前を入れると、敵・モンスターだけそのプリセットのチェックポイント・TAESD・解像度・サンプラー・LoRA タグの除去で描く。ゲームのモデルとは別にもう1つモデルを読み込むので、そのぶん VRAM を使う",
+        "en": "Empty draws without a preset (the checkpoint replacement and the values on the other tabs). A custom preset name draws only enemies and monsters with that preset's checkpoint, TAESD, resolution, sampler and LoRA tag removal. It loads a second model besides the game's, which uses more VRAM."
+      }
+    },
+    "BACKGROUND_PRESET": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "背景に使うプリセット",
+        "en": "Preset for backgrounds"
+      },
+      "note": {
+        "ja": "空ならプリセットを使わずに描く（モデルの差し替えと、道具画面のほかのタブの値）。カスタムプリセットの名前を入れると、背景だけそのプリセットのチェックポイント・TAESD・解像度・サンプラー・LoRA タグの除去で描く。ゲームのモデルとは別にもう1つモデルを読み込むので、そのぶん VRAM を使う",
+        "en": "Empty draws without a preset (the checkpoint replacement and the values on the other tabs). A custom preset name draws only backgrounds with that preset's checkpoint, TAESD, resolution, sampler and LoRA tag removal. It loads a second model besides the game's, which uses more VRAM."
+      }
+    },
+    "IMG2IMG": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "img2img（今の絵を下絵にして描き直す）を使う",
+        "en": "Use img2img (redraw from the current image)"
+      },
+      "note": {
+        "ja": "入にすると、ゲームの設定の画面の「画像の再生成」と主人公の描き直しの一覧に (img2img) が出る。押すと今の絵を下絵にして描き直すので、服の柄や色・ポーズ・持ち物が残りやすい。使うのは再生成のボタンだけ。sdcpp 系（cuda / vulkan / cpu）だけで効き、diffusers 系ではボタンを出さない",
+        "en": "When on, the game's settings-menu regeneration and the player's redraw menu offer (img2img). It starts from the current image, so clothing patterns, colours, pose and items tend to stay. Used only from the regenerate buttons. Works only on the sdcpp family (cuda / vulkan / cpu); the diffusers family never shows the button"
+      }
+    },
+    "IMG2IMG_PORTRAIT_PRESET": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "立ち絵の img2img のプリセット",
+        "en": "img2img preset for portraits"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く。ゲームのモデルと違うプリセットは、もう1つモデルを読み込むので VRAM を使う",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler. A preset with another model loads a second model, which uses more VRAM"
+      }
+    },
+    "IMG2IMG_PORTRAIT_STRENGTH": {
+      "type": "float",
+      "default": 0.5,
+      "min": 0.05,
+      "max": 1.0,
+      "label": {
+        "ja": "立ち絵の img2img の強さ",
+        "en": "img2img strength for portraits"
+      },
+      "note": {
+        "ja": "下絵をどこまで描き変えるか。小さいほど今の絵が残る。既定の 0.5 は、試した中で元の絵に最も近かった値",
+        "en": "How far the image moves away from the current one. Lower keeps more of it. The default 0.5 stayed closest to the original in testing"
+      }
+    },
+    "IMG2IMG_ENEMY_PRESET": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "敵・モンスターの img2img のプリセット",
+        "en": "img2img preset for enemies and monsters"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く。ゲームのモデルと違うプリセットは、もう1つモデルを読み込むので VRAM を使う",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler. A preset with another model loads a second model, which uses more VRAM"
+      }
+    },
+    "IMG2IMG_ENEMY_STRENGTH": {
+      "type": "float",
+      "default": 0.5,
+      "min": 0.05,
+      "max": 1.0,
+      "label": {
+        "ja": "敵・モンスターの img2img の強さ",
+        "en": "img2img strength for enemies and monsters"
+      },
+      "note": {
+        "ja": "下絵をどこまで描き変えるか。小さいほど今の絵が残る。既定の 0.5 は、試した中で元の絵に最も近かった値",
+        "en": "How far the image moves away from the current one. Lower keeps more of it. The default 0.5 stayed closest to the original in testing"
+      }
+    },
+    "IMG2IMG_BACKGROUND_PRESET": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "背景の img2img のプリセット",
+        "en": "img2img preset for backgrounds"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く。ゲームのモデルと違うプリセットは、もう1つモデルを読み込むので VRAM を使う",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler. A preset with another model loads a second model, which uses more VRAM"
+      }
+    },
+    "IMG2IMG_BACKGROUND_STRENGTH": {
+      "type": "float",
+      "default": 0.5,
+      "min": 0.05,
+      "max": 1.0,
+      "label": {
+        "ja": "背景の img2img の強さ",
+        "en": "img2img strength for backgrounds"
+      },
+      "note": {
+        "ja": "下絵をどこまで描き変えるか。小さいほど今の絵が残る。既定の 0.5 は、試した中で元の絵に最も近かった値",
+        "en": "How far the image moves away from the current one. Lower keeps more of it. The default 0.5 stayed closest to the original in testing"
+      }
+    },
+    "CHAIN": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "txt2img→img2img（2つのモデルで続けて描く）を使う",
+        "en": "Use txt2img then img2img (two models in a row)"
+      },
+      "note": {
+        "ja": "入にすると、1つ目のプリセットで描いた絵を下絵にして、2つ目のプリセットで描き直せる。ゲームの設定の画面の「画像の再生成」と主人公の描き直しの一覧に (txt2img→img2img) が出る。種類ごとに、通常の生成でも使うかを選べる。モデルを2つ読み込むので VRAM を多く使い、1枚にかかる時間もおよそ2倍になる",
+        "en": "When on, an image drawn with the first preset is redrawn with the second. The game's settings-menu regeneration and the player's redraw menu offer (txt2img then img2img), and each kind can use it for normal generation too. Two models are loaded, so it uses much more VRAM and each image takes about twice as long"
+      }
+    },
+    "CHAIN_PORTRAIT_AUTO": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "立ち絵の通常の生成でも txt2img→img2img を使う",
+        "en": "Use txt2img then img2img for normal portrait generation too"
+      },
+      "note": {
+        "ja": "上の txt2img→img2img が入のときだけ効く。入にすると、再生成のボタンを通らずに描く絵（新しい NPC・場所・敵が出たときなど）も、2つのモデルで続けて描く",
+        "en": "Takes effect only while txt2img then img2img is on. When on, images drawn without a regenerate button (a new NPC, place or enemy appearing, and so on) are drawn that way too"
+      }
+    },
+    "CHAIN_PORTRAIT_FIRST": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "立ち絵の1つ目（txt2img）のプリセット",
+        "en": "First preset (txt2img) for portraits"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler"
+      }
+    },
+    "CHAIN_PORTRAIT_SECOND": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "立ち絵の2つ目（img2img）のプリセット",
+        "en": "Second preset (img2img) for portraits"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler"
+      }
+    },
+    "CHAIN_PORTRAIT_STRENGTH": {
+      "type": "float",
+      "default": 0.6,
+      "min": 0.05,
+      "max": 1.0,
+      "label": {
+        "ja": "立ち絵の2つ目の強さ",
+        "en": "Second pass strength for portraits"
+      },
+      "note": {
+        "ja": "1つ目の絵をどこまで描き変えるか。小さいほど1つ目の絵が残る",
+        "en": "How far the second pass moves away from the first image. Lower keeps more of it"
+      }
+    },
+    "CHAIN_ENEMY_AUTO": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "敵・モンスターの通常の生成でも txt2img→img2img を使う",
+        "en": "Use txt2img then img2img for normal enemy or monster generation too"
+      },
+      "note": {
+        "ja": "上の txt2img→img2img が入のときだけ効く。入にすると、再生成のボタンを通らずに描く絵（新しい NPC・場所・敵が出たときなど）も、2つのモデルで続けて描く",
+        "en": "Takes effect only while txt2img then img2img is on. When on, images drawn without a regenerate button (a new NPC, place or enemy appearing, and so on) are drawn that way too"
+      }
+    },
+    "CHAIN_ENEMY_FIRST": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "敵・モンスターの1つ目（txt2img）のプリセット",
+        "en": "First preset (txt2img) for enemies and monsters"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler"
+      }
+    },
+    "CHAIN_ENEMY_SECOND": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "敵・モンスターの2つ目（img2img）のプリセット",
+        "en": "Second preset (img2img) for enemies and monsters"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler"
+      }
+    },
+    "CHAIN_ENEMY_STRENGTH": {
+      "type": "float",
+      "default": 0.6,
+      "min": 0.05,
+      "max": 1.0,
+      "label": {
+        "ja": "敵・モンスターの2つ目の強さ",
+        "en": "Second pass strength for enemies and monsters"
+      },
+      "note": {
+        "ja": "1つ目の絵をどこまで描き変えるか。小さいほど1つ目の絵が残る",
+        "en": "How far the second pass moves away from the first image. Lower keeps more of it"
+      }
+    },
+    "CHAIN_BACKGROUND_AUTO": {
+      "type": "bool",
+      "default": false,
+      "label": {
+        "ja": "背景の通常の生成でも txt2img→img2img を使う",
+        "en": "Use txt2img then img2img for normal background generation too"
+      },
+      "note": {
+        "ja": "上の txt2img→img2img が入のときだけ効く。入にすると、再生成のボタンを通らずに描く絵（新しい NPC・場所・敵が出たときなど）も、2つのモデルで続けて描く",
+        "en": "Takes effect only while txt2img then img2img is on. When on, images drawn without a regenerate button (a new NPC, place or enemy appearing, and so on) are drawn that way too"
+      }
+    },
+    "CHAIN_BACKGROUND_FIRST": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "背景の1つ目（txt2img）のプリセット",
+        "en": "First preset (txt2img) for backgrounds"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler"
+      }
+    },
+    "CHAIN_BACKGROUND_SECOND": {
+      "type": "str",
+      "default": "",
+      "label": {
+        "ja": "背景の2つ目（img2img）のプリセット",
+        "en": "Second preset (img2img) for backgrounds"
+      },
+      "note": {
+        "ja": "空ならゲーム既定のモデル（ゲームで選んだモデル。モデルの差し替えの前のもの）で描き、寸法・サンプラーは道具画面のほかのタブの値。カスタムプリセットの名前を入れると、そのプリセットのチェックポイント・寸法・サンプラーで描く",
+        "en": "Empty draws with the game's default model (the one chosen in the game, before any checkpoint replacement) using the size and sampler from the other tabs. A custom preset name draws with that preset's checkpoint, size and sampler"
+      }
+    },
+    "CHAIN_BACKGROUND_STRENGTH": {
+      "type": "float",
+      "default": 0.6,
+      "min": 0.05,
+      "max": 1.0,
+      "label": {
+        "ja": "背景の2つ目の強さ",
+        "en": "Second pass strength for backgrounds"
+      },
+      "note": {
+        "ja": "1つ目の絵をどこまで描き変えるか。小さいほど1つ目の絵が残る",
+        "en": "How far the second pass moves away from the first image. Lower keeps more of it"
+      }
+    }
+  },
+  "tool": {
+    "entry": "tool.py",
+    "label": {
+      "ja": "Stable Diffusion の設定を開く",
+      "en": "Open the Stable Diffusion settings"
+    },
+    "note": {
+      "ja": "元 InstantaleStableDiffusionMod の GUI を写した画面。タブは状態 / モデル・解像度・LoRA 付替・プロンプト追加・条件付き追加・タグ除去・完全置き換え・サンプラーの8枚で、固定行の「有効」チェックや一覧の行追加も元と同じ作り。モデル別のタブを足してあり、モデルを指定した規則と、Illustrious / NoobAI 系・Pony 系・素の SDXL に合わせたプロンプトの雛形をボタンで入れられる。同じタブで、ゲームの本文の語句の置き換えと、Danbooru のタグ一覧（取得ボタンあり）との照合を持てる。元 MOD の sd_upscale.ini を読み込んで設定と規則へ写せる。SD1.5 / SDXL のプリセット（元 MOD のモード切替に当たる）をボタンで入れ替えられる。現在の設定を名前を付けて保存し読み込めるカスタムプリセットもある（チェックポイント・TAESD などを組で切り替える）。解像度は入れた値で実際に何ピクセルになるかをその場で計算して見せ、チェックポイントは中身から SD1.5 / SDXL を判定して表示する。高度設定のタブでは、今の絵を下絵にした描き直し（img2img）と、2つのモデルで続けて描く（txt2img→img2img）を、立ち絵・敵・背景ごとにカスタムプリセットを選んで使える。ゲームの設定の画面の「画像の再生成」は、描き方ごとのボタン（txt2img / img2img / txt2img→img2img）に分かれる",
+      "en": "A dedicated window modelled on the original InstantaleStableDiffusionMod GUI: the same eight tabs (status / model, resolution, LoRA remap, prompt additions, conditional additions, tag removal, full replacement, sampler), per-kind rows with an enable checkbox and add-row tables, plus a per-model tab for rules limited to a checkpoint, one-button prompt templates for Illustrious / NoobAI, Pony and plain SDXL models, phrase replacement in the game's text and a check against the Danbooru tag list (with a download button). It can import the original sd_upscale.ini into settings and rules, swap in the SD1.5 or SDXL preset bundle with one button, save the current settings as named presets of your own and load them back (to switch checkpoint, TAESD and the rest together), computes as you type the size each kind will actually be generated at, and reads SD1.5 / SDXL from the checkpoint's contents. An advanced tab redraws portraits, enemies and backgrounds from their current image (img2img) and can draw them with two models in a row (txt2img then img2img), each with a custom preset of your choice. The game's settings menu splits its image regeneration button into one button per method (txt2img / img2img / txt2img then img2img)"
+    }
+  }
+}

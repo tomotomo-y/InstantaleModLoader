@@ -6,13 +6,17 @@
   手配の重さの合計で解禁され、ゲーム自身の依頼の生成に種類ごとの指示を差し込んで作る
 - 報酬は種類ごとの倍率（5〜10倍）、片付けると依頼の街の手配度が下がる。ギルドの掲示板からは隠し、
   掲示板に出さない依頼としてローダの窓口 `board` に置く（他の MOD が掲示板の依頼として拾わないように）
+- 作ってから `DEADLINE_DAYS` 日で取り下げる（受注期限）。見回りは日数が進んだ後と、事務所の一覧を組むとき
 - 公式の「裏の依頼掲示板」（`NotImplementedManager`）と同じ役割なので、公式が未実装のあいだだけ枠を乗っ取る
   （方針の例外。はじめは別のボタンだったが、選択肢が増えたので枠を使う形にした）。
-  印を付けるだけで spec は公式のまま。公式が実装したら触らない
+  ローダの窓口 `choices` の `replace` で同じ場所に差し替えるだけで、ゲームのボタン（spec は公式のまま）は書き換えない。
+  公式が実装したら触らない
+- 一覧は窓口の MOD だけの画面（`BOARD_SCREEN`）。下の事務所の選択肢は窓口が残すので、一覧で保存して読み直しても
+  一覧に戻り、「やめる」で事務所の選択肢に戻る。依頼のボタンはゲームの `QuestChoiceManager` の写しで、押下はゲームへ流す
 """
 import time
 
-from instantale_modloader import board, ui, wanted
+from instantale_modloader import board, choices, durations, frames, quest_clients, ui, wanted
 
 from . import common, theft, underworld
 
@@ -28,9 +32,10 @@ NOT_IMPLEMENTED_SPEC = "NotImplementedManager"
 OFFICIAL_BOARD_LABEL = "裏の依頼掲示板"
 #: 一覧の中の、裏の仕事を作るボタン（素の掲示板の「クエストを探す」に当たる）。
 SEARCH_LABEL = "裏の仕事を探す"
-#: 一覧を閉じるボタン。素の掲示板と同じ文言と spec（`JustSetButtonToNormalPhase`。2026-08-26 の `206_` の記録）。
+#: 一覧を閉じるボタン。素の掲示板と同じ文言（2026-08-26 の `206_` の記録）。
 BACK_LABEL = "やめる"
-BACK_SPEC = "JustSetButtonToNormalPhase"
+#: 一覧（窓口の MOD だけの画面）の名前。
+BOARD_SCREEN = "underworld board"
 #: 版1の途中まで足していたボタン（「裏の仕事：〈題名〉」と、枠に題名を付けた形）。セーブに焼かれた残骸を消すためだけに残す。
 JOB_LABEL_HEAD = "裏の仕事："
 #: `QuestChoiceManager(app, quest_type, quest_id)` の `quest_type`。`world.quests` に通るのはこれだけ（GAME.md §2.9）。
@@ -38,11 +43,17 @@ QUEST_TYPE = "settlement_quest"
 QUEST_CHOICE_SPEC = "QuestChoiceManager"
 #: 生成の頼み文へ差し込む印の寿命（秒）。`307_` と同じ。
 INJECT_TTL = 300.0
+
+# `random_quest_generator` の引数の並び（recon の signatures.json）。
+QUEST_GENERATOR_ARGS = ("world_overview", "settlement_name", "settlement_overview",
+                        "settlement_structure_description", "area_description", "quest_difficulty")
+#: 裏の仕事の受注期限（ゲームの日数）。作ってからこの日数が経つと、受けている最中でなければ取り下げる（2026-10-25。版4）。
+DEADLINE_DAYS = 30
 LOOKING_TEXT = "{broker}が帳面をめくり、回せる仕事を探している……"
 JOB_FOUND_TEXT = "「{name}の仕事だ。報酬は表の相場の{mult}倍。下手を打てば{town}には居られなくなる」{broker}が声を潜めた。"
 NO_JOB_TEXT = "「今は回せる仕事が無い」"
 JOB_DONE_TEXT = "{town}の官憲が、{name}の下手人を追い始めた。（手配度 {before} → {after}）"
-#: セーブから復元された印の無い残骸を見分けるラベル（`ui.Screen.prune_stale`。前方一致）。
+#: セーブから復元された印の無い残骸を見分けるラベル（窓口の `labels`。前方一致）。
 #: 店で盗むの外した「盗みを働く」も施設の選択肢に焼かれていたので、ここで一緒に消す。
 OUR_LABELS = (theft.THEFT_LABEL, SEARCH_LABEL, JOB_LABEL_HEAD)
 
@@ -54,10 +65,10 @@ def install(env):
     # -------------------------------------------------- 裏の仕事
     # 裏の事務所の「裏の依頼掲示板」の一覧に「裏の仕事を探す」を出す。押すとゲーム自身の依頼の生成（`generate_random_quest`）を
     # 呼び、その内側の `random_quest_generator` の頼み文へ種類ごとの指示を差し込む（`307_` と同じ形）。
-    # 依頼の id は控え（`state\` の `underworld`）に持ち、依頼の辞書には鍵を足さない（GAME.md §2.9）。
+    # 依頼の id と作った日は控え（`state\` の `underworld`）に持ち、依頼の辞書には鍵を足さない（GAME.md §2.9）。
     # ギルドの掲示板からは隠し、帰還のときに報酬へ倍率を掛け、依頼の街の手配度を下げる。
     inject = env.quest_inject
-    #: 公式の枠が実装されたことを1度だけ記録するための印。
+    #: 公式の枠が実装されたことを1度だけ記録するための印。`board` は最後に記録した一覧の並び。
     office_notes = {}
 
     def jobs_of(app):
@@ -76,9 +87,47 @@ def install(env):
         status = config.get("status") if isinstance(config, dict) else None
         return quest is not None and status == "incomplete"
 
-    def open_jobs_here(app, area_id):
-        """この街の、まだ片付いていない裏の仕事の id（古い順）。片付いた控えはここで捨てる。"""
+    def withdraw_stale(app):
+        """作ってから `DEADLINE_DAYS` 日経った裏の仕事を取り下げる（`ui.remove_quest` で世界から片付ける）。
+
+        受けている最中の仕事は帰還を待つ（次の見回りで取り下げる）。版3までの控えには作った日が無いので、初めて見た日を作った日とする。
+        """
+        day = ui.game_day(app)
+        if day is None:
+            return
         with worlds.lock:
+            playthrough, jobs = jobs_of(app)
+            changed = False
+            for quest_id, job in list(jobs.items()):
+                if not isinstance(job, dict):
+                    continue
+                made = job.get("day")
+                if isinstance(made, bool) or not isinstance(made, int):
+                    job["day"] = day
+                    changed = True
+                    continue
+                if day - made < DEADLINE_DAYS or not job_open(app, quest_id) \
+                        or ui.current_quest_id(app) == str(quest_id):
+                    continue
+                gone = ui.remove_quest(app, quest_id)
+                if not gone:
+                    continue
+                jobs.pop(quest_id, None)
+                changed = True
+                write("underworld: withdrew job {} made on day {} (day {}; removed from {})".format(
+                    quest_id, made, day, gone))
+            if changed:
+                worlds.save(playthrough)
+
+    def open_jobs_here(app, area_id, sweep=True):
+        """この街の、まだ片付いていない裏の仕事の id（古い順）。片付いた控えはここで捨てる。
+
+        `sweep` なら先に期限の過ぎた仕事を取り下げる。ゲームが依頼を数えた後（`active_quest_count`）では取り下げない
+        （数えた後に消すと、引く数が合わなくなる）。
+        """
+        with worlds.lock:
+            if sweep:
+                withdraw_stale(app)
             playthrough, jobs = jobs_of(app)
             gone = [qid for qid in jobs if not job_open(app, qid)]
             for qid in gone:
@@ -115,75 +164,75 @@ def install(env):
             worlds.save(playthrough)
         return False
 
-    def hijack_board(app, buttons):
-        """裏の事務所の公式の「裏の依頼掲示板」（未実装の枠）を、裏の仕事の入口にする。
+    def board_slot(app, buttons):
+        """裏の事務所の公式の「裏の依頼掲示板」（未実装の枠）を乗っ取るなら、そのゲームのボタン。
 
-        前の組み直しで付けた印と文言をいったん外してから付け直す（何度通っても同じ形）。
-        受けられる仕事が無い・締め出し中・公式が実装済みなら、素のゲームのボタンのまま。
+        受けられる仕事が無い・締め出し中・公式が実装済みなら None（素のゲームのボタンのまま）。
         """
         if not cfg.UNDERWORLD_ENABLED or office_of(app) is None:
-            return
-        at = next((index for index, entry in enumerate(buttons) if isinstance(entry, dict)
-                   and str(entry.get("text") or "").startswith(OFFICIAL_BOARD_LABEL)), None)
-        if at is None:
+            return None
+        found = next((entry for entry in buttons if isinstance(entry, dict)
+                      and str(entry.get("text") or "").startswith(OFFICIAL_BOARD_LABEL)), None)
+        if found is None:
             if not office_notes.get("no_board"):
                 office_notes["no_board"] = True
                 write("underworld: no official {!r} among the choices; no way in".format(OFFICIAL_BOARD_LABEL))
-            return
-        board = dict(buttons[at])
-        board.pop(screen.mark, None)
-        board["text"] = OFFICIAL_BOARD_LABEL
-        buttons[at] = board
-        official = ui.spec_cls_name(board)
+            return None
+        official = ui.spec_cls_name(found)
         if official != NOT_IMPLEMENTED_SPEC:
             # 公式の裏の依頼掲示板が実装された。こちらは手を引く。
             if not office_notes.get("official"):
                 office_notes["official"] = True
                 write("underworld: the official {!r} is implemented ({}); leaving it alone".format(
                     OFFICIAL_BOARD_LABEL, official))
-            return
+            return None
         if banned(app):
-            return              # 裁判で裏の事務所を売った。しばらく仕事は回ってこない
+            return None             # 裁判で裏の事務所を売った。しばらく仕事は回ってこない
         area_id = ui.area_id_of(ui.current_area(app))
         if not open_jobs_here(app, area_id) and not unlocked_kinds(app):
-            return              # 受けられる仕事も、作れる仕事も無い
-        hijacked = dict(board)
-        hijacked[screen.mark] = "board"
-        buttons[at] = hijacked
+            return None             # 受けられる仕事も、作れる仕事も無い
+        return found
 
     def unlocked_kinds(app):
         return underworld.unlocked(wanted.total_weight(getattr(app, "player", None)),
                                    cfg.UNDERWORLD_UNLOCK_PCT)
 
-    def board_entries(app):
+    def board_choices(app):
         """裏の依頼掲示板の一覧。素の掲示板（`DisplayQuestChoice`）と同じ並び:
-        片付けていない裏の仕事（ゲームの `QuestChoiceManager`）/ 少なければ「裏の仕事を探す」/ 「やめる」。
+        片付けていない裏の仕事（ゲームの `QuestChoiceManager` の写し。押下はゲームへ流す）/
+        少なければ「裏の仕事を探す」/ 「やめる」。
         """
         area_id = ui.area_id_of(ui.current_area(app))
-        entries = []
+        out = []
         pending = open_jobs_here(app, area_id)
         for quest_id in pending:
             title = ui.quest_value(ui.quest_of(app, quest_id), "quest_title", "") or "名も無い仕事"
-            entry = screen.button(title, cls_name=QUEST_CHOICE_SPEC, args=(QUEST_TYPE, str(quest_id)))
-            if entry is not None:
-                entries.append(entry)
+            spec = screen.make_spec(QUEST_CHOICE_SPEC, (QUEST_TYPE, str(quest_id)))
+            if spec is not None:
+                out.append(choices.Choice(title, base={"text": title, "spec": spec}))
         if len(pending) < cfg.UNDERWORLD_SEARCH_BELOW and unlocked_kinds(app):
-            entry = screen.button(SEARCH_LABEL, mark="search")
-            if entry is not None:
-                entries.append(entry)
-        back = screen.button(BACK_LABEL, cls_name=BACK_SPEC)
-        if back is not None:
-            entries.append(back)
-        write("underworld: board {}".format([entry.get("text") for entry in entries]))
-        return entries
+            out.append(choices.Choice(SEARCH_LABEL, on_press=press_search))
+        out.append(choices.Choice(BACK_LABEL, on_press=close_board))
+        texts = [choice.text for choice in out]
+        if office_notes.get("board") != texts:
+            office_notes["board"] = texts
+            write("underworld: board {}".format(texts))
+        return out
+
+    def board_screen(app, view, _data):
+        """一覧（窓口の MOD だけの画面）。事務所を離れていたら閉じる（None）。"""
+        if office_of(app) is None or not common.is_facility_screen(view.buttons):
+            return None
+        return board_choices(app)
 
     def show_board(app):
-        """一覧を並べる。差し替え・組み直しの合図・画面への塗りまで（ローダの `apply_buttons`。次のフレームでメインスレッド）。
+        """一覧を開く（窓口が次のフレームで組み直して塗る）。開いているなら組み直すだけ。"""
+        env.open_screen(app, BOARD_SCREEN, {})
 
-        `app.buttons` を差し替えて組み直しの合図を出すだけでは、データは一覧になっても画面は事務所の選択肢のままだった（実機）。
-        塗るのは HUD の `update_button_texts` で、組み直しの合図は塗らない（`ui.Screen.paint`）。
-        """
-        screen.apply_buttons(app, board_entries(app), "underworld board")
+    def close_board(app):
+        write("underworld: closed the board")
+        env.close_screen(app)
+        return None
 
     def hide_from_board(app, buttons):
         """ギルドの掲示板（`QuestChoiceManager` の並び）から裏の仕事を外す。"""
@@ -249,13 +298,14 @@ def install(env):
         loss = underworld.scaled(kind["loss"], cfg.UNDERWORLD_LOSS_PCT)
         with worlds.lock:
             playthrough, jobs = jobs_of(app)
-            jobs[quest_id] = {"kind": kind["key"], "area": area_id, "mult": mult, "loss": loss}
+            jobs[quest_id] = {"kind": kind["key"], "area": area_id, "mult": mult, "loss": loss,
+                              "client": str(getattr(_facility, "owner", "") or ""), "day": ui.game_day(app)}
             worlds.save(playthrough)
         quest = ui.quest_of(app, quest_id)
         summary = ui.quest_value(quest, "request_summary", "") or ""
         if isinstance(summary, str) and underworld.NOTE_MARK not in summary:
             ui.set_quest_value(app, quest_id, "request_summary",
-                               summary + underworld.note(kind, town, mult, loss))
+                               summary + underworld.note(kind, town, mult, loss, DEADLINE_DAYS))
         write("underworld: made job {} {!r} kind {} x{} loss {} (weight {})".format(
             quest_id, ui.quest_value(quest, "quest_title", ""), kind["name"], mult, loss,
             wanted.total_weight(player)))
@@ -266,26 +316,27 @@ def install(env):
         screen.when_idle(app, lambda: show_board(app), proceed_on_timeout=True, tag="underworld board")
 
     @ctx.wrap("scripts.llm.llm_manager_world_generate:random_quest_generator", required=False)
-    def random_quest_generator(orig, world_overview, settlement_name, settlement_overview,
-                               settlement_structure_description, area_description,
-                               quest_difficulty, *args, **kwargs):
+    def random_quest_generator(orig, *args, **kwargs):
         """裏の仕事・処刑場からの脱出を作る回だけ、`area_description` に指示を足す。印は1回で使い切る。
 
         `328_`（街の描写を伏せる）より内側に居るので、伏せられた後の描写に足される。
         難易度が置かれていれば `quest_difficulty` も差し替える（`307_` と同じ形。依頼の敵の強さはこの値で決まる）。
+        引数は受け取った形（位置かキーワード）のまま渡し、この2つだけを来た側に合わせて差し替える（TECH.md の規則の表）。
         """
         brief, at = inject.get("brief"), inject.get("at") or 0.0
         difficulty, tag = inject.get("difficulty"), inject.get("tag") or "underworld"
         inject.update(brief=None, difficulty=None)
         if brief and time.monotonic() - at <= INJECT_TTL:
-            area_description = (area_description or "") + brief
+            area_description = frames.arg(args, kwargs, "area_description", QUEST_GENERATOR_ARGS)
+            args, kwargs, _ = frames.replace_arg(args, kwargs, "area_description", QUEST_GENERATOR_ARGS,
+                                                 (area_description or "") + brief)
             write("{}: injected the brief ({} chars)".format(tag, len(brief)))
             if isinstance(difficulty, int) and not isinstance(difficulty, bool):
+                quest_difficulty = frames.arg(args, kwargs, "quest_difficulty", QUEST_GENERATOR_ARGS)
                 write("{}: quest difficulty {!r} -> {}".format(tag, quest_difficulty, difficulty))
-                quest_difficulty = difficulty
-        return orig(world_overview, settlement_name, settlement_overview,
-                    settlement_structure_description, area_description, quest_difficulty,
-                    *args, **kwargs)
+                args, kwargs, _ = frames.replace_arg(args, kwargs, "quest_difficulty",
+                                                     QUEST_GENERATOR_ARGS, difficulty)
+        return orig(*args, **kwargs)
 
     @ctx.wrap("__main__:DisplayQuestChoice.get_active_quest_count", required=False, safe=True)
     def active_quest_count(orig, self, *args, **kwargs):
@@ -294,7 +345,7 @@ def install(env):
         if isinstance(result, bool) or not isinstance(result, int):
             return result
         app = getattr(self, "app", None) or ui.find_app()
-        hidden = len(open_jobs_here(app, ui.area_id_of(ui.current_area(app)))) if app else 0
+        hidden = len(open_jobs_here(app, ui.area_id_of(ui.current_area(app)), sweep=False)) if app else 0
         return max(0, result - hidden) if hidden else result
 
     # 帰還の報酬に倍率を掛ける（`334_` の懸賞金と同じ形）。窓は `QuestEndManager.execute` の間だけ。
@@ -366,8 +417,11 @@ def install(env):
         with worlds.lock:
             playthrough, jobs = jobs_of(app)
             jobs.pop(quest_id, None)
-            # 片付けた数。裁判で司法取引（裏の事務所を売る）を持ちかけられるかに使う（`court`）。
             bucket = worlds.load(playthrough)
+            # 片付いた後も、依頼人と表に出さない依頼の印を残す（`client_rows` / `kept_off`）。
+            common.remember_past(bucket, quest_id, ui.quest_value(ui.quest_of(app, quest_id), "quest_title", ""),
+                                 client=job.get("client"))
+            # 片付けた数。裁判で司法取引（裏の事務所を売る）を持ちかけられるかに使う（`court`）。
             done = bucket.get("underworld_done")
             bucket["underworld_done"] = (done if isinstance(done, int) else 0) + 1
             worlds.save(playthrough)
@@ -390,39 +444,124 @@ def install(env):
                     screen.busy_off(self.app)
 
     def on_refresh(app, buttons):
-        """事務所なら掲示板の枠を乗っ取る。事務所の外の一覧（ギルドの掲示板）からは裏の仕事を隠す。"""
-        if office_of(app) is not None:
-            screen.prune_stale(buttons, OUR_LABELS)
-            if common.is_facility_screen(buttons):
-                hijack_board(app, buttons)
-        else:
+        """事務所の外の一覧（ギルドの掲示板）から裏の仕事を隠す（ゲームの一覧の間引き）。"""
+        if office_of(app) is None:
             hide_from_board(app, buttons)
 
-    def press_board(app, action):
-        """一覧は押下の処理から直に塗る（ローダの `apply_buttons` が次のフレームで塗る。実機で一覧が出た）。"""
+    def offer(app, view):
+        """事務所の選択肢の、公式の「裏の依頼掲示板」の枠を同じ場所で差し替える。"""
+        if not common.is_facility_screen(view.buttons):
+            return None
+        slot = board_slot(app, view.buttons)
+        if slot is None:
+            return None
+        return [choices.Choice(OFFICIAL_BOARD_LABEL, base=slot, replace=True, on_press=press_board)]
+
+    def press_board(app):
         write("pressed {!r}".format(OFFICIAL_BOARD_LABEL))
         show_board(app)
+        return None
 
-    def press_search(app, action):
+    def press_search(app):
         write("pressed {!r}".format(SEARCH_LABEL))
         screen.start_phase(app, SearchPhase(app), SEARCH_LABEL,
                            fallback=lambda: search_job(app))
+        return None
 
     def kept_off(app):
-        """ギルドの掲示板に出さない依頼（裏の仕事と処刑場からの脱出）。ローダの窓口 `board` に置く。
+        """ギルドの掲示板に出さない依頼（裏の仕事と処刑場からの脱出。片付いた分も）。ローダの窓口 `board` に置く。
 
         掲示板の依頼を拾う MOD（`911_` のライバル）が、裏の仕事を自分の獲物にしないように（実機で起きた）。
         """
         with worlds.lock:
             bucket = worlds.load(worlds.playthrough(app))
             ids = [str(quest_id) for quest_id in (bucket.get("underworld") or {})]
+            ids.extend(common.past_of(app, bucket))
             rescue = bucket.get("rescue")
         if isinstance(rescue, dict) and rescue.get("quest") is not None:
             ids.append(str(rescue["quest"]))
+        ids.extend(older_jobs(app, set(ids)))
         return ids
 
+    def office_owners(app):
+        """世界の裏の事務所の主の `{名前: 人物の id}`。"""
+        owners = {}
+        for area in ui.world_areas(app).values():
+            for node in ui.nodes_of(area):
+                for facility in ui.facilities_of(node).values():
+                    if ui.facility_type_of(facility) != OFFICE_FACILITY_TYPE:
+                        continue
+                    owner_id = getattr(facility, "owner", None)
+                    name = getattr(ui.character_of(app, str(owner_id)), "name", None) if owner_id else None
+                    if isinstance(name, str) and name.strip():
+                        owners[name.strip()] = str(owner_id)
+        return owners
+
+    def older_jobs(app, known):
+        """控えに無い、片付いた裏の仕事 `{依頼の id: 事務所の主の id}`（版3までに片付けた分）。
+
+        版3までは片付けると控えから消し、`kept_past` も無かった。
+        裏の仕事の依頼人の欄は最初の版から事務所の主の名前にさせている（`underworld.BRIEF_TEXT`）ので、それで見分ける。
+        片付いた分だけを数える（進行中の仕事は控えに在る）。VERIFICATION.md §3.115。
+        """
+        owners = office_owners(app)
+        if not owners:
+            return {}
+        found = {}
+        for quest_id in ui.quest_ids(app):
+            if str(quest_id) in known:
+                continue
+            quest = ui.quest_of(app, quest_id)
+            config = ui.quest_value(quest, "config", None) if quest is not None else None
+            if not isinstance(config, dict) or config.get("status") != "completed":
+                continue
+            client = ui.quest_value(quest, "client_name", "")
+            if isinstance(client, str) and client.strip() in owners:
+                found[str(quest_id)] = owners[client.strip()]
+        return found
+
+    #: 依頼人の行の写し（周回の鍵ごと）。錠が取れなかったときはこれで答える。
+    clients_copy = {}
+
+    def client_rows(app):
+        """裏の仕事と処刑場からの脱出の依頼人。ローダの窓口 `quest_clients` に置く（TECH.md §3.3.23）。
+
+        依頼人は裏の事務所の主と手引き役で、依頼の行方を知っている。
+        錠は待たない。読む側（`301_`）は会話の組み立ての最中に聞きに来る（`quest_claims` と同じ決まり）。
+        """
+        playthrough = worlds.playthrough(app)
+        if not worlds.lock.acquire(blocking=False):
+            return [dict(row) for row in clients_copy.get(playthrough) or []]
+        try:
+            bucket = worlds.load(playthrough)
+            rows = [{"quest": quest_id, "npc_id": job.get("client")}
+                    for quest_id, job in (bucket.get("underworld") or {}).items()
+                    if isinstance(job, dict) and job.get("client")]
+            rows.extend({"quest": quest_id, "npc_id": record.get("client"), "npc_name": record.get("name")}
+                        for quest_id, record in common.past_of(app, bucket).items()
+                        if record.get("client") or record.get("name"))
+            rescue = bucket.get("rescue")
+        finally:
+            worlds.lock.release()
+        if isinstance(rescue, dict) and rescue.get("quest") is not None and (rescue.get("client") or rescue.get("name")):
+            rows.append({"quest": rescue["quest"], "npc_id": rescue.get("client"), "npc_name": rescue.get("name")})
+        rows.extend({"quest": quest_id, "npc_id": owner_id}
+                    for quest_id, owner_id in older_jobs(app, {str(row["quest"]) for row in rows}).items())
+        clients_copy[playthrough] = [dict(row) for row in rows]
+        return rows
+
+    def after_days(call):
+        """日数が進んだ後に、期限の過ぎた裏の仕事を取り下げる（ローダの日数の関所 `durations.on_days`。TECH.md §3.3.21）。"""
+        try:
+            withdraw_stale(call.app)
+        except Exception:
+            ctx.log_exc("crime incentive: cannot withdraw the stale underworld jobs")
+
+    durations.on_days(env.owner + ":underworld", ctx, after=after_days, write=write)
     board.declare_kept_off(env.owner, ctx, kept_off)
+    quest_clients.declare(env.owner, ctx, client_rows)
     env.underworld_banned = banned
     env.on_refresh(on_refresh)
-    env.on_press("board", press_board)
-    env.on_press("search", press_search)
+    env.on_offer(offer)
+    env.on_screen(BOARD_SCREEN, board_screen)
+    env.on_labels(lambda app: OUR_LABELS)

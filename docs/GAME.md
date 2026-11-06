@@ -38,10 +38,53 @@ TECH.md と分けているのは読む理由が違うから。
 
 `out/recon/` は毎回上書きされるが、`build.json` と突き合わせて
 **`IDENTITY_KEYS`（`app_version` / `game_version` / `exe_size`）が1つでも違えば
-上書き前に `out/recon_snapshots/<版>_<日付>.zip` へ退避される**
-（控えが無いときも「別のビルド」扱い。退避は `SNAPSHOT_KEEP = 20` 本まで残し、古いものから消す。
-`recon.py` の `_same_build`）。
+上書き前に `recon_history/<版>_<日付>.zip`（`out/` の外、配布フォルダ直下）へ退避される**
+（控えが無いときも「別のビルド」扱い。`recon.py` の `_same_build`）。
+素性には 2026-10-14 から、同梱の llama-server の版（`bin\llama-*` のフォルダ名）・Python・Kivy の版も入る。
+2026-10-16 から exe の sha256（`exe_sha256`）も入る。
+Epic 以外の入手経路では版の名前が取れず、大きさの変わらない更新（中身だけの直し）を `exe_size` では見分けられないため。
+exe は約700MB で、ハッシュに0.5〜1秒かかるので、場所・大きさ・更新時刻が同じなら `recon_history/exe_digest.json` の控えを使う（`recon.exe_digest`）。
+それより前の控えには無いので、無い側があれば比べない。
+基準（下）にハッシュが無ければ、置き換えない回でも書き足す（基準は長く遊んだ回のもので、起動直後の走査では置き換わらないため）。
+
+退避の元は `recon_history/current/`（基準）で、今のビルドで見た中でいちばん多くのモジュールを読み込んだダンプを置く（`recon.update_current`）。
+次のどれかのとき、基準を `<版>_<日付>.zip` に固めて退避する。理由は zip の中の `archive_reason.txt` にある。
+
+| 理由（`archive_reason.txt` の1行目） | 条件 |
+| --- | --- |
+| `build changed` | 素性の鍵が1つでも違う（版の表記が同じでも、同梱の llama-server・Python・Kivy が替われば入る） |
+| `functions changed (N)` | 素性が同じで、今回のダンプが基準と同じかそれ以上に読み込んでいて、基準にあったモジュールの中で関数が消えた・引数が変わった・増えた。今回のほうが多く読み込んでいて「増えた」だけのときは入れない（起動直後の基準は `__main__` を組み立てている途中のため） |
+
+関数は `signatures.json`（ゲーム自身の関数の `{"module:qualname": "(引数)"}`）で比べる。
+MOD・ローダが足した関数、ローダが置いた名前（`_instantale…`。注入のときの `__main__._instantale_modloader_bootstrap` など）、その場所で定義されていない関数（ゲームが遊び始めてから `Item.set_callback` で代入するもの、`llm_manager.send_request` のように LLM の接続先の部品から import したもの）は入れない。
+
+同じビルドの記録どうしで、片方の関数（`targets.txt` の名前と引数）が丸ごともう片方に含まれていれば重複として扱う（`recon._redundant`）。
+起動直後の読み込み途中の記録と、中身の同じ記録が当たる。退避の前に重複なら作らず、刈り込みでも先に落とす。
+LLM の接続先が違う回（ローカルとクラウド）は、読み込まれる部品と `send_request` の引数が違うので、どちらも残る。
+退避は版ごとに1本（いちばん大きい zip）を必ず残し、同じ版の2本目以降を `SNAPSHOT_KEEP = 20` 本まで残して古いものから消す。
+前は版を問わず古い順に消したので、main_024 の控えは押し出されて失われた（VERIFICATION.md §3.100）。
+`game_version` だけはゲームに問い合わせて取るので、起動直後の注入では取れない（None）。
+どちらかが None なら `game_version` は比べない（VERIFICATION.md §3.100）。
 更新の前後で `targets.txt` を突き合わせれば、増えた対象・消えた対象がそのまま出る。
+
+版をまたいだ比べは、基準を置き換えるたびに recon が自分で行う（`recon.build_changes`。2026-10-15 から）。
+相手は、別のビルドの記録のうち最も新しく退避された版の、関数をいちばん多く含む zip。
+比べるのは `targets.txt`（古い zip には `signatures.json` が無いため）で、読み込まれていないモジュールの関数は「消えた」と数えない（`function_diff`）。
+結果は `recon_history/current/changes.json`（`since`・`identity`・`functions` の `kind` / `key` / `before` / `now`・`detected_at`）に置く。
+`detected_at` は同じ相手との比べが続くかぎり引き継ぐ。
+初めて書くときは、前の版の記録のうち最後に退避した zip の更新時刻（版が替わった最初の起動）にする。
+`changes.json` より前のローダで更新をまたいだときに、ローダを入れ替えた日を更新の日と取り違えないため。
+main_025 → main_026 を実物で比べると、消えた10・変わった13・増えた15で、MOD が包んでいる対象は11件だった
+（§1.5 の8件に加え、4つの部品の送り口の引数。`model=None` が `max_tokens` の前に入った）。
+
+役割の分け方:
+
+| 持ち主 | 持つもの |
+| --- | --- |
+| recon（`recon.py`・`000_recon`） | ゲーム側の事実。どの版か（`build_identity` / `build_key`）、版ごとの全関数の控え、前の版からの関数の変化（`changes.json`） |
+| drift（`drift.py`） | MOD との突き合わせと遊んでいる間の見張り。`changes.json` から更新されたこと自体と、MOD が包んだ対象の引数の変化を知らせる・包みの外れ・プロンプトの書き換えの空振り（TECH.md §5.13） |
+
+`recon_history/drift/` は drift の控え（版ごとの書き換えの当たり数）。recon は zip と `current/` 以外に触らない。
 
 ### 1.2 ゲーム自身のモジュール
 
@@ -86,7 +129,7 @@ Epic の `AppVersion` は
 ### 1.5 更新の記録
 
 `game_version` は main_023 以降 `014` のまま据え置きで、
-上がっているのは Epic の `AppVersion` だけ（`main_023` → `024` → `025`）。
+上がっているのは Epic の `AppVersion` だけ（`main_023` → `024` → `025` → `026`）。
 `python310.dll` は更新の前後で変わっていないので**注入基盤は無傷**。
 
 | 版 | ゲーム側の変化 | MOD 側 |
@@ -94,6 +137,7 @@ Epic の `AppVersion` は
 | main_022 → 023 | `targets.txt` 1466 → 1585。自由生成施設（§2.21）・`scripts.save_codec`・Steam 認証・装備強化が増えた | 対応不要。28/28 適用、警告0 |
 | main_023 → 024 | 賭博2種（ハイアンドロー / ロシアンルーレット）で 68 ターゲット増。起動処理の変更で満額到達が 80秒 → 41秒 | 6件が「Reported by ModLoader」として取り込まれた（下記） |
 | main_024 → 025 | `InstantaleApp.start_game` の 876 行が `experience_level=60` → `1` | `123_` が何もしなくなった（VERIFICATION_LOG.md §2.36） |
+| main_025 → 026 | `targets.txt` 1644 → 1736（名前で数えて4件減・96件増）。雇用の交渉が `ConversationPhaseManager.resolve_employment` へ移り、`ConversationEmployManager` / `EmployEndManager` は `__init__` だけになった。増えたのは仲間の成長（`award_companion_growth`）・世界の一括生成（`scripts.llm.batch_worker`）・ロシア語（`scripts.llm.output_language`）・新しい提供元 Jev（`scripts.jev`）。同梱の llama-server が b7054 → b10642 で `--checkpoint-every-n-tokens` が無くなった | `127_` の旗で llama-server が起きずに落ちたので版4で直した。136/136 適用（VERIFICATION.md §3.100） |
 
 #### 本体に取り込まれた修正の判定
 
@@ -164,6 +208,7 @@ Epic の `AppVersion` は
 `quest_event_log` が育つのはクエスト進行の後半なので町にいる間は0件のまま。
 `105_` が削るのはプロンプト本文に埋め込まれたスキーマの repr（§2.12）で、
 ゲームが直した「再生成時の重複・増幅」とは別物。
+`105_` は後に `127_` へ取り込み、窓を共有する起動（`--parallel` 無し）のときだけ縮める形にした（VERIFICATION_LOG.md §2.3）。
 
 `102_` は `superseded: main_023` で降ろした（`103_` は main_024 で同様）。
 消さずに伏せるのは**検出器として残す**ため。
@@ -343,6 +388,7 @@ app.refresh_choice_buttons(reset_page=True)
 
 ロードの途中にも組み直し（`refresh_choice_buttons`）は走るが、その時点では人物（`world.characters`）がまだ 0 人で、
 名簿もまだ空（2026-10-06、裏の事務所と死刑の判決の画面で保存したセーブで実測）。主人公の持ち物と依頼の一覧（`world.quests`）は揃っている。
+0 人ではなく、会話の相手がまだ居ない形で走ることもある（2026-10-18、仲間との会話中のセーブ。VERIFICATION.md §3.102）。
 人物や同行者を見て出すボタンは、この組み直しでは出ない。揃った後に組み直すのはローダの窓口 `choices`（TECH.md §3.3.14）。
 MOD のボタンを押しても、ゲームは保存しない（押下の処理を横取りしているため）。
 
@@ -461,6 +507,9 @@ display_button_load(dt)             True を見て今の一覧を塗り、予約
 
 - `args[0]` がいま話している相手の id。
   画面のボタンを読むだけで相手が分かる（`ConversationStartManager` を追跡する必要は無い）
+- 店の主と話すと、会話のボタンの先頭に施設の入口が付く（店は `売買する`）。
+  足す施設の種類は `conversation_start_method_3` の決め打ちで、exe の定数は `general_store` / `specialty_shop` / `medical_facility` → `ShoppingStartManagerRemake`、`blacksmith` → `EquipmentReinforcementStart`。
+  施設の `choices` は見ないので、宿屋と鍛冶屋の `choices` に `売買する` を足しても会話には出ない（`340_` が自分で入れる。VERIFICATION §3.105 / §3.114）
 - 会話中の `app.buttons` は「会話を終了する」1個だけ。
   会話画面も施設と同じ選択肢リストを使うので、自前の選択肢はその手前に挿す
 - 会話は「状態」であって画面ではない。
@@ -470,6 +519,10 @@ display_button_load(dt)             True を見て今の一覧を塗り、予約
   そこは自由記述なので、事情を書けば会話の要約とライフログに残る
 - 閉じ終わるまで待つ（要約で LLM が回るため最大120秒程度）。
   `app.in_conversation` が落ちるのを Clock で見張る
+- 閉じると、会話を始めたときに控えた選択肢（`app.buttons_backup`）をそのまま戻す。組み直さない。
+  main_026 からは雇用が会話の中で決まり（`ConversationPhaseManager.resolve_employment`）、雇った後も会話が続くので、
+  ギルドで雇って会話を閉じると、雇った人物が載ったままの冒険者の一覧に戻る。
+  一覧に入り直すと、雇った人物は消えて組み直される（2026-10-15 の実機。MOD の作用ではなく本体の動き）
 - 関係と感情はプロンプトに語句のリストで載る（例 `['初対面', '同行中']`）。
   **`'同行中'` はパーティ在籍の印**であり、パーティ外の連れ歩き（`1308_`）の意味では
   使われない。この語彙で同行状態を判定してはいけない
@@ -727,23 +780,25 @@ add_text('…はパーティから離脱した。')
 
 ### 2.9 クエスト
 
-格納場所は2つある。**役割が違うので、書く前にどちらかを選ぶ**（§2.9.1）。
+依頼の辞書は3か所にある。**役割が違うので、書く前にどれへ書くかを選ぶ**（§2.9.1）。
 
 ```text
-app.world.quests          {id: Quest インスタンス}   遊んでいるあいだの一覧
-app.world_dict['quests']  {id: dict}                 世界の雛形
+app.world.quests              {id: Quest インスタンス}   遊んでいるあいだの一覧
+app.save_data_dict['quests']  {id: dict}                 セーブの中身
+app.world_dict['quests']      {id: dict}                 世界の雛形
 ```
 
-新規 id の検出は両者の合併を取る（どちらに登録されるかを決め打ちしない）。
+新規 id の検出は、生きた一覧とセーブの中身の合併を取る（どちらに先に登録されるかを決め打ちしない）。
 
-#### 2.9.1 `world_dict` はセーブの中身ではなく世界の雛形
+#### 2.9.1 セーブに出るのは `save_data_dict`。`world_dict` は世界の雛形
 
-セーブに出るのは `app.world.quests` の側で、`world_dict['quests']` ではない。
-依頼を書くときに両方へ書く必要も無い。
+`savedata.json` に書き出されるのは `app.save_data_dict['quests']` で、生きた一覧でも雛形でもない。
+ゲームは生きた一覧へ書いた値をセーブの中身へ写さない。
 
 | | 中身 | 書き出し先 |
 | --- | --- | --- |
-| `app.world.quests` | その周回の全依頼（実測 22件） | `saves/<世界名>/savedata.json` |
+| `app.world.quests` | その周回の全依頼（実測 22件）。ゲームが遊ぶときに読む | 書き出されない |
+| `app.save_data_dict['quests']` | その周回の全依頼 | `saves/<世界名>/savedata.json` |
 | `app.world_dict['quests']` | 世界を作った時点の依頼（実測 12件） | `worlds/<世界名>/world_data.json` |
 
 同じ瞬間の実測（`206_` の記録と、両ファイルの復号。VERIFICATION_LOG.md §2.66）:
@@ -754,8 +809,15 @@ app.world_dict['quests']  {id: dict}                 世界の雛形
 - 雛形へ書いた難易度は `world_data.json` に焼かれる。
   **その世界で新しく始めた別のキャラクタにまで乗る**
 - 生きた一覧（`app.world.quests`）へ書いた難易度は、画面には出るが
-  `savedata.json` には出ない。
-  **セーブがどこから依頼を組んでいるかは未特定**（VERIFICATION.md §3.38 の残り）
+  `savedata.json` には出ない
+- 依頼を消す試し（2026-10-10、テストワールド。手順は下の「依頼を消す」）では、`app.save_data_dict['quests']` から消したときだけ、読み直しの後も消えていた。
+  生きた一覧だけから消すと、読み直しで戻った（そのとき `save_data_dict['quests']` に残っていた）
+- 生きた一覧へ書いた値は、受注・クリア・保存をまたいでもセーブの中身へ写らない（2026-10-10、実プレイのセーブ1件をログと突き合わせた）。
+  `325_` が生成の直後と受注の時点で難易度 74 を生きた一覧へ書き（ゲーム自身の値は 67）、その依頼を受けてクリアし、その後も保存と読み直しが続いた。
+  セーブの中身は 67・`completed` のままだった。
+  `config.status` はセーブに出ているので、状態の変化はゲームがセーブの中身へ自分で書いているとみられる（書く所は見ていない）
+- 生成の直後に新しい依頼が `save_data_dict['quests']` に入っているかは測っていない。
+  `307_` / `325_` は生成の直後と受注の時点の2回書くので、ログの `N store(s)` で分かる（2 なら入っている）
 - `get_quest_difficulties(area, world)` は生きた一覧のほうを読む。
   ある土地で 5件返したとき、雛形にはその土地の依頼が 3件しか無かった
   （返った5件に、雛形に現れない id が2つ入っていた）。
@@ -767,10 +829,10 @@ MOD からの書き方はこうなる。
 - 遊びを変えたいだけなら `app.world.quests` にだけ書く。
   セーブに残らないので、MOD を外せば素のまま。
   残らないぶんは、次に読む場面で書き直す（`318_` がこの形）
+- 読み直しの後も残したい値は、生きた一覧と `save_data_dict['quests']` の**両方**へ書く。
+  ローダの `ui.set_quest_value` / `ui.quest_stores` がこの2つを返す（v1.15.1 から。v1.15.0 までは2つ目が雛形で、セーブには届いていなかった）
 - 依頼と難易度は雛形（`world_dict`）へは書かない。世界のファイルに焼かれる
   （NPC の採番台帳と施設は別で、`world_dict` へ書く手順が決まっている。§2.23 / §2.28）
-- ローダの `ui.set_quest_value` / `ui.quest_stores` は**両方**へ書く。
-  雛形に触れたくない MOD は使わないこと
 
 掲示板（`DisplayQuestChoice`）のボタン:
 `PhaseSpec('QuestChoiceManager', ('settlement_quest', '2'))` /
@@ -789,6 +851,9 @@ MOD からの書き方はこうなる。
   内容に手を入れたいならさらに内側の
   `llm_manager_world_generate:random_quest_generator` の `area_description` に足すだけでよい
   （出力スキーマは1バイトも変わらない）
+- `random_quest_generator` に渡す `quest_difficulty` を差し替えても、依頼の記録の難易度は変わらない
+  （2026-10-21、`336_` の処刑場からの脱出の実機。82 を渡し、記録は 4、敵は HP 160・防御 16）。
+  頼みの数字にしか効かないので、敵の強さを変えたいなら作った後に記録（`ui.set_quest_value` の両方の格納先）へ書く（`307_` / `325_` の形）
 - 「クエストを探す」（`QuestSearchManager`）が並ぶのは、その街の未完了の依頼が2件より少ないときだけ（実測）。
   探した後は掲示板の一覧に戻り、新しい依頼が並ぶ（`206_` の 2026-08-26 の記録）
 - 一覧はゲームに組ませるのが安全。
@@ -807,9 +872,34 @@ MOD からの書き方はこうなる。
   `client_statement` / `area` / `events` / `enemies` / `boss`。
   ゲームがこれに `difficulty` / `neighboring_settlement_id` / `id` / `quest_type` /
   `config` / `quest_area_id` を足して保存する
-- 元からある依頼の `client_name` は**実在 NPC と結び付いていない**（世界生成時に付いた名前）
+- 元からある依頼の `client_name` は**実在 NPC と結び付いていない**（世界生成時に付いた名前）。
+  掲示板で作った依頼も同じ。形は「役職・名前」「役職 名前」「役職名前」「名前」「役職だけ」が混ざり、
+  同じ名前（エドワード・バルガス・エレナなど）が別々の拠点の依頼人に何度も現れる（2026-10-25 の2世界の実測。VERIFICATION.md §3.115）
 - **クエスト辞書に独自キーを足さない**（セーブに焼かれるうえ、
   再読み込み後に `Quest` インスタンスがそのキーを持つ保証が無い）。控えは `state/` に別ファイルで持つ
+
+#### 掲示板で作った依頼と、それを消す（2026-10-10 実測）
+
+テストワールドの土地7（街）で「クエストを探す」を3回押し、間に消す試しを挟んだ。
+`generate_random_quest` の前後を、ゲーム内スクリプトで包んで比べた（`tools\drive\`）。
+
+- 依頼は、いまいる土地の依頼として作られる。3回とも `neighboring_settlement_id` がいまいる土地の id（`'7'`）だった。`generate_random_quest` は引数を取らない
+- 依頼1件ごとに、ダンジョンの土地も1つ増える（`quest_area_id` が指す。`size` は None、`connections` は空）
+- 増えた依頼と土地は、生きた一覧（`app.world.quests` / `app.world.areas`）に入り、雛形（`world_dict`）には入らない
+- いまいる土地の `Area.quests`（依頼の id の並び）に、新しい id が足される
+- 依頼の id も土地の id も使い回されない。依頼 37 を消した後の次は 38、依頼 38 と土地 47 を消した後の次は依頼 39・土地 48 だった
+
+消す試しは、どれも消してから保存し（`setstate.py` の `save`）、題の画面から読み直して見た（各1回）。
+
+| 消した所 | 読み直しの後 |
+| --- | --- |
+| `world.quests` と、街の `Area.quests` の並び | 依頼が戻った（`incomplete`）。`Area.quests` の並びからは消えたまま |
+| 上に加えて `save_data_dict['quests']` | 依頼は消えたまま。ダンジョンの土地は残った |
+| 上に加えて、ダンジョンの土地を `world.areas` と `save_data_dict['areas']` から | 依頼も土地も消えたまま。読み直し・掲示板・次の生成で誤りは出なかった（`modloader.log` に新しいトレースバックなし） |
+
+- 消す前の `save_data_dict['areas']['7']['quests']` には、新しく作った依頼の id が入っていなかった。
+  それでも、生きた `Area.quests` から消した結果は読み直しの後に残っていた
+- 消した依頼を 911 や他の MOD が控えで指していた場合の扱いは見ていない
 
 #### 街の中身と初期依頼は初訪問で作られる（`225_` で実測）
 
@@ -835,6 +925,18 @@ random.sample(range(lo, hi), k=3)          save_area_json.py:329
 
 エディタで後から足した街（id 9 以降）は枠が無く、全域 `range(1, 77)` から引かれる（id 33 で `[6, 34, 3]`、id 21 で `[13, 30, 40]`）。
 `133_ui_area_difficulty` はこの表で未訪問の街の帯を見積もる。
+
+「クエストを探す」で作る1件も同じ枠から引く（2026-10-31、テストワールドの id 8 で `225_` 版9。VERIFICATION.md §3.117）:
+
+```text
+random.randint(lo, hi - 1)                 instantale.py:5957（DisplayQuestChoice.generate_random_quest）
+  → random_quest_generator(..., quest_difficulty)   :5960
+  → Quest.__init__ / 依頼の記録の difficulty        :5985
+```
+
+id 8 で `randint(67, 76)`。引いた値がそのまま LLM への指示と記録（セーブに残る側）へ渡る。
+id 9 以降の街での引数は測っていない（初訪問と同じ全域とみられる）。
+`922_town_quest_difficulty` はこの `randint` と上の `sample` の2か所で範囲を差し替える。
 
 #### 依頼の生成は、ローカル LLM で敵の一覧を書き続けて失敗することがある
 
@@ -978,8 +1080,12 @@ MOD 側でも「戦闘中は出さない」条件に使われるので、残骸�
   `None` を返すと抜けず、敵の次の手（継続効果など）を処理しに行く。
   一覧から消えた敵を引くと `KeyError`（`resolve_opponents`、`instantale.py:7266`）でワーカースレッドが死ぬ。
 - 敵の一覧が残ったまま戦闘の欄が畳まれると（大きさ 0）、その後に走る敵の欄の更新が
-  `ZeroDivisionError`（`scripts/hud/new_hud.py:2306` の `update_enemy_display`）でゲームごと落ちる。
+  `ZeroDivisionError`（`scripts/hud/new_hud.py:2307` の `update_enemy_display`。割る相手は `top_info_layout_battle` の高さ）でゲームごと落ちる。
   ゲーム自身の逃走は判定の中で敵を先に空にするので、この更新は欄が畳まれる前に済む。
+- 戦闘の点送りの最中に鞄を開いても、戦闘の欄は畳まれる（`[384, 456.3]` → `[0, 0]`。`333_` を切っても同じ）。
+  敵の欄の更新（`update_enemy_info` から `enemy_info` の差し替えを通って走る）は手の約1秒後に走るので、重なると上の 0 除算で落ちる。
+  更新が割り算で止まると、敵の名前で引く次の手が `resolve_opponents` の `KeyError` で止まる（更新を呼んで途中で失敗させた回で1回観察）。
+  手当ては `148_fix_enemy_panel_crash`（[VERIFICATION §3.123](verification/3.123.md)）。
 - 倒れた仲間も同じく `check_character_death` で一覧から外されるだけで、預けられない。
   一覧に居る仲間は主人公と一緒に動くので、もともと居場所（`location` の area / node / facility）を持たない
   （戦闘の前の控えでも、一覧に居る仲間の居場所はすべて None だった）。
@@ -998,6 +1104,9 @@ MOD 側でも「戦闘中は出さない」条件に使われるので、残骸�
   仲間が敵を倒し切ると、逃げるを押した戦闘でも `'won'` で終わる
   （2026-10-06。`316_` の追手3体、仲間2人。押してから終わるまで約40秒、仲間の2人が3体を倒した）。
   逃げた結果を確かめたいときは、仲間を一覧から外してから押す（闘技場では外して逃げると `'escaped'` で終わった）。
+  逃げた後も主人公の手番のボタンが並んだまま残る（2026-10-21）。
+  `147_fix_party_flee` は、主人公が預かりに入った手の直後に仲間も預かりへ移し、一覧を空にしてゲーム自身の逃走で終わらせる。
+  移した仲間も、逃走の終わり方がまとめて一覧へ戻した（実機1回。VERIFICATION.md §3.110）
 
 MOD が負けを逃走扱いで終わらせるなら、判定の外から終わり方を起こす前にこの状態を揃える
 （敵の一覧を空にし、外された主人公を預かりに入れて、戻すのはゲームに任せる。`334_` の `prepare_escape`）。
@@ -1045,6 +1154,10 @@ check_battle_end / enemy_delete_animation / convert_llm_output_to_instruction_di
   1手の前後で敵の状態を比べる MOD は、この抜けた敵を別に拾わないと取りこぼす
   （`308_` がとどめの一撃を取りこぼした原因）
 
+`resolve_battle_effect` の署名は `(self, character_key, character_side, battle_action, effect_to_enemies, *args)`（recon）。
+第1引数は `battle_action` の dict ではなく `character_key`。
+`236_probe_enemy_stats` 版5 は、引数の型と主な属性を `kind: resolve_args` の1行で1プロセス1回だけ書く。
+
 > 入れ子の順序（`calculate` → `resolve` → `process`）は署名から読んだだけで実測していない。
 > `308_` はこの順序に寄りかからない形（1手の外側で HP の差を測る）にしてある。
 
@@ -1089,7 +1202,7 @@ referee_enemy_new / referee_npc / referee_npc_rewrite                         �
 | `RemoveTextStatusEffect` | 名前を指した解除 |
 | `AttributeEffect` | `enhancement` / `reduction` × 6能力値（str/dex/con/wis/int/cha）× power 5段 |
 
-戻りの根は `narration` / `skill_effects` / `additional_effects` / `vfx`（8種の Literal）。
+戻りの根は `narration` / `skill_effects` / `additional_effects` / `vfx`（8種の Literal。演出の選び方は §2.10.5）。
 審判は頼まれなくても状態異常を出す
 （通常攻撃の記録で、敵の反撃として `TextStatusEffect`（拘束の状態異常、duration 3、
 毎ターン weak damage）がプレイヤーに付いた実例）。
@@ -1365,6 +1478,9 @@ NPC（敵・仲間）の魔法   2 × magic_power × k
 この段に入らないと分かった倍率の2通りを外した（1人12通り → 10通り）。
 試し打ちの間は `sys._instantale_probe_dry_run_thread` にそのスレッドの id を置き、
 `222_probe_battle_mechanics` はその間の計算を記録しない。
+印は立てる前の値を控えて戻す（入れ子でも外側の印を消さない。236 版5）。
+同じ印を `243_probe_value_curves` の一括計測と `215_probe_event_roll` の換算・`244_probe_ability_reads` の試しも立て、
+`214_` / `215_` / `220_` / `221_` / `222_` / `244_` は印の立っている自分のスレッドの呼び出しを記録しない（11-03。VERIFICATION.md §3.122）。
 
 ##### 記録に残らないもの
 
@@ -1373,6 +1489,47 @@ NPC（敵・仲間）の魔法   2 × magic_power × k
 入力文は引数 `command` として渡り、プロンプトには積まれない。
 どんな入力が strong を引き出すかを語で数えるには、
 `referee_player_any_input_new_new` を包んで `command` を控える必要がある。
+
+#### 2.10.5 攻撃の演出と効果音（`342_attack_animations` で実測）
+
+演出は `BattlePhaseManager.resolve_battle_effect` が `battle_action["vfx"]` を読んで決める。
+exe の定数で読めた値と絵のフォルダの対応は次のとおり（`resolve_opponents` の中）。
+
+| vfx | 絵のフォルダ |
+|---|---|
+| slash | `Assets/effects/battle_dark_/slash1` |
+| blow | `Assets/effects/blow` |
+| fire / fire_aoe | `battle_dark_/fire2` / `battle_dark_/fire_aoe3` |
+| ice / ice_aoe | `battle_dark_/mix_ice_earth1` / `battle_dark_/ice_aoe1` |
+| thunder / thunder_aoe | `Thunder_480p` / `Thunder_aoe` |
+| earth | `battle_dark_/earth3` |
+| water | `485.png_(64x64)` |
+
+- 審判の型（`referee_player_attack_new_new` などの `<locals>.Structure`）の `vfx` は
+  slash / fire / fire_aoe / ice / ice_aoe / thunder / thunder_aoe / earth の8つの Literal。
+  `blow` と `water` は処理があるのに選択肢に無いので、素のゲームでは出ない。
+  `referee_member_new_new` の定数には slash / fire / fire_aoe / ice / ice_aoe の5つしか並んでいなかった（型としては未確認）
+- 自由入力の審判（`referee_player_any_input_new_new`）は、送り口に `<locals>.Structure` を渡した後、答えを関数の中の
+  `FormattedStructure`（同じ8つの Literal。局所のクラスで、モジュールの属性ではない）で作り直す（`llm_manager_battle.py:821`）。
+  送り口の型だけ広げると、足した値（`arcane`）がそこで `ValidationError` になり、手番のスレッドが落ちる（2026-10-21 の実機。`319_` の防御の手番）。
+  モジュールの `FormattedStructure` を替えても届かなかった（実機）
+- `out\*.jsonl` に残っていた審判の戻り 6230 件のうち、slash が 5415 件（87%）
+- `Assets/effects` の絵のフォルダ 75 個のうち、ゲームが使うのは上の 10 個だけ。
+  武器・体の攻撃に使える絵は slash1・slash2・blow（どれも 64x64・8〜10 コマの白い筋と粒）しか無い
+- 効果音は `SoundManager.play_sound(app, sound_src)` の2つ目に名前を渡して鳴らす。名前の表は クリック / ダメージ1〜3 / 斬撃 / 打撃 / 炎（小・大）/ 雷（小・大）/ 氷（小・大）/ 接敵（通常・ボス）/ 取引開始。
+  戦闘の絵と音は `resolve_battle_effect` の中で Clock に積まれ、少し後に出る（`235_probe_sound_effects` の呼び出し元が `<lambda>`）。
+  実測では手から約0.4秒後
+- 1体の絵は `InstantaleApp.effect(src, width=192, height=192, pos_hint={敵の位置})` → `InstanTaleHUD.start_effect`、
+  全体の絵は `InstantaleApp.window_effect` → `InstanTaleHUD.start_window_effect` を通る（全体は1手に1回）。
+  場面の切り替え（`simple_fadeout` / `frames_gyaku`）と雷の全体（`Thunder_aoe`、960x960）も window_effect
+- 絵は `NearestNeighborImage` で、フォルダのコマを名前順に約 0.07 秒ずつ出す。拡大は最近傍なので、64 の絵はドット絵のように粗く出る。
+  絶対パスのフォルダも再生できる
+- ダメージの無い手（強化・弱体化だけ）と、敵が味方を打つ手（`character_side` が `敵側`）には絵を出さない
+- 全体の絵（window_effect）は、再生が終わっても部品を外さず最後のコマを出したまま残る
+  （2026-10-21 の実機。場面の切り替えの `frames_gyaku\frame_029.png` が不透明度1のまま残っていた）。
+  ゲームが使う絵は最後のコマが空なので見えない。1体の絵の部品は再生の後に残っていなかった。
+  ゲームに在って使われていない絵のうち、`342_` が使う9つ（`fire_aoe4`、`battle/` の `wind2`・`wind_aoe2`・`thunder_aoe2`・`wisp1`・`wisp_aoe1`・`neutral_energy1`・`neutral_energy_aoe1`・`water_aoe1`）は最後のコマに絵がある。
+  `battle_dark_` の下の絵は、最後に空の `image_end.png` を置いたものが多い
 
 ### 2.11 BGM
 
@@ -1397,6 +1554,12 @@ apply_music_volume(app)         main_023 で追加
 曲は再生のたびに `Sound(パス)` で作られるので、
 `SoundManager.sounds`（起動時に読む15種）と `play_sound*` の分を除外集合にすれば、
 残ったループ音は曲と言える。
+`207_probe_battle_bgm` 版4 は `mixer` の行で、鳴っているチャンネルごとに音の名前を添える。
+`app.music` と同じ音は `app.music`、鳴らす口・止める口に渡された相手の曲は `target.music`、
+`SoundManager.sounds` の音は `sounds[名前]`、どれでもない音は `other 長さs`。
+曲の本数 `music=N` は `app.music`・`target.music`・30秒以上の `other` を数える（行の例 `2/8 channel(s) busy: [0, 3]  music=1 (0=app.music, 3=sounds[斬撃])`）。
+11-03 の依頼の戦闘では、効果音は `sounds[名前]` ではなく `other 3.1s` で出た（`342_attack_animations` は `SoundManager.sounds` の外の音のファイルを鳴らす）。
+曲は `other 104.2s`〜`179.8s` で、30秒の境目で分かれた。
 
 止められなくなった曲は、止めずに `app.music` へ入れ直すと音が途切れず、
 しかも以後ゲーム自身の `stop_music` が効くようになる。
@@ -1571,6 +1734,42 @@ scripts.llm.request_llm_inference_any_server:send_request*                   任
 scripts.llm.llm_manager:*                                                    マネージャ群
 ```
 
+#### 送り口は部品ごとに別の関数（main_026 から）
+
+`scripts.llm.llm_manager` / `llm_manager_battle` / `llm_manager_world_generate` / `llm_manager_character_create` は、
+それぞれプロバイダの `send_request*` を持つ。
+main_025 までは、どれもプロバイダの関数をそのまま from-import した同じ関数だった。
+main_026 からは、部品ごとに `scripts.llm.output_language.localized_request`（ロシア語のとき出力言語の指示を足す包み）で包み直すので、
+**部品ごとに別の関数**になった（`__wrapped__` をたどると同じプロバイダの関数。2026-10-15 にゲームの中で id を比べた）。
+
+| 頼み | 送る部品 |
+| --- | --- |
+| 会話・語り・依頼の進行・売買・エピローグなど | `llm_manager` |
+| 戦闘の審判 | `llm_manager_battle` |
+| 世界の生成（`create_world_overview` / `create_story` / `create_settlement_detail` / `settlement_quest_generator`） | `llm_manager_world_generate` |
+| キャラの作成（`create_character` / `create_look`） | `llm_manager_character_create` |
+
+`llm_manager:send_request` だけを包んで同じ関数の別名を掴み直す形では、戦闘・世界の生成・キャラの作成の頼みに届かない。
+ローダの `llm.MANAGER_SEND_TARGETS` は部品ごとに包む（VERIFICATION.md §3.100）。
+ローカル（llama.cpp）の頼みは、どの部品から送っても `LlamaCppClient` を通る。
+
+送り口は `AIManager.set_ai_models` のたびに作り直される（2026-10-15 にゲームの中で前後の id を比べた）。
+
+- `set_ai_models` は、題の画面の「開始する」と世界の生成の画面に入るたびに、メインスレッドで走る。
+  7つの送り口をすべて新しい言語の包みで置き直すので、前に当てた包みは外れる。
+  言語の包みは `set_ai_models` の中（`instantale.py:519`）で、部品ごとに1回ずつ掛かる
+- 途中では、送り口にまだプロバイダの素の関数が入っている。
+  そこを包んで同じ関数の別名を張り替えると、プロバイダの属性（`request_llm_inference_*.send_request`）まで包みに替わる。
+  続く言語の包みはそれを包むので、以後の作り直しでも包みが中に残る
+- 言語の包みは `functools.wraps` で、包んだ関数の `__dict__` を写す。
+  ローダの包みを包むと、ローダの印（`__instantale_patch__` など）と `__original__` が写り、ゲームの関数がローダの層に見える
+- main_025 までは、ローダが張り替えたプロバイダの関数が作り直しのたびに入り直したので、包みが外れなかった
+- ローカル（llama.cpp）は、起動して題の画面に着いた時点で、4つの部品の `send_request` がプロバイダの素の関数そのもの（同じ関数）だった。
+  「開始する」の後は、クラウドと同じく部品ごとの言語の包みになる。
+  `send_request_with_no_structure` は「開始する」の後も、`llm_manager`・`llm_manager_battle`・プロバイダの属性が同じ関数のままだった（2026-10-15）
+
+ローダは `set_ai_models` の直後に包み直し、途中は包まない（TECH.md §5.3）。
+
 #### プロバイダは1つだけ import される
 
 **外部APIキー（クラウド）はプロバイダごとの `request_llm_inference_*` を通り、
@@ -1694,6 +1893,10 @@ alias_scan が同じ関数を持つ全モジュールを張り替え、どのプ
   ボタンは同じ文章を送り直すので、直らない誤りでは同じ所で止まる
 - `should_give_up` は 4xx でも偽を返す（404 の `model: ...` を32回まで送り直す作り）。
   ローダの `stalls` が 4xx を3回目で打ち切り、待ちを起こして行動を中断させる（TECH.md §5.12）
+- 送り口の `timeout` は待ちを打ち切らない。
+  2026-10-15（main_026）に、長い返事になる頼みを `timeout=0.5` で送ると、クラウド（Haiku 5.5）は 7.86 秒、ローカル（llama.cpp）は 5.83 秒後に返事を最後まで返した。
+  クラウドで送ったのは1回で、時間切れの送り直しも無かった。
+  ローダの `llm.ask` と `335_` は、待ちを打ち切らず、`timeout` を過ぎたらログに出す（TECH.md §5.3）
 
 #### クエスト1件に関わるマネージャ
 
@@ -1912,7 +2115,8 @@ generate_item_in_shopping(item_data, shop_owner_instance, item_stock_tier=2)
   ```
 
   売買の確認の窓は、品を落とした後のフレームでゲームが作る `ConfirmationWindow`（直下に `FloatLayout` と `Label`「品名:額G」、`FloatLayout` の下に `Button`「買う」「キャンセル」。ボタンは `on_press` で動く）。落とした呼び出しの中ではまだ出ていない。同じクラスを MOD が自分で作って品と同じ親へ足しても、中のボタンが 40×24 のまま並ばず画面に出ない（`336_` の実機。ゲームはこの窓を別の手順で出していると見られるが測っていない）。`ConfirmationModalView` は開けるが、ボタンが売買の確認より大きく、ModalView の覆いで後ろが暗くなる。ゲームが出した窓の文言を差し替えて借りることはできる（`336_` の盗む確認）
-- 窓の外側を押したときの閉じ方（2026-10-04 に実機で引数を写した）: `InstanTaleHUD._on_backdrop_touch(instance, touch)` が `turnoff_window_visibility(instance, 窓の表示の辞書)`（売買の窓は `hud.visible_twin_inventory_data` そのもの。`{'TorF': True, 'situation': 'shop', …}`）を呼び、続けて `hud.on_backdrop_callback()`（= `app.on_close_window`）で後始末する。後始末を呼ばないと窓は消えるが `is_popup_window_opened` が残る。後始末は `app.buttons_backup_for_shopping`（窓を開いたときの選択肢）を戻すので、窓を開いたまま戦闘を始めて後から閉じると、戦闘のボタンが店の選択肢に置き換わる
+- 窓の外側を押したときの閉じ方（2026-10-04 に実機で引数を写した）: `InstanTaleHUD._on_backdrop_touch(instance, touch)` が `turnoff_window_visibility(instance, 窓の表示の辞書)`（売買の窓は `hud.visible_twin_inventory_data` そのもの。`{'TorF': True, 'situation': 'shop', …}`）を呼び、続けて `hud.on_backdrop_callback()`（= `app.on_close_window`）で後始末する。後始末を呼ばないと窓は消えるが `is_popup_window_opened` が残る。後始末は `app.buttons_backup_for_shopping`（窓を開いたときの選択肢）を戻すので、窓を開いたまま戦闘を始めて後から閉じると、戦闘のボタンが店の選択肢に置き換わる。
+  `on_backdrop_callback` は HUD が作られたときの `app.on_close_window`（束ねたメソッド）なので、注入より前に作られた HUD では `InstantaleApp.on_close_window` の包みを通らない（2026-11-03 の実機。`relaunch.sh` の起動で、包みは型に掛かっていたが HUD の呼び口は素のままだった）。閉じたことを拾うなら、HUD がその場で引く `InstanTaleHUD.turnoff_window_visibility` を包む
 - 店でない施設でも、`toggle_twin_inventory_window(相手, 主人公, 見出し, 'shop')` で売買の窓が開く（2026-10-05、`336_` の盗品買取商。相手は裏の事務所の主で、持ち物は空）。
   ドラッグ・確認の窓・`Item.sell` の支払い・「〈品〉を売却した。」はゲームのまま動き、売った品は相手の持ち物へ積まれる。
   値段は開く前に `normalize_shop_inventory_prices(相手, 主人公)` で付ける。
@@ -1939,6 +2143,38 @@ generate_item_in_shopping(item_data, shop_owner_instance, item_stock_tier=2)
 
 > 回復アイテムだけは同じ品を何度でも買えて、在庫が尽きない。
 > `312_shop_restock` の「買った品を作り直させない」（既定 ON）が、その来店で増えたぶんを窓が組み上がる前に外す。
+
+##### 2.13.1.4 値切りは品の額を直に書き換える（実測。VERIFICATION.md §3.121）
+
+売買の窓を開いている間の入力欄は値切りになる（`ShoppingNegotiateManager.execute(choice_text)` → `shopping_negotiate_method` → LLM の `shopping_negotiator`）。
+値切りになるのは、入力欄の行き先 `app.function_correspond_to_input`（`PhaseSpec`）が `ShoppingNegotiateManager` のとき（2026-11-03 の実機）。
+ゲームの店の「売買する」は、窓を開くときにこれを差し替える（元の行き先は `app.input_backup_for_shopping` に控える）。窓を閉じても戻さず、次の場面（「出る」など）で `FreeInputStart` に戻る。
+`toggle_twin_inventory_window` を直に呼んで開いた窓では差し替わらず、入力は自由行動へ流れる（`336_` の盗品買取商は版5から自分で差し替え、閉じたら戻す）。
+同じ「売買する」で `in_shopping` も立つが、ゲームは読まない（§2.6）。
+`ShoppingNegotiateManager` は相手を今いる施設の主（`Facility.owner`。文字列の id）で引く。数の id を入れた施設では `KeyError` でスレッドが落ちた（試しで施設を書き換えたときの誤り）。
+LLM へ渡る品の額は、そのときの `attributes` の額（店の品は「価格」、手持ちの品は「参考買取価格」）。値段の MOD が書いた額がそのまま渡る。
+`player_attempt` は `bargaining` / `inspect_item` / `availability_inquiry` / null のどれかで、値切りなら `trade_direction`（`player_buys` / `player_sells`）・`target_item`・`decision`・`new_offer` が返る。
+
+- ゲームは `new_offer` を品の `attributes` へ直に書く。買う側は店の品の `買価`、売る側は手持ちの品の `売価`。`decision` が `counter`（店主の逆提示）でも書く
+- 書くのは `execute` の中で、値段の地点（`set_shop_price_for_*` / `normalize_shop_inventory_prices`）は通らない。同じ処理の中で保存も走る
+- 未検品の品を売ろうとすると、先に `inspect_item` で検品し、`app.inspected_item_ids` に足す。値段は検品の後の頼みで返る
+- 店の品の `買価` に書いた額は、窓を閉じても・店を出ても・読み直してもセーブに残る。店の窓を開き直しても付け直されない
+- 手持ちの品の `売価` に書いた額は、次に売買の窓を開いたときにゲームが付け直す（`set_shop_price_for_player`）。売る側の値切りは、その窓を閉じるまで
+- 売買の確認の表示と動く額はその額どおり。持ち主が変わると、ゲームが新しい持ち主の鍵で額を付け直す（`buy_item` / `sell_item` の中。値段の地点は通らない）
+
+##### 2.13.1.5 品を作る入口の戻りは品ではない（実測。VERIFICATION.md §3.121）
+
+2026-11-03 にテストワールドで入口を直に呼んで測った（作った品は抜いて戻した）:
+
+| 入口 | 戻り | 品の行き先 |
+| --- | --- | --- |
+| `generate_item_from_item_data(item_name, description, item_type, item_sub_type, value, item_appearance, rarity, obtainer)` | `(Item, 鍵)`（例 `(<Item>, 'item_91307')`）。`410_` の記録でも422回すべて tuple | `obtainer` の持ち物（同じ鍵） |
+| `generate_item_from_dict(item_dict, item_id, obtainer)` | None | `obtainer` の持ち物（渡した `item_id`） |
+| `generate_item_from_ready_made_data(obtainer, item_data, *args)` | 測っていない | |
+
+- `generate_item_from_item_data` で作った品は、主人公へ作っても店の主へ作っても `買価` / `売価` を持たない。額はゲームが値段の地点（`set_shop_price_for_*` / `normalize_shop_inventory_prices`）で付ける
+- `generate_item_from_dict` で作った品は、渡した辞書の額をそのまま持つ（読み込みで組み直す品はセーブの額）
+- 戻りをそのまま品として読むと、何もしないで抜ける。取り出し方は TECH.md §5.7 の `items.made_item`
 
 ##### 店の主は `job` が施設の種類と一致している
 
@@ -1983,6 +2219,39 @@ scripts.items:Item.__init__(self, name, item_type, attributes, description,
 > `sub_type` と `item_detail` は綴りが揃っていない（`weapon/small` は `small_weapon`、
 > `herb` は `plant`）。**表の鍵にするなら `item_detail` のほうを取る**（アイテムに書かれているのはこちら）。
 
+品の絵は `get_similar_embedding_id(外見文, item_sub_type)` が返す鍵から
+`Assets/images/item_candidates_dark/` ＋ 品種 ＋ `/` ＋ 鍵 ＋ `.png` と組まれ（exe の定数の並び）、
+`image_src` にこの相対パスのまま入る。
+絵の寸法は品のマス数に合わせてあり、武器は小型 32x32・中型 32x64・大型 32x96・長物 32x128（縦向き）、
+`body_armor` と `shield` は 64x64、ほかの大半は 32x32。
+`item_candidates` は `_dark` と同じ番号・同じ枚数の明るい版で、exe の定数に出てくるのは `_dark` のほうだけ。
+素材はほぼ全部が中世ファンタジーの絵で、銃・和風・現代と SF の品は無い（`128_` が足す。VERIFICATION.md §3.26）。
+
+外見文（`item_appearance`）は、LLM が品名・説明と一緒に書く英語の一文で、絵を選ぶのはこれだけ（説明文は使わない）。
+埋め込みのモデルは英語用なので、日本語の外見文はどれも同じベクトルになり、品と関係ない絵が付く。
+店の品揃え・依頼・作成の頼みは「英語で短い一文、画像生成プロンプトとして」と指示していて、記録の外見文 1,500 件余りに日本語は無かった。
+イベントの判定（`field_event_evaluator` / `quest_referee_event_resolve`）は効果 `get_item` で品を渡すが、外見文の書き方を指示しておらず、本文と同じ日本語で返る（記録 12件中12。2026-10-17）。
+
+食べ物は、`consumable` ではなく大半が `healing_item` に入っている。
+2026-10-10 にテストワールドの全員の持ち物（98品）を数えた:
+
+| `item_type` | 品数 | `item_detail` |
+| --- | --- | --- |
+| `healing_item` | 32 | food 8 / potion 8 / plant 7 / drink 5 / medicine 4 |
+| `wearable` | 26 | body_armor 18 / clothing 6 / accessory 2 |
+| `weapon` | 25 | small_weapon 11 / medium_weapon 10 / long_weapon 2 / large_weapon 2 |
+| `material` | 7 | metal・treasure・creature_part・liquid_material・scrap・relic が1つずつ |
+| `utility` | 6 | tool 4 / document 2 |
+| `consumable` | 2 | food 2 |
+
+「食べ物」と「薬」を分けたいときは `item_detail`（food / drink）まで見る（`338_` の値段の区分）。
+
+`consumable` の飲食物・薬は、店の品揃え・人物の持ち物・クラフトのどれからも出る（2026-10-19 に全セーブ7つを数えた。大半は店の品揃え）。
+クラフトの型（`item_craft_generator`）にも `HealingItem` と `Consumable` の両方があり、どちらにするかは LLM が選ぶ。
+`consumable` の品には `回復` と `疲労負荷` が書かれない（`134_` が作り直した品だけが持つ）。
+右クリックの「消費」が出るのは `healing_item` だけで（`new_hud` の定数に `consumable` が無い。実機でも `healing_item` に直した品にだけ出た）、`consumable` の品は使う手段が無い。
+`409_` が `healing_item` に直す（VERIFICATION.md §3.104）。
+
 `value` はその品が出たクエストの難易度と一致する（実セーブの21種類すべてが
 その世界の `quests[*].difficulty` かより深い土地の難度に対応）。
 この段階を返すのは `get_equipment_price(quest_difficulty)` / `get_heal_item_price` /
@@ -2003,7 +2272,11 @@ gold に直すのは `get_item_base_price` と `get_randomized_item_price`。
 - 渡る難易度は 70 を越える（85 まで観測）。スキーマの「1〜70」は LLM に見せる目盛りの説明で、ゲームの関数が切る値ではない。
   値段の関数の定義域は 0..76（§3 の `get_npc_employ_price` の走査）で、`318_` の難易度の上限の既定もこれに合わせてある。
   `get_weapon_spec` は 85 でも値を返した
-- 防具の `防御力` が同じ関数から作られるかは測っていない
+- 防具の `防御力` も同じ関数から作られる。11-03 の鍛冶屋の品揃えで、`243_` 版3の `link` に
+  `body_armor value=86 防御力 359 ← get_weapon_spec(86)=359`、`headgear value=83 防御力 341 ← get_weapon_spec(83)=341` と出た
+  （武器も同じ時に `long_weapon value=85 攻撃力 363 ← get_weapon_spec(85)=363`。`923_beyond_76` を入れた状態なので 76 を超えた分は 923 が延ばした値）
+- 品を作る入口 `generate_item_from_item_data` の戻り値は `(Item, str)` の tuple、`generate_item_from_dict` は None（`243_` の `link_result`）。
+  入口の戻り値を品として読む包みは空振りする。品は入口の間の `Item.__init__` で拾う（`410_` / `243_` 版3）
 
 ##### 値段は `attributes` に書かれている
 
@@ -2331,6 +2604,26 @@ Character.calculate_current_required_exp_on_display() / _gained_exp_on_display(g
   `get_enemy_exp_lvl` / `training_efficiency_ratio`）。
   **式を再現するより、支給された点数を写すほうが確実**（`306_`）
 
+#### 依頼を終えた仲間の成長は日数をかけて入る（main_026 から）
+
+```text
+InstantaleApp.award_companion_growth(difficulty, member_ids)   依頼を終えたとき。仲間ごとに保留を積む
+InstantaleApp.release_companion_growth(days)                    日数を送るたび。保留から日割りで入れる
+npcs[id].config.companion_quest_growth = {xp, base, days, stage}
+```
+
+2026-10-15 にクラウド（Haiku 5.5）で測った（主人公 Lv1、仲間は Lv8・経験値0のヴァルト、難易度4の依頼）。
+
+- 依頼を終えると `award_companion_growth(4, ['player', '5'])` が呼ばれ、戻り値は
+  `{'xp': 75.5, 'base': 0.42, 'stat_budget': 2.2, 'difficulty': 4, 'next_difficulty': 5}`。
+  経験値はすぐには入らず、`companion_quest_growth = {xp: 75.5, base: 0.42, days: 180, stage: 3}` に積まれる
+- 30日送ると `release_companion_growth(30)` が `xp 12.58`（75.5 × 30/180）と `base 0.07` を入れ、
+  経験値が 0 → 12.58、保留は `xp 62.9`・`days 150` に減った
+- `member_ids` には `'player'` も入るが、戻り値に並ぶのは仲間の分だけだった
+- `base` は6つの能力値すべてに同じだけ足される。上の依頼の後に180日送ると、ヴァルトの6つの能力値がどれも +0.423（筋力 10 → 10.42 など。小数のまま持つ）、経験値が +75.5 になった（2026-10-15、クラウド）
+- `stat_budget`（2.2）は、6つに配った量の合計（2.54）とも合わず、何を表すかは分かっていない
+- Lv72 の仲間2人（テストワールド、難易度の釣り合う依頼）では、`xp` も `base` も 0 で `stage` が 13 だった。レベルが高いと入らない
+
 #### 訓練・休暇のマネージャ（すべて `__main__`）
 
 | クラス | `__init__` | 何か |
@@ -2359,11 +2652,29 @@ process_choice(VacationEndManager,   '宿泊を終える')
 
 - 部屋は4つ。`犬小屋(0G)`＝`'kennel'` / `簡易寝台(10G)`＝`'bunk'` /
   `個室(100G)`＝`'private_room'` / `高級個室(1000G)`＝`'luxury_suite'`。
-- `宿泊する(Nヵ月)` の月数はプレイヤーの年齢の変動式（若いと3ヵ月、最長6ヵ月）。
+- `宿泊する(Nヵ月)` の月数はプレイヤーの年齢の変動式（若いと3ヵ月）。
   N は滞在の上限で、1回の長さではない。
   部屋選びが渡す `VacationStartManager` の第1引数は常に 1（実機5回とも `init_args=['1', ...]`）。
   MOD が N を渡すと N ヵ月分の暦と宿代が一度に動く（`331_` が踏んだ）。
-  実測は 20代=3・31歳=4 の2点だけで、年齢ごとの境目は未実測
+  年齢ごとの月数は `218_probe_vacation` の `display_vacation_choice` 160件（08-18〜11-01）で次の9点。
+  6ヵ月は上限ではない（49歳で7）。9点すべてに合う式の候補は `max(3, 年齢 // 7)` で、
+  27〜30・35〜41・43〜48・50歳以上は測っていない。
+
+  | 年齢 | 月数（`period_months`） | 件数 |
+  | --- | --- | --- |
+  | 20 | 3 | 1 |
+  | 22 | 3 | 20 |
+  | 23 | 3 | 7 |
+  | 25 | 3 | 50 |
+  | 26 | 3 | 2 |
+  | 31 | 4 | 68 |
+  | 34 | 4 | 9 |
+  | 42 | 6 | 1 |
+  | 49 | 7 | 2 |
+
+  `315_vacation_custom` の年齢の足し分は混ざっていない。
+  `DisplayVacationChoice.__init__` の包みは 315 → 218 の順（218 が外側）で、218 は 315 が `period_months` を差し替える前の引数を見る
+  （同じ時刻の `vacation_custom.log` に `stay: period_months 7 -> 1` がある）
 - 日数と宿代は `VacationStartManager.execute` の中で1回ずつ動く。
   宿泊の開始時点で全期間ぶんが一度に進むので、途中の活動を何回挟んでも暦は動かない
 - 1泊＝活動1回。`out/vacation.jsonl` の宿泊 54 回すべてが
@@ -2375,6 +2686,16 @@ process_choice(VacationEndManager,   '宿泊を終える')
 - LLM の描写のプロンプトは「このエリアで数ヵ月の宿泊をし」と月数を焼き込んでいる。
   宿泊の長さを変える MOD から見ると、
   ゲームの文言は月数を持つのに LLM 側は「数ヵ月」で固定される
+- 宿の主との会話の `response_prompt_instruction` にも宿泊の条件が焼き込まれている（exe の定数）。
+  `宿泊をしたいと伝えられた場合: … Nヵ月単位の宿泊が可能であり、前払いで簡易寝台10G、個室100G、高級個室1000Gが必要な事を説明する。… 犬小屋なら宿泊無料であることも…`
+  `N` は数字で届く（実プレイの 22 歳で 3。どこで決めるかは測っていない）。
+  金額は `scripts.languages:tr` を通るので、通貨の表記を変える MOD で `10円` になって届くことがある
+- `VacationStartManager.ufl_method_1` は宿の主の `life_log` に1行足す。
+  `{"day_start": 5388, "day_end": 5418, "summarized_count": 0, "content": "〈生活の記憶〉<主人公>を高級個室に1ヵ月間宿泊させた。\n"}`。
+  `day_end` は宿泊を終えた日、`day_start` はその月数×30日前で、部屋は素の名前（実記録 270 行）。
+  `elapse_days` を切り詰めても範囲の長さは縮まない。
+  0 日目から 7 日だけ泊まると `-23〜7` と負の日付になる。
+  主人公の `life_log` の宿泊の活動の記録（`〈生活の記憶〉…しばらく休暇をとり`、`<生活の記憶>…自己鍛錬に費やした`）も同じ形で、宿の主の記録と同じ範囲になる
 - **その頼み文に「どこに泊まったか」は入らない**（休養の `vacation_rest_overview_generator` も、
   社交の場面の `vacation_scene_generator` も。実測）。
   渡るのは上の一文と `【エリアの構造】`（そのエリアの全ロケーションの説明と NPC）だけで、
@@ -2729,6 +3050,24 @@ BattleStartManager(app, enemy_type='guard', enemy_content=None)
   （`guard_npc_generator` の第3引数と `generate_enemy_instance_from_quest_dict` の
   最後の引数）に渡る難易度を差し替える
 
+#### 特定の人物との戦闘（`enemy_type='specific'`）
+
+`339_town_factions` の刺客で実測した（2026-10-21。VERIFICATION.md §3.98「勢力の刺客」）。
+
+```text
+BattleStartManager(app, 'specific', [<人物の id>])     # 自由行動で特定の相手と戦うときのゲーム自身の形（220_ の記録）
+```
+
+- 敵はその人物そのもの（`world.characters` の `Character`）。戦闘で HP が 0 を割ったまま残る（`-7550/680` を実測）
+- 会話を閉じてから MOD が起こすと、終わり方は依頼の外の戦闘として `BattleEndManager`（`won` / `escaped`）になり、
+  締めは `guard_battle_summarizer`。その頼みの system は「プレイヤーキャラはこのエリアで犯罪者として指名手配されている。
+  先ほど衛兵に発見されて戦闘が始まり、そして終了した。」の決め打ちで、相手が誰でも衛兵との戦闘として語る
+- 手配度は衛兵との戦闘と同じく、**勝っても逃げても 10 下がる**（実測。勝ち 10 → 0、逃げ -10 → -20）
+- 会話の発言から自由行動の GM が始めた戦闘（`FreeInputStart` の中）は `BattleEndInFreeAction` で終わり、勝ち負けの印（`end_type`）が無い。
+  手配度は締めの要約の `lawfulness_loss` 次第（実測1回で 0）。主人公が逃げても、残った仲間が戦い続けて相手を倒した
+- **勝っても相手は死なない**（`config['is_dead']` は立たない）。会話から入った戦闘の後、同じ相手を会話で雇えた（2026-10-06 の `239_` の記録）。
+  退場させるなら MOD が `is_dead` を立てる（§2.22）
+
 ### 2.21 自由生成施設のシーン記述エンジン（`scripts.free_facility`）
 
 main_023 で入ったイベント記述用の実行エンジン。JSON のステップ列を解釈してシーンを走らせる。
@@ -3018,6 +3357,14 @@ llm_manager:conversation_facilitator_after_retrieval(..., retrieved_knowledge)
 
 - 第一声だけ変えたいなら `conversation_starter` に渡す messages のコピーを差し替える（`300_` の手口）
 - 自由入力で尋ねたときにも効かせたいなら `retrieved_knowledge` に足す
+- 相手が受けられる頼みは、返答の種類 `response_list`（`conversation_facilitator` も `_after_retrieval` も8番目）と、
+  その説明の文 `response_prompt_instruction`（10番目と9番目。プロンプトの【返答の要素】にそのまま載る）で決まる。
+  どちらも相手の施設の種類で決め打ちで、店の主は `["casual_response", "selling_response"]` と
+  「売買の提案の場合: selling_responseとして返答を記述。」、鍛冶屋の主は `upgrade_response`（装備の強化）、
+  宿屋の主は宿泊の値段の説明だけ（種類は `casual_response` のみ）、診療所の主は売買と `treat_response`。
+  載っていない頼みは「それ以外のあらゆる要求や取引: casual_response」に倒れるので、
+  宿屋と鍛冶屋の主は売買を頼まれても「ここは買い物をする店ではない」と答えた（2026-10-29、`213_` の記録と output_data）。
+  `340_` が主との会話の間だけ両方に売買を足す（VERIFICATION §3.114）
 
 > 差し込む条件は「誰と話しているか」で決めること。
 > `character_instance`（両者とも引数の4番目）から id を引いて突き合わせる。
@@ -3073,6 +3420,17 @@ llm_manager:conversation_facilitator_after_retrieval(..., retrieved_knowledge)
 `content` は `current_log` のリストをそのまま `str()` した文字列。
 移った後も `life_log` として毎回全文プロンプトに載るので、「前の話を引きずる」経路は途切れない。
 
+`life_log` は際限なくは伸びない。
+ゲームの `life_log_summarizer` が古い範囲を「200文字程度」の1エントリにまとめ直し、まとめたエントリは `summarized_count` が 1→2→3 と上がる。
+頼みには人物のプロフィール・特質と「人生ログの全体象」（`{"460日前-416日前": 文, …}` の dict）が載り、出力は `{"summary": str}`。
+まとめが走る契機は測っていない。
+`〈生活の記憶〉…休暇をとり` のような短いエントリはまとめから外れて残ることが多い。
+
+> 7月から3か月半遊んだ世界のセーブ 98 個を読むと、最大はいつも主人公で、8月以降は 5,000〜9,500字の間を上下した（一度のまとめで 43件 9,385字 → 33件 6,772字）。
+> NPC の最大は 3,880字。
+> その世界のローカルの頼み 120 件で最大は `master_ai_facilitator` の 18,773字 = 10,049 トークン（出力 238 を足して 10,287）、会話（`conversation_facilitator`）は 6,406。
+> 窓 16,384 を超えたものは無い。
+
 > **要約が薄いのは移送のせいではない**（移送は `str()` の丸写しで内容を落とさない）。
 > `resolver` の出力量が会話の長さにほとんど依らず一定だから。
 > 実測で 3ターン→116字 / 5ターン→185字 / **8ターン（5,597字まで育った会話）→118字**。
@@ -3097,6 +3455,9 @@ llm_manager:conversation_facilitator_after_retrieval(..., retrieved_knowledge)
 - `master_ai_facilitator_from_conversation` のプロンプト（実測 6,200〜8,100字）は
   NPC のプロフィール行と性格行を4回ずつ、感情行を2回含む（行単位の完全一致で損262字）。
   この経路は会話5関数を通らないため `311_` の注入も届かない
+
+> 5連コピーは上の長く遊んだ世界の 98 個のセーブには無かった（エントリを要約の区切りで切った完全一致で数えた）。
+> 重複の掃除は、要約を伸ばすときの枠作りとしては今も有効だが、窓あふれを防ぐ目的では要らない。
 
 `memory` は5鍵の dict（`life_log` / `memory_archive` / `session_log` /
 `prior_area_summary` / `brief_summary`）だが、会話2回の間ずっと動かなかった（更新契機は未実測）。
@@ -3314,6 +3675,86 @@ story = {world_situation, story_flow, current_rumor, current_story_phase}
 > 「保存されるのは書き直しの方」は実セーブで見える
 > （実セーブの `world_data["overview"]` は1段落の要約文）。
 
+入力した文章をそのまま世界にするには `145_fix_world_overview`。
+あの MOD は差し替えた後に `world_data.json` を読み返して照合するので、
+ここの読みが外れていれば `out\world_overview.log` に `WARN` が出る。
+概要を入れた生成が `create_world_overview_from_plot` を通ること、差し替えた概要が物語・集落・依頼まで届くことは実機で確かめた（VERIFICATION.md §3.96）。
+
+**`generate_new_world` を包んでも呼ばれないことがある。**
+画面はこの関数を**引数で受け取って控える**:
+
+```text
+scripts.hud.hud_world_generate:WorldGenerateScreen.__init__(
+    self, screen_manager, generate_new_world_callback, **kwargs)
+```
+
+控えを取った後にモジュールの属性を差し替えても、控えの方には届かない。
+画面はタイトルへ着くより前に組み上がっているので（`out\events.log` の
+`app.world_generate_screen`）、遅延 import を待ってから当てる包みは間に合わないことがある
+（外部の1回は2秒差で間に合わず、手元の3回は間に合った）。
+世界生成に仕掛けるなら、呼ぶ側が毎回モジュールを引く地点を選ぶこと
+（保存なら `save_world_json:write_obfuscated_json_file`。VERIFICATION.md §3.4）。
+
+#### 一括生成（main_026 から）
+
+```text
+題の画面「世界」→「一括生成」 → InstantaleApp.show_world_bulk_screen
+InstantaleApp.run_world_bulk_generation(world_path, stop_event, progress)
+  scripts.world_bulk_generation:BulkGenerator.run → _run
+    plan_tasks(world, root)                       仕事の並び
+    GameGenerationBackend.generate(task, world)   仕事1件（scripts.world_bulk_backend）
+    atomic_world_write(path, world)               仕事ごとに世界を書く
+  scripts.hud.hud_world_bulk:WorldBulkScreen.update_progress(state)   画面の「完了／残り／失敗」
+scripts.llm.batch_worker（RequestWorker / batch_requests）   送信の失敗を呼んだ側へ投げる
+```
+
+`scripts.world_bulk_*` は「開始／再開」を押した後に読み込まれる。
+ローダはそれを待って MOD を当て直すが、そのとき `BulkGenerator.run` はもう走っている。
+実行の始まりと終わりを包むなら、起動時から在る `run_world_bulk_generation` を選ぶこと（`241_` がそうしている）。
+
+画面の説明は「既存の世界の存在しない部分を一括で生成します」。
+世界を選んで「開始／再開」を押すと、遊ぶ前にまだ作っていない部分（集落の詳細・集落の依頼・人物の詳細など）の頼みを流し、作ったものを世界に書く。
+2026-10-15 に2回動かした（どちらもクラウドの Haiku 5.5）。
+
+| 回 | 世界 | 流れた頼み |
+| --- | --- | --- |
+| 01:52〜01:56 | 検証ワールド（作った直後） | `npc_detail_generater` 58件（`llm_manager`）・`settlement_quest_generator` 5件（`llm_manager_world_generate`） |
+| 11:48〜11:55 で中断 | 検証ワールド2（主人公で30日遊んだ後） | `create_settlement_detail` 6件・`settlement_quest_generator` 5件（どちらも `llm_manager_world_generate`） |
+
+- 始めるときに `set_ai_models` が走り、送り口が作り直される（§2.12）
+- 画面にはエリアの名前と「完了 N 件 ／ 残り N 件 ／ 失敗 N 件」が出る。2回目の回は残りが 374 から 420 に増えた（集落の詳細を作ると、その中の人物や依頼が残りに足されるとみられる）
+- 「中断する」で止まり、「中断しました。次回は残りから再開できます。」と出る
+- 2回目の回は約6分で6件しか進まなかった。全部流すと数時間と相応の推論費用がかかる見込み
+- 住人は街を作るのと同じ `save_area_json:write_area_data_to_world_dict` で素データへ書かれるが、遊ぶ前なので人物の組み立て（`World.generate_character`）は起きない。組み立てで名前の重複を直していた `120_` は、版8から一括生成の間の書き込みも裁く（作られた39人に重複2組が残っていた。VERIFICATION.md §3.101）
+- 頼みは遊んでいるときと同じ部品の送り口を通り、MOD の書き換えが届いた（`144_` の役の一文・`132_` の住人の外見の種・`111_` の規則。VERIFICATION.md §3.100）
+
+##### 仕事の種類と時間（`241_probe_world_bulk`）
+
+仕事は1件ずつ順に流れる。
+`world_bulk_generation` の定数にあるスレッドの部品は `Event` と `Lock` だけで、実機でも同時に走った仕事は最大1件だった。
+`batch_worker` は並列化の部品ではない。
+説明文は「Propagate provider worker errors to non-interactive generation jobs」で、遊んでいるときの再試行ボタンの代わりに、失敗を一括生成へ投げる。
+
+2026-10-15 夜に、検証ワールド3 の残りを最後まで流した。
+LLM はローカル（Fenrir-X-26B-A4B、llama-server の `--parallel 1`）、絵は手元の sdcpp_cuda で、`343_stable_diffusion`（当時 916）の解像度とサンプラーの上書きが効いている。
+21:11〜22:40 の 89 分で 632 件。失敗は0件。
+
+| 仕事 | 件数 | 1件 | うち絵（GPU） | 絵の枚数 | 1件で何が起きるか |
+| --- | --- | --- | --- | --- | --- |
+| `area` | 2 | 44秒 | 0 | 0 | 集落の詳細と依頼。1件で残りが約60件増える（背景・モンスター・人物・店） |
+| `story` | 5 | 15秒 | 0 | 0 | 固定の依頼。1件で背景5件・モンスター4〜6件増える |
+| `npc` | 71 | 1.5秒 | 0 | 0 | 人物の詳細 |
+| `shop` | 60 | 3.1秒 | 0 | 0 | 店の品。1軒を `(1/3)`〜`(3/3)` の3件に分ける。仕事の `ids` は `(エリア, ノード, 施設, 段)`。頼みは売買と同じ `shop_item_generator_ordinary` / `shop_additional_item_generator_ordinary`（exe の定数。`340_` が店の種類で差し替える。VERIFICATION §3.114） |
+| `portrait` | 71 | 12.0秒 | 9.0秒 | 2枚（素描 1.9秒・仕上げ 7.7秒） | 人物の立ち絵。5件は絵を描かずに済んだ |
+| `background` | 316 | 7.2秒 | 6.3秒 | 1枚 | 背景 |
+| `monster` | 107 | 14.3秒 | 10.3秒 | 1枚 | モンスターの絵 |
+
+- 合計 5346 秒のうち、仕事の中が 5107 秒。絵が 3746 秒（73%）、絵の外（主に LLM の待ち）が 1361 秒
+- 仕事の間は 239 秒（4%）。並べ直しが 632 回で 141 秒（世界が育つほど1回が重くなる）、保存が 24 秒
+- 並びは 21:09 の回（エリア1件で中断）の始めに 410 件。エリアと固定の依頼を作るたびに増え、最大 638 件になった
+- `plan_tasks` の並びは残りではない。モンスターは描き終えても並びに残り（107件描いた後も 111件）、本体がその後で外す。終わった世界で「開始／再開」を押すと 0.9 秒で「完了0／残り0」になり、描き直さない
+- クラウドの回（11:48、Haiku 5.5）はエリア1件が 46〜52秒で、ローカルと同じくらいだった
+
 ### 2.28 素データの辞書は2つあり、遊んでいる最中の追加は片方に届かない
 
 ```text
@@ -3521,9 +3962,92 @@ Atk:<n>(+<n>)\nDef:<n>(+<n>)\nExp:<n>/<n>\nGold:<n>\nAge:<n>\nSta:…\nLocation:
   （モンスター・衛兵）と
   `generate_enemy_image_from_character(world_name, name, fullbody_path, size)`
   （NPC の戦闘用の絵）。`131_` はここを包んでスレッドに旗を立て、
-  その中に居る間は工程の包みを全部ゲームのままにする
+  その中に居る間は立ち絵の処理と顔の処理を通さない
 - SD の段の設定（`character_generation_quality` の `highres_upscale` / `highres`）はここへ来る寸法を変えない。
   プロキシ MOD が 640x1216 で描いていても、この経路へ渡るのは 512x1024
+
+敵と背景の絵は、同じ世界のフォルダの別の置き場に残る（2026-10-28）。
+
+| 種類 | 置き場 | 背景を抜いた絵 |
+| --- | --- | --- |
+| 立ち絵 | `characters\<名前>\` | `no_bg_image.png` |
+| 敵・モンスター | `monsters\<名前>\`（`base_image.png`・`pixelated_image_resized.png`・`reduced_color_image.png`・`add_border_image.png`） | `base_image.png`（RGBA。描いた寸法のまま） |
+| 背景 | `backgrounds\<場所の名前>\`（`image.png`・`prompts.json`） | `image.png`（背景は抜かない。描いた寸法のまま） |
+
+設定の画面（歯車）の「画像の再生成」のボタンは `InstantaleApp.regenerate_current_image` を呼ぶ。
+描くのは作業のスレッド（`_regenerate_current_image_thread`）で、いまの画面に合わせて
+`_regenerate_conversation_character_image`（会話の相手）・`_regenerate_background_image`（背景）・
+`_regenerate_first_enemy_image`（戦闘中の最初の敵）のどれかへ分かれる（recon の名前。中は読めない）。
+会話の相手は `generate_character_image` から描き直す。
+描き終えてから同じ名前のファイルを書き直すだけで、描く前に今の絵を消さない（`343_` の描き直しで実測）。
+押した後、ゲームは設定の画面を閉じる。
+
+設定の画面は `InstanTaleHUD.toggle_setting_window_visibility` で開け閉めする（2026-10-28 実測）。
+枠は `setting_window_layout`（FloatLayout、`pos_hint` は `center_x` 0.5・`center_y` 0.68）で、開くと 500x525、閉じると 0x0・不透明度 0 になる。
+中のボタン3つ（`setting_window_shutdown_button` / `_return_to_title_button` / `_regenerate_image_button`）は素の Kivy の `Button`（375x100、MisakiGothic 25、`pos_hint` は空）で、開くたびに枠へ足され、閉じると外れる（閉じている間は親が無い）。
+並びは上から終了・タイトル・再生成で、上下の余白 62.5・間 50。
+ボタンの暗い下地は `canvas.before`（色 0.07, 0.06, 0.05, 0.5）、明るい縁は `canvas.after` の細い四角4本（色 0.8, 0.78, 0.76）で、ローダの `ui.popup_button` と同じ描き方。
+ドライブから開くときは `InstantaleApp.toggle_setting_window` を呼ぶ。開いた形は次のコマで組まれるので、同じ呼び出しの中で読むとまだ並んでいない。
+HUD の `toggle_setting_window_visibility` を直に呼ぶと、ゲームが `AttributeError: 'InstanTaleHUD' object has no attribute 'close_button_binding'` で落ちる（2026-10-29）。
+開いているかは枠の大きさで見る（閉じていても枠は画面に付いたまま）。
+左下の本の絵のボタンも、この設定の画面を開く。
+主人公のキャラクターシート（`character_image_right` に立ち絵が出る）は `InstantaleApp.toggle_character_sheet_window(0)` で開け閉めする（0 番が主人公）。右の欄の顔の枠は押せる部品ではない。
+
+敵の `monsters\<名前>\base_image.png` は描いたままの絵で、背景が付いている。
+ゲームが背景を抜いた形は `pixelated_image_resized.png`（256x256）と `reduced_color_image.png`（128x128）の透明度にある。
+描いた絵に明るい背景が入ると、背景抜きが本体ごと消し、戦闘の画面では輪郭だけが残る（`343_` の描き直しで2回。VERIFICATION.md §3.65）。
+宿の犬小屋の部屋は背景を新しく描かず、ゲームの既定の背景を出す。
+
+#### 敵の絵の工程（2026-11-06 実測）
+
+`generate_enemy_image` の中の順は立ち絵と違う。
+`size` は `small` / `medium` / `large` で、縮める先が 96 / 128 / 200 になる。
+
+| 順 | 工程 | 中くらいの敵の寸法 |
+| --- | --- | --- |
+| 1 | `generate_image_real_lcm` | 描いた絵（プリセットで 512〜1024 の正方形） |
+| 2 | `remove_background` | 同じ |
+| 3 | `pixel_art_process(絵, 128, 128, num_colors='16')` | `(入力そのまま, 128x128)`。ゲームが使うのは2つ目 |
+| 4 | `add_border_to_image` | 128x128。白い縁を固定のピクセル数で足す |
+| 5 | `apply_dark_fantasy_tone`（引数なし） | 128x128。既定の `randomize=35` で雑音が乗る |
+| 6 | `reduce_image_colors(絵, 64)` | 128x128 |
+| 7 | 2倍に伸ばして保存（包めない） | 256x256。戦闘画面が読む `pixelated_image_resized.png` |
+
+- 戻り値は `(base_image.png のパス, pixelated_image_resized.png のパス, 正のプロンプト, 負のプロンプト)`
+- 7の2倍は入って来た絵の実寸を見る。1024x1024 を渡すと 2048x2048 を保存する
+- `generate_enemy_image_from_character(世界, 名前, 全身の絵のパス, size)` の `size` は `{"width": …, "height": …}` の辞書で、`pixel_art_process` をキーワード（`pixelation_width` / `pixelation_height`）で呼ぶ。
+  縁・色調・減色を通らず、2倍に伸ばして `characters\<名前>\opponent_image.png` に保存し、そのパスを文字列で返す。
+  `<名前>` のフォルダが無いと保存で `FileNotFoundError` になる
+- 戦闘画面の絵は `hud.enemy_images[敵の名前]` の `scripts.hud.new_hud:NearestNeighborImage`。
+  `on_texture` が `mag_filter` と `min_filter` を両方 `nearest` にする
+- 部品の大きさは実寸で決まらない。192x192 でも 1024x1024 でも 240x240 のまま（`fit_mode` は `contain`）。
+  画面の大きさと敵の数で決まる部分は測っていない
+- 依頼の敵は同じ名前の絵があれば使い回すので、新しく描かれないことがある（VERIFICATION.md §3.65 の記録と同じ）。描き直しは設定の画面の「画像の再生成」が戦闘中の最初の敵に効く
+
+#### 背景抜きのモデル（2026-11-06 実測）
+
+`scripts.image_processing.request_remove_background:remove_background(image, use_rembg_alpha_matting=True)` が `bin\rembg_sidecar\rembg.exe` の `POST /remove` を呼ぶ。
+サイドカーのポートは起動ごとに変わり（`url` に入る）、引数は `alpha_matting` だけで、モデルは u2net に固定。
+`generate_enemy_image` はこの関数を入口と同じスレッドで呼ぶ。
+ゲームのフォルダの `runtime\models\u2net\` には `u2net.onnx`・`isnet-anime.onnx`・`u2netp.onnx`・`u2net_human_seg.onnx` がある。
+
+敵は `(plain background,black background:1.1)` で描かれるが、モデルごとに本体を落とす絵が違う。
+
+| モデル | 残りやすい | 消えやすい |
+| --- | --- | --- |
+| u2net | 生き物・機械 | 飾りの多い人型 |
+| isnet-anime | 人型・飾り | 生き物・機械 |
+| u2net_human_seg | 人型の一部 | 人型でない敵。人型も大きく欠ける |
+
+ゲームの工程は透明度をそのまま運ぶので、本体の透明度が低いと荒くした絵では輪郭の線だけが残る。
+
+#### 背景の工程
+
+`generate_image_real_lcm` → `pixel_art_process(絵, 512, 256)` → `apply_dark_fantasy_tone` → `reduce_image_colors(絵, 16)` の順。
+`pixel_art_process` は `image_generation_background` の写しを呼び、色調と減色は `scripts.image_processing` のモジュールの属性を呼ぶ。
+立ち絵と敵は3つとも `from` の写しを持つので、それぞれの置き場を `alias_scan=False` で包むと片方だけに当たる。
+`apply_dark_fantasy_tone` に `randomize=0` を渡すと `np.random.randint` が `ValueError: high <= 0` を投げ、生成スレッドが死ぬ。
+下限の 1 は画素値が最大1落ちるだけ。
 
 #### 顔
 
@@ -3662,8 +4186,12 @@ MOD の控え（`state\<MOD>\`）は世界名で引いていたので、前の�
 | 寸法 | `width` / `height` | `width` / `height` |
 | サンプラー | `sample_method` / `sample_steps` / `cfg_scale` / `scheduler` | `num_inference_steps` / `guidance_scale` |
 | 種 | `seed`（実測は `-1`） | 実測では来ていない |
-| img2img | `image_to_image_anime` が `init_image` 付きで同じ出口へ | 関数ごと無い |
+| img2img | `image_to_image_anime` が `init_image` 付きで同じ出口へ。出口の `strength` の既定は 0.75 | 関数ごと無い |
 | LoRA | ゲームが上の層と出口の**間**で `<lora:...>` を足す | 概念が無い（`lora_dir` も `taesd_path` も無い） |
+
+sdcpp 系の出口へ `init_image` を渡すときは、絵の寸法を `width` / `height` と同じにする。
+違うと出口の中（ネイティブ）で `OSError('exception: access violation writing 0x0000000000000000')` になる（2026-10-28、24回とも。ゲームは落ちず、例外として戻る）。
+寸法を揃えれば、SD1.5 でも SDXL でも txt2img の部品のまま img2img が描ける。
 
 素の値（`sdcpp_cuda`、実測）:
 
@@ -3712,6 +4240,11 @@ AIManager.set_ai_models (instantale.py:510〜516)   一族を import する行�
 （実測 11 回。`pipe=null` の4回は建ち、既に在る7回は建たなかった）。
 モジュール変数の差し替えを効かせるには、ゲームの起動し直しが要る。
 
+描いた後に同じプロセスで別の部品を建てると、`StableDiffusion.__init__` の中（ネイティブ）で `access violation writing 0x0000000000000000` になる（2026-10-29、建たなかったプロセス 8 個のどれも1枚以上描いた後）。
+`generate_image` が関数の中で作った進み具合のコールバック（exe の平文に `StableDiffusion.generate_image.<locals>.sd_progress_callback`）を `sd_cpp.sd_set_progress_callback` で DLL に登録したまま返り、モデルの読み込みの途中でそれが呼ばれるため。
+建てる前に `sd_cpp.sd_set_progress_callback(None, None)` で外せば建つ（`sd_cpp` は部品のクラスのモジュールの属性。VERIFICATION.md §3.65）。
+落ちた後に建て直しを繰り返すと、ゲームの部品の `generate_image` も `access violation reading 0x0000000000000048` で描けなくなる。
+
 > バックエンドを切り替えても画質の設定は付いてこない。
 > `diffusers_openvino` の manager には `image_to_image_anime` が無いのに、
 > `character_generation_quality` が `highres_upscale`（2段で描く指定）のまま残ると、
@@ -3734,6 +4267,132 @@ AIManager.set_ai_models (instantale.py:510〜516)   一族を import する行�
 > 上の実測はプロキシが入っていない状態で録ったもので、
 > 3つのバックエンドとも `stable-diffusion.dll` は退避されている `-real.dll` とハッシュが一致していた
 > （入っているかどうかはこの比較で分かる。`-real.dll` の有無では分からない）。
+
+### 2.34 画面左下のアイコンの列（`icon_button_layout`）
+
+画面左下の能力値の欄の下端に、ゲーム自身のアイコンが4つ並ぶ。
+2026-10-10 にテストワールドで、窓 1980×1080（dpi 96）のときの値を読んだ（読むだけ）。
+
+| 番号 | 絵（`Assets/images/icons/interface/`） | 開くもの | `pos_hint` |
+| --- | --- | --- | --- |
+| 0 | `dark_icon_inventory.png`（袋） | 持ち物 | `{'x': 0.07, 'y': 0.03}` |
+| 1 | `dark_icon_book.png`（本） | タイトルに戻るなどの設定 | `{'x': 0.30, 'y': 0.03}` |
+| 2 | `dark_icon_scroll.png`（羊皮紙） | キャラ情報 | `{'x': 0.53, 'y': 0.03}` |
+| 3 | `dark_icon_hammer.png`（ハンマー） | クラフト | `{'x': 0.76, 'y': 0.03}` |
+
+- 入れ物は `InstanTaleHUD.icon_button_layout`。FloatLayout で、`size_hint` (1, 1)。
+  このときは pos (39.6, 37.8)、大きさ 396×332.6 で、親（FloatLayout。能力値の Label と並ぶ）と同じ箱
+- ボタンは `icon_buttons`（HoverableButton）。`size_hint` は (None, None)、大きさは 40×40 の固定。
+  絵は `normal_image` / `hover_image` / `click_image` の3枚（`_hover` / `_click` の付いた名前）で、`icon_button_images` にも同じ組がある
+- 押下は `set_icon_button_callback(icon_index, callback)` で番号ごとに結ばれ、`InstantaleApp.on_icon_btn_press(icon_index)` に届く（`out\recon\game_modules.txt`）
+- 位置は比率（`pos_hint`）、大きさはピクセルの固定値。窓を狭めると間だけが詰まる。
+  1980 幅では間が 51px、ハンマーの右から欄の枠までが 55px 空いている
+- `116_ui_party_expand` は `icon_buttons` を「触らない相手」に数えている（`panel.py` の `game_buttons`）
+- ボタンの型は `scripts.hud.new_hud:HoverableButton(normal_image, hover_image, click_image, **kwargs)`
+  （ButtonBehavior ＋ `NearestNeighborImage`。リコンの一覧）。絵は `source` を差し替えて切り替える
+- 乗せた時の絵は、ボタン自身ではなく HUD の画面（`Screen 'hud'` の `on_mouse_pos`。`Window.mouse_pos` に結んである）が切り替える。
+  切り替えるのは自分の4つだけで、同じ型のボタンを列に足しても、乗せた・外れたは届かない（2026-10-10 に `Window.mouse_pos` を動かして確かめた）。
+  `is_popup_window_opened` / `is_button_enabled` / `is_adding_text` / `in_battle` / `disabled` のどれを立てても、乗せれば切り替わった
+- 押した時（`on_press`）は押した時の絵、離した時（`on_release`）はマウスが上にあれば乗せた時の絵、外れていれば普段の絵（型が自分で切り替える）
+- 押すと効果音が鳴る。音は `Assets/sounds/sounds/ui/常時/` の `アイコン_鞄.wav`（持ち物）・`アイコン_キャラシート.wav`（キャラ情報）・
+  `アイコン_クラフト.wav`（クラフト）。キャラ情報は開くときだけ鳴り、閉じるときは鳴らなかった（開いて閉じて1回）。
+  鳴らす口は `app.sound_manager.play_sound_from_src(app, パス)`
+
+### 2.35 キャラを作る画面のさいころは世界を渡さない。絵の前置きには medieval が付く（`143_` の作業より）
+
+キャラを作る画面は `scripts.create_world:StoryApp(screen_manager, start_game_callback, world_name, generate_character_image_callback)`。
+世界名は受け取っていて、`self.world_name` に持つ（2026-10-11 の実機。さいころの押下の包みで読めた）。
+さいころ（`on_dice_press` → `generate_random_character`）が呼ぶのは
+`scripts.llm.llm_manager_character_create:create_character(talent_point_left)` で、引数は才能点だけ。
+
+`output_data\unknown\unknown\create_character\` の4件（2026-09-20〜10-11）で見た頼み文:
+
+- system は「あなたは大人向けの無骨で無慈悲なダークファンタジーRPG『Instantale』のキャラクター生成AIです。」の1文
+- user は「**1体のプレイヤーキャラクター**を**ランダムに**生成してください」で始まり、才能点・年齢・能力値・スキル・特質の決まりと
+  「[medieval, masterpiece, high quality, full body, standing, black background] は自動で追加される」が続く
+- 世界の名前・概要・情勢は1字も入っていない。保存先も世界名と主人公名の段が `unknown`
+- 4件とも、北方の出の傭兵で、顔に傷があり、革か鉄の鎧を着ていた（うち2件は元坑夫）
+
+さいころの返答から約1〜2秒後に、`create_look(name, gender, profile, look)` が続いて送られる（4件とも。`create_look\` の時刻）。
+日本語の外見文から category と立ち絵の英語の要素（8要素以下）を作り直す頼みで、
+system は「世界観と背景に基づき」と言うが、渡すのは名前・性別・出自・外見だけで、世界は入っていない。
+頭に `[medieval, masterpiece, high quality, full body, standing, black background, {category}]` を足すと書いてある。
+主人公の立ち絵に使われるのはこちらの要素（さいころの返答にも `image_generation_prompt` があるが、立ち絵のフォルダの `prompts.json` に載っていたのは `create_look` の要素だった。2026-10-11）。
+
+作成画面のスキル・特質の枠から生成するときは `create_skill(character_data, skill_request)` / `create_trait(character_data, trait_request)`。
+どちらも世界を渡さない。頼み文は exe の定数で読んだ（記録は無い）:
+
+- system はどちらも「あなたは大人向けの無骨で無慈悲なダークファンタジーRPGのキャラクター生成AIです。」で始まり、
+  「**キャラクターに追加する1つのアクティブスキル**を生成してください」/「**キャラクターに追加する1つの特質（…）の獲得に必要な消費ポイント量**を生成してください」と続く
+- user は「【キャラクターのデータ】- …」と「【スキルのリクエスト】- …」/「【特質のリクエスト】- …」
+- スキルの属性の例は「火、水、毒、闇など」（さいころの頼みも同じ）
+- 特質の【その他】は「この世界の誰もが魔法、精霊、神、悪魔、自然の力を借りた大いなる術を唱えられるわけでは無し、…」で、魔法のある世界を前提にしている
+
+窓の「生成」をスクリプトから押しても（`click`・`on_press` / `on_release` の発火とも）頼みは送られなかった（2026-10-11）。押下の先は測っていない。
+
+さいころに渡る才能点（`talent_point_left`）は、貯まっている才能点（`common_savedata.json` の `talent_point`）そのもの。
+手元では 2497 で、頼み文は「10 で貧弱・30 で一端の冒険者・60 で名の知れた実力者・150 で伝説」「概ねスキル・能力・年齢で 1/3 ずつ」と目安を書く。
+13 件の返答では、能力値の補正は +5 まで、スキルは1つで有用度 5〜26、年齢は 31〜46 に収まった（使えるのは 2172〜2497 点）。
+年齢の目安は 44 歳が 0 点で、若くするほど高い（40 歳 1・33 歳 4・30 歳 7・25 歳 23・20 歳 66。45 歳から上は1歳ごとに1点戻る）。
+若さに払う点の見返りは、宿の休養などで回復に掛かる期間が短いこと（宿泊の月数は年齢の変動式。§2.17 の「宿泊の流れ」）。
+若いほど1回の活動の周期が短くなり、寿命までに遊べる回数が増える。
+画面が実際に数える式（`StoryApp.set_point_use`）は読めない。
+数えた結果は作成画面の「残り才能: 2497(-61)」の文字にだけ出る（括弧の中がこのキャラの使う点）。`StoryApp` は残りを属性に持たない（在るのは `talent_point` / `get_talent_point` / `set_point_use`）。
+物語を始めても、貯まっている才能点は減らなかった（2026-10-11、使う点 31 のキャラ。`common_savedata.json` が 2497 のまま）。
+頼み文に「およそ N 点使う」と目安を足しても、生成 AI は能力値・スキル・特質に 10〜30 点ほどしか使わなかった（6回。VERIFICATION.md §3.93）。
+
+#### 絵の前置き（`image_generation.<方式>.image_generation_creature` / `image_generation_background`）
+
+立ち絵も背景も、要素の前後にゲームの決まった文字列が付く（exe の定数と、描いたフォルダの `prompts.json`）。
+
+| 絵 | 前 | 後 |
+| --- | --- | --- |
+| 人物（`generate_character_image(world_name, name, category, prompt)`） | `full-body, masterpiece,high quality, detailed face, medieval, dark fantasy, watercolor, standing,shabby, ` ＋ category | `empty background,black background,wallpaper` |
+| 背景（`generate_background_image(world_name, location, prompt)`） | `masterpiece, best quality, watercolor, fantasy setting, medieval, highly detailed, ` | なし（否定に `photoreal, modern, urban, ...`） |
+
+頼み文が「自動で足す」と書く一覧（`[medieval, masterpiece, high quality, full body, standing, black background]`）は実際の前置きと同じではない。
+人物は組み立てた文を `prompts.json` に書いてから、方式ごとの描く関数（`generate_image_anime` / `generate_upscaled_image_anime` / `generate_image_real_lcm` など。最初の引数が前置き込みの文）を呼ぶ。
+背景は `generate_and_save_background(world_name, location, positive_prompt, negative_prompt)` が `prompts.json` を書いて描く。
+背景の頼み文（`background_image_creator`）の system は「あなたは中世ファンタジーRPGビジュアルノベルの背景画像の生成担当です」で始まる。
+敵・モンスターの絵は `prompts.json` を残さず、前置きは見ていない。
+
+NPC を作る頼み（`create_settlement_detail` など）は `【世界のデータ】` に世界の概要と地図の構造を載せている。
+渡していないのは主人公を作る2つだけ。
+
+世界の文の在り処は `world_dict["world_data"]` の `overview`（概要）と `story.world_situation`（情勢）。
+作成画面の時点の `app.world_dict` は作成中の世界ではなかった（2026-10-11 の実機。9回とも世界名が食い違った）。
+`143_` は画面が受け取った `world_name` で `worlds\<世界名>\world_data.json`（§2.16 の XOR）を読む。
+
+### 2.36 頼み文の世界観の決め打ち（`144_` の作業より）
+
+`output_data` に残る頼みを種類ごとに1件ずつ（いちばん新しいもの）読んだ（2026-10-11。ゲームの頼み 58種と MOD の頼み 17種）。
+世界に関係なく同じ文が入るもののうち、ジャンルや世界の暮らしを決めているものは5種類あった。
+
+**役の一文。** ゲームの頼みの 29種が「あなたは」で始まるジャンルの一文を持つ。書き方は次のとおり。
+
+| 書き出し | 例 |
+| --- | --- |
+| `あなたはダークファンタジーTRPGの〜` | 語り（`quest_starter` / `quest_summarizer` / `quest_referee_event_resolve` / `field_event_evaluator` など）・休暇・訓練・内部処理（`life_detail_setter`） |
+| `あなたはダークファンタジーRPGの〜` | NPC の生成（`master_ai_npc_generater` / `npc_detail_generater` / `guard_npc_generator` / `colosseum_enemy_generator`）・語り（`narrator` / `narrator_initial`）・世界と町の生成 |
+| `あなたは大人向けの無骨で無慈悲なダークファンタジーRPG『Instantale』の〜` | さいころ（`create_character`） |
+| `あなたはいわゆる大人向けのダークファンタジーRPGの〜` | `create_look` / `check_illegal_content` |
+| `あなたは中世ファンタジーRPGビジュアルノベルの〜` | 背景（`background_image_creator`） |
+| `あなたはダークファンタジーTRPGシステムのベースモデルとして` | `quest_referee_with_free_action` |
+
+同梱の MOD にも同じ書き出しを写したものがある（`300_` / `330_` / `331_` の頼み）。
+29種のうち20種は、頼みのどこにも世界の情報（`世界の概要`・`【世界の情報】`・`world_overview`）が無い。
+語り・依頼の進行と要約・休暇・訓練・NPC の詳細・背景・キャラの審査がそれで、生成 AI が知る世界観は役の一文だけになる。
+
+**会話の調子。** 会話の4種（`conversation_facilitator` など）の「この世界は救いのないダークファンタジーであり、優等生的・現代的な言い回しや不要な気遣いはしない。」は、ゲームの文ではなく `111_` の同梱ルール（`llm_replacements.default.txt` の「生成文言改変」）が足している。
+
+**許可の理由。** 会話・自由行動（`master_ai_facilitator`）・世界の審査（`check_world_content_violation`）が「ダークファンタジーであるため、窃盗、暴力、暗殺、戦闘などの犯罪行為は許可する。」と書く。
+キャラの審査（`check_illegal_content`）は「ダークファンタジーであるため、殺人者、盗賊、奴隷、生贄などの設定は許可される。」。
+
+**【共通世界観】。** 世界の生成（`create_world_overview`）・ストーリー（`create_story`）・町の生成（`create_settlement_detail`）が同じ塊を持つ。
+後ろに「- エリア:」の項が続くのは町の生成だけで、世界とストーリーの生成では冒険者の項の後にすぐ【予め指定済みの設定】【手順】が来る（ストーリーの方は項の中に改行もある）。
+冒険者の項は「この世界にはギルドとそれに属する職業冒険者たちがいるが、夢のある仕事ではない。社会的立場は低いし…元奴隷。そして多くは…死ぬか、何らかの後遺を負って引退する。…」で、エリアの項（エリアごとに拠点が1つ）はゲームの仕組みの説明。
+
+**絵の前置き。** §2.35 の表。人物の `medieval, dark fantasy, ... shabby`、背景の `fantasy setting, medieval` と否定の `modern, urban`。
 
 ---
 

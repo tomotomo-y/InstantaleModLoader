@@ -101,6 +101,10 @@ narration モードのセリフは `move_phase` の内側（入れ子の narrato
 申し出だけ出すと、同じ優先度で後から申し出たほかの MOD が、会話を始めないこちらに譲って黙ってしまう。
 
 版3: ローダの窓口 `arrivals` で、同じ到着で会話を始めるほかの MOD に譲るようにした（conversation モードのみ）。
+
+版6: `conversation_starter`・`ConversationPhaseManager.conversation_continued`・`ConversationStartManager.__init__` の
+フックは、引数を受け取った形のまま元の関数へ渡す（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
+第一声の読み替えは、来た側（位置かキーワード）に合わせて `messages` を差し替える。
 """
 
 import random
@@ -194,7 +198,7 @@ BUSY_FLAGS = ("in_battle", "in_boss_battle", "in_colosseum_battle",
 # 「買い物中か」の信号としては当てにならない。
 # これを見ていると店系の施設でイベントがほとんど出なくなる。
 # 買い物窓が開いている状態は
-# `is_popup_window_opened`（会話を始める直前に見る）で弾ける。
+# `is_popup_window_opened`（待っている間と会話を始める直前に見る。`gone`）で弾ける。
 
 LANGUAGE_NAMES = {"japanese": "日本語", "english": "英語"}
 
@@ -461,6 +465,9 @@ def apply(ctx):
             busy = [flag for flag in BUSY_FLAGS if getattr(app, flag, False)]
             if busy:
                 return "became busy {}".format(busy)
+            # 待っている間に売買の窓が開いた＝着いた後にもう手を付けている。閉じた後に声をかけても場面に合わない。
+            if "is_popup_window_opened" in ui.busy_signals(app):
+                return "a window was opened"
             # 手が空くまでの間に、衛兵のような別の画面に変わっていることもある。
             other = off_the_first_screen(app)
             if other:
@@ -649,14 +656,15 @@ def apply(ctx):
     # ------------------------------------------------------------------ フック
     arrivals.install(ctx, write)
 
-    @ctx.wrap("__main__:MovePhaseManager.move_phase", required=False)
-    def move_phase(orig, self, *args, **kwargs):
+    # 施設を移る前後はローダの窓口 `arrivals` から呼ばれる（TECH.md §3.3.21）。
+    def before_move(call):
         state["move_count"] += 1
         if EVENT_MODE == "narration":
             # 情景描写は move_phase の *内側* で呼ばれる。
             # だから印は先に置く。
             state["pending"] = {"at": time.monotonic(), "move_no": state["move_count"]}
-        result = orig(self, *args, **kwargs)
+
+    def after_move(call):
         state["pending"] = None
         if EVENT_MODE == "conversation":
             try:
@@ -668,7 +676,8 @@ def apply(ctx):
             except Exception:
                 # イベントの失敗で移動そのものを巻き添えにしない。
                 ctx.log_exc("arrival event: launch failed")
-        return result
+
+    arrivals.on(ARRIVAL_OWNER, ctx, (arrivals.FACILITY,), before=before_move, after=after_move, write=write)
 
     @ctx.wrap("scripts.llm.llm_manager:narrator", required=False)
     def narrator(orig, *args, **kwargs):
@@ -696,7 +705,7 @@ def apply(ctx):
 
     # ---------------------------------------------- 第一声の読み替え（conversation）
     @ctx.wrap("scripts.llm.llm_manager:conversation_starter", required=False)
-    def conversation_starter(orig, messages, *args, **kwargs):
+    def conversation_starter(orig, *args, **kwargs):
         """こちらが起こした会話のときだけ、開始の合図を差し替える。
 
         ゲーム本来の合図は `<行動: 話しかける>`（＝プレイヤーが話しかけた）。
@@ -705,16 +714,17 @@ def apply(ctx):
         """
         mark = state["rephrase"]
         if mark is None or not REPHRASE_OPENING:
-            return orig(messages, *args, **kwargs)
+            return orig(*args, **kwargs)
         state["rephrase"] = None
         if time.monotonic() - mark["at"] > REPHRASE_TTL:
             write("rephrase: stale marker, left untouched")
-            return orig(messages, *args, **kwargs)
+            return orig(*args, **kwargs)
+        messages = frames.arg(args, kwargs, "messages", 0)
         if not isinstance(messages, list) or not messages:
-            return orig(messages, *args, **kwargs)
+            return orig(*args, **kwargs)
         last = messages[-1]
         if not isinstance(last, dict) or "content" not in last:
-            return orig(messages, *args, **kwargs)
+            return orig(*args, **kwargs)
         replacement = dict(last)
         replacement["content"] = (
             "<状況: {facility}に入ってきた{player}に、あなたの方から声をかけた。"
@@ -724,7 +734,9 @@ def apply(ctx):
                                          "name", "旅人"), 40))
         write("rephrase: {!r} -> {!r}".format(
             frames.short(last.get("content"), 60), replacement["content"]))
-        return orig(messages[:-1] + [replacement], *args, **kwargs)
+        args, kwargs, _ = frames.replace_arg(args, kwargs, "messages", 0,
+                                             messages[:-1] + [replacement])
+        return orig(*args, **kwargs)
 
     # ================================================================
     # 応答されずに終わった回数を数える
@@ -785,13 +797,13 @@ def apply(ctx):
 
     @ctx.wrap("__main__:ConversationPhaseManager.conversation_continued",
               required=False)
-    def conversation_continued(orig, self, choice_text, *args, **kwargs):
+    def conversation_continued(orig, self, *args, **kwargs):
         """1ターン進んだ＝プレイヤーが返事をした。値には触らない。"""
         try:
             note_response(getattr(getattr(self, "app", None), "in_conversation", None))
         except Exception:
             ctx.log_exc("watch: cannot note the response")
-        return orig(self, choice_text, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:ConversationEndManager.__init__", required=False)
     def conversation_end_init(orig, self, *args, **kwargs):
@@ -808,7 +820,7 @@ def apply(ctx):
             app = frames.arg(args, kwargs, "app", 0) or find_app()
             _partner, entry = ui.conversation_partner(getattr(app, "buttons", None))
             native = ui.spec_args(entry) if entry is not None else None
-            if isinstance(end_text, str) and native and len(native) >= 3                     and end_text != native[2]:
+            if isinstance(end_text, str) and native and len(native) >= 3 and end_text != native[2]:
                 setattr(self, MOD_CLOSE_ATTR, True)
         except Exception:
             pass
@@ -834,12 +846,13 @@ def apply(ctx):
 
     # ------------------------------- ゲーム自身が使う character_id の形を控える
     @ctx.wrap("__main__:ConversationStartManager.__init__", required=False)
-    def conversation_start_init(orig, self, app, character_id, *args, **kwargs):
+    def conversation_start_init(orig, self, *args, **kwargs):
+        character_id = frames.arg(args, kwargs, "character_id", 1)   # (app, character_id)
         kind = "{} {!r}".format(type(character_id).__name__, character_id)
         if state["npc_id_kind"] != kind:
             state["npc_id_kind"] = kind
             write("observed ConversationStartManager(character_id={})".format(kind))
-        return orig(self, app, character_id, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # ------------------------------------------------------------ 自己テスト
     def selftest():

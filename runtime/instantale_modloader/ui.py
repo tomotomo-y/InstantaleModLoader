@@ -734,14 +734,20 @@ def add_gold(app, amount, on_error=None):
 # クエストの格納先（`301_` / `305_` / `307_` が共有する）
 # --------------------------------------------------------------------------
 def quest_stores(app):
-    """クエストが入っている**2つ**の場所（`206_` の計測。GAME.md §2.9）。
+    """クエストが入っている**2つ**の場所（GAME.md §2.9.1）。
 
-        app.world.quests          {id: Quest インスタンス}  ゲームが遊ぶときに読む
-        app.world_dict['quests']  {id: dict}                セーブに出るのはこちら
+        app.world.quests              {id: Quest インスタンス}  ゲームが遊ぶときに読む
+        app.save_data_dict['quests']  {id: dict}                セーブに書き出される
 
     **読むのはどちらでもよいが、書くときは必ず両方。**
-    片方だけ直すと画面の表示と保存内容がずれる。
+    生きた一覧だけに書くと、画面には出るが読み直すと素の値へ戻る
+    （生きた一覧へ書いた難易度は、受注・クリア・保存をまたいでもセーブへ写らなかった）。
     どちらに登録されるかを決め打ちしないので、無い側は黙って落ちる。
+
+    v1.15.0 までは2つ目を雛形（`app.world_dict['quests']`）としていた。
+    雛形はセーブではなく世界のファイル（`world_data.json`）で、
+    掲示板で作った依頼はそこに現れないため、書けていたのは生きた一覧だけだった。
+    雛形へは書かない（同じ世界で始めた別のキャラクタにまで乗る）。
 
     この4つは `301_` / `305_` / `307_` に1字違わず写されていた。
     写して回るものはローダの語彙（TECH.md §3.2.3）。
@@ -750,9 +756,10 @@ def quest_stores(app):
     quests = frames.attr(frames.attr(app, "world", None), "quests", None)
     if isinstance(quests, dict):
         stores.append(quests)
-    world_dict = frames.attr(app, "world_dict", None)
-    if isinstance(world_dict, dict) and isinstance(world_dict.get("quests"), dict):
-        stores.append(world_dict["quests"])
+    save_data = frames.attr(app, "save_data_dict", None)
+    saved = save_data.get("quests") if isinstance(save_data, dict) else None
+    if isinstance(saved, dict) and saved is not quests:
+        stores.append(saved)
     return stores
 
 
@@ -772,6 +779,65 @@ def quest_of(app, quest_id):
         if quest_id in store:
             return store[quest_id]
     return None
+
+
+def remove_quest(app, quest_id, with_area=True):
+    """MOD が作らせた依頼を世界から片付ける。消した所の名前の並びを返す（何も無ければ空）。
+
+    消す先は5か所（GAME.md §2.9「掲示板で作った依頼と、それを消す」の実測）:
+
+        app.world.quests[id]                      遊んでいる間の一覧
+        app.save_data_dict['quests'][id]          残すと読み直しで依頼が戻る
+        依頼の街の Area.quests の並び            （素データの並びにもあれば消す）
+        ダンジョンの土地 app.world.areas[...]     with_area のとき。ほかの依頼が同じ土地を指していれば残す
+        app.save_data_dict['areas'][...]          同上
+
+    雛形（`world_dict`）には触らない（掲示板で作った依頼はそこに現れない）。
+    受けている最中の依頼は消さない（呼ぶ側が帰還を待つ）。保存は呼ぶ側の次の保存に任せる。
+    """
+    quest_id = str(quest_id)
+    if current_quest_id(app) == quest_id:
+        return []
+    quest = quest_of(app, quest_id)
+    if quest is None:
+        return []
+    town = str(quest_value(quest, "neighboring_settlement_id", "") or "")
+    dungeon = str(quest_value(quest, "quest_area_id", "") or "")
+    gone = []
+    live = frames.attr(frames.attr(app, "world", None), "quests", None)
+    if isinstance(live, dict) and live.pop(quest_id, None) is not None:
+        gone.append("world.quests")
+    save_data = frames.attr(app, "save_data_dict", None)
+    if not isinstance(save_data, dict):
+        save_data = {}
+    saved = save_data.get("quests")
+    if isinstance(saved, dict) and saved is not live and saved.pop(quest_id, None) is not None:
+        gone.append("save_data_dict.quests")
+    saved_areas = save_data.get("areas") if isinstance(save_data.get("areas"), dict) else {}
+    area = world_areas(app).get(town) if town else None
+    for where, row in (("Area.quests", frames.attr(area, "quests", None)),
+                       ("save_data_dict.areas.quests",
+                        (saved_areas.get(town) or {}).get("quests")
+                        if isinstance(saved_areas.get(town), dict) else None)):
+        if isinstance(row, list):
+            before = len(row)
+            row[:] = [value for value in row if str(value) != quest_id]
+            if len(row) != before:
+                gone.append(where)
+    if with_area and dungeon:
+        still_used = any(str(quest_value(other, "quest_area_id", "")) == dungeon
+                         for store in quest_stores(app) for other in store.values())
+        holder = frames.attr(frames.attr(app, "world", None), "areas", None)
+        size = (saved_areas.get(dungeon) or {}).get("size") \
+            if isinstance(saved_areas.get(dungeon), dict) else None
+        if size not in (None, "dungeon"):
+            still_used = True           # 街を指していた（依頼のダンジョンではない）。消さない
+        if not still_used:
+            if isinstance(holder, dict) and holder.pop(dungeon, None) is not None:
+                gone.append("world.areas")
+            if saved_areas.pop(dungeon, None) is not None:
+                gone.append("save_data_dict.areas")
+    return gone
 
 
 def world_overview(app, limit=None):
@@ -833,7 +899,7 @@ def quest_value(quest, name, default=None):
 
 
 def set_quest_value(app, quest_id, name, value, on_error=None):
-    """**両方の格納先に**書く。書けた数を返す。
+    """**両方の格納先に**書く。書けた数を返す（`len(quest_stores(app))` が満額）。
 
     片方だけに書くと、画面に出ているものとセーブされるものがずれる。
     書けなかったことは `on_error(メッセージ)` に渡す（無ければ黙る）。
@@ -1121,7 +1187,7 @@ def icon_strokes(icon, flipped=False):
     次に何が起きるかをそのまま形にする。
     **MOD 固有の絵柄はここに足さない** ― `113_` の「伸縮」、`116_` の「人」、
     `122_` の本や吹き出しは、その MOD だけの語彙なので MOD のフォルダに置く（TECH.md §3.2.3 の表でいう
-    MOD 側）。
+    MOD 側）。2つ以上の MOD が同じ意味で使う絵柄（「さいころ」＝名前の再生成）はここに置く。
     """
     flip = (lambda y: 1.0 - y) if flipped else (lambda y: y)
 
@@ -1136,6 +1202,14 @@ def icon_strokes(icon, flipped=False):
     if icon == "矢印":
         return [line((0.50, 0.18), (0.50, 0.82)),
                 line((0.28, 0.60), (0.50, 0.82), (0.72, 0.60))]
+    if icon == "さいころ":
+        # 名前の再生成（角を落としたサイコロの面と3つの目。目は長さの無い線で、丸い端が点になる）。
+        # `121_` の人物欄の二つ名と、`317_` の評判の画面の二つ名・呼び名で同じ形を使うのでここに置く。
+        return [line((0.28, 0.16), (0.72, 0.16), (0.84, 0.28), (0.84, 0.72), (0.72, 0.84),
+                     (0.28, 0.84), (0.16, 0.72), (0.16, 0.28), (0.28, 0.16)),
+                line((0.33, 0.67), (0.34, 0.67)),
+                line((0.50, 0.50), (0.51, 0.50)),
+                line((0.67, 0.33), (0.68, 0.33))]
     if icon == "枠":
         # 四隅のかぎ括弧。
         # 広げる前は外を向き、広がっているときは内を向く。
@@ -1441,7 +1515,7 @@ def lawfulness_of(entry):
     """
     if entry is None:
         return None
-    value = entry.get(LAWFULNESS_KEY) if isinstance(entry, dict)         else getattr(entry, LAWFULNESS_KEY, None)
+    value = entry.get(LAWFULNESS_KEY) if isinstance(entry, dict) else getattr(entry, LAWFULNESS_KEY, None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return int(value)
@@ -1906,7 +1980,7 @@ _AFTER_LOAD_ATTR = "_instantale_after_load"
 AFTER_LOAD_DEPRECATED = (
     "ui.refresh_choices_after_load is kept only for backward compatibility (called by {mod}). "
     "Register the choices with the loader window `choices` instead "
-    "(choices.provide(ctx, screen, refresh=..., presses=...); TECH.md §3.3.14). "
+    "(choices.provide(ctx, screen, offer=..., screens=...) with choices.Choice; TECH.md §3.3.14). "
     "The window refreshes once the characters have arrived after a load, "
     "and does not rely on the load_game_new wrap, which may miss a load that began before it was installed.")
 
@@ -2014,6 +2088,67 @@ def character_name(app, character_id, limit=40, fallback=None):
     if isinstance(name, str) and name.strip():
         return frames.short(name, limit)
     return str(character_id) if fallback is None else fallback
+
+
+#: 戦闘で逃げた者の預かり。逃げる手で `app.party` から外した者を、ゲームはここへ入れる（GAME.md §2.10）。
+ESCAPED_ATTR = "escaped_member_in_battle"
+
+
+def put_back_party(app, members):
+    """一覧（`app.party`）に居ない者を戻す。`(戻した id, 引けなかった id)` を返す。
+
+    `members` は `(id, 実体)` の並び。実体が None か id のままなら、主人公は `app.player`、
+    仲間は `character_of` で引く。
+    戻した者は預かり（`ESCAPED_ATTR`。実行中は `{id: Character}`）から外す。
+    主人公を戻したら一覧の先頭へ置く（セーブの並びを崩さない）。
+
+    逃げる手で敵も倒し切ると、ゲームは勝ちの終わり方へ進み、預かりを一覧へ戻さない（GAME.md §2.10）。
+    戦闘の終わりに預かりを使う MOD（`107_` / `147_` / `334_`）と窓口 `defeat` が、この1つで戻す。
+    """
+    party = getattr(app, "party", None) if app is not None else None
+    if not isinstance(party, dict):
+        return [], []
+    escaped = getattr(app, ESCAPED_ATTR, None)
+    back, missing = [], []
+    for member_id, value in members:
+        if member_id in party:
+            continue
+        if value is None or isinstance(value, (str, int)):
+            value = (getattr(app, "player", None) if member_id == PLAYER_ID
+                     else character_of(app, member_id))
+        if value is None:
+            missing.append(member_id)
+            continue
+        party[member_id] = value
+        if isinstance(escaped, dict):
+            escaped.pop(member_id, None)
+        back.append(member_id)
+    if PLAYER_ID in back and next(iter(party)) != PLAYER_ID:
+        ordered = [(PLAYER_ID, party[PLAYER_ID])] + [
+            (key, value) for key, value in party.items() if key != PLAYER_ID]
+        party.clear()
+        party.update(ordered)
+    return back, missing
+
+
+def return_escaped(app):
+    """預かりに残っている者を全部一覧へ戻し、預かりを空にする。`(戻した id, 引けなかった id)`。
+
+    預かりは実行中は `{id: Character}`、セーブから戻ったときは id の並びなので、どちらも受ける。
+    空にできなかったときは例外をそのまま投げる（戻した者は一覧に入ったまま。呼ぶ側が記録する）。
+    """
+    escaped = getattr(app, ESCAPED_ATTR, None) if app is not None else None
+    if not escaped or not isinstance(getattr(app, "party", None), dict):
+        return [], []
+    if isinstance(escaped, dict):
+        held = list(escaped.items())
+    elif isinstance(escaped, (list, tuple)):
+        held = [(member_id, None) for member_id in escaped]
+    else:
+        return [], []
+    result = put_back_party(app, held)
+    escaped.clear()
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -2676,8 +2811,20 @@ class Screen(object):
 
         既に手が空いているなら見張りは立てず、
         その場で予約する（無駄に 1ポーリング分待たないため）。
+
+        `settle` の間もプレイヤーは押せるので、`then` の直前にもう一度見る。
+        塞がっていれば見張りに戻り、`cancel_if` が理由を返せば取り消す。
+        見ずに走らせていた頃、`300_` が「売買する」で開いた売買の窓の上から会話を始め、
+        窓を閉じると窓を開く前の選択肢が戻って、会話が閉じられないまま立ち絵が付いてきた（実機）。
         """
         deadline = time.monotonic() + timeout
+
+        def settled():
+            if not self._others_busy(app) and not (cancel_if is not None and cancel_if()):
+                then()
+                return
+            if tick(0.0) is not False:
+                self._interval(tick, poll)
 
         def tick(_dt):
             try:
@@ -2688,7 +2835,7 @@ class Screen(object):
                         return False
                 busy = self._others_busy(app)
                 if not busy:
-                    self.schedule(then, settle)
+                    self.schedule(settled, settle)
                     return False
                 if time.monotonic() > deadline:
                     if proceed_on_timeout:

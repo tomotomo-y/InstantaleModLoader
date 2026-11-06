@@ -263,6 +263,10 @@ def setup(mode="conversation", override=1.0, reply="「いらっしゃい」", *
         setattr(mod, name, value)
     ctx = FakeCtx(os.path.join(HERE, os.pardir, os.pardir, "out", "test"))
     calls = install_fake_llm(reply)
+    # 施設の移動はローダの窓口 `arrivals` が1つの世代に1枚だけ包む。
+    # 偽の ctx を作り直すたびに忘れさせないと、2回目の ctx に包みが渡らない
+    from instantale_modloader import gates
+    gates.reset_all()
     mod.apply(ctx)
     hooks = {
         "move": ctx.hooks["__main__:MovePhaseManager.move_phase"],
@@ -353,6 +357,23 @@ app.in_conversation = True
 clock.run_onces()
 check("押さない", not app.process_choice_calls, app.process_choice_calls)
 app.in_conversation = False
+
+print("4b. 手が空いてから押すまでの間に売買の窓が開いたら取り消す")
+# 押すのは手が空いてから settle 後。その間に「売買する」が押されると、窓の上から会話が始まり、
+# 窓を閉じると窓を開く前の選択肢が戻って会話が閉じられないまま「出る」で立ち絵が付いてきた（実機）。
+clock = install_fake_kivy()
+mod, ctx, calls, hooks = setup()
+app.process_choice_calls = []
+do_move(hooks)
+check("押す処理が予約される", len(clock.onces) == 1, len(clock.onces))
+app.is_popup_window_opened = True
+clock.run_onces()
+check("窓の上からは押さない", not app.process_choice_calls, app.process_choice_calls)
+check("見張りにも戻らない", not clock.intervals and not clock.onces, (clock.intervals, clock.onces))
+app.is_popup_window_opened = False
+clock.tick()
+clock.run_onces()
+check("窓を閉じた後も押さない", not app.process_choice_calls, app.process_choice_calls)
 
 print("5. いつまでも手が空かなければ諦める")
 clock = install_fake_kivy()
@@ -668,6 +689,22 @@ hooks["starter"](lambda messages, *a, **k: seen.setdefault("messages", messages)
                  original, "life_log", "player")
 check("印は1回で使い切る（次の会話は素通し）",
       seen["messages"][-1]["content"] == "<行動: 話しかける>", seen["messages"])
+
+# ゲームがキーワード引数で呼んでも、受け取った形のまま messages だけを差し替える（版6）。
+clock = install_fake_kivy()
+mod, ctx, calls, hooks = setup()
+do_move(hooks)
+clock.tick()
+clock.run_onces()
+seen.clear()
+hooks["starter"](lambda *a, **k: seen.update(args=a, kwargs=k),
+                 messages=original, character_life_log="life_log", player="player")
+check("キーワード引数で呼ばれても最後のメッセージが差し替わる",
+      "あなたの方から声をかけた" in seen["kwargs"]["messages"][-1]["content"],
+      seen.get("kwargs"))
+check("  → 受け取った形のまま渡す（位置引数に直さない）",
+      seen["args"] == () and sorted(seen["kwargs"]) == ["character_life_log", "messages", "player"],
+      (seen.get("args"), sorted(seen.get("kwargs") or {})))
 
 # ============================================================== narration
 print()

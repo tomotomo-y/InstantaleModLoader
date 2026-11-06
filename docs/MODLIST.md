@@ -8,8 +8,8 @@
 手で書き換えても次の生成で消える。
 直す先は各 MOD の `mod.json` か MODS.md の見出し。
 
-同梱 136 本（基盤 2 / 修正 49 / 追加 44 / 計測 41）。
-うち 19 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
+同梱 156 本（基盤 2 / 修正 56 / 追加 52 / 計測 46）。
+うち 22 本は外部の MOD 作者からの提供（下の「提供を受けた MOD」）。
 ほかに 3 本は自作だが、外部からの提案を取り込んでいる（下の「提案を取り込んだ MOD」）。
 
 並びはフォルダ名順。
@@ -37,7 +37,7 @@
 
 ---
 
-## 修正（49本）
+## 修正（56本）
 
 ゲームのバグ・不便を直す。
 
@@ -48,7 +48,7 @@
 | [`102_fix_prompt_dedup`](MODS.md#102_fix_prompt_dedup-llm-へ送る文章の重複を畳む) | プロンプト重複の除去 | LLM へ送る文章の重複を畳む | - | 取込済 main_023 |
 | [`103_fix_eventlog_trim`](MODS.md#103_fix_eventlog_trim-llm-へ送るイベントログを刈り込む) | プロンプト内のイベントログの刈り込み | LLM へ送るイベントログを刈り込む | - | 取込済 main_024 |
 | [`104_balance_area_bgm`](MODS.md#104_balance_area_bgm-新しいエリアのbgmの偏りを均す) | エリアBGMの偏りの均し | 新しいエリアのBGMの偏りを均す | 1 |  |
-| [`105_fix_schema_compact`](MODS.md#105_fix_schema_compact-llm-へ送るスキーマ説明を圧縮する) | スキーマ説明の圧縮 | LLM へ送るスキーマ説明を圧縮する | - |  |
+| [`105_fix_schema_compact`](MODS.md#105_fix_schema_compact-llm-へ送るスキーマ説明を圧縮する) | スキーマ説明の圧縮 | LLM へ送るスキーマ説明を圧縮する | - | 取込済 127_llm_response_speed |
 | [`106_fix_battle_bgm_restore`](MODS.md#106_fix_battle_bgm_restore-戦闘後にbgmが戻らないのを直す) | 戦闘後の戦闘BGMの停止 | 戦闘後にBGMが戻らないのを直す | 1 | 取込済 main_024 |
 | [`107_fix_battle_flag_stuck`](MODS.md#107_fix_battle_flag_stuck-戦闘と売買の後に残る最中の印を下ろす) | 戦闘と売買の後始末漏れの修正 | 戦闘と売買の後に残る「最中」の印を下ろす | - |  |
 | [`108_fix_shop_inventory_overflow`](MODS.md#108_fix_shop_inventory_overflow-売買画面を開くと落ちるのを直す) | 売買画面クラッシュの修正 | 売買画面を開くと落ちるのを直す | - | 取込済 main_024 |
@@ -65,7 +65,7 @@
 | [`114_ui_input_focus`](MODS.md#114_ui_input_focus-自由入力のあと入力欄にフォーカスを戻す) | 入力欄のフォーカスを保つ | 自由入力のあと入力欄にフォーカスを戻す | 3 |  |
 | [`115_ui_item_list_fit`](MODS.md#115_ui_item_list_fit-はみ出すアイテム一覧を画面内に収める) | アイテム・スキル一覧を画面に収める | はみ出すアイテム一覧を画面内に収める | 3 |  |
 | [`116_ui_party_expand`](MODS.md#116_ui_party_expand-4人目以降の仲間も表示する) | パーティ欄の4人目以降を表示 | 4人目以降の仲間も表示する | 14 |  |
-| [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い応答が途中で切れるのを直す) | 長い本文をより多く見せる | 長い応答が途中で切れるのを直す | 1 |  |
+| [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い本文の表示を末尾に絞り本文が消えるのを防ぐ) | 長い本文の表示を末尾に絞り、本文が消えるのを防ぐ | 長い本文の表示を末尾に絞り、本文が消えるのを防ぐ | 1 |  |
 | [`118_batch_message_render`](MODS.md#118_batch_message_render-本文の出し方逐次一括と既読の色を選ぶ) | 本文の一括表示と既読の灰色化 | 本文の出し方（逐次／一括）と既読の色を選ぶ | 4 |  |
 | [`119_fix_crime_attribution`](MODS.md#119_fix_crime_attribution-他人の犯罪が主人公のものになるのを直す) | 他人の犯罪で手配される件の修正 | 他人の犯罪が主人公のものになるのを直す | - |  |
 | [`120_fix_npc_name_collision`](MODS.md#120_fix_npc_name_collision-npc-の名前が重複するのを直す) | NPC名の重複・類似の防止 | NPC の名前が重複するのを直す | 5 |  |
@@ -75,11 +75,11 @@
 | [`124_ui_craft_window_fit`](MODS.md#124_ui_craft_window_fit-クラフト画面の枠の重なりを直す) | クラフト画面の枠の重なりを直す | クラフト画面の枠の重なりを直す | 3 |  |
 | [`125_balance_charisma_impression`](MODS.md#125_balance_charisma_impression-魅力だけで全員に好かれるのを直す) | 魅力だけで全員に好かれるのを直す | 魅力だけで全員に好かれるのを直す | 3 |  |
 | [`126_ui_title_version`](MODS.md#126_ui_title_version-タイトル画面にローダの版を出す) | タイトル画面にローダの版を出す | タイトル画面にローダの版を出す | 4 |  |
-| [`127_llm_response_speed`](MODS.md#127_llm_response_speed-ローカル-llm-の応答を速くする) | ローカルLLMの応答を速くする | ローカル LLM の応答を速くする | 3 |  |
-| [`128_item_image_variety`](MODS.md#128_item_image_variety-アイテム画像の偏りを均す) | アイテム画像の均し | アイテム画像の偏りを均す | 3 |  |
+| [`127_llm_response_speed`](MODS.md#127_llm_response_speed-ローカル-llm-の応答を速くする) | ローカルLLMの応答を速くする | ローカル LLM の応答を速くする | 6 |  |
+| [`128_item_image_variety`](MODS.md#128_item_image_variety-アイテム画像を似た候補から散らして選び素材に無い武器防具服消耗品の絵を足す) | アイテム画像の拡充 | アイテム画像を似た候補から散らして選び、素材に無い武器・防具・服・消耗品の絵を足す | 65 |  |
 | [`129_balance_item_price`](MODS.md#129_balance_item_price-アイテムの値段を付け直す) | アイテムの値付けの調整 | アイテムの値段を付け直す | 19 |  |
 | [`130_currency_unit`](MODS.md#130_currency_unit-通貨の呼び名と所持金の表示を変える) | 通貨の表記を変更する | 通貨の呼び名と所持金の表示を変える | 4 |  |
-| [`131_sharp_portrait`](MODS.md#131_sharp_portrait-立ち絵の縮小減色を通さず顔の検出をやり直す) | 立ち絵の高画質化と顔認識精度の向上 | 立ち絵の縮小・減色を通さず、顔の検出をやり直す | 2 |  |
+| [`131_sharp_portrait`](MODS.md#131_sharp_portrait-立ち絵敵背景の縮小と減色を通さず背景抜きと顔の検出を確かにする) | 立ち絵・敵・背景の高画質化、背景抜きと顔認識の精度向上 | 立ち絵・敵・背景の縮小と減色を通さず、背景抜きと顔の検出を確かにする | 8 |  |
 | [`132_npc_variety`](MODS.md#132_npc_variety-npc-の外見性格経歴に種を渡す) | NPC の外見・性格・経歴の多様化 | NPC の外見・性格・経歴に種を渡す | 7 |  |
 | [`133_ui_area_difficulty`](MODS.md#133_ui_area_difficulty-移動先に適正レベル帯を出す) | 移動先の適正レベル帯の表示 | 移動先に適正レベル帯を出す | 9 |  |
 | [`134_balance_item_effects`](MODS.md#134_balance_item_effects-アイテムの効果を分類ごとに作り直す) | アイテム効果の調整 | アイテムの効果を分類ごとに作り直す | 18 |  |
@@ -91,11 +91,18 @@
 | [`140_fix_busy_dots_speed`](MODS.md#140_fix_busy_dots_speed-待機表示のを普段の速さで流す) | 待機表示の「…」を普段の速さで流す | 待機表示の「…」を普段の速さで流す | - |  |
 | [`141_ui_free_input_echo`](MODS.md#141_ui_free_input_echo-会話の外で送った文も本文に残す) | 会話の外で送った文も本文に残す | 会話の外で送った文も本文に残す | - |  |
 | [`142_balance_quest_stamina`](MODS.md#142_balance_quest_stamina-依頼のクリアで減るスタミナを難易度と被弾で変える) | 依頼のクリアで減るスタミナを難易度と被弾で変える | 依頼のクリアで減るスタミナを難易度と被弾で変える | 7 |  |
-| [`406_gemini_user_role_fix`](MODS.md#406_gemini_user_role_fix-クラウド-api-の-gemini-で-user-role-の無い依頼を補う) | Geminiの無応答の防止 | クラウド API の Gemini で user role の無い依頼を補う | - |  |
+| [`143_fix_random_character`](MODS.md#143_fix_random_character-ランダムで作るキャラを世界観に合わせ作りもばらつかせる) | ランダムで作るキャラを世界観に合わせ、作りもばらつかせる | ランダムで作るキャラを世界観に合わせ、作りもばらつかせる | 6 |  |
+| [`144_fix_hardcoded_worldview`](MODS.md#144_fix_hardcoded_worldview-プロンプトと絵の世界観の決め打ちを外す) | プロンプトと絵の世界観の決め打ちを外す | プロンプトと絵の世界観の決め打ちを外す | 6 |  |
+| [`145_fix_world_overview`](MODS.md#145_fix_world_overview-入力した世界の概要をそのまま使う) | 入力した世界の概要をそのまま使う | 入力した世界の概要をそのまま使う | 1 |  |
+| [`146_fix_save_only_entities`](MODS.md#146_fix_save_only_entities-セーブにしか無い施設人物で落ちるのを直す) | セーブにしか無い施設・人物で落ちるのを直す | セーブにしか無い施設・人物で落ちるのを直す | 1 |  |
+| [`147_fix_party_flee`](MODS.md#147_fix_party_flee-主人公が逃げると仲間も一緒に戦闘から逃げる) | 主人公が逃げると仲間も一緒に戦闘から逃げる | 主人公が逃げると仲間も一緒に戦闘から逃げる | - |  |
+| [`148_fix_enemy_panel_crash`](MODS.md#148_fix_enemy_panel_crash-戦闘中に持ち物を開いてもゲームが落ちない) | 戦闘中に持ち物を開いてもゲームが落ちない | 戦闘中に持ち物を開いてもゲームが落ちない | - |  |
+| [`406_user_role_fix`](MODS.md#406_user_role_fix-クラウド-api-の-geminiclaude-でuser-role-の無い依頼が返らない断られるのを防ぐ) | Gemini・Claudeの無応答の防止 | クラウド API の Gemini・Claude で、user role の無い依頼が返らない・断られるのを防ぐ | - |  |
+| [`409_fix_crafted_item_type`](MODS.md#409_fix_crafted_item_type-右クリックに消費が出ない飲食物薬を使えるようにする) | 右クリックに「消費」が出ない飲食物・薬を使えるようにする | 右クリックに「消費」が出ない飲食物・薬を使えるようにする | 1 |  |
 
 ---
 
-## 追加（44本）
+## 追加（52本）
 
 ゲームに無かった遊びを足す。
 
@@ -103,7 +110,7 @@
 |---|---|---|---|---|
 | [`1308_companion_travel`](MODS.md#1308_companion_travel-npcを連れて歩ける) | NPCを連れて歩く | NPCを連れて歩ける | 5 |  |
 | [`300_event_facility_arrival`](MODS.md#300_event_facility_arrival-施設でnpcから話しかけてくる) | 施設でNPCが話しかける | 施設でNPCから話しかけてくる | 13 |  |
-| [`301_quest_from_conversation`](MODS.md#301_quest_from_conversation-会話から依頼を受けられる) | 会話から依頼を受ける | 会話から依頼を受けられる | 9 |  |
+| [`301_quest_from_conversation`](MODS.md#301_quest_from_conversation-会話から依頼を受けられる) | 会話から依頼を受ける | 会話から依頼を受けられる | 12 |  |
 | [`302_leave_party_in_conversation`](MODS.md#302_leave_party_in_conversation-会話から仲間と別れられる) | 会話で仲間と別れる | 会話から仲間と別れられる | 1 |  |
 | [`303_quest_end_party_to_guild`](MODS.md#303_quest_end_party_to_guild-解散した仲間を町のギルドに残す) | 解散した仲間をいまの町に残す | 解散した仲間を町のギルドに残す | 2 |  |
 | [`304_quest_end_keep_party`](MODS.md#304_quest_end_keep_party-クエストをクリアしても解散しない) | クエスト後も解散しない | クエストをクリアしても解散しない | 2 |  |
@@ -117,7 +124,7 @@
 | [`314_area_move_custom`](MODS.md#314_area_move_custom-エリア移動の日数料金文言を変える) | 街移動のカスタマイズ | エリア移動の日数・料金・文言を変える | 16 |  |
 | [`315_vacation_custom`](MODS.md#315_vacation_custom-宿の宿泊期間部屋宿代を変える) | 宿泊のカスタマイズ | 宿の宿泊期間・部屋・宿代を変える | 14 |  |
 | [`316_bounty_hunter`](MODS.md#316_bounty_hunter-手配されていると追手が来る) | 賞金稼ぎが襲ってくる | 手配されていると追手が来る | 17 |  |
-| [`317_reputation`](MODS.md#317_reputation-評判と二つ名) | 評判と二つ名 | 評判と二つ名 | 8 |  |
+| [`317_reputation`](MODS.md#317_reputation-評判と二つ名) | 評判と二つ名 | 評判と二つ名 | 12 |  |
 | [`318_area_difficulty_growth`](MODS.md#318_area_difficulty_growth-土地が育つ依頼の難易度が上がる) | 依頼クリアで難易度上昇 | 土地が育つ（依頼の難易度が上がる） | 7 |  |
 | [`319_battle_tactics`](MODS.md#319_battle_tactics-戦闘を複数手の駆け引きにする) | 戦闘の数値とバフ・デバフの作り直し | 戦闘を複数手の駆け引きにする | 18 |  |
 | [`320_guild_adventurer_recruit`](MODS.md#320_guild_adventurer_recruit-ギルドの冒険者の補充) | ギルドの冒険者の補充 | ギルドの冒険者の補充 | 2 |  |
@@ -136,8 +143,14 @@
 | [`333_equipment_slots`](MODS.md#333_equipment_slots-インベントリに装備枠を追加) | インベントリに装備枠を追加 | インベントリに装備枠を追加 | 4 |  |
 | [`334_colosseum_custom`](MODS.md#334_colosseum_custom-闘技場の相手の強さと懸賞金を決める) | 闘技場のカスタマイズ | 闘技場の相手の強さと懸賞金を決める | 13 |  |
 | [`335_player_portrait_regenerate`](MODS.md#335_player_portrait_regenerate-人物欄から主人公の立ち絵を描き直せる) | 人物欄から主人公の立ち絵を描き直せる | 人物欄から主人公の立ち絵を描き直せる | - |  |
-| [`336_crime_overhaul`](MODS.md#336_crime_overhaul-犯罪まわりの全面改修) | 犯罪まわりの全面改修 | 犯罪まわりの全面改修 | 78 |  |
+| [`336_crime_overhaul`](MODS.md#336_crime_overhaul-犯罪まわりの全面改修) | 犯罪まわりの全面改修 | 犯罪まわりの全面改修 | 80 |  |
 | [`337_conversation_affinity`](MODS.md#337_conversation_affinity-会話による好感度の変動) | 会話による好感度の変動 | 会話による好感度の変動 | 4 |  |
+| [`338_town_incidents`](MODS.md#338_town_incidents-街に盗賊や疫病などの困り事や祝祭や豊作などの良い出来事が起き日を追って移り変わる) | 街の出来事 | 街に盗賊や疫病などの困り事や、祝祭や豊作などの良い出来事が起き、日を追って移り変わる | 18 |  |
+| [`339_town_factions`](MODS.md#339_town_factions-勢力ごとに主人公の見られ方が変わりその勢力の-npc-の態度に表れる) | 街の勢力 | 勢力ごとに主人公の見られ方が変わり、その勢力の NPC の態度に表れる | 22 |  |
+| [`340_shop_lineup`](MODS.md#340_shop_lineup-宿屋と鍛冶屋でも売買でき店の種類ごとに品揃えの傾向が付く) | 宿屋と鍛冶屋でも売買でき、店の種類ごとに品揃えの傾向が付く | 宿屋と鍛冶屋でも売買でき、店の種類ごとに品揃えの傾向が付く | 1 |  |
+| [`341_shopkeeper_attitude`](MODS.md#341_shopkeeper_attitude-店主の人柄と主人公との関係で売買の値段が変わる) | 店主の人柄と主人公との関係で売買の値段が変わる | 店主の人柄と主人公との関係で売買の値段が変わる | 6 |  |
+| [`342_attack_animations`](MODS.md#342_attack_animations-攻撃の演出が武器と属性に合ったものになる) | 攻撃の演出が武器と属性に合ったものになる | 攻撃の演出が武器と属性に合ったものになる | 1 |  |
+| [`343_stable_diffusion`](MODS.md#343_stable_diffusion-stable-diffusion-の解像度サンプラーモデルプロンプトを差し替える) | Stable Diffusionの各種差し替え | Stable Diffusion の解像度・サンプラー・モデル・プロンプトを差し替える | 51 |  |
 | [`401_battle_character_context`](MODS.md#401_battle_character_context-戦闘の審判へ同行者の人物と装備を見せる) | 戦闘の審判への仲間の情報補完 | 戦闘の審判へ同行者の人物と装備を見せる | - |  |
 | [`402_party_inventory_transfer`](MODS.md#402_party_inventory_transfer-仲間とアイテムを受け渡しできる) | 仲間とのアイテム受け渡し | 仲間とアイテムを受け渡しできる | - |  |
 | [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | NPC同士の認知と関係記憶 | NPC同士がお互いを認知し、関係を覚える | 5 |  |
@@ -145,10 +158,12 @@
 | [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給表示特産品) | 地域毎に物価が変動する | 街ごとの需給・表示・特産品 | 11 |  |
 | [`407_npc_starting_equipment`](MODS.md#407_npc_starting_equipment-パーティーに加わった-npc-に初期装備を一度だけ持たせる) | NPC初期装備 | パーティーに加わった NPC に初期装備を一度だけ持たせる | - |  |
 | [`408_visual_changes_based_on_equipment`](MODS.md#408_visual_changes_based_on_equipment-立ち絵を再生成すると装備の見た目が描き足される) | 装備品に応じた立ち絵の追加描写 | 立ち絵を再生成すると装備の見た目が描き足される | 1 |  |
+| [`410_weapon_skill_chance`](MODS.md#410_weapon_skill_chance-武器にたまにスキルが付く) | 武器にたまにスキルが付く | 武器にたまにスキルが付く | 13 |  |
+| [`411_equipment_bonuses`](MODS.md#411_equipment_bonuses-高品質の装備に能力値補正や武器防具の効果が付く) | 高品質の装備に能力値補正や武器・防具の効果が付く | 高品質の装備に能力値補正や武器・防具の効果が付く | 48 |  |
 
 ---
 
-## 計測（41本）
+## 計測（46本）
 
 ゲームは変えない。`out\` にログを残すだけ。デバッグモードのときだけ読み込まれる。
 
@@ -158,10 +173,10 @@
 | `201_probe_missing_attr` | `FreeInputStart` の欠落属性を読んでいる箇所を特定する |
 | `202_probe_summarizers` | サマライザ／ファシリテータの引数を測り、空 `Literal[]` の発生源を追う |
 | `203_probe_create_model` | pydantic モデル生成の瞬間に空 `Literal[]` を捕らえ、呼び出し元まで記録する |
-| `204_probe_prompt_bloat` | EVENTLOG / DEDUP / サイドカー起動という3つのプロンプト肥大化挙動を測る |
+| `204_probe_prompt_bloat` | EVENTLOG / DEDUP / サイドカー起動という3つのプロンプト肥大化挙動と、ローカル LLM の頼みごとの頼みと出力のトークン数・窓あふれを測る |
 | `205_probe_player_events` | プレイヤーの行動をトリガーにしたイベントの差し込み場所を特定する |
 | `206_probe_quest_flow` | クエストの受注経路と、選択肢ボタンの登録方法を特定する |
-| `207_probe_battle_bgm` | BGM を鳴らす・止める呼び出しと、鳴っているミキサーの本数を見張る（戦闘BGMの直しが退行していないかの見張り） |
+| `207_probe_battle_bgm` | BGM を鳴らす・止める呼び出しと、鳴っているミキサーの本数（うち曲の本数）を見張る（戦闘BGMの直しが退行していないかの見張り） |
 | `208_probe_item_detail` | アイテム説明欄の opacity の上げ下げを見張り、閉じた後も残る原因を測る（寸法は最初の数品だけ写す） |
 | `209_probe_free_facility` | シーン記述エンジンの中身（ステップ・フラグのスコープ・プログラムの出どころ）を写し取り、MOD から使えるかを測る |
 | `210_probe_character_state` | NPC の死亡の印を特定し、誰がその NPC を参照しているかを数えて、印だけで安全に退場させられるかを測る |
@@ -173,7 +188,7 @@
 | `216_probe_llm_overlap` | LLM リクエストの多重送信をプロセス内で数える（`127_` の `--parallel 1` によるキュー待ちが実プレイでどれだけ起こるか） |
 | `217_probe_area_move` | エリア移動の未実測部分を録る |
 | `218_probe_vacation` | 宿の宿泊の未実測部分を録る |
-| `219_probe_crash_log` | 本体のクラッシュ記録が落ちる呼び出しを見分ける |
+| `219_probe_crash_log` | 本体のクラッシュ記録が壊れる退行を見張る |
 | `220_probe_bounty_hunter` | 手配度に応じて追手を出す MOD（`316_`）を書くための下調べ |
 | `221_probe_item_level` | 品物のレベルを誰が決めているかを録る |
 | `222_probe_battle_mechanics` | 戦闘の数の作られ方を録る |
@@ -195,12 +210,17 @@
 | `238_probe_prison` | 逮捕・裁判・服役・釈放の流れを録る |
 | `239_probe_game_flags` | ゲームの「〜の最中」の旗 7 つ（`in_battle` / `in_boss_battle` / `in_colosseum_battle` / `in_conversation` / `in_free_input` / `in_action_in_conversation` / `in_shopping`）を録る |
 | `240_probe_stamina` | 主人公と同行者のスタミナ（`physical_integrity` / `max_physical_integrity`）と疲労の旗（`exhausted`）が変わるたびに、呼び出し元の連鎖と、依頼や戦闘の最中かを録る |
+| `241_probe_world_bulk` | 世界の一括生成（main_026 から、世界→一括生成）で、残りの仕事の種類ごとの件数、仕事1件の時間と、そのうち絵を描いた時間（GPU）・CPU・待ち（主に LLM）を録る |
+| `242_probe_world_reads` | 遊んでいる最中にゲームが世界の素データ（`app.world_dict` |
+| `243_probe_value_curves` | 難易度と品の価値から数を作るゲームの関数が、76 を超えたときにどう振る舞うかを録る |
+| `244_probe_ability_reads` | ゲームが能力値をどこで読み、そこから作る値（攻撃力・魔力・防御・最大 HP）をいつ組み直すかを録る |
+| `245_probe_shop_negotiation` | 店の売買の窓で値切ったとき、決まった額が品のどこに書かれ、いつまで残るかを録る |
 
 ---
 
 ## 提供を受けた MOD
 
-外部の MOD 作者から提供を受けて同梱している 19 本。
+外部の MOD 作者から提供を受けて同梱している 22 本。
 
 番号の帯では数えられない。
 いま提供を取り込む先は出どころの帯（`4xx`）だが、
@@ -218,7 +238,7 @@
 | [`1132_policy_guardrail_bypass`](MODS.md#1132_policy_guardrail_bypass-安全ポリシーのガードレールを外す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
 | [`1133_generation_limits`](MODS.md#1133_generation_limits-クエスト敵の水増しを抑え大規模生成の出力枠を広げる) | yoshinari/tomotomo-y 様 | そのまま取り込み |
 | [`1134_quest_split_generation`](MODS.md#1134_quest_split_generation-討伐クエスト3件を1件ずつ生成する) | yoshinari/tomotomo-y 様 | そのまま取り込み |
-| [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い応答が途中で切れるのを直す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
+| [`117_message_text_integrity`](MODS.md#117_message_text_integrity-長い本文の表示を末尾に絞り本文が消えるのを防ぐ) | yoshinari/tomotomo-y 様 | そのまま取り込み |
 | [`118_batch_message_render`](MODS.md#118_batch_message_render-本文の出し方逐次一括と既読の色を選ぶ) | yoshinari/tomotomo-y 様 | 提供者と共同 |
 | [`119_fix_crime_attribution`](MODS.md#119_fix_crime_attribution-他人の犯罪が主人公のものになるのを直す) | yoshinari/tomotomo-y 様 | そのまま取り込み |
 | [`1308_companion_travel`](MODS.md#1308_companion_travel-npcを連れて歩ける) | yoshinari/tomotomo-y 様 | そのまま取り込み |
@@ -229,9 +249,12 @@
 | [`403_npc_social_memory`](MODS.md#403_npc_social_memory-npc同士がお互いを認知し関係を覚える) | MoririnJP 様 | そのまま取り込み |
 | [`404_party_talk`](MODS.md#404_party_talk-パーティーメンバー全員と話す) | MoririnJP 様 | 提供者と共同 |
 | [`405_regional_economy`](MODS.md#405_regional_economy-街ごとの需給表示特産品) | MoririnJP 様 | 提供者と共同 |
-| [`406_gemini_user_role_fix`](MODS.md#406_gemini_user_role_fix-クラウド-api-の-gemini-で-user-role-の無い依頼を補う) | MoririnJP 様 | そのまま取り込み |
+| [`406_user_role_fix`](MODS.md#406_user_role_fix-クラウド-api-の-geminiclaude-でuser-role-の無い依頼が返らない断られるのを防ぐ) | MoririnJP 様 | 提供者と共同 |
 | [`407_npc_starting_equipment`](MODS.md#407_npc_starting_equipment-パーティーに加わった-npc-に初期装備を一度だけ持たせる) | MoririnJP 様 | そのまま取り込み |
 | [`408_visual_changes_based_on_equipment`](MODS.md#408_visual_changes_based_on_equipment-立ち絵を再生成すると装備の見た目が描き足される) | MoririnJP 様 | そのまま取り込み |
+| [`409_fix_crafted_item_type`](MODS.md#409_fix_crafted_item_type-右クリックに消費が出ない飲食物薬を使えるようにする) | わさの 様 | 提供者と共同 |
+| [`410_weapon_skill_chance`](MODS.md#410_weapon_skill_chance-武器にたまにスキルが付く) | わさの 様 | 提供者と共同 |
+| [`411_equipment_bonuses`](MODS.md#411_equipment_bonuses-高品質の装備に能力値補正や武器防具の効果が付く) | わさの 様 | 提供者と共同 |
 
 ---
 

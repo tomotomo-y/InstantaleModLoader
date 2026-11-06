@@ -177,10 +177,15 @@ class VacationStartManager:
             # ― ここが既に差し引き後の正しい値であること）。
             self.app.gold_after_payment = self.app.player.gold
         self.app.stays.append((self.months, self.quality, choice_text))
-        self.app.add_text("{}ヵ月泊まることにした。".format(self.months))
+        if getattr(self.app, "keyword_text", False):
+            # キーワード引数で出すビルド（315 版9 は受け取った形のまま文言を差し替える）。
+            self.app.add_text(context="{}ヵ月泊まることにした。".format(self.months))
+        else:
+            self.app.add_text("{}ヵ月泊まることにした。".format(self.months))
         self.app.change_background_image_to_inn_room(self.quality)
         if type(self).elapses:
             self.app.elapse_days(int(str(self.months)) * 30)
+        self.write_keeper_memory()
         self.app.add_text("何をして過ごす？")
         self.app.buttons = [
             {"text": "休養をとる",
@@ -193,6 +198,22 @@ class VacationStartManager:
         ]
         self.app.refresh_choice_buttons(reset_page=True)
         return None
+
+    def write_keeper_memory(self):
+        """宿の主の記録（実物の形）。終わりは今日、始まりは月数×30日前で、日数の切り詰めを知らない。"""
+        location = getattr(self.app.player, "location", None)
+        if location is None:
+            return
+        keeper = self.app.world.characters[location.owner]
+        names = {"kennel": "犬小屋", "bunk": "簡易寝台", "private_room": "個室", "luxury_suite": "高級個室"}
+        span = int(str(self.months)) * 30
+        end = self.app.world.days_elapsed
+        keeper.life_log.append({
+            "day_start": end - span,
+            "day_end": end,
+            "summarized_count": 0,
+            "content": "〈生活の記憶〉{}を{}に{}ヵ月間宿泊させた。\n".format(
+                "エリス", names[str(self.quality)], self.months)})
 
 
 class VacationRestManager:
@@ -212,6 +233,13 @@ class VacationRestManager:
         self.app.send_prompt(REST_PROMPT)
         for prompt in type(self).extra_prompts:
             self.app.send_prompt(prompt)
+        logs = getattr(self.app.player, "life_log", None)
+        if logs is not None:
+            # 実物の形。終わりは今日、始まりは月数×30日前で、日数の切り詰めを知らない。
+            today = self.app.world.days_elapsed
+            logs.append({"day_start": today - int(str(self.months)) * 30, "day_end": today,
+                         "summarized_count": 0,
+                         "content": "〈生活の記憶〉エリスはしばらく休暇をとり、回復につとめた。\n"})
         self.app.add_text("静かな時を過ごした。")
         return None
 
@@ -275,6 +303,9 @@ class InstantaleApp:
     def elapse_days(self, days):
         self.elapsed.append(days)
         self.day += days
+        world = getattr(self, "world", None)
+        if isinstance(getattr(world, "days_elapsed", None), int):
+            world.days_elapsed += days
         return None
 
     def change_background_image_to_inn_room(self, quality):
@@ -498,7 +529,8 @@ def setup(configure=None, age=25):
     main.current_app = app
     app.open_inn_menu()
     CLOCK.settle()
-    globals()["REST_CLS"] = rest_cls
+    global REST_CLS
+    REST_CLS = rest_cls
     return module, ctx, app, choice_cls, start_cls
 
 
@@ -664,6 +696,9 @@ check("文言も 6ヵ月", "6ヵ月泊まることにした。" in app.texts, ap
 check("日数送りも 6ヵ月ぶん（180日）", app.elapsed == [180], app.elapsed)
 check("宿代はゲームのまま 100", app.player.gold == 4900, app.player.gold)
 check("エラーなし", not ctx.errors, ctx.errors)
+keyword_choice = choice_cls(app=app, period_months=GAME_MONTHS)
+check("キーワード引数で作られても月数を 6 に差し替える",
+      keyword_choice.period_months == 6, keyword_choice.period_months)
 
 print("[期間] 1ヵ月・40代（+2ヵ月）＝ゲームの3ヵ月と同じになり、何も動かない")
 
@@ -716,6 +751,13 @@ check("文言は実際の期間（1週間泊まることにした。）",
 check("ゲームの 1ヵ月 の文言は出ない",
       not any("1ヵ月泊まる" in t for t in app.texts), app.texts)
 check("日数送りが 7日 に切り詰まる", app.elapsed == [7], app.elapsed)
+module_kw, ctx_kw, app_kw, _choice_kw, _start_kw = setup(configure=week1)
+app_kw.keyword_text = True
+press(app_kw, "宿泊する(1週間)")
+press(app_kw, "個室(100G)")
+check("キーワード引数の文言も実際の期間に直す",
+      "1週間泊まることにした。" in app_kw.texts
+      and not any("1ヵ月泊まる" in t for t in app_kw.texts), app_kw.texts)
 check("暦も7日だけ進む", app.day == 7, app.day)
 check("宿代は1回ぶん（100G）", app.player.gold == 4900, app.player.gold)
 press(app, "宿泊を終える")
@@ -856,6 +898,232 @@ check("人生ログの「数ヵ月」には当たらない（錨が無い）",
 check("エラーなし", not ctx.errors, ctx.errors)
 REST_CLS.extra_prompts = ()
 
+# ================================================================ 宿の主
+#: ゲームの指示文（exe の定数。GAME.md §2.17）。
+INN_INSTRUCTION = ("  - 宿泊をしたいと伝えられた場合: casual_responseとして返答を記述。"
+                   "3ヵ月単位の宿泊が可能であり、前払いで簡易寝台10G、個室100G、高級個室1000Gが必要な事を説明する。"
+                   "本当にやるならこの会話からではなく手続きをとる必要があること、"
+                   "犬小屋なら宿泊無料であることも状況に応じて伝えていいが、伝えなくてもいい。"
+                   "絶対に値引きや期間の変更はしないし聞かれるまで言及もしない。")
+TALK = "scripts.llm.llm_manager:conversation_facilitator"
+TALK_AFTER = "scripts.llm.llm_manager:conversation_facilitator_after_retrieval"
+
+
+def keeper_talk(ctx, instruction, target=TALK, keyword=False):
+    """宿の主との会話の LLM を呼び、届いた指示文を返す。"""
+    seen = []
+
+    def orig(*args, **kwargs):
+        seen.append(kwargs["response_prompt_instruction"] if "response_prompt_instruction" in kwargs
+                    else args[10 if target == TALK else 9])
+        return "answer"
+
+    if keyword:
+        result = ctx.hooks[target](orig, "messages", response_prompt_instruction=instruction)
+    else:
+        args = ["a{}".format(i) for i in range(10 if target == TALK else 9)] + [instruction, "last"]
+        result = ctx.hooks[target](orig, *args)
+    check("元の関数の答えを返す", result == "answer", result)
+    return seen[0]
+
+
+def rooms_renamed(module):
+    module.STAY_LENGTH = "1週間"
+    module.AGE_SCALING = False
+    module.SIMPLE_NAME = "相部屋"
+    module.SIMPLE_PRICE = 20
+    module.KENNEL_NAME = "馬房の隅"
+    module.KENNEL_PRICE = 5
+
+
+print("[宿の主] 素の設定なら指示文は変わらない")
+module, ctx, app, choice_cls, start_cls = setup()
+check("素の設定の期間は年齢の月数のまま", keeper_talk(ctx, INN_INSTRUCTION) == INN_INSTRUCTION,
+      keeper_talk(ctx, INN_INSTRUCTION))
+check("書き換えの行が出ない", "keeper:" not in read_log(), read_log())
+
+print("[宿の主] 1週間の設定で「1週間単位」と言う（報告の不具合）")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+got = keeper_talk(ctx, INN_INSTRUCTION)
+check("1週間単位", "1週間単位の宿泊が可能" in got, got)
+check("3ヵ月は残らない", "3ヵ月" not in got, got)
+check("値段は素のまま", "前払いで簡易寝台10G、個室100G、高級個室1000Gが必要な事" in got, got)
+check("前後の文はそのまま", got.endswith("絶対に値引きや期間の変更はしないし聞かれるまで言及もしない。")
+      and got.startswith("  - 宿泊をしたいと伝えられた場合"), got)
+got = keeper_talk(ctx, INN_INSTRUCTION, target=TALK_AFTER)
+check("_after_retrieval も同じ（位置が違う）", "1週間単位の宿泊が可能" in got, got)
+got = keeper_talk(ctx, INN_INSTRUCTION, keyword=True)
+check("キーワード引数で来ても差し替える", "1週間単位の宿泊が可能" in got, got)
+other = "  - 雑談や質問の場合: casual_responseとして返答を記述。"
+check("宿の主の文でなければ触らない", keeper_talk(ctx, other) == other)
+check("エラーなし", not ctx.errors, ctx.errors)
+
+print("[宿の主] 年齢の加算まで揃う（30代の1週間は2週間）")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1, age=31)
+got = keeper_talk(ctx, INN_INSTRUCTION)
+check("2週間単位", "2週間単位の宿泊が可能" in got, got)
+
+print("[宿の主] 月単位でもボタンと同じ期間を言う")
+module, ctx, app, choice_cls, start_cls = setup(configure=month6)
+got = keeper_talk(ctx, INN_INSTRUCTION)
+check("6ヵ月単位", "6ヵ月単位の宿泊が可能" in got, got)
+
+print("[宿の主] 部屋の名前と宿代を変えると指示文も揃う")
+module, ctx, app, choice_cls, start_cls = setup(configure=rooms_renamed)
+got = keeper_talk(ctx, INN_INSTRUCTION)
+check("相部屋20G", "前払いで相部屋20G、個室100G、高級個室1000Gが必要な事" in got, got)
+check("有料の犬小屋は無料と言わない", "馬房の隅なら5Gで泊まれることも" in got and "宿泊無料" not in got, got)
+
+print("[宿の主] 通貨の表記が先に直っていても当たる（130 は tr の段で直す）")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+yen = INN_INSTRUCTION.replace("10G", "10円").replace("100G", "100円").replace("1000G", "1000円")
+got = keeper_talk(ctx, yen)
+check("1週間単位", "1週間単位の宿泊が可能" in got, got)
+
+print("[宿の主] 文が変わったビルドでは触らず、ログに残す")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+module_state = getattr(sys, module.STATE_STORE_ATTR)
+module_state.pop("terms_missed", None)
+changed = "  - 宿泊をしたいと伝えられた場合: 3ヵ月ごとの料金を説明する。"
+check("そのまま渡す", keeper_talk(ctx, changed) == changed)
+check("当たらなかったことが残る", "WARN keeper: the inn terms did not match" in read_log(), read_log())
+
+print("[宿の主] 設定を切れば指示文に触らない")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1_no_llm)
+check("フックを置かない", TALK not in ctx.hooks and TALK_AFTER not in ctx.hooks)
+
+
+def inn_with_keeper(app):
+    """主のいる宿に立たせる。戻り値は主。"""
+    keeper = type("Keeper", (), {})()
+    keeper.life_log = []
+    world = type("World", (), {})()
+    world.characters = {"9": keeper}
+    world.days_elapsed = 100
+    app.world = world
+    location = type("Facility", (), {})()
+    location.owner = "9"
+    app.player.location = location
+    return keeper
+
+
+print("[記録] 1週間の宿泊は「1週間」「7日」と残る（報告の不具合の2つ目）")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+keeper = inn_with_keeper(app)
+old = {"day_start": 10, "day_end": 40, "summarized_count": 0,
+       "content": "〈生活の記憶〉エリスを個室に1ヵ月間宿泊させた。\n"}
+keeper.life_log.append(dict(old))
+press(app, "宿泊する(1週間)")
+press(app, "個室(100G)")
+entry = keeper.life_log[-1]
+check("期間が1週間", entry["content"] == "〈生活の記憶〉エリスを個室に1週間宿泊させた。\n", entry)
+check("範囲が7日", (entry["day_start"], entry["day_end"]) == (100, 107), entry)
+check("前からある記録には触らない", keeper.life_log[0] == old, keeper.life_log[0])
+press(app, "まだ宿泊する")
+entry = keeper.life_log[-1]
+check("連泊の2回目も直る", "1週間宿泊させた" in entry["content"]
+      and entry["day_end"] - entry["day_start"] == 7, entry)
+check("エラーなし", not ctx.errors, ctx.errors)
+
+print("[記録] 範囲が今日で終わらない記録は、範囲を触らずログに残す")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+keeper = inn_with_keeper(app)
+real_write = start_cls.write_keeper_memory
+
+
+def shifted(self):
+    real_write(self)
+    self.app.world.characters["9"].life_log[-1]["day_end"] += 1
+
+
+start_cls.write_keeper_memory = shifted
+press(app, "宿泊する(1週間)")
+press(app, "個室(100G)")
+entry = keeper.life_log[-1]
+check("範囲はゲームのまま", (entry["day_start"], entry["day_end"]) == (77, 108), entry)
+check("文は直る", "1週間宿泊させた" in entry["content"], entry)
+check("ログに残る", "WARN memory: the range" in read_log(), read_log())
+
+print("[記録] 月単位は部屋の名前だけ直し、範囲はゲームのまま")
+module, ctx, app, choice_cls, start_cls = setup(
+    configure=lambda m: (month6(m), setattr(m, "SIMPLE_NAME", "相部屋")))
+keeper = inn_with_keeper(app)
+press(app, "宿泊する(6ヵ月)")
+press(app, "相部屋(10G)")
+entry = keeper.life_log[-1]
+check("相部屋に6ヵ月間", entry["content"] == "〈生活の記憶〉エリスを相部屋に6ヵ月間宿泊させた。\n", entry)
+check("範囲は180日", entry["day_end"] - entry["day_start"] == 180, entry)
+
+print("[記録] 素の設定なら何も変わらない")
+module, ctx, app, choice_cls, start_cls = setup()
+keeper = inn_with_keeper(app)
+press(app, STAY_TEXT)
+press(app, "個室(100G)")
+entry = keeper.life_log[-1]
+check("文はゲームのまま", entry["content"] == "〈生活の記憶〉エリスを個室に3ヵ月間宿泊させた。\n", entry)
+check("範囲もゲームのまま", entry["day_end"] - entry["day_start"] == 90, entry)
+
+print("[記録] 週単位なら主人公の活動の記録の範囲も実際の日数になる")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+keeper = inn_with_keeper(app)
+oneday = {"day_start": 90, "day_end": 90, "summarized_count": 0, "content": "〈生活の記憶〉前からある記録。\n"}
+old_long = {"day_start": 10, "day_end": 40, "summarized_count": 0, "content": "〈生活の記憶〉前からある長い記録。\n"}
+app.player.life_log = [dict(oneday), dict(old_long)]
+press(app, "宿泊する(1週間)")
+press(app, "個室(100G)")
+press(app, "休養をとる")
+entry = app.player.life_log[-1]
+check("範囲が7日", (entry["day_start"], entry["day_end"]) == (100, 107), entry)
+check("文はゲームのまま", entry["content"] == "〈生活の記憶〉エリスはしばらく休暇をとり、回復につとめた。\n", entry)
+check("前からある記録には触らない", app.player.life_log[:2] == [oneday, old_long], app.player.life_log[:2])
+check("ログに残る", "memory: player" in read_log(), read_log())
+check("エラーなし", not ctx.errors, ctx.errors)
+
+print("[記録] 宿泊の間に増えた短い記録は伸ばさない")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+keeper = inn_with_keeper(app)
+app.player.life_log = []
+real_exec = REST_CLS.execute
+
+
+def rest_with_short(self, *args, **kwargs):
+    self.app.player.life_log.append({"day_start": 107, "day_end": 107, "summarized_count": 0,
+                                     "content": "〈生活の記憶〉1日の出来事。\n"})
+    return real_exec(self, *args, **kwargs)
+
+
+REST_CLS.execute = rest_with_short
+press(app, "宿泊する(1週間)")
+press(app, "個室(100G)")
+press(app, "休養をとる")
+short = app.player.life_log[0]
+check("1日の記録はそのまま", (short["day_start"], short["day_end"]) == (107, 107), short)
+long_entry = app.player.life_log[-1]
+check("長い記録だけ縮む", (long_entry["day_start"], long_entry["day_end"]) == (100, 107), long_entry)
+
+print("[記録] 月単位なら主人公の記録の範囲はゲームのまま")
+module, ctx, app, choice_cls, start_cls = setup(configure=month6)
+keeper = inn_with_keeper(app)
+app.player.life_log = []
+press(app, "宿泊する(6ヵ月)")
+press(app, "個室(100G)")
+press(app, "休養をとる")
+entry = app.player.life_log[-1]
+check("範囲は180日", entry["day_end"] - entry["day_start"] == 180, entry)
+
+print("[記録] 主のいない建物では何もしない")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1)
+press(app, "宿泊する(1週間)")
+press(app, "個室(100G)")
+check("エラーなし", not ctx.errors, ctx.errors)
+
+print("[記録] 設定を切れば直さない")
+module, ctx, app, choice_cls, start_cls = setup(configure=week1_no_llm)
+keeper = inn_with_keeper(app)
+press(app, "宿泊する(1週間)")
+press(app, "個室(100G)")
+check("ゲームの文のまま", "1ヵ月間宿泊させた" in keeper.life_log[-1]["content"], keeper.life_log[-1])
+
 # ================================================================ 語彙
 print("[語彙] quality も料金も当たらないビルド（設定は変えてあるのに、何もしない）")
 
@@ -891,6 +1159,19 @@ check("画面に出ていた 20G ではなく設定の 5G が引かれる",
 choice_cls.rooms = ROOMS
 GAME_PRICES["bunk"] = 10
 
+print("[語彙] 料金だけ変わったビルドで設定が既定のままなら、ゲームの額のまま")
+module, ctx, app, choice_cls, start_cls = setup()
+choice_cls.rooms = (ROOMS[0], ("簡易寝台(20G)", "bunk", 20)) + ROOMS[2:]
+GAME_PRICES["bunk"] = 20
+press(app, STAY_TEXT)
+check("ラベルはゲームの 20G のまま（既定の 10G へ書き換えない）",
+      texts_of(app)[1] == "簡易寝台(20G)", texts_of(app))
+press(app, "簡易寝台(20G)")
+check("ゲームの 20G が引かれる（前払いで差を埋めない）",
+      app.player.gold == 4980, app.player.gold)
+choice_cls.rooms = ROOMS
+GAME_PRICES["bunk"] = 10
+
 print("[語彙] 手持ちが「設定額以上・素の宿代未満」でも当たった部屋は泊まれる")
 module, ctx, app, choice_cls, start_cls = setup(configure=simple5)
 app.player.gold = 8
@@ -900,6 +1181,102 @@ check("簡易寝台が 5G 表示になる", texts_of(app)[1] == "簡易寝台(5G
 press(app, "簡易寝台(5G)")
 check("素の10Gに満たなくても泊まれて、5だけ引かれる", app.player.gold == 3,
       (app.player.gold, app.texts))
+
+# ================================================================ 宿代の段（ローダ）
+print("[段] 宿代の段（prices.adjust_inn）が設定額の上に掛かる")
+prices = ml.prices
+module, ctx, app, choice_cls, start_cls = setup(configure=luxury300)
+prices.adjust_inn("test_layer", lambda _app, quality, price: price * 1.5
+                  if quality in ("luxury_suite", "private_room") else None)
+press(app, STAY_TEXT)
+check("設定額 300 の 1.5 倍で表示", texts_of(app)[3] == "王侯の間(450G)", texts_of(app))
+check("素の部屋にも段が掛かる（個室 100 → 150）", texts_of(app)[2] == "個室(150G)",
+      texts_of(app))
+check("段の掛からない部屋はゲームのまま", texts_of(app)[1] == "簡易寝台(10G)", texts_of(app))
+check("窓口の答えも段を通した額", prices.inn_room(app, "luxury_suite") == 450
+      and prices.inn_room_base(app, "luxury_suite") == 300,
+      (prices.inn_room(app, "luxury_suite"), prices.inn_room_base(app, "luxury_suite")))
+press(app, "個室(150G)")
+check("1回でちょうど段を通した額（150）が引かれる", app.player.gold == 4850, app.player.gold)
+check("支払いの瞬間から差し引き後の値", app.gold_after_payment == 4850, app.gold_after_payment)
+prices.forget_inn_prices("test_layer")
+check("段を外すと答えは設定額へ戻る", prices.inn_room(app, "luxury_suite") == 300,
+      prices.inn_room(app, "luxury_suite"))
+
+print("[段] 段で上がった額に手持ちが足りなければ断る")
+module, ctx, app, choice_cls, start_cls = setup()
+prices.adjust_inn("test_layer", lambda _app, quality, price: price * 3)
+app.player.gold = 250
+press(app, STAY_TEXT)
+check("素の個室が 300 で表示", texts_of(app)[2] == "個室(300G)", texts_of(app))
+press(app, "個室(300G)")
+check("宿泊を起こさない", not app.stays, app.stays)
+check("断りの一言が出る", any("足りない" in t for t in app.texts), app.texts)
+check("所持金はそのまま", app.player.gold == 250, app.player.gold)
+prices.forget_inn_prices("test_layer")
+
+print("[段] ロードで戻った段つきの文言を、起動し直した後に素の額と取り違えない")
+# 部屋選びの画面で保存したセーブには段を掛けた文言（個室(125G)）が残る。
+# 起動し直して段が外れた（設定を変えた・MOD を切った）状態で読むと、ゲームの書式のままなので
+# 素の額 125 と控え、ゲームが引く 100 との差 25 を前払いで足していた（実機で 75 しか減らなかった）。
+module, ctx, app, choice_cls, start_cls = setup()
+prices.adjust_inn("test_layer", lambda _app, quality, price: price * 1.25
+                  if quality == "private_room" else None)
+press(app, STAY_TEXT)
+check("段の掛かった文言で保存される", texts_of(app)[2] == "個室(125G)", texts_of(app))
+saved = [dict(entry) for entry in app.buttons]
+prices.forget_inn_prices("test_layer")
+inn_store = prices._inn_store()
+inn_store["observed"].clear()            # 起動し直した（控えはプロセスの中だけ）
+inn_store["ours"].clear()
+loaded_world = type("World", (), {})()   # 世界の読み込み（choices が見分ける）
+loaded_world.characters = {}             # 実機と同じく、読み込みの途中の組み直しでは人物が 0 人
+app.world = loaded_world
+app.buttons = saved
+app.refresh_choice_buttons(reset_page=True)
+CLOCK.settle()
+loaded_world.characters = {"1": object()}   # 人物が揃った後の組み直し（実機ではここで書き直して控えていた）
+app.refresh_choice_buttons(reset_page=True)
+CLOCK.settle()
+check("段つきの額を素の額として控えない", "private_room" not in inn_store["observed"],
+      dict(inn_store["observed"]))
+check("文言は素の額へ戻る", texts_of(app)[2] == "個室(100G)", texts_of(app))
+gold = app.player.gold
+press(app, "個室(100G)")
+check("素の額 100 がちょうど引かれる", app.player.gold == gold - 100, (gold, app.player.gold))
+check("人物が揃った後の組み直しで印は下りる", ml.choices.from_save() is False
+      and not ml.choices._store().get("save_pending"), ml.choices._store().get("save_pending"))
+
+for after, label in ((200, "設定を別の額に変えた"), (100, "設定を素の額へ戻した")):
+    print("[部屋] 部屋選びの画面で保存し、{}後に起動し直して読んでも、保存時の額を素の額と取り違えない".format(label))
+    # 315 だけの経路。部屋の名前は変えず宿代だけ 150 にしていると、保存した文言（個室(150G)）は
+    # ゲームの書式のままで、起動し直した後の設定（200 や素の 100）で 315 が書く文言とも違う。
+    # v1.15.0 の 315 はこれを素の額 150 と控え、ゲームが引く 100 との差を前払いで足していた。
+    module, ctx, app, choice_cls, start_cls = setup(configure=lambda m: setattr(m, "PRIVATE_PRICE", 150))
+    press(app, STAY_TEXT)
+    check("315 の額の文言で保存される", texts_of(app)[2] == "個室(150G)", texts_of(app))
+    saved = [dict(entry) for entry in app.buttons]
+    inn_store = prices._inn_store()
+    inn_store["observed"].clear()            # 起動し直した（控えはプロセスの中だけ）
+    inn_store["ours"].clear()
+    module.PRIVATE_PRICE = after             # 起動し直す間に設定を変えた
+    loaded_world = type("World", (), {})()
+    loaded_world.characters = {}
+    app.world = loaded_world
+    app.buttons = saved
+    app.refresh_choice_buttons(reset_page=True)
+    CLOCK.settle()
+    loaded_world.characters = {"1": object()}
+    app.refresh_choice_buttons(reset_page=True)
+    CLOCK.settle()
+    check("保存時の額を素の額として控えない", inn_store["observed"].get("private_room") in (None, 100),
+          dict(inn_store["observed"]))
+    shown = "個室({}G)".format(after)
+    check("文言は今の設定の額", texts_of(app)[2] == shown, texts_of(app))
+    gold = app.player.gold
+    press(app, shown)
+    check("今の設定の額 {} がちょうど引かれる".format(after), app.player.gold == gold - after,
+          (gold, app.player.gold))
 
 # ================================================================ まとめ
 print()

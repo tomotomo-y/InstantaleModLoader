@@ -1,9 +1,10 @@
 #!/bin/sh
 # ゲームを閉じて起動し直し、世界を読み込んで遊べる画面まで進める。決め打ちの待ちはせず、段ごとに状態を見る。
-# 使い方: sh tools/drive/relaunch.sh [restore]
+# 使い方: sh tools/drive/relaunch.sh [restore|title]
 #   要るもの: IML_GAME_DIR・IML_DRIVE_WORLD（restore なら IML_DRIVE_BACKUP も）
 #   restore を付けると、起動の前にセーブ・世界の骨格・state\ を控え（backup.sh が作ったもの）へ戻す。
 #   控えの後にできた立ち絵のフォルダと state\ のファイルは消さず、out/backup/test_leftovers/ へ移す。
+#   title を付けると、題の画面が出たところで止め、世界は選ばない（キャラのまだ居ない世界へ自分で進むとき）。
 . "$(dirname "$0")/common.sh"
 need IML_GAME_DIR IML_DRIVE_WORLD || exit 1
 GAME=$(cygpath -u "$IML_GAME_DIR" 2>/dev/null || echo "$IML_GAME_DIR")
@@ -34,8 +35,15 @@ if [ "$1" = "restore" ]; then
       mkdir -p "$LEFT/characters"; mv "$d" "$LEFT/characters/$(basename "$d")_$(date +%H%M%S)" && echo "moved portrait $(basename "$d")"; done
   fi
   cd "$ROOT" || exit 1
-  for f in $(cd "$B" && find state -type f); do cmp -s "$B/$f" "$f" || { mkdir -p "$(dirname "$f")"; cp -p "$B/$f" "$f"; echo "restored $f"; }; done
-  find state -path state/models -prune -o -name "${IML_DRIVE_WORLD}*" -type f -newer "$B/save/savedata.json" -print | while read -r f; do
+  # 戻すのは試した世界の控え（`<世界>.json`・`<世界>.jsonl`・`<世界>.cast.json` などと、周回の `<世界>×<主人公>.json`）だけ。
+  # 全部を戻すと、控えの後に別のセッションが遊んだ別の世界の控えまで控えの時点へ巻き戻す（2026-10-11 に踏みかけた）。
+  # 名前の前方一致にしないのも同じ理由（「テスト」で「テストワールド」の控えまで戻る）。
+  # 世界をまたいで1つのファイル（`state\city_case.json` など）は戻さない。別の世界の遊びも入っている。
+  # 名前に空白を含む控え（世界×主人公）があるので、find の出力は1行ずつ読む（for で回すと空白で切れる）。
+  (cd "$B" && find state -type f \( -name "${IML_DRIVE_WORLD}.*" -o -name "${IML_DRIVE_WORLD}×*" \)) | while read -r f; do
+    cmp -s "$B/$f" "$f" && continue
+    mkdir -p "$(dirname "$f")" && cp -p "$B/$f" "$f" && echo "restored $f"; done
+  find state \( -path state/models -o -path state/stable_diffusion/models \) -prune -o -type f \( -name "${IML_DRIVE_WORLD}.*" -o -name "${IML_DRIVE_WORLD}×*" \) -newer "$B/save/savedata.json" -print | while read -r f; do
     [ -f "$B/$f" ] && continue
     mkdir -p "$LEFT/$(dirname "$f")"; mv "$f" "$LEFT/${f}_$(date +%H%M%S)" && echo "moved new state $f"; done
 fi
@@ -53,9 +61,13 @@ done
 stamp "injected"
 
 wait_stage title 90 >/dev/null || exit 1
+[ "$1" = "title" ] && { stamp "title"; exit 0; }
+wait_boot_settled 60 || stamp "boot not settled; going on"
 drive clicktext.py --wait 30 --args "$(jarg texts '["開始する"]')" >/dev/null
 stamp "title -> 開始する"
 wait_stage worlds 60 >/dev/null || exit 1
+# 「開始する」でもモジュールが読まれ、当て直しがもう1回起きることがある
+wait_boot_settled 60 || stamp "boot not settled; going on"
 drive clicktext.py --wait 20 --args "$(jarg texts "[\"$IML_DRIVE_WORLD\"]" contains true)" >/dev/null
 stamp "world picked"
 s=$(wait_stage playing 120) || { echo "$s"; exit 1; }

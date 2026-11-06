@@ -97,12 +97,15 @@
 ##### 記録
 
 `out/bounty_hunter_send.log`。来た回も、来なかった回とその理由も1行ずつ。
+
+版6: `BattleStartManager.__init__` のフックは、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
 """
 
 import random
 import sys
 
-from instantale_modloader import choices, confinement, guards, ui, wanted
+from instantale_modloader import arrivals, choices, confinement, durations, frames, guards, ui, wanted
 from instantale_modloader.state import WorldStore, world_key
 
 from . import hunt
@@ -584,8 +587,7 @@ def apply(ctx):
         return result
 
     @ctx.wrap("__main__:BattleStartManager.__init__", required=False, safe=True)
-    def battle_start_init(orig, self, app=None, enemy_type=None, enemy_content=None,
-                          *args, **kwargs):
+    def battle_start_init(orig, self, *args, **kwargs):
         """**ゲーム自身が衛兵を出したこと**を知る唯一の入口。
 
         自分が組んだぶんは `memo["building"]` で見分ける
@@ -594,7 +596,10 @@ def apply(ctx):
         同じマネージャを通るので、見ないとクエストの戦闘1回でクールダウンがやり直しになる
         （クエスト中は暦が進まないので、そのまま日数ぶん追手が来なくなる）。
         """
-        result = orig(self, app, enemy_type, enemy_content, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
+        # (app, enemy_type, enemy_content)。受け取った形のまま渡し、ここでは読むだけ。
+        app = frames.arg(args, kwargs, "app", 0)
+        enemy_type = frames.arg(args, kwargs, "enemy_type", 1)
         if not memo["building"]:
             # 別の戦闘が始まった。前の追手の戦闘が終わりを通らずに消えていても（負けた・ロードした）、
             # 次の戦闘の終わりを追手の戦闘と取り違えない。
@@ -667,7 +672,7 @@ def apply(ctx):
     def quest_reward(difficulty):
         """その難易度の依頼1件の報酬（ゲームのヘルパ）。引けなければ None。"""
         reward = getattr(sys.modules.get(FUNCTIONS_MODULE), "get_quest_reward", None)
-        if not callable(reward) or isinstance(difficulty, bool)                 or not isinstance(difficulty, (int, float)):
+        if not callable(reward) or isinstance(difficulty, bool) or not isinstance(difficulty, (int, float)):
             return None
         value = reward(max(1, int(round(difficulty))))
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -745,52 +750,39 @@ def apply(ctx):
         schedule(lambda: launch_when_painted(app, frames_left - 1))
 
     # ------------------------------------------------------------ 出す場面（4つ）
-    @ctx.wrap("__main__:AreaMoveManager.execute", required=False, safe=True)
-    def area_arrival(orig, self, choice_text=None, *args, **kwargs):
-        result = orig(self, choice_text, *args, **kwargs)
+    # 着いた後・日数が進んだ後はローダの窓口（`arrivals` / `durations.on_days`。TECH.md §3.3.21）
+    def area_arrival(call):
         try:
-            visit("到着(土地)", getattr(self, "app", None) or ui.find_app(),
-                  ON_AREA_ARRIVAL)
+            visit("到着(土地)", call.app, ON_AREA_ARRIVAL)
         except Exception:
             ctx.log_exc("bounty hunter: 土地への到着で失敗")
-        return result
 
-    @ctx.wrap("__main__:MovePhaseManager.move_phase", required=False, safe=True)
-    def facility_arrival(orig, self, *args, **kwargs):
-        result = orig(self, *args, **kwargs)
+    def facility_arrival(call):
         try:
-            visit("到着(施設)", getattr(self, "app", None) or ui.find_app(),
-                  ON_FACILITY_ARRIVAL)
+            visit("到着(施設)", call.app, ON_FACILITY_ARRIVAL)
         except Exception:
             ctx.log_exc("bounty hunter: 施設への到着で失敗")
-        return result
 
-    @ctx.wrap("__main__:InstantaleApp.elapse_days", required=False, safe=True)
-    def elapse_days(orig, self, days=None, *args, **kwargs):
+    arrivals.on(OWNER, ctx, (arrivals.AREA,), after=area_arrival, write=write)
+    arrivals.on(OWNER, ctx, (arrivals.FACILITY,), after=facility_arrival, write=write)
+
+    def after_days(call):
         """暦を数えるのはここだけ。`ON_DAYS` が OFF でも数は数える。
 
-        数えるのは**暦が実際に動いた日数**（`orig` の前後の `ui.game_day` の差）。
-        この包みは日数送りの関所（`durations.install`）より外側に載るので、
-        `days` は関所が差し替える前の素の値（徒歩 90 など）で、
-        307_ / 314_ / 315_ が日数を変えた回は暦の進みと食い違う（TECH.md §3.3.3）。
-        暦が読めないときだけ `days` を足す。
+        数えるのは**暦が実際に動いた日数**（関所が測る前後の `ui.game_day` の差。`call.moved`）。
+        暦が読めないときは関所が渡した日数（`call.granted`）になる。
         """
-        before = ui.game_day(self)
-        result = orig(self, days, *args, **kwargs)
         try:
-            load_memo(self)
-            after = ui.game_day(self)
-            if before is not None and after is not None:
-                moved = after - before
-            else:
-                moved = days if _is_number(days) else 0
-            if moved > 0:
-                memo["days"] += float(moved)
-                save_memo(self)
-            visit("日数経過", self, ON_DAYS)
+            app = call.app
+            load_memo(app)
+            if call.moved > 0:
+                memo["days"] += float(call.moved)
+                save_memo(app)
+            visit("日数経過", app, ON_DAYS)
         except Exception:
             ctx.log_exc("bounty hunter: 日数の経過で失敗")
-        return result
+
+    durations.on_days(OWNER, ctx, after=after_days, write=write)
 
     @ctx.wrap("scripts.llm.llm_manager:master_ai_facilitator", required=False,
               safe=True)

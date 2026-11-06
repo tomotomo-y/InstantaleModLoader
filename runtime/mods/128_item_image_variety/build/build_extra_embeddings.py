@@ -9,7 +9,6 @@
   自分が
   top1 に来る率（キャプション同士が似すぎていないか＝新規画像が実際に選ばれ得るかの目安）
 """
-import glob
 import io
 import json
 import os
@@ -17,10 +16,13 @@ import sys
 
 import numpy as np
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 SP = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SP)
-from minibert import MiniLM
+from minibert import MiniLM  # noqa: E402
+from build_guns import split_pattern, write_lines  # noqa: E402  外見文と同じく武器の合成語を2語に分けて埋め込む
+
+if (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":   # build_guns が包み直していれば重ねない
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 MOD_DATA = os.path.join(os.path.dirname(SP), "data")
 EMB_DIR = r"C:\Program Files\Epic Games\Instantaleq6Ve7\Data\item_embeddings"
@@ -32,8 +34,9 @@ CAPTION_FILES = {
     "accessory": ["captions_accessory.json"],
 }
 
-missing = json.load(open(os.path.join(SP, "missing_images.json"), encoding="utf-8"))
+missing =json.load(open(os.path.join(SP, "missing_images.json"), encoding="utf-8"))
 model = MiniLM()
+split = split_pattern()
 os.makedirs(MOD_DATA, exist_ok=True)
 
 for folder, files in CAPTION_FILES.items():
@@ -46,10 +49,10 @@ for folder, files in CAPTION_FILES.items():
 
     out = {}
     for stem, cap in captions.items():
-        v = model.embed(cap)
+        v = model.embed(split.sub(r"\1 \2", cap))
         out[stem] = [float(x) for x in v]
     path = os.path.join(MOD_DATA, folder + ".json")
-    json.dump(out, open(path, "w", encoding="utf-8"))
+    write_lines(path, out)
 
     # 自己検索: 合成辞書（素+追加）の中で、自分のキャプションが自分を引くか
     base = json.load(open(os.path.join(EMB_DIR, folder + ".json"), encoding="utf-8"))

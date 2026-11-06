@@ -1,0 +1,264 @@
+med_m1_r0_00	medium_weapon	A steel longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_01	medium_weapon	A blackened iron longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_02	medium_weapon	A blackened iron longsword with a cross guard.
+med_m1_r0_03	medium_weapon	A blackened iron longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_04	medium_weapon	A blackened iron longsword with a cross guard and blue details.
+med_m1_r0_05	medium_weapon	A steel longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_06	medium_weapon	A blackened iron longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_07	medium_weapon	A blackened iron longsword with a cross guard and blue details.
+med_m1_r0_08	medium_weapon	A steel longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_09	medium_weapon	A blued steel longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_10	medium_weapon	A steel longsword with a cross guard.
+med_m1_r0_11	medium_weapon	A blackened iron longsword with a cross guard and a leather-wrapped grip.
+med_m1_r0_12	medium_weapon	A blackened iron longsword with a cross guard and red details.
+med_m1_r0_13	medium_weapon	A polished steel longsword with a cross guard and a leather-wrapped grip.
+med_m1_r1_00	medium_weapon	A polished steel curved sabre with a knuckle guard.
+med_m1_r1_01	medium_weapon	A blackened iron curved sabre with a knuckle guard.
+med_m1_r1_02	medium_weapon	A blackened iron curved sabre with a knuckle guard and a leather-wrapped grip.
+med_m1_r1_03	medium_weapon	A blackened iron curved sabre with a knuckle guard, a leather-wrapped grip and red details.
+med_m1_r1_04	medium_weapon	A steel curved sabre with a knuckle guard and a leather-wrapped grip.
+med_m1_r1_05	medium_weapon	A blackened iron curved sabre with a knuckle guard and a leather-wrapped grip.
+med_m1_r1_06	medium_weapon	A steel curved sabre with a knuckle guard and a leather-wrapped grip.
+med_m1_r1_07	medium_weapon	A bronze curved sabre with a knuckle guard and a leather-wrapped grip.
+med_m1_r1_08	medium_weapon	A blackened iron curved sabre with a knuckle guard and red details.
+med_m1_r1_09	medium_weapon	A steel curved sabre with a knuckle guard and a leather-wrapped grip.
+med_m1_r1_10	medium_weapon	A blackened iron slender rapier with a swept hilt.
+med_m1_r1_11	medium_weapon	A blackened iron slender rapier with a swept hilt.
+med_m1_r1_12	medium_weapon	A blackened iron slender rapier with a swept hilt and a leather-wrapped grip.
+med_m1_r1_13	medium_weapon	A red-lacquered slender rapier with a swept hilt.
+med_m1_r2_00	medium_weapon	A steel one-handed battle axe with a wooden haft.
+med_m1_r2_01	medium_weapon	A blackened iron one-handed battle axe with a wooden haft.
+med_m1_r2_02	medium_weapon	A blackened iron one-handed battle axe with a wooden haft.
+med_m1_r2_03	medium_weapon	A blackened iron one-handed battle axe with a wooden haft and red details.
+med_m1_r2_04	medium_weapon	A blackened iron one-handed battle axe with a wooden haft.
+med_m1_r2_05	medium_weapon	A blackened iron one-handed battle axe with a wooden haft and red details.
+med_m1_r2_06	medium_weapon	A blackened iron spiked mace with a wooden haft.
+med_m1_r2_07	medium_weapon	A blackened iron spiked mace.
+med_m1_r2_08	medium_weapon	A bronze spiked mace with a wooden haft.
+med_m1_r2_09	medium_weapon	A steel war hammer with a wooden haft.
+med_m1_r2_10	medium_weapon	A blackened iron spiked mace with a wooden haft.
+med_m1_r2_11	medium_weapon	A blackened iron war hammer with a wooden haft and blue details.
+med_m4_r0_00	medium_weapon	A blackened iron flail with a spiked iron ball on a chain, a wooden haft and red details.
+med_m4_r0_01	medium_weapon	A blackened iron flail with a spiked iron ball on a chain.
+med_m4_r0_02	medium_weapon	A blackened iron flail with a spiked iron ball on a chain and a wooden haft.
+med_m4_r0_03	medium_weapon	A blackened iron flail with a spiked iron ball on a chain.
+med_m4_r0_04	medium_weapon	A red-lacquered flail with a spiked iron ball on a chain.
+med_m4_r0_05	medium_weapon	A blackened iron flail with a spiked iron ball on a chain and a wooden haft.
+med_m4_r0_06	medium_weapon	A polished steel flail with a spiked iron ball on a chain, a wooden haft and blue details.
+med_m4_r0_07	medium_weapon	A blackened iron flail with a spiked iron ball on a chain.
+med_m4_r0_08	medium_weapon	A polished steel flail with a spiked iron ball on a chain and a wooden haft.
+med_m4_r0_09	medium_weapon	A red-lacquered flail with a spiked iron ball on a chain.
+med_m4_r1_00	medium_weapon	A spiked wooden club.
+med_m4_r1_01	medium_weapon	A spiked wooden club.
+med_m4_r1_02	medium_weapon	A spiked wooden club.
+med_m4_r1_03	medium_weapon	A spiked wooden club with red details.
+med_m4_r1_04	medium_weapon	A spiked wooden club.
+med_m4_r1_05	medium_weapon	A spiked wooden club.
+med_m4_r1_06	medium_weapon	A spiked wooden club with red details.
+med_m4_r1_07	medium_weapon	A spiked wooden club.
+med_m4_r1_08	medium_weapon	A spiked wooden club with red details.
+med_m4_r1_09	medium_weapon	A spiked wooden club.
+med_m4_r2_00	long_weapon	A gnarled wooden staff.
+med_m4_r2_01	long_weapon	A wooden wizard's staff with an ornate head and blue details.
+med_m4_r2_02	long_weapon	A wooden wizard's staff with an ornate head and blue details.
+med_m4_r2_03	long_weapon	A wooden wizard's staff with an ornate head.
+med_m4_r2_04	long_weapon	A wooden wizard's staff with an ornate head and blue details.
+med_m4_r2_05	long_weapon	A wooden wizard's staff with an ornate head and purple details.
+med_m4_r2_06	long_weapon	A wooden plain quarterstaff.
+med_m4_r2_07	long_weapon	A wooden plain quarterstaff.
+med_m4_r2_08	long_weapon	A wooden plain quarterstaff.
+med_m4_r2_09	long_weapon	A wooden wizard's staff with an ornate head and blue details.
+med_m7_r0_00	shield	A round wooden shield with an iron boss.
+med_m7_r0_01	shield	A round wooden shield with an iron boss.
+med_m7_r0_02	shield	A round wooden shield with an iron boss and red details.
+med_m7_r0_03	shield	A black round wooden shield with an iron boss.
+med_m7_r0_04	shield	A round wooden shield with an iron boss.
+med_m7_r0_05	shield	A round wooden shield with an iron boss.
+med_m7_r0_06	shield	A blue round wooden shield with an iron boss.
+med_m7_r0_07	shield	A black round wooden shield with an iron boss.
+med_m7_r1_00	shield	A blackened iron kite shield with a leather-wrapped grip.
+med_m7_r1_01	shield	A steel kite shield with red details.
+med_m7_r1_02	shield	A blackened iron kite shield.
+med_m7_r1_03	shield	A red-lacquered kite shield with a leather-wrapped grip.
+med_m7_r1_04	shield	A blackened iron tower shield with a leather-wrapped grip.
+med_m7_r1_05	shield	A blued steel tower shield.
+med_m7_r1_06	shield	A blackened iron tower shield with a leather-wrapped grip and red details.
+med_m7_r1_07	shield	A blackened iron tower shield.
+med_m7_r2_00	clothing	A brown rough cloth tunic.
+med_m7_r2_01	body_armor	A white quilted gambeson with leather straps.
+med_m7_r2_02	body_armor	A brown quilted gambeson.
+med_m7_r2_03	body_armor	A brown leather jerkin.
+med_m7_r2_04	body_armor	A blackened iron chainmail hauberk.
+med_m7_r2_05	clothing	A brown ragged cloth tunic.
+med_m7_r2_06	body_armor	A red quilted gambeson with leather straps.
+med_m7_r2_07	body_armor	A black chainmail with a plate breastplate.
+med_m7_r3_00	body_armor	A blackened iron scale armor with leather straps.
+med_m7_r3_01	body_armor	A blackened iron studded brigandine with leather straps and red details.
+med_m7_r3_02	body_armor	A blackened iron plate cuirass with leather straps.
+med_m7_r3_03	body_armor	A blackened iron plate cuirass with leather straps.
+med_m7_r3_04	body_armor	A blackened iron plate cuirass.
+med_m7_r3_05	body_armor	A blackened iron plate cuirass with leather straps.
+med_m7_r3_06	body_armor	A blackened iron plate cuirass with leather straps.
+med_m7_r3_07	body_armor	A blackened iron plate cuirass with leather straps.
+med_m5_r0_00	small_weapon	A blackened iron dagger with a leather-wrapped grip.
+med_m5_r0_01	small_weapon	A steel dagger with a leather-wrapped grip.
+med_m5_r0_02	small_weapon	A blackened iron dagger with a leather-wrapped grip.
+med_m5_r0_03	small_weapon	A blackened iron dagger.
+med_m5_r0_04	small_weapon	A blackened iron dagger with red details.
+med_m5_r0_05	small_weapon	A blackened iron dagger.
+med_m5_r0_06	small_weapon	A polished steel dagger with a leather-wrapped grip.
+med_m5_r0_07	small_weapon	A blackened iron dagger with red details.
+med_m5_r0_08	small_weapon	A blued steel dagger.
+med_m5_r0_09	small_weapon	A blackened iron dagger.
+med_m5_r0_10	small_weapon	A polished steel dagger with a leather-wrapped grip and red details.
+med_m5_r0_11	small_weapon	A polished steel slender stiletto with a leather-wrapped grip.
+med_m5_r1_00	small_weapon	A steel knife with a leather-wrapped grip.
+med_m5_r1_01	small_weapon	A steel knife with a leather-wrapped grip.
+med_m5_r1_02	small_weapon	A blackened iron knife with a leather-wrapped grip.
+med_m5_r1_03	small_weapon	A steel knife with a leather-wrapped grip.
+med_m5_r1_04	small_weapon	A steel meat cleaver with a leather-wrapped grip and red details.
+med_m5_r1_05	small_weapon	A steel meat cleaver with a leather-wrapped grip and red details.
+med_m5_r1_06	small_weapon	A bronze curved machete with a leather-wrapped grip.
+med_m5_r1_07	small_weapon	A steel curved machete with red details.
+med_m5_r1_08	small_weapon	A steel meat cleaver.
+med_m5_r1_09	small_weapon	A steel sickle with a leather-wrapped grip.
+med_m5_r1_10	small_weapon	A steel sickle with a leather-wrapped grip.
+med_m5_r1_11	small_weapon	A steel sickle with a leather-wrapped grip and red details.
+med_m5_r2_00	throwable_weapon	A black pair of throwing knives.
+med_m5_r2_01	throwable_weapon	A black set of throwing knives with red details.
+med_m5_r2_02	throwable_weapon	A black set of throwing knives.
+med_m5_r2_03	throwable_weapon	A blackened iron throwing axe with a wooden haft.
+med_m5_r2_04	throwable_weapon	A steel throwing axe with a wooden haft and red details.
+med_m5_r2_05	throwable_weapon	A blackened iron throwing axe with a wooden haft.
+med_m5_r2_06	throwable_weapon	A black set of throwing darts.
+med_m5_r2_07	throwable_weapon	A red set of throwing darts with blue details.
+med_m5_r2_08	throwable_weapon	A blue set of throwing darts with red details.
+med_m5_r2_09	throwable_weapon	A black set of throwing darts.
+med_m5_r3_00	throwable_weapon	A black bola sling with stone weights and red details.
+med_m5_r3_01	throwable_weapon	A brown bola sling with stone weights.
+med_m5_r3_02	throwable_weapon	A brown bola sling with stone weights.
+med_m5_r3_03	throwable_weapon	A black pile of iron balls.
+med_m5_r3_04	throwable_weapon	A brown pile of iron balls.
+med_m5_r3_05	throwable_weapon	A black pile of iron balls.
+med_m5_r3_06	throwable_weapon	A brown clay powder pot bomb with a fuse.
+med_m5_r3_07	throwable_weapon	A brown clay powder pot bomb with a fuse.
+med_m5_r3_08	throwable_weapon	A brown clay powder pot bomb with a fuse.
+med_m5_r3_09	throwable_weapon	A black clay powder pot bomb with a fuse.
+med_m5_r3_10	throwable_weapon	A brown cloth smoke bomb pouch.
+med_m5_r3_11	throwable_weapon	A black cloth smoke bomb pouch.
+med_m5_r3_12	throwable_weapon	A brown cloth smoke bomb pouch.
+med_m5_r3_13	throwable_weapon	A black cloth smoke bomb pouch.
+med_mtw1_00	large_weapon	A steel broad-bladed two-handed claymore.
+med_mtw1_01	large_weapon	A blackened iron greatsword with a leather-wrapped ricasso and a leather-wrapped grip.
+med_mtw1_02	large_weapon	A blackened iron wavy-bladed flamberge greatsword.
+med_mtw1_03	large_weapon	A steel round-tipped executioner's sword.
+med_mtw1_04	large_weapon	A steel claymore with a rusted chipped blade and a leather-wrapped grip.
+med_mtw1_05	large_weapon	A polished steel greatsword with a swept crossguard and a leather-wrapped grip.
+med_mtw1_06	large_weapon	A blackened iron greatsword with a deep fuller.
+med_mtw1_07	large_weapon	A steel greatsword with a large ball pommel and a leather-wrapped grip.
+med_mtw1_08	large_weapon	A steel long thin estoc sword.
+med_mtw1_09	large_weapon	A steel ceremonial greatsword with gold inlay and a leather-wrapped grip.
+med_mtw2_00	large_weapon	A steel double-bladed great axe with a wooden haft.
+med_mtw2_01	large_weapon	A steel bearded great axe with a wooden haft.
+med_mtw2_02	large_weapon	A blackened iron long-hafted woodcutter's axe with a wooden haft.
+med_mtw2_03	large_weapon	A steel crescent-bladed great axe with a wooden haft.
+med_mtw2_04	large_weapon	A blackened iron studded battle axe with a wooden haft.
+med_mtw2_05	large_weapon	A steel great axe with a rusted blade and a wooden haft.
+med_mtw2_06	large_weapon	A steel great axe with a hooked back spike and a wooden haft.
+med_mtw2_07	large_weapon	A steel great axe with holes in the blade and a wooden haft.
+med_mtw2_08	large_weapon	A steel northern great axe with a leather-wrapped grip and a wooden haft.
+med_mtw2_09	large_weapon	A blackened iron one-piece wrought axe with a wooden haft.
+med_mtw3_00	large_weapon	A blackened iron square-headed two-handed maul with a wooden haft.
+med_mtw3_01	large_weapon	A blackened iron war hammer with a spiked back and a wooden haft.
+med_mtw3_02	large_weapon	A blackened iron spiked ball mace with a wooden haft.
+med_mtw3_03	large_weapon	A blackened iron heavy flanged mace with a wooden haft.
+med_mtw3_04	large_weapon	A studded wooden club.
+med_mtw3_05	large_weapon	A wooden log club with iron bands.
+med_mtw3_06	large_weapon	A polished steel ornate ceremonial war hammer with a wooden haft and red details.
+med_mtw3_07	large_weapon	A steel maul with a rusted head and a wooden haft.
+med_mtw3_08	large_weapon	A wooden boulder-headed club.
+med_mtw3_09	large_weapon	A wooden thick club bound with iron bands.
+med_mpl1_00	long_weapon	A blackened iron leaf-bladed spear with a wooden haft.
+med_mpl1_01	long_weapon	A blackened iron long thin spear with a wooden haft.
+med_mpl1_02	long_weapon	A blackened iron broad-bladed spear with a wooden haft.
+med_mpl1_03	long_weapon	A steel winged spear with a wooden haft.
+med_mpl1_04	long_weapon	A blackened iron barbed hunting spear with a wooden haft.
+med_mpl1_05	long_weapon	A steel tasseled spear with a wooden haft and red details.
+med_mpl1_06	long_weapon	A blackened iron old spear with a rusted head and a wooden haft.
+med_mpl1_07	long_weapon	A blackened iron banded spear with a wooden haft.
+med_mpl1_08	long_weapon	A brown cavalry lance.
+med_mpl1_09	long_weapon	A steel short triangular-headed spear with a wooden haft.
+med_mpl2_00	long_weapon	A steel halberd with an axe blade and hook and a wooden haft.
+med_mpl2_01	long_weapon	A blackened iron crescent-bladed halberd with a wooden haft.
+med_mpl2_02	long_weapon	A grey broad-bladed glaive.
+med_mpl2_03	large_weapon	A steel scythe-bladed polearm with a wooden haft.
+med_mpl2_04	long_weapon	A brown cross-bladed polearm.
+med_mpl2_05	long_weapon	A grey hooked bill polearm.
+med_mpl2_06	long_weapon	A blackened iron hammer-headed polearm with a wooden haft.
+med_mpl2_07	long_weapon	A brown three-pronged fork polearm.
+med_mpl2_08	long_weapon	A grey wavy-bladed polearm.
+med_mpl2_09	long_weapon	A blackened iron double-axe halberd with a wooden haft.
+med_mbw1_00	long_weapon	A plain wooden longbow.
+med_mbw1_01	long_weapon	A wooden leather-gripped longbow.
+med_mbw1_02	long_weapon	A black wooden longbow.
+med_mbw1_03	long_weapon	A white wooden longbow.
+med_mbw1_04	long_weapon	A wooden horn-tipped composite bow.
+med_mbw1_05	long_weapon	A wooden recurve bow.
+med_mbw1_06	long_weapon	A wooden old bow with a broken string.
+med_mbw1_07	long_weapon	A wooden iron-fitted bow.
+med_mbw1_08	long_weapon	A wooden carved ceremonial bow.
+med_mbw1_09	long_weapon	A wooden short hunting bow.
+med_mbw2_00	medium_weapon	A plain wooden crossbow.
+med_mbw2_01	medium_weapon	A wooden iron-armed crossbow.
+med_mbw2_02	medium_weapon	A wooden heavy crossbow with a winch.
+med_mbw2_03	medium_weapon	A wooden small one-handed crossbow.
+med_mbw2_04	medium_weapon	A wooden dark-stained crossbow.
+med_mbw2_05	medium_weapon	A wooden brass-trimmed crossbow.
+med_mbw2_06	medium_weapon	A wooden double-bolt crossbow.
+med_mbw2_07	medium_weapon	A wooden wide siege crossbow.
+med_mbw2_08	medium_weapon	A wooden leather-wrapped crossbow.
+med_mbw2_09	medium_weapon	A wooden old crossbow with a rusted bow.
+med_mbw3_00	accessory	A brown leather quiver.
+med_mbw3_01	accessory	A black leather quiver.
+med_mbw3_02	accessory	A studded leather quiver.
+med_mbw3_03	accessory	A leather fur-trimmed quiver.
+med_mbw3_04	accessory	A leather wooden slat quiver.
+med_mbw3_05	accessory	A leather quiver wrapped in red cloth.
+med_mbw3_06	accessory	A leather quiver with metal fittings.
+med_mbw3_07	accessory	A leather hip quiver on a belt.
+med_msw1_00	medium_weapon	A steel plain one-handed sword with a leather-wrapped grip.
+med_msw1_01	medium_weapon	A polished steel gold-guarded knight's broadsword with a leather-wrapped grip.
+med_msw1_02	medium_weapon	A steel broad single-edged falchion sword with a leather-wrapped grip.
+med_msw1_03	medium_weapon	A steel deeply curved scimitar sword with a leather-wrapped grip and red details.
+med_msw1_04	medium_weapon	A polished steel shell-guarded pirate cutlass sword with a leather-wrapped grip.
+med_msw1_05	medium_weapon	A blackened iron cup-hilted slender rapier.
+med_msw1_06	medium_weapon	A steel short broad gladius sword with a leather-wrapped grip.
+med_msw1_07	medium_weapon	A steel hand-and-a-half bastard sword.
+med_msw1_08	medium_weapon	A blackened iron sickle-curved shotel sword.
+med_msw1_09	medium_weapon	A polished steel comb-toothed sword with a leather-wrapped grip.
+med_msw1_10	medium_weapon	A polished steel fork-tipped sword with a leather-wrapped grip.
+med_msw1_11	medium_weapon	A polished steel jeweled royal sword with a leather-wrapped grip.
+med_msw2_00	large_weapon	A polished steel claymore with a forward-angled guard.
+med_msw2_01	large_weapon	A polished steel zweihander sword with a ricasso spike and a leather-wrapped grip.
+med_msw2_02	large_weapon	A steel huge slab-like hero's greatsword.
+med_msw2_03	large_weapon	A steel triple-fullered greatsword with a leather-wrapped grip.
+med_msw2_04	large_weapon	A polished steel winged-guard knight's greatsword with a leather-wrapped grip.
+med_msw2_05	large_weapon	A steel spiked-guard dark greatsword with red details.
+med_msw2_06	large_weapon	A polished steel cross-guarded two-handed longsword with a leather-wrapped grip.
+med_msw2_07	large_weapon	A steel flared single-edged greatsword with a leather-wrapped grip.
+med_msw2_08	large_weapon	A polished steel bone-hilted barbarian greatsword with a leather-wrapped grip.
+med_msw2_09	large_weapon	A steel two-handed curved great sabre with a leather-wrapped grip.
+med_msw2_10	large_weapon	A polished steel greatsword with round holes in the blade and a leather-wrapped grip.
+med_msw2_11	large_weapon	A steel stepped broad greatsword with a leather-wrapped grip.
+med_msw3_00	small_weapon	A steel straight double-edged dagger with a leather-wrapped grip.
+med_msw3_01	small_weapon	A polished steel thin stiletto dagger with a leather-wrapped grip.
+med_msw3_02	small_weapon	A polished steel basket-hilted main gauche dagger with a leather-wrapped grip.
+med_msw3_03	small_weapon	A steel inward-curved kukri knife with a leather-wrapped grip and red details.
+med_msw3_04	small_weapon	A steel triple-blade parrying dagger with a leather-wrapped grip and red details.
+med_msw3_05	small_weapon	A steel guardless hunter's knife with a leather-wrapped grip and red details.
+med_msw3_06	small_weapon	A steel short crescent dagger with a leather-wrapped grip.
+med_msw3_07	small_weapon	A polished steel wavy-bladed dagger with a leather-wrapped grip.
+med_msw3_08	small_weapon	A steel saw-backed dagger with red details.
+med_msw3_09	small_weapon	A steel broad leaf-shaped dagger.
+med_msw3_10	small_weapon	A polished steel ring-pommel dagger with a leather-wrapped grip.
+med_msw3_11	small_weapon	A polished steel bone-hilted ritual dagger with a leather-wrapped grip and red details.

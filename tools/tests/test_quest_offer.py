@@ -39,6 +39,7 @@ if RUNTIME_DIR not in sys.path:
 
 import instantale_modloader as ml                      # noqa: E402
 from instantale_modloader import ui as mlui            # noqa: E402
+from instantale_modloader import gates, modnpc         # noqa: E402
 
 
 def find_mod(suffix):
@@ -199,9 +200,9 @@ class DisplayQuestChoice:
                       client_name="テスト依頼人A", difficulty=41,
                       neighboring_settlement_id="7")
         self.app.world.quests[new_id] = quest
-        self.app.world_dict["quests"][new_id] = {"id": new_id,
-                                                 "quest_title": "こぼれ話の依頼",
-                                                 "client_name": "テスト依頼人A"}
+        self.app.save_data_dict["quests"][new_id] = {"id": new_id,
+                                                     "quest_title": "こぼれ話の依頼",
+                                                     "client_name": "テスト依頼人A"}
         return quest
 
 
@@ -210,6 +211,7 @@ class InstantaleApp:
         self.world = world
         self.world_dict = {"world_data": {"world_name": "テスト世界"},
                            "quests": {}}
+        self.save_data_dict = {"quests": {}}
         # 名簿。セーブでは game_variables['party'] で、必ず 'player' を含む
         # （GAME.md §2.8）。同行者を足すときはここへ id を入れる。
         self.game_variables = {"party": ["player"]}
@@ -431,8 +433,12 @@ def facility_buttons():
 
 
 def setup(history=None, partner="62", in_conversation=True,
-          party=()):
-    """mod を適用し、NPC 62 と会話している状態の app を返す。"""
+          party=(), own_quest=True):
+    """mod を適用し、NPC 62 と会話している状態の app を返す。
+
+    `own_quest` が真なら、NPC 62 が出した未完了の依頼（50）をこの町に置く。
+    「依頼を受ける」は相手の依頼が掲示板に在るときだけ出る。
+    """
     # クラスは毎回作り直す。
     # `__main__` に載せるのは mod が
     # `getattr(__main__, 名前)` で引くため（本番と同じ形）。
@@ -449,6 +455,12 @@ def setup(history=None, partner="62", in_conversation=True,
     main.JustSetButtonToNormalPhase = JustSetButtonToNormalPhase
     main.PhaseSpec = PhaseSpec
 
+    choices.reset()
+    # 関所（窓口の包み・modnpc の頼み文の包み）は1つの世代に1枚なので、
+    # ctx を作り直すたびに忘れさせる（残すと2回目の ctx に包みが渡らない）。
+    gates.reset_all()
+    if hasattr(sys, modnpc.INSTALLED_ATTR):
+        delattr(sys, modnpc.INSTALLED_ATTR)
     mod = load_mod()
     ctx = FakeCtx(os.path.join(HERE, os.pardir, os.pardir, "out", "test"))
     mod.apply(ctx)
@@ -467,6 +479,9 @@ def setup(history=None, partner="62", in_conversation=True,
                           client_name="名も無い誰か", neighboring_settlement_id="7"),
               "43": Quest(id="43", quest_title="霧の追跡", difficulty=43,
                           client_name="名も無い誰か", neighboring_settlement_id="7")}
+    if own_quest:
+        quests["50"] = Quest(id="50", quest_title="書類の配達", difficulty=50,
+                             client_name="テストNPC D", neighboring_settlement_id="7")
     # `profile` を持たせる。
     # 片付いた依頼の注入は、この素のプロフィールの後ろへ足す形になる。
     characters = {"62": Character(id="62", name="テストNPC D",
@@ -490,16 +505,20 @@ def setup(history=None, partner="62", in_conversation=True,
     return mod, ctx, app
 
 
-def index_of(app, mark):
+def index_of(app, action):
+    """窓口が組んだこの MOD のボタンの位置（offer=依頼を受ける / generate=この話から依頼を作る）。"""
+    label = {"offer": LABELS.OFFER_LABEL, "generate": LABELS.GENERATE_LABEL}[action]
     for i, entry in enumerate(app.buttons):
-        if entry.get(MARK) == mark:
+        if choices.ours(entry) and str(entry.get("text") or "").startswith(label):
             return i
     return -1
 
 
 HUD = install_fake_hud()
 clock = install_fake_kivy()
-MARK = load_mod().MARK
+from instantale_modloader import choices  # noqa: E402
+LABELS = load_mod()
+MARK = LABELS.MARK
 
 # ============================================================ 設置
 print("=== ボタンの設置 ===")
@@ -607,7 +626,7 @@ app.refresh_choice_buttons()
 # 「この話から依頼を作る」が出るのは**会話画面**。
 # 掲示板ではない会話画面に置けば会話を閉じずに生成でき、
 # 掲示板は「既にある依頼を選ぶ場所」に徹せる。
-generate = [b for b in app.buttons if b.get(MARK) == "generate"]
+generate = [b for b in app.buttons if choices.ours(b) and b["text"].startswith(LABELS.GENERATE_LABEL)]
 check("会話メニューに「この話から依頼を作る」が出る", generate,
       [b["text"] for b in app.buttons])
 check("依頼人の名前が文言に入る",
@@ -621,7 +640,7 @@ quest_buttons = [b for b in app.buttons
 check("会話から開くと、その NPC 発でない依頼は間引かれる", not quest_buttons,
       [b["text"] for b in app.buttons])
 check("掲示板には「この話から依頼を作る」を出さない",
-      not any(b.get(MARK) == "generate" for b in app.buttons),
+      index_of(app, "generate") < 0,
       [b["text"] for b in app.buttons])
 check("掲示板をいじった後も HUD を塗り直す", app.hud.painted, app.hud.painted)
 
@@ -654,7 +673,7 @@ app.refresh_choice_buttons()
 app.on_button_press(index_of(app, "offer"))
 clock.settle()
 check("会話が無ければ「この話から依頼を作る」は出さない",
-      all(b.get(MARK) != "generate" for b in app.buttons),
+      index_of(app, "generate") < 0,
       [b["text"] for b in app.buttons])
 
 # ゲーム本来の掲示板（DisplayQuestChoice を直接押した）なら1件も間引かない。
@@ -669,6 +688,52 @@ texts = [b["text"] for b in app.buttons]
 check("ゲーム本来の掲示板では「クエストを探す」も残る",
       "クエストを探す" in texts, texts)
 check("ゲーム本来の掲示板では他 MOD のボタンも残る", "掲示板メモ" in texts, texts)
+
+# ゲームが受注を断った（疲労）。掲示板は並ばず、施設のボタンのまま並べ直される。
+clock = install_fake_kivy()
+mod, ctx, app = setup(history=history)
+app.refresh_choice_buttons()
+board_cls = sys.modules["__main__"].DisplayQuestChoice
+refused = board_cls.update_button_display
+board_cls.update_button_display = lambda self: (
+    setattr(self.app, "buttons", facility_buttons()),
+    self.app.refresh_choice_buttons(reset_page=True))
+try:
+    app.on_button_press(index_of(app, "offer"))
+    clock.settle()
+    texts = [b["text"] for b in app.buttons]
+    check("掲示板でなければ施設のボタンを間引かない",
+          texts == [b["text"] for b in facility_buttons()], texts)
+finally:
+    board_cls.update_button_display = refused
+# 絞り込みが残っていると、次に開いた掲示板まで会話の相手で絞られる。
+board_cls(app).update_button_display()
+clock.settle()
+kept = [b for b in app.buttons if b["spec"].cls_name == "QuestChoiceManager"]
+check("掲示板でなければ絞り込みを解く（次の掲示板は全件）", len(kept) == 2,
+      [b["text"] for b in app.buttons])
+
+# 会話から開いた掲示板で依頼を押し、受注画面から戻ると、絞り込みは残っている（受注画面の押下では解かない）。
+# その後でほかの MOD が窓口で組んだボタン（302 の「ここで別れる」など）を押した。
+# この MOD のボタンと取り違えると絞り込みが解けず、次の掲示板が会話の相手で絞られる。
+clock = install_fake_kivy()
+mod, ctx, app = setup(history=history)
+app.refresh_choice_buttons()
+app.on_button_press(index_of(app, "offer"))
+clock.settle()
+app.buttons = [{"text": "【39】水底の警備", "spec": PhaseSpec("QuestChoiceManager", ["*unknown*", "39"])}]
+app.on_button_press(0)                                   # 掲示板の依頼を押した
+app.buttons = [{"text": "やめる", "spec": PhaseSpec("JustSetButtonToNormalPhase", [])}]
+app.on_button_press(0)                                   # 受注画面の「やめる」
+app.buttons = talk_buttons("62") + [{"text": "ここで別れる", "spec": PhaseSpec("JustSetButtonToNormalPhase", []),
+                                     choices.CHOICE_KEY: {"owner": "302_party_action", "choice": None, "under": None}}]
+app.on_button_press(len(app.buttons) - 1)
+board_cls = sys.modules["__main__"].DisplayQuestChoice
+board_cls(app).update_button_display()
+clock.settle()
+kept = [b for b in app.buttons if b["spec"].cls_name == "QuestChoiceManager"]
+check("ほかの MOD の窓口のボタンを押しても絞り込みを解く（次の掲示板は全件）", len(kept) == 2,
+      [b["text"] for b in app.buttons])
 
 # ============================================================ 依頼 id の読み取り
 print("=== spec からの読み取り（語彙を知らずに済ませる） ===")
@@ -703,8 +768,8 @@ check("残骸と合わせて二重にならない",
       texts.count("依頼を受ける（話を切り上げる）") == 1, texts)
 check("生成ボタンも二重にならない",
       len([t for t in texts if t.startswith("この話から依頼を作る")]) == 1, texts)
-check("残った方は印がある（押せば効く）",
-      all(mod.MARK in b for b in app.buttons
+check("残った方は窓口のボタン（押せば効く）",
+      all(choices.ours(b) for b in app.buttons
           if b["text"].startswith(("依頼を受ける", "この話から依頼を作る"))), texts)
 check("会話を終了するは残る", "会話を終了する" in texts, texts)
 
@@ -740,8 +805,7 @@ check("印の無い残骸は marked_by_a_mod に引っかからない",
 # ============================================================ 302_ との共存
 print("=== 302_ との共存 ===")
 
-party_mark = load_mod(PARTY_MOD, "party_leave_mod_probe").MARK
-check("印のキーが 302_ と違う", MARK != party_mark, (MARK, party_mark))
+party_mark = "mod_party_action"            # 版4までの 302_ の印（ほかの MOD の印の付いたボタン）
 
 mod, ctx, app = setup()
 app.buttons = talk_buttons("62") + [{"text": "ここで別れる",
@@ -751,6 +815,34 @@ app.on_button_press(len(app.buttons) - 1)
 check("302_ のボタンはこちらでは素通しになる",
       app.pressed_by_game == ["ここで別れる"], app.pressed_by_game)
 
+# ============================================================ 自前の一覧（LIST_MODE = "mod"）
+# 既定では使わない形。窓口 `choices` の MOD だけの画面で出し、下の画面は窓口が残す。
+print("=== 自前の一覧（MOD だけの画面） ===")
+clock = install_fake_kivy()
+mod, ctx, app = setup(history=history)
+list_mode, quest_type = mod.LIST_MODE, mod.QUEST_TYPE_FOR_CHOICE
+try:
+    mod.LIST_MODE, mod.QUEST_TYPE_FOR_CHOICE = "mod", "*verified*"
+    app.refresh_choice_buttons()
+    app.on_button_press(index_of(app, "offer"))
+    clock.settle()
+    texts = [b["text"] for b in app.buttons]
+    check("自前の一覧は依頼3件と「やめる」", len(texts) == 4 and texts[-1] == mod.CANCEL_LABEL
+          and all(choices.ours(b) for b in app.buttons), texts)
+    check("依頼のボタンはゲームの QuestChoiceManager の写し",
+          [mlui.spec_cls_name(b) for b in app.buttons[:2]] == ["QuestChoiceManager"] * 2,
+          [mlui.spec_cls_name(b) for b in app.buttons])
+    check("保存の間は下のゲームの一覧に戻る（一覧のボタンはセーブに残らない）",
+          [b["text"] for b in choices.strip(app.buttons)[0]] == ["会話を終了する"],
+          choices.strip(app.buttons)[0])
+    app.on_button_press(len(app.buttons) - 1)
+    clock.settle()
+    check("「やめる」で一覧を閉じて下の画面に戻る",
+          choices.opened(app) is None and mod.CANCEL_LABEL not in [b["text"] for b in app.buttons],
+          [b["text"] for b in app.buttons])
+finally:
+    mod.LIST_MODE, mod.QUEST_TYPE_FOR_CHOICE = list_mode, quest_type
+
 # ============================================================ 311_ の人物像
 # mod どうしは import せず**同じファイルを読む**ことで繋がる（TECH.md §3.2.3）。
 # ここで見るのは「在れば添える」「無ければ何も足さない」の2つ。
@@ -759,7 +851,7 @@ print("=== 311_ が覚えた人物像 ===")
 GEN_TARGET = "scripts.llm.llm_manager_world_generate:random_quest_generator"
 
 
-def press_generate(ctx_obj, app_obj):
+def press_generate(ctx_obj, app_obj, keyword=False, shapes=None):
     """「この話から依頼を作る」を押し、生成側へ渡った `area_description` を返す。
 
     **本物と同じ入れ子にする。**
@@ -767,20 +859,27 @@ def press_generate(ctx_obj, app_obj):
     `generate_random_quest()` の内側で走るので、
     その外から呼んでも遅い ― 生成が終わった時点で mod は印を使い切って
     `None` に戻している。
+    `keyword=True` ならゲームがキーワードで呼んだ形にし、`shapes` に `orig` が受けた形を控える。
     """
     seen = {}
     board_cls = sys.modules["__main__"].DisplayQuestChoice
     original = board_cls.generate_random_quest
 
-    def orig(world_overview, settlement_name, settlement_overview,
-             settlement_structure_description, area_description, quest_difficulty,
-             *args, **kwargs):
-        seen["area"] = area_description
+    def orig(*args, **kwargs):
+        if shapes is not None:
+            shapes.append((len(args), sorted(kwargs)))
+        seen["area"] = kwargs["area_description"] if "area_description" in kwargs else args[4]
         return {"quest_title": "こぼれ話の依頼", "client_name": "テストNPC D"}
 
     def generate_random_quest(self):
-        ctx_obj.hooks[GEN_TARGET](orig, "世界の概要", "テストの町A", "町の概要",
-                                  "町の構造", "エリアの説明", 41)
+        if keyword:
+            ctx_obj.hooks[GEN_TARGET](orig, world_overview="世界の概要", settlement_name="テストの町A",
+                                      settlement_overview="町の概要",
+                                      settlement_structure_description="町の構造",
+                                      area_description="エリアの説明", quest_difficulty=41)
+        else:
+            ctx_obj.hooks[GEN_TARGET](orig, "世界の概要", "テストの町A", "町の概要",
+                                      "町の構造", "エリアの説明", 41)
         return original(self)
 
     board_cls.generate_random_quest = generate_random_quest
@@ -828,10 +927,27 @@ area = press_generate(ctx, app)
 check("311_ が無ければ会話の記録だけを添える", "会話の記録" in area, area[-300:])
 check("311_ が無くても人物像の節は足さない",
       "過去の会話から分かっていること" not in area, area[-300:])
+
+# ゲームがキーワードで呼んでも、受けた形のまま `area_description` だけを差し替える（版8）。
+mod_kw, ctx_kw, app_kw = setup(history=history)
+shapes = []
+area_kw = press_generate(ctx_kw, app_kw, keyword=True, shapes=shapes)
+check("キーワードで呼ばれても会話の記録を添える",
+      area_kw.startswith("エリアの説明") and "会話の記録" in area_kw, area_kw[-300:])
+check("  → 受けた形のまま渡す（位置に直さない）",
+      shapes == [(0, ["area_description", "quest_difficulty", "settlement_name",
+                      "settlement_overview", "settlement_structure_description",
+                      "world_overview"])], shapes)
 with io.open(os.path.join(ctx.state_dir, mod.CLIENTS_BASENAME), encoding="utf-8") as fh:
     made = json.load(fh).get(ml.state.playthrough_key(app)) or {}
 check("作った依頼の依頼人は周回の鍵（世界×主人公）の下に控える",
       any(record.get("npc_id") == "62" for record in made.values()), made)
+saved = app.save_data_dict["quests"]
+newest = max(saved, key=int) if saved else None
+check("依頼人の上書きはセーブ側（`save_data_dict['quests']`）にも届く",
+      newest is not None and saved[newest].get("client_name") == "テストNPC D", saved)
+check("雛形（`world_dict['quests']`）には書かない",
+      app.world_dict["quests"] == {}, app.world_dict["quests"])
 
 # 生成の後の読み直しで投げた回。生成中の印と待機表示を残さない。
 print("=== 生成の途中で投げても後始末は通る ===")
@@ -880,6 +996,38 @@ CONV_TARGETS = (
     "scripts.llm.llm_manager:conversation_starter_in_quest")
 
 
+def install_fake_llm_manager():
+    """会話5関数を持つ `scripts.llm.llm_manager` を差し込む。
+
+    ローダの `modnpc` の関所は、いま差し込まれている素の関数の署名で引数を名前に直す。
+    モジュールが無いと素通りするので、先頭4引数の並び（GAME.md §2.25）だけ揃えて置く。
+    """
+    name = "scripts.llm.llm_manager"
+    module = sys.modules.get(name) or types.ModuleType(name)
+    for target in CONV_TARGETS:
+        def site(messages, character_life_log, player, character_instance,
+                 *args, **kwargs):
+            return "返答"
+        setattr(module, target.split(":", 1)[1], site)
+
+    # 依頼を終えたと言われたときの決まりを足す2本は、実物の引数の名前を持たせる（recon の signatures.json）。
+    def facilitator(messages, character_life_log, player, character_instance, worldview=None, world_story=None,
+                    area_residency=None, area_achievements=None, response_list=None, negotiate=None,
+                    response_prompt_instruction=None, **kwargs):
+        return "返答"
+
+    def after_retrieval(messages, character_life_log, player, character_instance, worldview=None, world_story=None,
+                        area_residency=None, area_achievements=None, response_list=None,
+                        response_prompt_instruction=None, **kwargs):
+        return "返答"
+    module.conversation_facilitator = facilitator
+    module.conversation_facilitator_after_retrieval = after_retrieval
+    sys.modules[name] = module
+
+
+install_fake_llm_manager()
+
+
 def clients_path(ctx_obj):
     return os.path.join(ctx_obj.state_dir, mod.CLIENTS_BASENAME)
 
@@ -917,7 +1065,7 @@ def add_quest(app_obj, quest_id, title, status, client_name="名も無い誰か"
 
 
 def talk_once(ctx_obj, app_obj, npc, target=CONV_TARGETS[0], as_kwarg=False):
-    """会話5関数の1本を mod のフック越しに1回呼ぶ。
+    """会話5関数の1本をローダの `modnpc` の関所越しに1回呼ぶ。
 
     先頭4引数の並びは5本とも同じ（GAME.md §2.25）。
     返すのは「元の関数に何が渡ったか」と「何回呼ばれたか」。
@@ -942,9 +1090,23 @@ def profile_seen(seen):
     return getattr(seen["npc"], "profile", "") or ""
 
 
-check("会話5関数すべてを包む",
+def client_part(body):
+    """プロフィールのうち、依頼人として伝える節（噂の節より前）。"""
+    if LABELS.COMPLETED_HEADING not in body:
+        return ""
+    part = body[body.index(LABELS.COMPLETED_HEADING):]
+    return part.split("\n\n", 1)[0]
+
+
+mod, ctx, app = setup()
+check("会話5関数すべてに modnpc の関所が立つ",
       all(target in ctx.hooks for target in CONV_TARGETS),
       [t for t in CONV_TARGETS if t not in ctx.hooks])
+check("会話の notes を modnpc の全員向けの層に登録する",
+      any(layer.get("owner") == "301_quest_from_conversation"
+          and callable(layer.get("notes"))
+          for layer in modnpc.layers_for("any-id")),
+      [layer.get("owner") for layer in modnpc.layers_for("any-id")])
 
 # -- 片付いた依頼が載る。未完了と、別の相手の依頼は載らない。
 mod, ctx, app = setup()
@@ -962,7 +1124,7 @@ try:
     check("片付いた依頼が会話のプロフィールに載る",
           mod.COMPLETED_HEADING in body and "瘴霧の夜警" in body, body)
     check("未完了の依頼は載せない", "水路の見張り" not in body, body)
-    check("別の相手が出した依頼は載せない", "鍛冶場の火事" not in body, body)
+    check("別の相手が出した依頼は依頼人の節に載せない", "鍛冶場の火事" not in client_part(body), body)
     check("元のプロフィールを残す", "堅実な町の事務官。" in body, body)
     check("元の関数は1回だけ呼ぶ", seen["calls"] == 1, seen["calls"])
     check("渡すのは複製で、世界の人物そのものではない",
@@ -1001,15 +1163,14 @@ try:
     # 相手を変えると、その相手の依頼だけになる（取り違えの裏返し）。
     body = profile_seen(talk_once(ctx, app, app.world.characters["63"]))
     check("相手が変わればその相手の依頼だけが載る",
-          "鍛冶場の火事" in body and "瘴霧の夜警" not in body, body)
+          "鍛冶場の火事" in client_part(body) and "瘴霧の夜警" not in client_part(body), body)
 
     # 依頼をひとつも出していない相手。
     stranger = Character(id="64", name="通りすがり", profile="旅の商人。")
     app.world.characters["64"] = stranger
     seen = talk_once(ctx, app, stranger)
-    check("依頼を出していない相手には何も足さない",
-          mod.COMPLETED_HEADING not in profile_seen(seen)
-          and seen["npc"] is stranger, profile_seen(seen))
+    check("依頼を出していない相手には依頼人の節を足さない",
+          mod.COMPLETED_HEADING not in profile_seen(seen), profile_seen(seen))
     check("エラーを出していない", not ctx.errors, ctx.errors)
 finally:
     clear_clients(ctx)
@@ -1136,7 +1297,7 @@ try:
     app.player.name = "前の主人公"
     body = profile_seen(talk_once(ctx, app, app.world.characters["62"]))
     check("別の主人公は前の主人公の依頼人の控えを引かない",
-          "古井戸の調べ" not in body, body)
+          "古井戸の調べ" not in client_part(body), body)
 finally:
     clear_clients(ctx)
 
@@ -1147,7 +1308,7 @@ try:
     data = read_clients(ctx)
     check("控えに別の主人公の周回が在れば移さない",
           data.get(MOVE_WORLD) == MOVE_OLD and MOVE_MINE not in data, data)
-    check("移さなかった世界名だけの分は引かない", "古井戸の調べ" not in body, body)
+    check("移さなかった世界名だけの分は引かない", "古井戸の調べ" not in client_part(body), body)
 finally:
     clear_clients(ctx)
 
@@ -1273,6 +1434,54 @@ try:
 finally:
     mod.EXCLUDE_PARTY_MEMBERS = excluded
 
+# 仲間との会話中のセーブを読んだ途中。人物はほぼ空（相手が居ない）で、名簿もまだ空。
+# 仲間かどうかを見分けられないので出さない。セーブから戻った依頼の選択肢も落とす（VERIFICATION.md §3.102）。
+mod, ctx, app = setup(history=history, party=["62"])
+app.refresh_choice_buttons()
+loading = app.world.characters
+app.world.characters = {"63": loading["63"]}
+app.game_variables["party"] = []
+app.buttons = talk_buttons("62")
+app.buttons[0:0] = [{"text": "依頼を受ける（話を切り上げる）", "spec": PhaseSpec("JustSetButtonToNormalPhase", []),
+                     MARK: "offer"},
+                    {"text": "この話から依頼を作る", "spec": PhaseSpec("JustSetButtonToNormalPhase", []),
+                     MARK: "generate"}]
+mark = log_mark(ctx)
+app.refresh_choice_buttons()
+check("人物が揃う前は「依頼を受ける」を出さない", index_of(app, "offer") < 0,
+      [b.get("text") for b in app.buttons])
+check("人物が揃う前は「この話から依頼を作る」も出さない", index_of(app, "generate") < 0,
+      [b.get("text") for b in app.buttons])
+check("前の版の印の付いた依頼のボタンは落とした記録が残る", "with the older mark" in log_since(ctx, mark),
+      log_since(ctx, mark)[-200:])
+app.world.characters = loading
+app.game_variables["party"] = ["player", "62"]
+app.refresh_choice_buttons()
+check("揃った後も仲間には出さない", index_of(app, "offer") < 0 and index_of(app, "generate") < 0,
+      [b.get("text") for b in app.buttons])
+app.game_variables["party"] = ["player"]
+app.refresh_choice_buttons()
+check("揃った後、仲間でなければ出す", index_of(app, "offer") >= 0,
+      [b.get("text") for b in app.buttons])
+# 設定を切っていても、揃うまでは待つ（揃う前に足すと「この話から依頼を作る」に相手の名前が付かない）。
+mod, ctx, app = setup(history=history, party=["62"])
+loading = app.world.characters
+app.world.characters = {"63": loading["63"]}
+excluded = mod.EXCLUDE_PARTY_MEMBERS
+try:
+    mod.EXCLUDE_PARTY_MEMBERS = False
+    app.refresh_choice_buttons()
+    check("設定を切っても人物が揃う前は出さない", index_of(app, "offer") < 0,
+          [b.get("text") for b in app.buttons])
+    app.world.characters = loading
+    app.refresh_choice_buttons()
+    check("設定を切ると揃った後は仲間にも名前付きで出す",
+          index_of(app, "offer") >= 0 and index_of(app, "generate") >= 0
+          and "テストNPC D" in app.buttons[index_of(app, "generate")]["text"],
+          [b.get("text") for b in app.buttons])
+finally:
+    mod.EXCLUDE_PARTY_MEMBERS = excluded
+
 # 名簿がどこにも無い世界。**消す側に倒さない**。
 mod, ctx, app = setup(history=history)
 del app.game_variables
@@ -1288,7 +1497,7 @@ print("=== ロードで再開した会話の相手 ===")
 
 
 def generate_label(app_obj):
-    entry = [b for b in app_obj.buttons if b.get(MARK) == "generate"]
+    entry = [b for b in app_obj.buttons if choices.ours(b) and b["text"].startswith(LABELS.GENERATE_LABEL)]
     return entry[0]["text"] if entry else None
 
 
@@ -1357,6 +1566,301 @@ for world_name, expect in (("テスト世界", True), ("別のテスト世界", 
     written = log_since(ctx, mark)
     check("控えた話で絞るのは同じ世界だけ（{}）".format(world_name),
           ("filtering for" in written) == expect, written[-200:])
+
+print("=== 「依頼を受ける」は相手の依頼が掲示板に在るときだけ ===")
+from instantale_modloader import board as loader_board  # noqa: E402
+from instantale_modloader import quest_claims as loader_claims  # noqa: E402
+from instantale_modloader import quest_clients as loader_clients  # noqa: E402
+
+
+class LiveCtx:
+    def superseded(self):
+        return False
+
+
+def reset_windows():
+    loader_board.reset()
+    loader_claims.reset()
+    loader_clients.reset()
+
+
+def offer_shown(app_obj):
+    app_obj.refresh_choice_buttons()
+    return index_of(app_obj, "offer") >= 0
+
+
+reset_windows()
+clock = install_fake_kivy()
+mod, ctx, app = setup(history=history, own_quest=False)
+clear_clients(ctx)
+check("相手の依頼が無ければ「依頼を受ける」を出さない", not offer_shown(app), [b["text"] for b in app.buttons])
+check("相手の依頼が無くても「この話から依頼を作る」は出す", index_of(app, "generate") >= 0,
+      [b["text"] for b in app.buttons])
+
+mod, ctx, app = setup(history=history)
+check("相手の依頼がこの町の掲示板に在れば出す", offer_shown(app), [b["text"] for b in app.buttons])
+app.world.quests["50"].config = {"status": "completed"}
+check("相手の依頼が片付いていれば出さない", not offer_shown(app), [b["text"] for b in app.buttons])
+mod, ctx, app = setup(history=history)
+app.world.quests["50"].neighboring_settlement_id = "8"
+check("相手の依頼がほかの町の掲示板なら出さない", not offer_shown(app), [b["text"] for b in app.buttons])
+mod, ctx, app = setup(history=history)
+loader_board.declare_kept_off("336_test", LiveCtx(), lambda a: ["50"])
+check("掲示板に出さない依頼（窓口 board）しか無ければ出さない", not offer_shown(app),
+      [b["text"] for b in app.buttons])
+reset_windows()
+
+# ほかの MOD が依頼人を置いた依頼（窓口 quest_clients）。押した先の絞り込みも同じ依頼を残す。
+clock = install_fake_kivy()
+mod, ctx, app = setup(history=history, own_quest=False)
+loader_clients.declare("336_test", LiveCtx(), lambda a: [{"quest": 39, "npc_id": 62}])
+check("ほかの MOD が依頼人を置いた依頼でも出す", offer_shown(app), [b["text"] for b in app.buttons])
+app.on_button_press(index_of(app, "offer"))
+clock.settle()
+kept = [ui_spec_args[1] for ui_spec_args in
+        (b["spec"].args for b in app.buttons if b["spec"].cls_name == "QuestChoiceManager")]
+check("絞り込んだ掲示板にもその依頼が残る", kept == ["39"], [b["text"] for b in app.buttons])
+reset_windows()
+
+print("=== 街で片付けた依頼を噂として伝える ===")
+mod, ctx, app = setup(own_quest=False)
+clear_clients(ctx)
+add_quest(app, 70, "灯台の修理", "completed")
+app.world.quests["70"].request_summary = "港の灯台が嵐で壊れた。直してほしい。\n詳しくは灯台守に。"
+add_quest(app, 71, "黒羽屋の金庫", "completed")
+app.world.quests["71"].request_summary = "商家の金庫から帳簿を持ち出してほしい。\n\n【裏の仕事：強盗】報酬は表の相場の8倍。"
+add_quest(app, 72, "隣町の護衛", "completed")
+app.world.quests["72"].neighboring_settlement_id = "8"
+add_quest(app, 73, "ライバルの獲物", "completed")
+add_quest(app, 74, "まだの依頼", "incomplete")
+loader_board.declare_kept_off("336_test", LiveCtx(), lambda a: ["71"])
+loader_claims.declare("911_test", LiveCtx(), lambda a: [
+    {"quest": "73", "area": "7", "title": "ライバルの獲物", "by": "ガラン", "state": loader_claims.DONE, "day": 1}])
+town_heading = mod.TOWN_HEADING.format(player="テストプレイヤー")
+
+
+def section(body, heading):
+    if heading not in body:
+        return ""
+    return body[body.index(heading):].split("\n\n", 1)[0]
+
+
+body = profile_seen(talk_once(ctx, app, app.world.characters["63"]))
+town, secret = section(body, town_heading), section(body, mod.SECRET_HEADING)
+check("街で片付いた依頼を噂の節に載せる", "灯台の修理" in town, body)
+check("要約の頭の1行を添える", "港の灯台が嵐で壊れた。直してほしい。" in town and "灯台守" not in town, town)
+check("掲示板に出さない依頼は誰の仕業かを伏せた節に載せる", "黒羽屋の金庫" in secret and "黒羽屋" not in town, body)
+check("伏せる節の頭には主人公の名前を出さない", "テストプレイヤー" not in mod.SECRET_HEADING, mod.SECRET_HEADING)
+check("MOD が足した【…】の注記は載せない", "裏の仕事" not in body and "8倍" not in body, body)
+check("ほかの町の依頼は載せない", "隣町の護衛" not in body, body)
+check("主人公以外が片付けた依頼（窓口 quest_claims）は載せない", "ライバルの獲物" not in body, body)
+check("未完了の依頼は載せない", "まだの依頼" not in body, body)
+check("依頼人の節は足さない（この相手の依頼は無い）", mod.COMPLETED_HEADING not in body, body)
+
+# 裏の仕事の依頼人（窓口 quest_clients）は、依頼人として知っている。噂の側には回さない。
+loader_clients.declare("336_test", LiveCtx(), lambda a: [{"quest": "71", "npc_id": "63"}])
+body = profile_seen(talk_once(ctx, app, app.world.characters["63"]))
+check("裏の仕事の依頼人には依頼人の節で伝える",
+      "黒羽屋の金庫" in client_part(body) and mod.SECRET_HEADING not in body, body)
+loader_clients.reset()
+
+app.game_variables["party"] = ["player", "63"]
+body = profile_seen(talk_once(ctx, app, app.world.characters["63"]))
+check("同行している相手には噂を足さない", town_heading not in body and mod.SECRET_HEADING not in body, body)
+app.game_variables["party"] = ["player"]
+
+add_quest(app, 75, "橋の補修", "completed")
+mod.MAX_TOWN_TOLD = 1
+try:
+    body = profile_seen(talk_once(ctx, app, app.world.characters["63"]))
+    town = section(body, town_heading)
+    check("件数の上限まで、新しいものから載せる", "橋の補修" in town and "灯台の修理" not in town, town)
+finally:
+    mod.MAX_TOWN_TOLD = 3
+mod.TELL_TOWN_QUESTS = False
+try:
+    body = profile_seen(talk_once(ctx, app, app.world.characters["63"]))
+    check("設定を切ると噂を足さない", town_heading not in body and mod.SECRET_HEADING not in body, body)
+finally:
+    mod.TELL_TOWN_QUESTS = True
+reset_windows()
+
+print("=== 依頼から戻った後の会話 ===")
+
+END_TARGET = "__main__:QuestEndManager.execute"
+FINISH_TARGET = "__main__:ConversationEndManager.finish_conversation"
+QUIET = "切り出す必要は無い"
+
+
+def returning(party=()):
+    """62 と話した後で依頼に出る前の状態を作る。控えは空から始める。"""
+    mod_obj, ctx_obj, app_obj = setup(own_quest=False, in_conversation=False, party=party)
+    clear_clients(ctx_obj)
+    store = getattr(sys, mod_obj.RETURNS_STORE_ATTR)
+    key = store.playthrough(app_obj)
+    path = store.path(key)
+    if os.path.isfile(path):
+        os.remove(path)
+    store._buckets.clear()
+    app_obj.world.days_elapsed = 100
+    app_obj.world.characters["62"].current_log = ["<会話>依頼の前に話した。"]
+    app_obj.world.characters["63"].current_log = []
+    return mod_obj, ctx_obj, app_obj
+
+
+def end_quest(ctx_obj, app_obj, quest_id=None):
+    """依頼を終える。受けた形のまま元の処理へ渡るかも見る。"""
+    app_obj.current_quest_data = app_obj.world.quests.get(str(quest_id)) if quest_id is not None else None
+    seen = []
+    holder = type("Manager", (), {})()
+    holder.app = app_obj
+    ctx_obj.hooks[END_TARGET](lambda self, *a, **k: seen.append((self, a, k)), holder, "帰還する")
+    check("元の処理へ1回渡る", seen == [(holder, ("帰還する",), {})], seen)
+    app_obj.current_quest_data = None
+
+
+def finish_talk(ctx_obj, app_obj, npc_id):
+    holder = type("Manager", (), {})()
+    holder.app = app_obj
+    app_obj.in_conversation = str(npc_id)
+    ctx_obj.hooks[FINISH_TARGET](lambda self, *a, **k: None, holder)
+    app_obj.in_conversation = False
+
+
+def body_of(ctx_obj, app_obj, npc_id):
+    return profile_seen(talk_once(ctx_obj, app_obj, app_obj.world.characters[str(npc_id)]))
+
+
+def opening_of(ctx_obj, app_obj, npc_id):
+    """第一声のリクエストの `messages` の最後の文。"""
+    seen = []
+    given = [{"role": "user", "content": "<行動: 話しかける>"}]
+
+    def orig(messages, *args, **kwargs):
+        seen.append(messages)
+        return "返答"
+    ctx_obj.hooks[CONV_TARGETS[3]](orig, given, [], app_obj.player, app_obj.world.characters[str(npc_id)])
+    check("渡された messages そのものは書き換えない", given[0]["content"] == "<行動: 話しかける>", given)
+    return seen[0][-1]["content"]
+
+
+def rule_of(ctx_obj, app_obj, npc_id, target=CONV_TARGETS[0]):
+    """返事のリクエストの `response_prompt_instruction`。"""
+    seen = []
+    at = 10 if target == CONV_TARGETS[0] else 9
+
+    def orig(*args, **kwargs):
+        seen.append(kwargs["response_prompt_instruction"] if "response_prompt_instruction" in kwargs else args[at])
+        return "返答"
+    args = [[], [], app_obj.player, app_obj.world.characters[str(npc_id)]] + [None] * (at - 4) + ["元の決まり"]
+    ctx_obj.hooks[target](orig, *args)
+    return seen[0]
+
+
+# -- 出発前に話していた相手だけに伝わる。依頼の題は書かない。
+mod, ctx, app = returning()
+add_quest(app, "70", "別の街の用事", "completed")
+app.world.quests["70"].neighboring_settlement_id = "8"
+try:
+    check("依頼の前は何も足さない", mod.ABSENCE_HEADING not in body_of(ctx, app, "62"))
+    end_quest(ctx, app, "70")
+    body = body_of(ctx, app, "62")
+    check("出発前に話していた相手に離れていたことを伝える", mod.ABSENCE_HEADING in body, body)
+    check("さっきの続きにしないと言う", "たった今の続きとして扱わない" in body, body)
+    check("主人公の名前が入る", "テストプレイヤーは" in body, body)
+    check("無関係な依頼の題は渡らない", "別の街の用事" not in body, body)
+    check("話していない相手には足さない", mod.ABSENCE_HEADING not in body_of(ctx, app, "63"))
+    opening = opening_of(ctx, app, "62")
+    check("第一声に戻ってきた状況を足す", opening.startswith("<行動: 話しかける>") and "今戻ってきた" in opening, opening)
+    check("第一声にも依頼の題は渡らない", "別の街の用事" not in opening, opening)
+    check("話していない相手の第一声はそのまま", opening_of(ctx, app, "63") == "<行動: 話しかける>")
+    app.world.characters["64"] = Character(id="64", name="初対面の人", profile="旅人。")
+    check("初対面の相手には足さない", mod.ABSENCE_HEADING not in body_of(ctx, app, "64"))
+
+    # -- 会話の間は何度回っても伝わり、話し終えたら消える。別の相手の分は残る。
+    app.world.characters["65"] = Character(id="65", name="もう一人", profile="町人。", current_log=["話した。"])
+    end_quest(ctx, app, "70")
+    check("会話の2回目のリクエストにも伝わる", mod.ABSENCE_HEADING in body_of(ctx, app, "62"))
+    finish_talk(ctx, app, "62")
+    check("話し終えたら消える", mod.ABSENCE_HEADING not in body_of(ctx, app, "62"))
+    check("別の相手の分は残る", mod.ABSENCE_HEADING in body_of(ctx, app, "65"))
+
+    # -- 日付が変われば前の会話は人生ログへ移るので、足さない。
+    app.world.days_elapsed = 101
+    check("日付が変われば足さない", mod.ABSENCE_HEADING not in body_of(ctx, app, "65"))
+    app.world.days_elapsed = 100
+
+    # -- 起動し直しても残る。
+    store = getattr(sys, mod.RETURNS_STORE_ATTR)
+    store._buckets.clear()
+    check("控えはファイルから読み直せる", mod.ABSENCE_HEADING in body_of(ctx, app, "65"))
+    check("エラーなし", not ctx.errors, ctx.errors)
+
+    # -- 同行している仲間には足さない。
+    mod, ctx, app = returning(party=("62",))
+    end_quest(ctx, app)
+    check("同行した仲間には足さない", mod.ABSENCE_HEADING not in body_of(ctx, app, "62"))
+
+    # -- 切れば足さない。
+    mod, ctx, app = returning()
+    mod.TELL_QUEST_ABSENCE = False
+    end_quest(ctx, app)
+    check("設定を切れば足さない", mod.ABSENCE_HEADING not in body_of(ctx, app, "62"))
+
+    # -- 依頼人: 戻って最初の会話だけ「自分から切り出す必要は無い」を外す。
+    mod, ctx, app = returning()
+    add_quest(app, "71", "水門の点検", "completed")
+    add_quest(app, "72", "昔の用事", "completed")
+    add_quest(app, "73", "人の依頼", "completed")
+    seed_client(ctx, app, "71", "62", "テストNPC D")
+    seed_client(ctx, app, "72", "62", "テストNPC D")
+    seed_client(ctx, app, "73", "63", "テストNPC E")
+    part = client_part(body_of(ctx, app, "62"))
+    check("依頼の前は切り出さなくてよいまま", QUIET in part, part)
+    check("報酬と手続きのことを伝える", "報酬の受け取りまで済んで" in part and "手続きは要らない" in part, part)
+    check("終えたと言われたら受ける", "テストプレイヤーが終えたと言えば" in part, part)
+    end_quest(ctx, app, "71")
+    part = client_part(body_of(ctx, app, "62"))
+    check("戻って最初の会話では外す", "水門の点検" in part and QUIET not in part, part)
+    opening = opening_of(ctx, app, "62")
+    check("依頼人の第一声には依頼の題と結末を足す", "依頼「水門の点検」を片付け" in opening and "今戻ってきた" not in opening, opening)
+    rule = rule_of(ctx, app, "62")
+    check("返事の決まりを足す", rule.startswith("元の決まり") and "手続きを求めず" in rule, rule)
+    rule = rule_of(ctx, app, "62", target=CONV_TARGETS[1])
+    check("_after_retrieval にも足す", "早かったとは言わない" in rule, rule)
+    other = client_part(body_of(ctx, app, "63"))
+    check("別の依頼人はそのまま", "人の依頼" in other and QUIET in other, other)
+    finish_talk(ctx, app, "62")
+    part = client_part(body_of(ctx, app, "62"))
+    check("話し終えたら元に戻る", "水門の点検" in part and QUIET in part, part)
+    check("話し終えたら第一声もそのまま", opening_of(ctx, app, "62") == "<行動: 話しかける>")
+    check("返事の決まりは残す（片付いた依頼を知らせている間）", "手続きを求めず" in rule_of(ctx, app, "62"))
+    check("依頼人の控えは残る", "水門の点検" in part)
+
+    # -- 放棄など、片付いていない依頼では外さない。
+    mod, ctx, app = returning()
+    add_quest(app, "74", "昔の用事", "completed")
+    add_quest(app, "75", "諦めた用事", "incomplete")
+    seed_client(ctx, app, "74", "62", "テストNPC D")
+    seed_client(ctx, app, "75", "62", "テストNPC D")
+    end_quest(ctx, app, "75")
+    part = client_part(body_of(ctx, app, "62"))
+    check("片付いていない依頼では外さない", QUIET in part, part)
+
+    # -- 噂: 相手は増やさず、手続きが要らないことを足す。切り出さなくてよいは残す。
+    mod, ctx, app = returning()
+    add_quest(app, "76", "街の用事", "completed")
+    end_quest(ctx, app, "76")
+    body = body_of(ctx, app, "63")
+    check("噂に手続きのことが入る", "街の用事" in body and "手続きは要らない" in body, body)
+    check("噂では切り出さなくてよいのまま", QUIET in body, body)
+    check("噂の相手に離れていたとは言わない", mod.ABSENCE_HEADING not in body, body)
+    check("噂の相手にも返事の決まりを足す", "手続きを求めず" in rule_of(ctx, app, "63"))
+    check("噂の相手の第一声はそのまま", opening_of(ctx, app, "63") == "<行動: 話しかける>")
+    app.world.quests["76"].neighboring_settlement_id = "8"
+    check("知らせていない相手には決まりを足さない", rule_of(ctx, app, "63") == "元の決まり", rule_of(ctx, app, "63"))
+finally:
+    clear_clients(ctx)
 
 print()
 if failures:

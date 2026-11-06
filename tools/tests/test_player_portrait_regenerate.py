@@ -130,6 +130,107 @@ check("英語が取れなければ None",
       mod._player_look(FakeStore(), write, None, dict(player, look_description="z")) is None)
 check("外見文が無ければ None",
       mod._player_look(FakeStore(), write, None, dict(player, look_description="")) is None)
+
+# 版4: 独自の頼み（短いタグ）を先に使い、外見文ごとに控える
+look_calls = []
+fake.create_look = lambda *a: look_calls.append(a) or {"image_generation_prompt": ["from create look"]}
+asked = []
+
+
+def ask_tags(desc):
+    asked.append(desc)
+    return ["black hair", "blue inner hair", desc_tag[desc]]
+
+
+desc_tag = {"説明A": "black pants", "説明B": "red cape"}
+store4 = FakeStore()
+pa = dict(player, look_description="説明A")
+got_a = mod._player_look(store4, write, None, pa, ask=ask_tags)
+check("独自の頼みのタグを使い、create_look は呼ばない",
+      got_a == ["black hair", "blue inner hair", "black pants"] and not look_calls, (got_a, look_calls))
+got_b = mod._player_look(store4, write, None, dict(player, look_description="説明B"), ask=ask_tags)
+got_a2 = mod._player_look(store4, write, None, pa, ask=ask_tags)
+check("説明を変えて戻すと、前の要素が戻り、頼み直さない",
+      got_a2 == got_a and asked == ["説明A", "説明B"], (got_a2, asked))
+check("控えは外見文ごと（looks）と最後の1件（look）",
+      len(store4.buckets["w|p"]["looks"]) == 2 and store4.buckets["w|p"]["look"]["prompts"] == got_b,
+      store4.buckets)
+got_fb = mod._player_look(FakeStore(), write, None, dict(player, look_description="説明C"),
+                          ask=lambda desc: [])
+check("独自の頼みで取れなければ create_look に戻す", got_fb == ["from create look"], got_fb)
+legacy = FakeStore()
+legacy.buckets["w|p"] = {"look": {"source": __import__("hashlib").sha256("説明D".encode("utf-8")).hexdigest(),
+                                   "prompts": ["old tag"]}}
+check("版3 の控え（look）も読む",
+      mod._player_look(legacy, write, None, dict(player, look_description="説明D"),
+                       ask=lambda desc: ["new tag"]) == ["old tag"])
+fresh_store = FakeStore()
+pf = dict(player, look_description="説明F")
+mod._player_look(fresh_store, write, None, pf, ask=lambda desc: ["old tag"])
+got_f = mod._player_look(fresh_store, write, None, pf, ask=lambda desc: ["new tag"], fresh=True)
+check("fresh なら記録があっても頼み直し、記録を置き換える",
+      got_f == ["new tag"] and mod._player_look(fresh_store, write, None, pf, ask=None) == ["new tag"],
+      (got_f, fresh_store.buckets))
+fake.create_look = lambda *a: {"image_generation_prompt": ["全部日本語"]}
+got_keep = mod._player_look(fresh_store, write, None, pf, ask=lambda desc: [], fresh=True)
+check("作り直せなければ記録で描く", got_keep == ["new tag"]
+      and any("using the kept look" in str(line) for line in logs), got_keep)
+check("記録が無く作れなければ None",
+      mod._player_look(FakeStore(), write, None, pf, ask=lambda desc: [], fresh=True) is None)
+fake.create_look = lambda *a: look_calls.append(a) or {"image_generation_prompt": ["from create look"]}
+check("ゲームの外では Shift は押されていない扱い", mod._shift_held() is False)
+many = FakeStore()
+for i in range(mod.MAX_LOOKS + 3):
+    mod._player_look(many, write, None, dict(player, look_description="多{}".format(i)),
+                     ask=lambda desc: ["tag {}".format(len(desc))])
+check("外見文ごとの控えは上限まで", len(many.buckets["w|p"]["looks"]) == mod.MAX_LOOKS,
+      len(many.buckets["w|p"]["looks"]))
+
+_real_create, _real_ask = mod.llm.create_structure, mod.llm.ask
+try:
+    sent = {}
+    mod.llm.create_structure = lambda ctx, name, fields, label="llm": ("structure", name, list(fields))
+
+    def _fake_ask(ctx, manager, message, timeout, structure=None, label="llm", write=None, **kw):
+        sent.update(manager=manager, message=message, structure=structure)
+        return {"tags": ["Black Hair", "黒髪", "blue eyes"] + ["tag {}".format(i) for i in range(20)]}
+    mod.llm.ask = _fake_ask
+    tags = mod._ask_tags(None, write, "【外見】黒髪")
+    check("タグは英語だけ・{}個まで".format(mod.MAX_TAGS),
+          tags[:2] == ["black hair", "blue eyes"] and len(tags) == mod.MAX_TAGS, tags)
+    check("頼みは MOD 専用の名前と構造で送る",
+          sent["manager"] == mod.LOOK_MANAGER and sent["structure"][1] == mod.LOOK_STRUCTURE
+          and sent["message"][0]["role"] == "system" and "【外見】黒髪" in sent["message"][1]["content"], sent)
+    mod.llm.ask = lambda *a, **k: None
+    check("返事が無ければ空", mod._ask_tags(None, write, "x") == [])
+    mod.llm.create_structure = lambda *a, **k: None
+    check("構造が作れなければ空", mod._ask_tags(None, write, "x") == [])
+finally:
+    mod.llm.create_structure, mod.llm.ask = _real_create, _real_ask
+
+# ゲームの送り口は timeout で待ちを打ち切らない（main_026 の実測）。335 も打ち切らず、LOOK_TIMEOUT 秒を過ぎたらログに出す
+import time as _time
+_flags = []
+
+
+def _slow_look(*a):
+    _flags.append(getattr(mod._LOOK_CALL, "active", False))
+    _time.sleep(0.6)
+    return ["late"]
+
+
+fake.create_look = _slow_look
+_saved_timeout, mod.LOOK_TIMEOUT = mod.LOOK_TIMEOUT, 0.2
+del logs[:]
+try:
+    _got = mod._player_look(FakeStore(), write, None, dict(player, look_description="slow"))
+finally:
+    mod.LOOK_TIMEOUT = _saved_timeout
+check("外見の頼みが LOOK_TIMEOUT 秒を過ぎても打ち切らず、返った外見を使う", _got == ["late"], _got)
+check("  過ぎたときと返ったときにログに出す",
+      any(line.startswith("slow:") for line in logs) and any("returned after" in line for line in logs), logs)
+check("外見を作らせている印は、頼みを呼ぶスレッドに立つ", _flags == [True], _flags)
+
 del sys.modules[mod.CREATE_LOOK_MODULE]
 check("create_look が無ければ None",
       mod._player_look(FakeStore(), write, None, dict(player, look_description="w")) is None)
@@ -395,8 +496,77 @@ check("押すと仕事を積み、描いている間は隠す",
       (captured.get("jobs"), mod._runtime()["busy"], button.opacity))
 portrait.fire("pos")
 check("描いている間は置き直しても隠れたまま", button.opacity == 0.0)
+check("Shift 無しは作り直さない", captured["jobs"][-1].get("fresh") is False, captured["jobs"][-1])
 captured["done"]({"app": app})
 check("描き終えたら戻す", not mod._runtime()["busy"] and button.opacity == 1.0)
+mod._shift_held = lambda: True
+button.fire("on_release")
+check("Shift を押しながらなら作り直しを積む", captured["jobs"][-1].get("fresh") is True, captured["jobs"][-1])
+captured["done"]({"app": app})
+hook_store.buckets.clear()
+sys.modules[image_module.__name__] = image_module
+captured["run"]({"app": app, "key": "k"})
+kept_words = list(seen[-1][0][3]) if seen else None
+look_module.create_look = lambda *a: {"image_generation_prompt": ["silver hair"]}
+captured["run"]({"app": app, "key": "k", "fresh": True})
+check("作り直しの仕事は記録を使わない", seen and seen[-1][0][3] == ["silver hair"] and kept_words != ["silver hair"],
+      (kept_words, seen[-1] if seen else None))
+print("=== 描き方の一覧 ===")
+imagegen = mod.imagegen
+check("描き方を出す MOD が居なければ一覧を出さない（すぐ描く）",
+      captured["jobs"][0].get("method") == "txt2img" and not getattr(sheet_hud, mod.MENU_ATTR, None),
+      captured["jobs"][0])
+
+
+class MenuCtx(object):
+    def superseded(self):
+        return False
+
+
+menu_items = []
+
+
+def fake_popup(text):
+    item = FakeButton()
+    item.text, item.height, item.width = text, 37.0, 75.0
+    menu_items.append(item)
+    return item
+
+
+mod.ui.popup_button = fake_popup
+mod.ui.clamp_into_window = lambda widget: None
+mod._shift_held = lambda: False
+imagegen.declare_methods("test_343", MenuCtx(), lambda kind: ["chain", "img2img"] if kind == "portrait" else [])
+before = len(captured["jobs"])
+button.fire("on_release")
+menu = getattr(sheet_hud, mod.MENU_ATTR, None) or []
+check("押すと描き方の一覧を出す（txt2img・img2img・txt2img→img2img の順）",
+      [item.text for item in menu] == ["txt2img", "img2img", "txt2img→img2img"]
+      and all(item in host.children for item in menu) and len(captured["jobs"]) == before,
+      [item.text for item in menu])
+check("一覧はボタンの右に、上端を揃えて並べる",
+      menu and abs(menu[0].x - (button.x + button.width + 4)) < 0.01
+      and abs(menu[0].y + menu[0].height - (button.y + button.height)) < 0.01
+      and menu[1].y < menu[0].y, [m.pos for m in menu])
+button.fire("on_release")
+check("もう一度押すと一覧を閉じる", not getattr(sheet_hud, mod.MENU_ATTR, None)
+      and not any(item in host.children for item in menu))
+button.fire("on_release")
+menu = getattr(sheet_hud, mod.MENU_ATTR, None) or []
+menu[1].fire("on_release")
+check("一覧で選ぶと閉じて、その描き方の仕事を積む",
+      captured["jobs"][-1].get("method") == "img2img" and not getattr(sheet_hud, mod.MENU_ATTR, None)
+      and mod._runtime()["busy"], captured["jobs"][-1])
+captured["done"]({"app": app})
+button.fire("on_release")
+toggle(lambda self: None, sheet_hud)
+check("人物欄を開け閉めしたら一覧を閉じる", not getattr(sheet_hud, mod.MENU_ATTR, None))
+drawn = []
+image_module.generate_character_image = lambda *a, **k: drawn.append(imagegen.method_now())
+captured["run"]({"app": app, "key": "k", "method": "chain"})
+check("描くあいだ、選んだ描き方を窓口に立てる（描くのは 343）",
+      drawn == ["chain"] and imagegen.method_now() is None, drawn)
+imagegen.withdraw_methods("test_343")
 check("例外なし", not any(str(line).startswith("EXC") for line in logs),
       [line for line in logs if str(line).startswith("EXC")])
 

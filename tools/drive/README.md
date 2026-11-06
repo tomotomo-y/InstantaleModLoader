@@ -81,13 +81,16 @@ sh tools/drive/relaunch.sh restore        # 4. 控えへ戻して起動し直す
 
 | ファイル | すること |
 |---|---|
-| `backup.sh [名前]` | セーブ・世界の骨格（`world_data.json`）・`state\` を `out/backup/<名前>_<日時>/` へ写す。立ち絵のフォルダは写さず、名前の一覧だけ控える。`state\models\`（画像生成のモデル、数 GB）は写さない |
-| `relaunch.sh [restore]` | ゲームを閉じて起動し直し、注入・題の画面・世界の一覧・遊べる画面を順に待つ。注入は GUI と同じく、ゲームの Python の初期化と窓の出現を待ってから流す（`watcher.py --once`）。`restore` を付けると、起動の前に控えへ戻す |
+| `backup.sh [名前]` | セーブ・世界の骨格（`world_data.json`）・`state\` を `out/backup/<名前>_<日時>/` へ写す。立ち絵のフォルダは写さず、名前の一覧だけ控える。`state\stable_diffusion\models\`（画像生成のモデル、数 GB。v1.18.0 までは `state\models\`）は写さない |
+| `relaunch.sh [restore\|title]` | ゲームを閉じて起動し直し、注入・題の画面・世界の一覧・遊べる画面を順に待つ。注入は GUI と同じく、ゲームの Python の初期化と窓の出現を待ってから流す（`watcher.py --once`）。`restore` を付けると、起動の前に控えへ戻す。`title` を付けると題の画面で止め、世界は選ばない（キャラのまだ居ない世界へ進むとき）。世界を選ぶ前に、ローダの当て直しの終わりを `wait_boot_settled` で待つ（当て直しの間はフックが抜けていて、MOD の施設の中のセーブを読むと落ちる） |
 | `reload.sh` | ゲームを閉じずに題の画面へ戻り、同じ世界を読み直す（約9秒）。保存とロードをまたいで値が残るかの確認に使う |
 | `waitchoice.sh 文字 [秒]` | その選択肢が並ぶまで待つ（`w` の中身）。終了コードは 0 並んだ / 1 時間切れ / 2 ゲームオーバー / 3 別の画面で落ち着いた |
 | `nav.sh` | 上のコマンドを読み込む |
 | `common.sh` | ほかのシェルスクリプトが読む共通部分。直には動かさない |
 
+`relaunch.sh restore` が `state\` から戻すのは、試した世界の控え（`<世界>.json`・`<世界>.jsonl` など名前の後ろが `.` のものと、周回の `<世界>×<主人公>.json`）だけ。
+ほかの世界の控えは、控えの後に別のセッションが遊んでいても触らない（名前が似た世界も、前方一致では拾わない）。
+世界をまたいで1つのファイル（`state\city_case.json` など）も戻さない。
 `relaunch.sh restore` は、控えの後にできたものを消さずに `out/backup/test_leftovers/` へ移す。
 移すのは、控えの時に無かった立ち絵のフォルダと、控えの後にできた `state\` のファイル。
 
@@ -102,7 +105,7 @@ python tools/drive/drive.py <ファイル> --args '<JSON>' --wait <秒>
 | `ready.py` | `world` | 今どの段か（title / worlds / playing / gameover / busy） |
 | `press.py` | `text` | 画面の選択肢を1つ押す |
 | `choices.py` | | 画面とデータの選択肢、手が空いているかの旗 |
-| `clicktext.py` | `texts`・`contains`・`pause` | 選択肢の欄の外の文字（題の画面・世界の札）を押す |
+| `clicktext.py` | `texts`・`contains`・`pause` | 選択肢の欄の外の文字（題の画面・世界の札）を押す。一覧の中の札は、画面の中ほどまで送ってから押す |
 | `setstate.py` | `law`・`gold`・`affinity`・`elapse`・`save` | 遊びの状態を書き換える |
 | `where.py` | `npcs` | 今いる所・日数・会話の相手・手待ち、並べた人物の居場所と好感度 |
 | `texts.py` | `contains`・`last` | 画面の本文から語を含む行を拾う |
@@ -111,9 +114,37 @@ python tools/drive/drive.py <ファイル> --args '<JSON>' --wait <秒>
 | `talkto.py` | `npc` | 人物に話しかけて会話を始める（ゲーム自身の `ConversationStartManager`）。一覧に出ない相手（仲間が1人だけのときの仲間など）に |
 | `setmod.py` | `mod`・`name`・`value` | MOD の定数を書き換える |
 | `act.py` | `text`・`timeout` | 入力欄に書いて送り、手が空くまで待つ |
-| `trade.py` | `do`（open / close / status / prices） | 売買の窓。`prices` は手持ちの品の売値を、値段の計算の段ごとに並べる |
-| `sell.py` | `item` | 開いている売買の窓で、手持ちの品を1つ売る |
-| `steal.py` | `mode`・`enter` | `336_crime_overhaul` の店で盗む（乱数をその間だけ固定する） |
+| `trade.py` | `do`（open / close / status / prices / shop） | 売買の窓。`prices` は手持ちの品の売値を、`shop` は棚の品の買値を、値段の計算の段ごとに並べる |
+| `sell.py` | `item` | 開いている売買の窓で、手持ちの品を1つ売る。空きの探し方と掴む位置は `buy.py` と同じ |
+| `buy.py` | `item` | 開いている売買の窓で、店の棚の品を1つ買う（手持ちの空いたマスへ落として「買う」を押す）。空きは品の大きさで探し、品の真ん中を掴む（2x2 の品は左下のマスを掴むと動かない） |
+| `steal.py` | `mode`・`enter` | `336_crime_overhaul` の店で盗む（乱数をその間だけ固定する）。問い合わせるのは手持ちの空きに入る品で、窓・「盗む」・確認の窓が出るのを待つ。出なければ書いて窓を閉じる |
+| `incident.py` | `kind`・`area`・`elapse`・`force` | `338_town_incidents` の出来事を、決めた街（id か名前。省くといまいる街）に決めた種類で起こす。次の1回の抽選だけ候補を絞り、日数を送る。`force` でその街の収まった後の休みを外す |
+| `typein.py` | `fields` | 入力欄に文字を書く（押さない）。欄は `hint_text` の一部で選ぶ（世界を作る画面の「名前」「概要」など） |
+| `clickimage.py` | `image` | 文字の無い絵のボタンを、絵のファイル名の一部で押す（キャラを作る画面のランダム作成のボタン `dice_1` など） |
+| `settingwindow.py` | `press` | ゲームの設定の画面（歯車）を開いて中のボタンを並べ、`press` の文字のボタンを押す（「画像の再生成(img2img)」など） |
+| `screenwait.py` | `leave`・`texts`・`enabled`・`timeout` | 遊ぶ画面の手待ちで見分けられない段を待つ。画面の名前が変わる・文字が見える・ボタンが押せるようになる、のどれか |
+
+### 世界とキャラを作る
+
+```sh
+sh tools/drive/relaunch.sh title
+python tools/drive/drive.py clicktext.py --args '{"texts":["世界","世界を生成する"]}'
+python tools/drive/drive.py typein.py --args '{"fields":{"名前":"<世界の名前>","概要":"<世界の概要>"}}'
+python tools/drive/drive.py clicktext.py --args '{"texts":["生成する"]}'
+python tools/drive/drive.py screenwait.py --args '{"texts":["<世界の名前>'"'"'を生成し保存しました"],"timeout":1500}' --wait 1550
+# 題の画面へ戻り「開始する」。世界の一覧が出るのを待ってから札を押す（続けて押すと切り替わる途中で届かない）
+python tools/drive/drive.py clicktext.py --args '{"texts":["戻る","戻る","開始する"]}'
+python tools/drive/drive.py screenwait.py --args '{"texts":["<世界の名前>"],"timeout":30}'
+python tools/drive/drive.py clicktext.py --args '{"texts":["<世界の名前>"]}'
+python tools/drive/drive.py clickimage.py --args '{"image":"dice_1"}'
+python tools/drive/drive.py screenwait.py --args '{"enabled":"人生を始める","timeout":500}' --wait 520
+python tools/drive/drive.py clicktext.py --args '{"texts":["人生を始める"]}'
+```
+
+- `typein.py` は世界を作る画面が出きってから流し、返事が `field '名前': 1 hit(s)` と `field '概要': 1 hit(s)` の両方であることを確かめてから「生成する」を押す。画面が出きる前に流すと欄が空のまま生成が走り、ゲームが自前の名前と概要で世界を作る
+- 世界の生成は終わっても画面が変わらない。同じ画面に「世界'<名前>'を生成し保存しました。」が出るのを待つ（約3〜4分）
+- 世界の名前は、生成した世界の `saves\` と `worlds\` のフォルダ名になる。キャラを作った後は `IML_DRIVE_WORLD` に入れれば `relaunch.sh` が使える
+- ランダム作成は名前・出自・外見・能力・立ち絵を作る。押せるようになった「人生を始める」で始まる
 
 ### ゲーム内スクリプトを足すとき
 

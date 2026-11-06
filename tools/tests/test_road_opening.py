@@ -37,6 +37,7 @@ if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
 import instantale_modloader as ml                      # noqa: E402
+from instantale_modloader import choices              # noqa: E402
 
 
 def find_mod(suffix):
@@ -130,6 +131,8 @@ class World:
         self.quests = {}
         self.name = save_data_dict["world_data"]["world_name"]
         self.days_elapsed = save_data_dict["world_data"]["days_elapsed"]
+        # 人物が揃った世界（窓口 `choices` は人物が 0 人の間をロードの途中と見て MOD の選択肢を組まない）
+        self.characters = {"1": object()}
 
 
 class Player:
@@ -292,7 +295,14 @@ class DisplayQuestChoice:
         return None
 
     def generate_random_quest(self):
-        if self.app.generator_hook is not None:
+        if self.app.generator_hook is not None and getattr(self.app, "keyword_generator", False):
+            # ゲームがキーワード引数で呼ぶ版（325 版8 は受け取った形のまま渡す）。
+            self.app.generator_hook(world_overview="世界の概要", settlement_name="開始の町",
+                                    settlement_overview="静かな町",
+                                    settlement_structure_description="丘陵地帯",
+                                    area_description="風が吹き抜ける丘陵地帯。",
+                                    quest_difficulty=type(self).game_difficulty)
+        elif self.app.generator_hook is not None:
             self.app.generator_hook("世界の概要", "開始の町", "静かな町", "丘陵地帯",
                                     "風が吹き抜ける丘陵地帯。", type(self).game_difficulty)
         ids = [int(k) for k in self.app.world.quests] or [0]
@@ -595,6 +605,12 @@ def setup(configure=None, keep_state=False, world_dict=None):
         for name in os.listdir(STATE_DIR):
             os.remove(os.path.join(STATE_DIR, name))
 
+    # 窓口 `choices` の置き場（開いた画面の控え）は `sys` と state に在る。前の検査の画面を持ち越さない
+    choices.reset()
+    folder = os.path.join(OUT_DIR, "state", choices.STATE_DIRNAME)
+    if os.path.isdir(folder):
+        for name in os.listdir(folder):
+            os.remove(os.path.join(folder, name))
     install_fake_functions(QUESTS)
     module = load_mod()
     if configure is not None:
@@ -621,9 +637,12 @@ def setup(configure=None, keep_state=False, world_dict=None):
 
     raw = ctx.hooks.get("scripts.llm.llm_manager_world_generate:random_quest_generator")
 
-    def plain_generator(world_overview, settlement_name, settlement_overview,
-                        structure, area_description, difficulty, *a, **kw):
+    def plain_generator(*a, **kw):
+        # 位置でもキーワードでも受け、渡ってきた形も控える。
+        area_description = kw["area_description"] if "area_description" in kw else a[4]
+        difficulty = kw["quest_difficulty"] if "quest_difficulty" in kw else a[5]
         app.generated.append((area_description, difficulty))
+        app.__dict__.setdefault("generated_shapes", []).append((len(a), sorted(kw)))
         return {"quest_title": classes["board"].next_title}
 
     def generator(*args, **kwargs):
@@ -711,6 +730,7 @@ check("game's destinations untouched",
 check("search button carries the mark", app.buttons[-2].get("mod_road_opening") == "search")
 check("search button uses the harmless spec",
       app.buttons[-2]["spec"].cls_name == "JustSetButtonToNormalPhase")
+check("search button is the window's button", choices.ours(app.buttons[-2]))
 open_list(app, classes)
 check("reopened list has one search button",
       texts(app).count("新たな道を探す") == 1, texts(app))
@@ -751,6 +771,16 @@ press(app, "黄金の砂漠")
 means = texts(app)
 check("means: pay / dungeon / back", means[0].startswith("お金を支払い委託する（4,000G／14日）")
       and means[1].startswith("自ら切り拓く（難易度 ") and means[2] == "やめる", means)
+# 手段の画面で保存して読み直す。セーブには下の一覧（行き先とやめる）が残り、読み直すと同じ行き先の手段の画面に戻る
+under = choices.strip(app.buttons)[0]
+check("saving on the means screen keeps the move list in the save",
+      [b.get("text") for b in under] == ["風鳴りの村", "潮騒の村", "湖畔の町", "やめる"],
+      [b.get("text") for b in under])
+app.buttons = [dict(b) for b in under]
+choices._store()["opened"].clear()
+app.refresh_choice_buttons(reset_page=True)
+CLOCK.settle()
+check("reloading returns to the means screen of the same destination", texts(app) == means, texts(app))
 app.player.gold = 3999
 press(app, "お金を支払い")
 check("refused when short of gold", any("足りない" in t for t in app.texts), app.texts)
@@ -1082,6 +1112,27 @@ check("mark key unique", not any('"mod_road_opening"' in src for src in others.v
 check("state dir unique",
       not any('"road_opening"' in src and "own=False" not in src
               for src in others.values()))
+
+# ================================================================ 引数の渡し方（版8）
+# ゲームがキーワード引数で呼んでも、受け取った形のまま2つだけを差し替える。
+# `setup()` は注入し直すので、ほかの段に響かないよう最後に置く。
+print("[keyword call]")
+module_kw, ctx_kw, app_kw, classes_kw = setup()
+app_kw.keyword_generator = True
+open_list(app_kw, classes_kw)
+press(app_kw, "新たな道を探す")
+press(app_kw, "霧の要塞都市")
+module_kw.DIFFICULTY_MODE = "harder"
+press(app_kw, "自ら切り拓く")
+check("keyword call: road brief and difficulty are still put in",
+      app_kw.generated and "霧の要塞都市" in app_kw.generated[0][0]
+      and app_kw.generated[0][1] == 52 + 2 * 2, app_kw.generated)
+check("keyword call: arguments passed on as received (not turned positional)",
+      getattr(app_kw, "generated_shapes", None) == [(0, ["area_description", "quest_difficulty",
+                                                          "settlement_name", "settlement_overview",
+                                                          "settlement_structure_description",
+                                                          "world_overview"])],
+      getattr(app_kw, "generated_shapes", None))
 
 print()
 if failures:

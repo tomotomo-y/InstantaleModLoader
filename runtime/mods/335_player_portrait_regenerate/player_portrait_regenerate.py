@@ -2,7 +2,7 @@
 """人物欄の主人公の立ち絵の左上にボタンを置き、主人公の立ち絵を描き直す（DOC.md）。
 
 主人公は英語の外見プロンプトをセーブに持たない（日本語の look_description だけ）。
-本体が主人公作成時に使う ``create_look`` で英語の要素を作ってから描く
+LLM に英語の短いタグを頼み（頼めなければ本体の ``create_look``）、それで描く
 （DOC.md「英語の外見」）。
 描き終えた絵を画面へ出し直すのは 138_fix_character_image_refresh。
 装備の見た目を足すのは 408_visual_changes_based_on_equipment（入っていれば）。
@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+from typing import List
 
 from instantale_modloader import frames, imagegen, jobs, llm, state, ui
 
@@ -21,7 +22,10 @@ CREATE_LOOK_MODULE = "scripts.llm.llm_manager_character_create"
 # ゲームの送り口。`create_look` が呼ぶ。ゲーム側の `timeout` の既定は無期限なので（GAME.md §2.12）、
 # 外見を作らせている間だけ時間切れを付ける（`336_` の盗みの稼ぎと同じく、後から生える別名を見張って包む）。
 SEND_TARGET = "scripts.llm.llm_manager:send_request"
-#: 外見を作らせる1回の待ちの上限（秒）。返らなければ描き直しを取りやめ、ボタンを戻す。
+# `create_look` は `llm_manager_character_create` の送り口から送る。main_026 から部品ごとに別の関数になり、
+# `llm_manager` だけを包む形では届かなくなった（VERIFICATION.md §3.100）。同じ関数なら二重には包まない（llm.watch_aliases）。
+SEND_TARGETS = (SEND_TARGET, CREATE_LOOK_MODULE + ":send_request")
+#: 外見を作らせる1回の待ちの目安（秒）。過ぎたらログに出し、返事が来るまで待つ（打ち切らない。遅い環境で毎回取りやめないため）。
 LOOK_TIMEOUT = 120.0
 # いま外見を作らせているスレッドの印（`_player_look` が立て、送り口の包みが読む）。
 _LOOK_CALL = threading.local()
@@ -43,6 +47,24 @@ SD_ITEM = re.compile(r"^[a-z0-9][a-z0-9 '-]*$")
 MAX_ITEM_WORDS = 4
 MAX_ITEM_CHARS = 40
 
+# 外見文を短いタグにする頼み（版4。`_ask_tags`）。記録は output_data の `mod_335_player_look` に残る。
+LOOK_MANAGER = "mod_335_player_look"
+LOOK_STRUCTURE = "PlayerLookTags335"
+#: タグの数の上限。前置きと合わせて SD が1回に読む 75トークンに収まる数（実測 73。18個だと 77 で超えた）。
+MAX_TAGS = 16
+#: 外見文ごとの控えの数の上限。古いものから捨てる。
+MAX_LOOKS = 8
+LOOK_SYSTEM = (
+    "あなたは Stable Diffusion の画像生成用のプロンプトを書く担当です。\n"
+    "人物の外見の説明（日本語）を読み、絵に描ける特徴を漏らさず、英語の短いタグの並びに直してください。\n"
+    "- 1つのタグは英語で1〜3語。Danbooru のタグの言い方を優先する（例: black hair, blue eyes, off-shoulder, black pants, knee boots）。\n"
+    "- 説明にある物は全部入れる。次の順で並べる: 髪（色・内側や毛先の色・長さ・髪型）、目（色・目つき）、表情、体つき、"
+    "上衣、鎧、ベルトやポーチ、下衣、履き物、首や頭の装飾、武器や持ち物。\n"
+    "- 1つのタグに with や and で2つの物を入れない。別のタグに分ける。\n"
+    "- 説明に無い物は足さない。性別・年齢・人数・画質・背景・ポーズ・画風のタグは書かない（別に付ける）。\n"
+    "- タグは全部で{}個まで。".format(MAX_TAGS)
+)
+
 # 他の立ち絵の生成が終わるまでこの秒数だけ待つ。
 IDLE_WAIT = 30.0
 IDLE_POLL = 0.5
@@ -57,6 +79,12 @@ BUTTON_WATCH_ATTR = BUTTON_ATTR + "_watch"
 BUTTON_SIZE = 24.0
 # 立ち絵の左上の角からの間（upx）。
 BUTTON_INSET = 6.0
+# 描き方の一覧（txt2img / img2img / txt2img→img2img）。描き方を出す MOD（343）が居て、
+# txt2img のほかにも選べるときだけ、ボタンを押すとその右に出す（ローダの描き方の窓口。TECH.md §5.11）。
+MENU_ATTR = BUTTON_ATTR + "_menu"
+# ボタンと一覧の間・一覧の行の間（upx）と、文字の左右の余白（px）。
+MENU_GAP = 4.0
+MENU_PADDING = 24.0
 PORTRAIT_WIDGET = "character_image_right"
 # 立ち絵のこれが変わったら置き直す（窓の大きさ・絵の差し替え・開閉）。
 PORTRAIT_EVENTS = ("pos", "size", "texture", "opacity", "source")
@@ -220,11 +248,75 @@ def _look_words(got):
     return []
 
 
-def _player_look(store, write, app, player):
+def _cached_look(bucket, source):
+    """外見文のハッシュに当たる控えの要素。無ければ空。
+
+    版4 から外見文ごとに `looks` に持つ（説明を一度変えて戻したときに、前の要素へ戻すため）。
+    版3 までの `look`（最後の1件だけ）も読む。
+    """
+    looks = bucket.get("looks")
+    if isinstance(looks, dict):
+        words = _sd_items(looks.get(source))
+        if words:
+            return words
+    record = bucket.get("look")
+    if isinstance(record, dict) and record.get("source") == source:
+        return _sd_items(record.get("prompts"))
+    return []
+
+
+def _keep_look(bucket, source, words):
+    """作った要素を外見文のハッシュごとに控える。`look` には最後の1件を残す（版3 と同じ形）。"""
+    looks = bucket.get("looks")
+    if not isinstance(looks, dict):
+        looks = {}
+        record = bucket.get("look")
+        if isinstance(record, dict) and record.get("source") and record.get("prompts"):
+            looks[record["source"]] = list(record["prompts"])
+    looks[source] = list(words)
+    while len(looks) > MAX_LOOKS:
+        looks.pop(next(iter(looks)))
+    bucket["looks"] = looks
+    bucket["look"] = {"source": source, "prompts": list(words)}
+
+
+def _ask_tags(ctx, write, desc):
+    """外見文を短いタグの並びにする（版4）。頼めない・読めないときは空。
+
+    ゲームの `create_look` は「8要素以下」と頼むので、LLM が細部を長い言い回しに詰め込み、
+    4語を超える要素（胸甲・ズボンとブーツ・髪の内側の色など）がここで落ちていた。
+    見える物を全部 1〜3語のタグで書かせ、16個までにする（SD1.5 / SDXL が1回に読む 75トークンに収まる。
+    VERIFICATION.md §2.94）。
+    """
+    structure = llm.create_structure(ctx, LOOK_STRUCTURE, {"tags": (List[str], ...)},
+                                     label="player portrait")
+    if structure is None:
+        return []
+    got = llm.ask(ctx, LOOK_MANAGER,
+                  [{"role": "system", "content": LOOK_SYSTEM},
+                   {"role": "user", "content": "【外見の説明】\n" + desc}],
+                  timeout=LOOK_TIMEOUT, structure=structure, label="player portrait", write=write)
+    tags = (got or {}).get("tags") if isinstance(got, dict) else None
+    return _sd_items(tags)[:MAX_TAGS]
+
+
+def _shift_held():
+    """Shift を押しているか。ゲームの外（検査）では False。"""
+    try:
+        from kivy.core.window import Window
+
+        return "shift" in (Window.modifiers or ())
+    except Exception:
+        return False
+
+
+def _player_look(store, write, app, player, ask=None, fresh=False):
     """主人公の英語の外見プロンプト。外見文が同じ間は控えを使う。
 
     look_description（日本語）をそのまま SD1.5 へ渡さない。
-    作れなければ None（描き直しは止める）。
+    `ask`（外見文 -> 要素）が渡されればまずそれで作り、空ならゲームの `create_look` で作る。
+    `fresh` なら控えがあっても作り直す（Shift を押しながらボタンを押したとき）。
+    作り直せなければ控えを使う。控えも無ければ None（描き直しは止める）。
     """
     desc = _text(player, "look_description")
     if not desc:
@@ -233,31 +325,64 @@ def _player_look(store, write, app, player):
     source = hashlib.sha256(desc.encode("utf-8")).hexdigest()
     playthrough = store.playthrough(app)
     bucket = store.load(playthrough)
-    record = bucket.get("look")
-    if isinstance(record, dict) and record.get("source") == source:
-        words = _sd_items(record.get("prompts"))
+    kept = _cached_look(bucket, source)
+    if kept and not fresh:
+        return kept
+    if fresh:
+        write("rebuilding look on request")
+    words = _make_look(write, player, desc, ask)
+    if not words:
+        if kept:
+            write("rebuild failed; using the kept look")
+        return kept or None
+    _keep_look(bucket, source, words)
+    store.save(playthrough)
+    return words
+
+
+def _make_look(write, player, desc, ask):
+    """外見文から英語の要素を作る。作れなければ None。"""
+    if ask is not None:
+        words = ask(desc)
         if words:
+            write("look prepared ({} tag(s))".format(len(words)))
             return words
+        write("tags unavailable; falling back to create_look")
 
     module = sys.modules.get(CREATE_LOOK_MODULE)
     create = getattr(module, "create_look", None)
     if not callable(create):
         write("skipped: create_look unavailable")
         return None
-    # 時間切れの例外は描き直しの仕事ごと終わらせる（Worker が記録し、on_done がボタンを戻す）。
-    # 付けないと、1回返らないだけで描き直しの仕事が鍵を握ったまま残り、ゲームを閉じるまで押しても何も起きない。
-    _LOOK_CALL.active = True
-    try:
-        got = create(_text(player, "name"), _gender_of(player),
-                     _text(player, "profile"), desc)
-    finally:
-        _LOOK_CALL.active = False
+    # ゲームの送り口は `timeout` を受け取っても待ちを打ち切らない（VERIFICATION.md §3.101）。
+    # ここでも打ち切らず、`LOOK_TIMEOUT` 秒を過ぎたらログに出して待ち続ける（ローダの `llm.ask` と同じ）。
+    box = {}
+
+    def call():
+        _LOOK_CALL.active = True
+        try:
+            box["got"] = create(_text(player, "name"), _gender_of(player),
+                                _text(player, "profile"), desc)
+        except Exception as exc:
+            box["exc"] = exc
+        finally:
+            _LOOK_CALL.active = False
+
+    caller = threading.Thread(target=call, name="335_create_look", daemon=True)
+    caller.start()
+    started = time.monotonic()
+    caller.join(LOOK_TIMEOUT)
+    if caller.is_alive():
+        write("slow: create_look has not returned after {}s; still waiting".format(LOOK_TIMEOUT))
+        caller.join()
+        write("create_look returned after {:.1f}s".format(time.monotonic() - started))
+    if "exc" in box:
+        raise box["exc"]
+    got = box.get("got")
     words = _look_words(got)
     if not words:
         write("skipped: create_look returned {!r}".format(repr(got)[:200]))
         return None
-    bucket["look"] = {"source": source, "prompts": list(words)}
-    store.save(playthrough)
     write("look prepared ({} item(s))".format(len(words)))
     return words
 
@@ -339,7 +464,7 @@ def apply(ctx):
                                                          insert=True)
             return orig(*args, **kwargs)
 
-    llm.watch_aliases(ctx, [SEND_TARGET], install_send, label="player portrait")
+    llm.watch_aliases(ctx, list(SEND_TARGETS), install_send, label="player portrait")
 
     def finish_job(job):
         app = job.get("app") if isinstance(job, dict) else None
@@ -364,16 +489,20 @@ def apply(ctx):
         if generator is None:
             write("skipped: image module unavailable")
             return
-        words = _player_look(store, write, app, player)
+        words = _player_look(store, write, app, player,
+                             ask=lambda desc: _ask_tags(ctx, write, desc),
+                             fresh=bool(job.get("fresh")))
         if not words:
             return
         if not _wait_idle(runtime):
             write("skipped: another portrait is still generating")
             return
-        # 本体は並びを「, 」で繋ぐ（実測。408 の native prompt type: list）。
-        generator(state.world_key(app), _text(player, "name"),
-                  _text(player, "category") or "character", list(words))
-        write("regenerated {}".format(_text(player, "name")))
+        # 選んだ描き方は、このスレッドの描き方として立てる（描くのは 343。ローダの描き方の窓口）。
+        with imagegen.drawing_method(job.get("method") or "txt2img") as method:
+            # 本体は並びを「, 」で繋ぐ（実測。408 の native prompt type: list）。
+            generator(state.world_key(app), _text(player, "name"),
+                      _text(player, "category") or "character", list(words))
+        write("regenerated {} ({})".format(_text(player, "name"), method))
 
     worker = _worker(ctx, run_job, write, finish_job)
 
@@ -401,6 +530,60 @@ def apply(ctx):
         visible = (rect is not None and app is not None and not runtime["busy"]
                    and _portrait_shows_player(app, image))
         ui.show_widget(button, visible)
+        if visible:
+            place_menu(hud, button)
+        else:
+            close_menu(hud)
+
+    def close_menu(hud):
+        """描き方の一覧を外す。"""
+        for item in getattr(hud, MENU_ATTR, None) or ():
+            parent = frames.attr(item, "parent", None)
+            if parent is not None:
+                try:
+                    parent.remove_widget(item)
+                except Exception:
+                    ctx.log_exc("player portrait: could not remove the method menu")
+        setattr(hud, MENU_ATTR, [])
+
+    def place_menu(hud, button):
+        """一覧をボタンの右へ、上端を揃えて縦に並べる。"""
+        gap = ui.upx(MENU_GAP)
+        top = button.y + button.height
+        for index, item in enumerate(getattr(hud, MENU_ATTR, None) or ()):
+            item.pos = (button.x + button.width + gap, top - (index + 1) * item.height - index * gap)
+            ui.clamp_into_window(item)
+
+    def open_menu(hud, button, choices, fresh):
+        """描き方の一覧を出す。選んだら一覧を閉じて描く。"""
+        host = ui.overlay_host(hud)
+        if host is None:
+            return
+        # 既定の字体（Roboto）には「→」が無く四角になった（実機）。ゲームの字体を写す。
+        try:
+            font = ui.font_from(hud, max_depth=6)
+        except Exception:
+            font = None
+        items = []
+        for method in choices:
+            item = ui.popup_button(imagegen.METHOD_LABELS[method])
+            if font:
+                item.font_name = font
+            try:
+                item.texture_update()
+                item.width = max(float(item.width), float(item.texture_size[0]) + MENU_PADDING)
+            except Exception:
+                pass                         # 測れなければ既定の幅のまま
+
+            def chosen(*_args, picked=method):
+                close_menu(hud)
+                start(hud, button, picked, fresh or _shift_held())
+
+            item.bind(on_release=chosen)
+            host.add_widget(item)
+            items.append(item)
+        setattr(hud, MENU_ATTR, items)
+        place_menu(hud, button)
 
     def request(button):
         app = ui.find_app()
@@ -409,14 +592,29 @@ def apply(ctx):
             return
         if not _portrait_shows_player(app, _value(hud, PORTRAIT_WIDGET)):
             return
+        # Shift を押しながら押したら、控えの要素を使わずに作り直す（DOC.md「英語の外見」）。
+        fresh = _shift_held()
+        choices = imagegen.methods("portrait")
+        if len(choices) <= 1:
+            start(hud, button, "txt2img", fresh)
+        elif getattr(hud, MENU_ATTR, None):
+            close_menu(hud)                  # もう一度押したら閉じる
+        else:
+            open_menu(hud, button, choices, fresh)
+
+    def start(hud, button, method, fresh):
+        """選んだ描き方で描き直しの仕事を積む。"""
+        app = ui.find_app()
+        if app is None or runtime["busy"]:
+            return
         runtime["busy"] = True
         ui.show_widget(button, False)
         key = state.playthrough_key(app) + ":player"
-        if not worker.enqueue({"app": app, "key": key}):
+        if not worker.enqueue({"app": app, "key": key, "fresh": fresh, "method": method}):
             runtime["busy"] = False
             place_button(hud, button)
             return
-        write("regeneration requested")
+        write("regeneration requested ({})".format(method) + (" (rebuild look)" if fresh else ""))
 
     def rebind(button, attr, target, events, callback):
         """target の events に callback を結ぶ。前の注入が結んだものは外す。
@@ -476,6 +674,7 @@ def apply(ctx):
         required=False, safe=True)
     def character_sheet(orig, self, *args, **kwargs):
         result = orig(self, *args, **kwargs)
+        close_menu(self)                     # 人物欄を開け閉めしたら一覧は閉じる
         button = ensure_button(self)
         if button is not None:
             place_button(self, button)

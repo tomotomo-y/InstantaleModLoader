@@ -58,12 +58,17 @@
 - `311_` / `403_` / `300_` の控えは読みも書きもしない
 
 遊び方の説明は DOC.md、検証の経過は VERIFICATION.md §3.54。
+
+版6: 宿泊のフック（`VacationStartManager.__init__`・`execute`・活動と社交の `execute`・
+`VacationSocializeResolveManager.__init__`・`VacationEndManager.execute`）は、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。`npc_id_list` は引数の並びの8番目（`args[7]`）として読み書きする。
 """
 
+import os
 import random
 import sys
 
-from instantale_modloader import choices, frames, llm, ui
+from instantale_modloader import choices, durations, frames, llm, loads, ui
 from instantale_modloader.state import WorldStore
 
 LOG_BASENAME = "inn_quality.log"
@@ -235,6 +240,7 @@ def life_log_dict(app, character):
 
 def apply(ctx):
     write = ctx.logger(LOG_BASENAME)
+    mod_owner = os.path.basename(getattr(ctx, "mod_dir", "") or "") or "327_inn_quality"
     screen = ui.Screen(ctx, write, tag="inn quality", mark=MARK)
 
     # 置き場は `sys`（`315_` と同じ理由。当て直しが宿泊の最中に挟まっても窓と残りが消えない）。
@@ -258,19 +264,20 @@ def apply(ctx):
 
     # ============================================================ 活動の数
     @ctx.wrap("__main__:VacationStartManager.__init__", required=False, safe=True)
-    def start_init(orig, self, app, months=None, quality=None, *args, **kwargs):
-        result = orig(self, app, months, quality, *args, **kwargs)
-        self._mod_inn_quality = str(quality)
+    def start_init(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
+        # (app, months, quality)。受け取った形のまま渡し、ここでは読むだけ。
+        self._mod_inn_quality = str(frames.arg(args, kwargs, "quality", 2))
         return result
 
     @ctx.wrap("__main__:VacationStartManager.execute", required=False)
-    def start_execute(orig, self, choice_text=None, *args, **kwargs):
+    def start_execute(orig, self, *args, **kwargs):
         quality = getattr(self, "_mod_inn_quality", None)
         state["window"] = {"quality": quality, "elapsed": False}
         state["stay"] = None
         state["partner"] = None
         try:
-            return orig(self, choice_text, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         finally:
             window, state["window"] = state["window"], None
             try:
@@ -286,30 +293,31 @@ def apply(ctx):
             except Exception:
                 ctx.log_exc("inn quality: cannot open the stay")
 
-    @ctx.wrap("__main__:InstantaleApp.elapse_days", required=False)
-    def elapse_days(orig, self, days=None, *args, **kwargs):
+    def days_begin(call):
+        """日数が進む前（ローダの日数の関所 `durations.on_days`。TECH.md §3.3.21）。"""
         window = state["window"]
         if window is not None:
             window["elapsed"] = True
-        return orig(self, days, *args, **kwargs)
+
+    durations.on_days(mod_owner, ctx, before=days_begin, write=write)
 
     def install_counter(cls_name):
         @ctx.wrap("__main__:{}.execute".format(cls_name), required=False)
-        def activity_execute(orig, self, choice_text=None, *args, **kwargs):
+        def activity_execute(orig, self, *args, **kwargs):
             # 入口で数える。活動は自分の `execute` の中で次の画面を描くので、
             # 出口で数えると最後の活動の後にもう1回並んでしまう。
             stay = state["stay"]
             if stay is not None:
                 stay["left"] -= 1
                 write("activity: {} left={}".format(cls_name, stay["left"]))
-            return orig(self, choice_text, *args, **kwargs)
+            return orig(self, *args, **kwargs)
 
     for name in ACTIVITY_CLASSES:
         if name != SOCIALIZE_CLASS:
             install_counter(name)
 
     @ctx.wrap("__main__:VacationSocializeManager.execute", required=False)
-    def socialize_execute(orig, self, choice_text=None, *args, **kwargs):
+    def socialize_execute(orig, self, *args, **kwargs):
         """数えるのは他の活動と同じ。加えて、この社交の相手を決めて控える（差し替えは下の3か所）。"""
         stay = state["stay"]
         if stay is not None:
@@ -326,7 +334,7 @@ def apply(ctx):
                 write("social: untouched ({})".format(tier))
         except Exception:
             ctx.log_exc("inn quality: cannot pick the social partner")
-        return orig(self, choice_text, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     def swap_npc_list(site, index, args, kwargs):
         """`npc_list` を選んだ相手1人にする。要素の形は元の1つ目を写す。"""
@@ -368,24 +376,28 @@ def apply(ctx):
         return orig(*args, **kwargs)
 
     @ctx.wrap("__main__:VacationSocializeResolveManager.__init__", required=False)
-    def resolve_init(orig, self, app, months=None, quality=None, *args, **kwargs):
-        """感情の反映は `npc_id_list` から引かれるので、ここも同じ1人にする。"""
+    def resolve_init(orig, self, *args, **kwargs):
+        """感情の反映は `npc_id_list` から引かれるので、ここも同じ1人にする。
+
+        引数は (app, months, quality, life_overview_narration, event_choice_text,
+        event_scene_depiction, location_name, npc_id_list)。受け取った形のまま渡す。
+        """
         try:
             partner = state.get("partner")
             if partner is not None:
-                before = frames.arg(args, kwargs, "npc_id_list", 4)
-                args, kwargs, done = frames.replace_arg(args, kwargs, "npc_id_list", 4, [partner[0]])
+                before = frames.arg(args, kwargs, "npc_id_list", 7)
+                args, kwargs, done = frames.replace_arg(args, kwargs, "npc_id_list", 7, [partner[0]])
                 write("social: npc_id_list {} -> [{}]{}".format(
                     before, partner[0], "" if done else " (argument not reached)"))
         except Exception:
             ctx.log_exc("inn quality: cannot replace npc_id_list")
-        return orig(self, app, months, quality, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:VacationEndManager.execute", required=False)
-    def end_execute(orig, self, choice_text=None, *args, **kwargs):
+    def end_execute(orig, self, *args, **kwargs):
         state["stay"] = None
         state["partner"] = None
-        return orig(self, choice_text, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     def refresh_buttons(self, _buttons):
         """描かれる直前に、活動の一覧を写す／残りがあれば並べ直す。"""
@@ -395,13 +407,15 @@ def apply(ctx):
                 activities = [e for e in buttons
                               if ui.spec_cls_name(e) in ACTIVITY_CLASSES]
                 if activities:
-                    if not any(screen.mark_of(e) for e in activities):
-                        state["menu"] = [(e.get("text"), ui.spec_cls_name(e),
-                                          ui.spec_args(e) or []) for e in activities]
+                    # 写し直した活動も同じ並びなので、どれを写しても一覧は同じ
+                    state["menu"] = [(e.get("text"), ui.spec_cls_name(e),
+                                      ui.spec_args(e) or []) for e in activities]
                 elif state["stay"] and state["stay"]["left"] > 0 \
                         and state["menu"] \
                         and ui.find_spec_button(buttons, END_CLASS) is not None:
-                    entries = [screen.button(text, mark="again", cls_name=cls, args=argv)
+                    # ゲームの活動のボタン（spec はゲームのまま）を写し直す。押下はゲームが受ける。
+                    # セーブに残っても、MOD の無い起動でそのまま活動を選べる。印は付けない
+                    entries = [screen.button(text, cls_name=cls, args=argv)
                                for text, cls, argv in state["menu"]]
                     entries = [e for e in entries if e is not None]
                     buttons[0:0] = entries
@@ -476,17 +490,19 @@ def apply(ctx):
                 ctx.log_exc("inn quality: cannot write the records after the save")
         return result
 
-    @ctx.wrap("__main__:World.__init__", required=False, safe=True)
-    def world_init(orig, self, *args, **kwargs):
-        """ロードと新規開始。まだ書いていない記録を捨て、次に引くときに `state\\` から読み直す。"""
-        result = orig(self, *args, **kwargs)
+    def world_init(call):
+        """ロードと新規開始（世界を組み立てた後。ローダの窓口 `loads`）。
+
+        まだ書いていない記録を捨て、次に引くときに `state\\` から読み直す。
+        """
         with worlds.lock:
             dropped = sorted(pending)
             pending.clear()
             worlds.forget()
         if dropped:
             write("load: unsaved records of {} dropped".format(dropped))
-        return result
+
+    loads.on(mod_owner, ctx, (loads.WORLD,), after=world_init, write=write)
 
     def rewrite_outgoing(texts, site):
         if not REGULAR_MEMORY or not texts:

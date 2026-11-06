@@ -7,8 +7,11 @@
 判事の頼み文は、反省の色があれば情状酌量し、ふざけていれば重くするよう指示している（GAME.md §2.20）。
 
 - 釈明: 画面にそのことが出ないので、裁判の画面に1度だけ知らせる
-- 弁護人・司法取引・判事の買収: 裁判の画面に自前のボタンを足す。押しても判決へは進まない（同じ画面に戻る）。
+- 弁護人・司法取引・判事の買収: 裁判の画面に自前のボタンを足す（ローダの窓口 `choices` の `offer`）。
+  押しても判決へは進まない（同じ画面に戻る）。
   効き目は判事の頼みへの一文と、判決のボタンの直し（`trial.adjust`）の両方で確かにする
+- 判決のボタンの直しはゲームのデータ（セーブに残る判決）を直す処理なので、組み直しの前（`refresh`）で行う。
+  無罪放免は判決の画面を「無罪放免」1つにする（窓口の `claim`。ゲームの判決のボタンは書き換えない）
 - 情状: 検察と判事の頼みに手配の重さとこの土地での活躍を足し、壊れた「人生ログの全体象」をゲーム自身の
   `context_manager.get_life_log_text` の文に置き換える
 
@@ -16,18 +19,14 @@
 メモリだけだと、払った後や裁判が始まった後にロードすると効き目が消え、ボタンがまた出た。
 介入を押した後と判決を直した後は、ゲーム自身の保存を呼ぶ（払った額・効き目・直した判決を同じ保存に入れる）。
 """
-import sys
+from instantale_modloader import choices, llm, ui, wanted
 
-from instantale_modloader import llm, ui, wanted
-
-from . import trial
+from . import common, trial
 
 HINT_TEXT = "入力欄に書いて送った言葉が、そのまま判事への釈明になる。\nボタンを押せば、その文言が釈明になる。"
 SEND_TARGET = "scripts.llm.llm_manager:send_request"
-LIFE_LOG_MODULE = "scripts.llm.context_manager"
 #: 置き換える人生の記録の上限（字）。頼みが長くなりすぎないように。
 LIFE_LOG_LIMIT = 1500
-MARK_HEAD = "court:"
 
 
 def trial_args(buttons):
@@ -39,17 +38,8 @@ def trial_args(buttons):
 
 
 def life_log_text(app, character):
-    """ゲーム自身の作り方の人生の記録を、頼みに載せる文にする。読めなければ空。"""
-    module = sys.modules.get(LIFE_LOG_MODULE)
-    build = getattr(module, "get_life_log_text", None)
-    try:
-        value = build(app, character) if callable(build) else None
-    except Exception:
-        value = None
-    if not value:
-        return ""
-    text = str(value)
-    return text if len(text) <= LIFE_LOG_LIMIT else text[:LIFE_LOG_LIMIT] + "…"
+    """ゲーム自身の作り方の人生の記録を、頼みに載せる文にする（`common.life_log_text`）。"""
+    return common.life_log_text(app, character, LIFE_LOG_LIMIT)
 
 
 def install(env):
@@ -112,29 +102,35 @@ def install(env):
                                   cfg.TRIAL_BRIBE_BASE_PCT, cfg.TRIAL_BRIBE_PER_POINT)
 
     # ---------------------------------------------------- 裁判の画面
-    def insert_buttons(app, buttons):
+    def intervention_choices(app):
+        """裁判の画面に足す介入のボタン（使った介入は出さない）。"""
         effects = court["effects"]
         texts = []
-        if cfg.TRIAL_LAWYER_ENABLED and not effects["lawyer"]:
+        if cfg.TRIAL_LAWYER_ENABLED and not effects.get("lawyer"):
             cost = fee_of(app, cfg.TRIAL_LAWYER_PCT)
             if can_pay(app, cost):
                 texts.append(("lawyer", ui.rewrite_coins(
                     trial.LAWYER_LABEL.format(cost=ui.money(cost)))))
-        if cfg.TRIAL_PLEA_ENABLED and not effects["plea"] and plea_open(app):
+        if cfg.TRIAL_PLEA_ENABLED and not effects.get("plea") and plea_open(app):
             texts.append(("plea", trial.PLEA_LABEL))
-        if cfg.TRIAL_BRIBE_ENABLED and effects["bribe"] is None:
+        if cfg.TRIAL_BRIBE_ENABLED and effects.get("bribe") is None:
             cost = fee_of(app, cfg.TRIAL_BRIBE_PCT)
             if can_pay(app, cost):
                 texts.append(("bribe", ui.rewrite_coins(trial.BRIBE_LABEL.format(
                     cost=ui.money(cost), chance=bribe_odds(app)))))
-        entries = [screen.button(text, mark=MARK_HEAD + key) for key, text in texts]
-        buttons.extend(entry for entry in entries if entry is not None)
+        return [choices.Choice(text, on_press=lambda app, key=key: press(app, key)) for key, text in texts]
 
     def on_trial_screen(app, buttons, args):
         load_court(app)
         key = repr(args)[:400]
         if key != court["key"]:
             new_trial(app, key, args)
+        elif court["applied"] or court["acquit"] is not None:
+            # 判決の後に、同じ裁判の画面のセーブを読んだ。判決はまだ出ていないので、出し直しを受けられる形に戻す
+            # （使った介入はそのまま。`applied` が残ると、判事がまた0年を返しても無罪放免へ差し替えない）
+            court.update(applied=False, acquit=None)
+            store_court(app)
+            write("court: back on the trial screen; the verdict will be read again")
         if cfg.TRIAL_HINT and not court["told"]:
             court["told"] = True
             store_court(app)
@@ -142,11 +138,6 @@ def install(env):
                 (args[0] or {}).get("sentencing_request") if args and isinstance(args[0], dict)
                 else None))
             screen.schedule(lambda: screen.say(app, HINT_TEXT))
-        # 自分のボタンは一度外して、いまの状態で並べ直す（使った介入は消える）。
-        buttons[:] = [entry for entry in buttons
-                      if not str(screen.mark_of(entry) or "").startswith(MARK_HEAD)]
-        screen.prune_stale(buttons, trial.LABEL_HEADS)
-        insert_buttons(app, buttons)
 
     # ---------------------------------------------------- 判決の画面
     def on_verdict_screen(app, buttons, verdict):
@@ -154,7 +145,7 @@ def install(env):
         effects = court["effects"]
         kind, years = verdict
         if not court["applied"] and court["acquit"] == "open" and trial.acquitted(kind, years):
-            acquit_screen(app, buttons)
+            acquit_screen(app)
             return
         if court["applied"] or court["args"] is None or not any(effects.values()):
             return
@@ -189,13 +180,8 @@ def install(env):
         screen.schedule(lambda: screen.say(app, line))
         save_soon(app, "verdict adjusted")      # 直した判決のボタンを保存に入れる（控えの「直した」と揃える）
 
-    def acquit_screen(app, buttons):
-        """判事が懲役0年（無罪）を返した。判決のボタンを「無罪放免」1つに差し替える。"""
-        entry = screen.button(trial.ACQUIT_LABEL, mark=MARK_HEAD + "acquit")
-        if entry is None:
-            write("WARN court: cannot build the acquittal button; leaving the game's")
-            return
-        buttons[:] = [entry]
+    def acquit_screen(app):
+        """判事が懲役0年（無罪）を返した。判決の画面を「無罪放免」1つにする（`claim` が出す）。"""
         court["applied"] = True
         court["acquit"] = "done"
         store_court(app)
@@ -216,6 +202,10 @@ def install(env):
         write("court: released; area {} lawfulness {} -> {}".format(area_id, before, after))
         court["acquit"] = None
         store_court(app)
+        # 司法取引を持ちかけていれば、締め出しは放免の日から数える（服役の後と同じ。`prison.start_ban`）
+        start_ban = getattr(env, "start_ban", None)
+        if callable(start_ban):
+            start_ban(app)
         screen.say(app, trial.ACQUIT_TEXT.format(area=env.area_label(app, area_id), before=before, after=after))
         redraw = getattr(app, "change_background_image_to_current_location", None)
         normal = getattr(app, "set_buttons_to_normal", None)
@@ -236,13 +226,28 @@ def install(env):
         if verdict is not None:
             on_verdict_screen(app, buttons, verdict)
 
-    # ---------------------------------------------------- 介入を押した
-    def press(app, action):
+    def offer(app, view):
+        """裁判の画面に弁護人・司法取引・判事の買収を足す（`on_trial_screen` が裁判の控えを揃えた後）。"""
+        if trial_args(view.buttons) is None:
+            return None
         load_court(app)
-        key = action[len(MARK_HEAD):]
+        return intervention_choices(app)
+
+    def claim(app, view):
+        """無罪放免を出した判決の画面は「無罪放免」1つだけ（ロードの後も控えの `acquit` から組む）。"""
+        if trial.verdict_of(view.buttons, ui.spec_cls_name, ui.spec_args) is None:
+            return None
+        load_court(app)
+        if court["acquit"] != "done":
+            return None
+        return [choices.Choice(trial.ACQUIT_LABEL, on_press=lambda app: press(app, "acquit"))]
+
+    # ---------------------------------------------------- 介入を押した
+    def press(app, key):
+        load_court(app)
         if key == "acquit":
             release(app)
-            return
+            return None
         effects = court["effects"]
         line = None
         if key == "lawyer" and not effects.get("lawyer"):
@@ -274,9 +279,10 @@ def install(env):
             store_court(app)
             env.refresh_gold(app)
             screen.say(app, ui.rewrite_coins(line))
-        screen.apply_buttons(app, None, "court")
+        choices.repaint(app)            # 使った介入のボタンを消す（組み直すと今の控えで並ぶ）
         if line:
             save_soon(app, "court " + key)
+        return None
 
     # ---------------------------------------------------- 検察と判事の頼み
     def rewrite_message(message, app, judge):
@@ -318,6 +324,10 @@ def install(env):
                         notes = "\n".join(note for note in (notes, trial.NOTE_ACQUIT) if note)
                         court["acquit"] = "open"
                         store_court(app)
+                    elif court["acquit"] == "open":
+                        # 前の送り（落ちる前・読み直す前）で開いた道は、今回の判事には渡していない
+                        court["acquit"] = None
+                        store_court(app)
                 if notes:
                     content = content.rstrip() + "\n\n" + notes
                     changed = True
@@ -348,4 +358,6 @@ def install(env):
 
     llm.watch_aliases(ctx, [SEND_TARGET], install_send, label="crime incentive court")
     env.on_refresh(on_refresh)
-    env.on_press(MARK_HEAD, press)
+    env.on_offer(offer)
+    env.on_claim(claim)
+    env.on_labels(lambda app: trial.LABEL_HEADS)

@@ -35,12 +35,16 @@ for key, spec_ in manifest["settings"].items():
     assert getattr(MOD, key) == spec_["default"], key
     if spec_["type"] == "choice":
         assert spec_["default"] in spec_["values"], key
-# モデルの一覧は、off 以外すべてに表示名（Claude Opus 5.5 / GPT-6.1 Sol の形）を付ける
-for key in ("OPENAI_MODEL", "CLAUDE_MODEL"):
-    spec_ = manifest["settings"][key]
-    named = set(spec_["value_labels"])
-    assert named == set(spec_["values"]) - {MOD.OFF}, (key, set(spec_["values"]) ^ named)
-    assert all(label.startswith(("GPT-", "Claude ")) for label in spec_["value_labels"].values()), key
+# モデルの一覧は、off 以外すべてに表示名（Claude Haiku 5.5 の形）を付ける
+spec_ = manifest["settings"]["CLAUDE_MODEL"]
+named = set(spec_["value_labels"])
+assert named == set(spec_["values"]) - {MOD.OFF}, set(spec_["values"]) ^ named
+assert all(label.startswith("Claude ") for label in spec_["value_labels"].values())
+# 一覧に載せるのはゲームの一覧（main_026）に無いモデルだけ。OpenAI の一覧は外した（全部ゲームの一覧に入った）
+GAME_CLAUDE = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-fable-5", "claude-sonnet-5",
+               "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-haiku-4-5-20251001"}
+assert not set(spec_["values"]) & GAME_CLAUDE, set(spec_["values"]) & GAME_CLAUDE
+assert "OPENAI_MODEL" not in manifest["settings"] and not hasattr(MOD, "OPENAI_MODEL")
 
 
 class Ctx(object):
@@ -88,6 +92,7 @@ assert any("cache stable" in line and "cache 5m" in line for line in ctx.lines),
 
 # ここから下の差し替えの検査は、キャッシュを切って本文の形だけを見る（キャッシュは後ろの節）
 MOD.OPENAI_CACHE, MOD.CLAUDE_CACHE = "keep", "off"
+MOD.OPENAI_CUSTOM = "gpt-6-luna"           # OpenAI は名前を書いたときだけ差し替える
 ctx = Ctx()
 MOD.apply(ctx)
 # Claude 側は差し替えもキャッシュも切っていても包む（文法が大きすぎるときの迂回）
@@ -158,16 +163,16 @@ sent = ctx.hooks[OA.POST](orig, OPENAI, "/responses",
 assert sent == {"model": "gpt-5.5", "reasoning": {"effort": "low"}}, sent
 MOD.OPENAI_EFFORT, MOD.OPENAI_CUSTOM = "keep", ""
 
-# off なら OpenAI の送信を包まない（タイトル画面の包みは、前の1行を外すために残る）。
+# 名前を書いていなければ OpenAI の送信を包まない（タイトル画面の包みは、前の1行を外すために残る）。
 # Claude は文法が大きすぎるときの迂回のために包み、型の無い要求は本文をそのまま渡す
-MOD.OPENAI_MODEL = "off"
+assert MOD.OPENAI_CUSTOM == ""
 ctx = Ctx()
 MOD.apply(ctx)
 assert OA.POST not in ctx.hooks and CL.POST in ctx.hooks, ctx.hooks
 plain = {"model": "claude-sonnet-5", "max_tokens": 10, "messages": []}
 assert ctx.hooks[CL.POST](orig, OPENAI, "/v1/messages", body=plain) == plain
 assert not any("[claude]" in line for line in ctx.lines), ctx.lines
-MOD.OPENAI_MODEL = "gpt-6-luna"
+MOD.OPENAI_CUSTOM = "gpt-6-luna"
 
 # ---------------------------------------------------------------- Claude
 MOD.CLAUDE_MODEL = "claude-opus-5-5"
@@ -203,6 +208,25 @@ fixed = {"model": "x", "thinking": {"type": "disabled"}, "output_config": {"effo
 CL.fix(fixed, "claude-sonnet-5-5", "keep")
 assert "thinking" not in fixed, fixed
 assert CL.traits("claude-sonnet-5")["between_tools"] is False
+# ゲームで Sonnet 5.5 を選ぶと、ゲーム自身が between_tools で送る（main_026）。
+# 受けない差し替え先には disabled へ戻す（Haiku 5.5 は 400 で断った。実機）。切れない先には外す。受ける先はそのまま
+game_sonnet55 = {"model": "claude-sonnet-5-5", "thinking": {"type": "between_tools"}, "output_config": {"effort": "low"}}
+fixed = dict(game_sonnet55)
+changed = CL.fix(fixed, "claude-haiku-5-5", "medium")
+assert fixed["thinking"] == {"type": "disabled"} and "thinking between_tools->disabled" in changed, (fixed, changed)
+fixed = dict(game_sonnet55, output_config={"effort": "max"})
+CL.fix(fixed, "claude-haiku-5-5", "keep")
+assert "thinking" not in fixed, fixed
+for target in ("claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5"):
+    fixed = dict(game_sonnet55)
+    CL.fix(fixed, target, "keep")
+    assert fixed["thinking"] == {"type": "disabled"}, (target, fixed)
+for target in ("claude-opus-5-5", "claude-fable-5-1", "my-new-claude"):
+    fixed = dict(game_sonnet55)
+    CL.fix(fixed, target, "keep")
+    assert "thinking" not in fixed, (target, fixed)
+fixed = dict(game_sonnet55)
+assert CL.fix(fixed, "claude-sonnet-5-5", "keep") == [] and fixed == game_sonnet55, fixed
 
 # Haiku 5.5 は disabled と強制ツール指定を受けるが、sampling は断る。xhigh / max では disabled も断る
 fixed = {"model": "x", "thinking": {"type": "disabled"}, "temperature": 0.7,
@@ -351,13 +375,13 @@ assert sent["input"][0]["content"] == [
 assert sent["input"][1] == {"role": "user", "content": "やあ"}
 
 # GPT-5.5 以前へ送るときと、chat.completions の経路では触らない
-MOD.OPENAI_MODEL = "gpt-5.5"
+MOD.OPENAI_CUSTOM = "gpt-5.5"
 ctx = Ctx()
 MOD.apply(ctx)
 sent = ask(SHARED + "一回目")
 assert "prompt_cache_options" not in sent, sent
 assert OA.apply_cache({"input": []}, "gpt-6-luna", "off", PC.Prefixes(), "/chat/completions") == []
-MOD.OPENAI_MODEL, MOD.OPENAI_CACHE = "gpt-6-luna", "keep"
+MOD.OPENAI_CUSTOM, MOD.OPENAI_CACHE = "gpt-6-luna", "keep"
 
 # keep（既定）は何も足さない
 ctx = Ctx()
@@ -367,29 +391,56 @@ assert "prompt_cache_options" not in ask(SHARED + "一回目", model="gpt-6-luna
 # ---------------------------------------------------------------- タイトル画面の1行
 # 出すのは、API キーでクラウドを使っていて、そのプロバイダを差し替えているときだけ
 NAMES = MOD.model_names(folder)
-assert NAMES["claude-sonnet-5-5"] == "Claude Sonnet 5.5" and NAMES["gpt-6.1-sol"] == "GPT-6.1 Sol"
+assert NAMES == {"claude-haiku-5-5": "Claude Haiku 5.5", "claude-opus-5": "Claude Opus 5"}, NAMES
 cloud = {"inference": "cloud_api_key", "provider": "Claude API", "model": "claude-sonnet-5"}
 t = MOD.title_text(cloud, "gpt-6-luna", "claude-haiku-5-5", NAMES, claude_effort="medium")
 assert t == "LLM: Claude Haiku 5.5 / effort: medium", t
 t = MOD.title_text(cloud, "gpt-6-luna", "claude-sonnet-5-5", NAMES)
-assert t == "LLM: Claude Sonnet 5.5 / effort: ゲームのまま", t
-assert MOD.title_text(cloud, None, "claude-haiku-4-5", NAMES, claude_effort="low") ==     "LLM: Claude Haiku 4.5", "推論量を受けないモデルには付けない"
+assert t == "LLM: claude-sonnet-5-5 / effort: high（既定）", "keep でゲームが付けない（Sonnet 5）なら差し替え先の既定"
+t = MOD.title_text(dict(cloud, model="claude-opus-5-5"), None, "claude-haiku-5-5", NAMES)
+assert t == "LLM: Claude Haiku 5.5 / effort: low", "keep でゲームが low を付けるモデル（Opus 5.5）はそのまま"
+t = MOD.title_text(cloud, None, "claude-opus-5-5", NAMES)
+assert t == "LLM: claude-opus-5-5 / effort: medium（既定）", "Opus 5.5 / Haiku 5.5 の既定は medium"
+assert MOD.title_text(cloud, None, "my-claude", NAMES) == "LLM: my-claude / effort: 既定", "既定の分からない名前"
+assert MOD.title_text(cloud, None, "claude-haiku-4-5", NAMES, claude_effort="low") ==     "LLM: claude-haiku-4-5", "推論量を受けないモデルには付けない"
 openai_cloud = dict(cloud, provider="OpenAI API", model="gpt-5.5")
 t = MOD.title_text(openai_cloud, "gpt-6-luna", None, NAMES)
-assert t == "LLM: GPT-6 Luna / effort: none", "keep ならゲームが組む値（gpt-5.5 は none）"
+assert t == "LLM: gpt-6-luna / effort: none", "keep ならゲームが組む値（gpt-5.5 は none）"
 t = MOD.title_text(openai_cloud, "gpt-6-astra", None, NAMES)
-assert t == "LLM: GPT-6 Astra / effort: low", "差し替え先の読み替え（Astra は none を断る）を通す"
+assert t == "LLM: gpt-6-astra / effort: low", "差し替え先の読み替え（Astra は none を断る）を通す"
 t = MOD.title_text(dict(openai_cloud, model="gpt-5"), "gpt-6-luna", None, NAMES)
-assert t == "LLM: GPT-6 Luna / effort: none", "gpt-5 の minimal も読み替える"
+assert t == "LLM: gpt-6-luna / effort: none", "gpt-5 の minimal も読み替える"
 t = MOD.title_text(dict(openai_cloud, model="gpt-4.1"), "gpt-6-luna", None, NAMES)
-assert t == "LLM: GPT-6 Luna", "推論量を送らない経路では付けない"
+assert t == "LLM: gpt-6-luna", "推論量を送らない経路では付けない"
 t = MOD.title_text(openai_cloud, "gpt-6-luna", None, NAMES, openai_effort="high")
-assert t == "LLM: GPT-6 Luna / effort: high", t
+assert t == "LLM: gpt-6-luna / effort: high", t
 assert MOD.title_text(cloud, "gpt-6-luna", "my-claude", NAMES, claude_effort="low") ==     "LLM: my-claude / effort: low", "一覧に無い名前はそのまま"
 assert MOD.title_text(cloud, "gpt-6-luna", None, NAMES) is None, "そのプロバイダを差し替えていなければ出さない"
 assert MOD.title_text(dict(cloud, inference="local"), "gpt-6-luna", "claude-sonnet-5-5", NAMES) is None
 assert MOD.title_text(dict(cloud, provider="Gemini API(Experimental)"), "gpt-6-luna", "x", NAMES) is None
 assert MOD.title_text(None, "gpt-6-luna", None, NAMES) is None
+t = MOD.title_text(dict(openai_cloud, model="gpt-6-sol"), "gpt-6-luna", None, NAMES)
+assert t == "LLM: gpt-6-luna / effort: none", "ゲームの一覧の GPT-6 系も none を組む（main_026）"
+
+# 差し替えていないときも出す（既定はオフ）。ゲームが選んだモデルと、ゲームが組む推論量
+U = dict(unswapped=True)
+t = MOD.title_text(dict(cloud, model="claude-sonnet-5-5"), None, None, NAMES, claude_effort="high", **U)
+assert t == "LLM: claude-sonnet-5-5 / effort: low", "推論量の設定は差し替えるときだけ効く"
+t = MOD.title_text(cloud, None, None, NAMES, **U)
+assert t == "LLM: claude-sonnet-5 / effort: high（既定）", t
+t = MOD.title_text(dict(cloud, model="claude-haiku-4-5-20251001"), None, None, NAMES, **U)
+assert t == "LLM: claude-haiku-4-5-20251001", "推論量を受けないモデルには付けない"
+for model, effort in (("gpt-5.5", "none"), ("gpt-6-astra", "low"), ("gpt-6.1-sol", "low"),
+                      ("gpt-5.6-luna", "none"), ("gpt-5", "minimal")):
+    t = MOD.title_text(dict(openai_cloud, model=model), None, None, NAMES, openai_effort="high", **U)
+    assert t == "LLM: {} / effort: {}".format(model, effort), t
+assert MOD.title_text(dict(openai_cloud, model="gpt-4.1"), None, None, NAMES, **U) == "LLM: gpt-4.1"
+t = MOD.title_text(cloud, None, "claude-haiku-5-5", NAMES, claude_effort="medium", **U)
+assert t == "LLM: Claude Haiku 5.5 / effort: medium", "差し替えているときは今までどおり"
+assert MOD.title_text(dict(cloud, inference="local"), None, None, NAMES, **U) is None
+assert MOD.title_text(dict(cloud, provider="Gemini API(Experimental)"), None, None, NAMES, **U) is None
+assert MOD.title_text(dict(cloud, model=None), None, None, NAMES, **U) is None, "モデルが読めなければ出さない"
+assert MOD.TITLE_MODEL_UNSWAPPED is False, "既定は出さない"
 
 # apply() はタイトル画面を包み、開いている画面へは on_ready で付ける。世代を鍵に混ぜる
 ctx = Ctx()
@@ -434,7 +485,7 @@ assert order == [("$defs", "Skill", "properties", "effects", "items"), ("propert
 narrow = GR.loosen(QUEST, order[:1])
 item = narrow["$defs"]["Skill"]["properties"]["effects"]["items"]
 assert item["type"] == "string" and item["description"].startswith(GR.MARK), item
-assert '"enum":["buff"]' in item["description"] and "title" not in item["description"], item
+assert '"const":"buff"' in item["description"] and "title" not in item["description"], item
 assert "Buff" not in narrow["$defs"] and "Damage" in narrow["$defs"], sorted(narrow["$defs"])  # loot が Damage を使う
 assert "anyOf" in QUEST["$defs"]["Skill"]["properties"]["effects"]["items"]  # 元の型は変えない
 
@@ -481,9 +532,9 @@ api = Api()
 parsed = []
 request = {"model": "claude-haiku-5-5", "max_tokens": 100, "messages": [],
            "output_config": {"format": {"type": "json_schema", "schema": QUEST}}}
-reply = post(api, OPENAI, "/v1/messages", body=request,
+answer = post(api, OPENAI, "/v1/messages", body=request,
              options={"post_parser": lambda message: parsed.append(json.loads(message.content[0].text)) or "parsed"})
-assert reply == "parsed" and len(api.calls) == 2, (reply, len(api.calls))
+assert answer == "parsed" and len(api.calls) == 2, (answer, len(api.calls))
 assert parsed[0]["enemies"][0]["skills"][0]["effects"][0] == {"type": "buff", "turns": 3}, parsed
 assert any("grammar too large; sent with 1 choice(s)" in line for line in ctx.lines), ctx.lines
 assert request["output_config"]["format"]["schema"] is QUEST  # 呼び出し側の本文は変えない
@@ -504,6 +555,113 @@ try:
     raise AssertionError("別の理由の 400 を握った")
 except RuntimeError as exc:
     assert "max_tokens" in str(exc)
+
+# ---------------------------------------------------------------- SDK が説明文へ移した const を戻す
+# SDK は Literal の1値（const）を外して説明文に `{const: ward}` と書く。そのままだと自由な文字列として縛られる
+AREA = {
+    "type": "object", "additionalProperties": False, "required": ["places"],
+    "properties": {"places": {"type": "array", "items": {"anyOf": [
+        {"$ref": "#/$defs/Ward"}, {"$ref": "#/$defs/Place"}]}}},
+    "$defs": {
+        "Ward": {"type": "object", "properties": {
+            "type": {"type": "string", "title": "Type", "description": "{const: ward}"},
+            "name": {"type": "string", "description": "区画の名前"}}},
+        "Place": {"type": "object", "properties": {
+            "type": {"type": "string", "description": "場所の種類\n\n{const: location}"},
+            "level": {"type": "integer", "description": "{const: 3}"},
+            "size": {"type": "integer", "description": "{maximum: 10, minimum: 1}"},
+            "kind": {"type": "string", "enum": ["a"], "description": "{const: b}"}}}}}
+fixed_area, restored = GR.restore_const(AREA)
+ward_type = fixed_area["$defs"]["Ward"]["properties"]["type"]
+place = fixed_area["$defs"]["Place"]["properties"]
+assert restored == 2, restored
+assert ward_type == {"type": "string", "title": "Type", "enum": ["ward"]}, ward_type
+assert place["type"] == {"type": "string", "description": "場所の種類", "enum": ["location"]}, place["type"]
+assert "enum" not in place["level"] and "enum" not in place["size"], place  # 文字列の欄だけ・const だけ
+assert place["kind"]["enum"] == ["a"], place["kind"]  # 縛りのある欄は触らない
+assert "enum" not in AREA["$defs"]["Ward"]["properties"]["type"]  # 元の型は変えない
+assert GR.restore_const(QUEST) == (QUEST, 0)  # 戻すものが無ければ元のまま
+
+MOD.CLAUDE_MODEL, MOD.CLAUDE_CACHE = "off", "off"
+ctx = Ctx()
+MOD.apply(ctx)
+sent = []
+post = ctx.hooks[CL.POST]
+area_request = {"model": "claude-haiku-5-5", "max_tokens": 100, "messages": [],
+                "output_config": {"format": {"type": "json_schema", "schema": AREA}}}
+post(lambda self_, path, *args, **kwargs: sent.append(kwargs["body"]), OPENAI, "/v1/messages",
+     body=area_request, options={})
+assert sent[0]["output_config"]["format"]["schema"] == fixed_area, sent
+assert any("const->enum 2" in line for line in ctx.lines), ctx.lines  # 差し替えが off でも戻す
+assert area_request["output_config"]["format"]["schema"] is AREA  # 呼び出し側の本文は変えない
+
+# ---------------------------------------------------------------- SDK が説明文へ移した数の範囲に寄せる
+BD = sys.modules[NAME + ".claude_bounds"]
+assert BD.bounds({"description": "回数\n\n{maximum: 10, minimum: 1}"}) == {"maximum": 10, "minimum": 1}
+assert BD.bounds({"description": "{example: 火}"}) == {} and BD.bounds({"description": "回数"}) == {}
+SKILLS = {
+    "type": "object", "additionalProperties": False, "required": ["skills", "tags"],
+    "properties": {
+        "skills": {"type": "array", "items": {"$ref": "#/$defs/Skill"}},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "{maxItems: 2, minItems: 2}"},
+        "loose": {"anyOf": [{"type": "integer", "description": "{minimum: 0}"}, {"type": "null"}]}},
+    "$defs": {
+        "Skill": {"type": "object", "additionalProperties": False, "required": ["max_uses", "effects"],
+                  "properties": {
+                      "max_uses": {"type": "integer", "description": "{maximum: 10, minimum: 1}"},
+                      "effects": {"type": "array", "items": {"anyOf": [
+                          {"$ref": "#/$defs/Status"}, {"$ref": "#/$defs/Buff"}]}}}},
+        "Status": {"type": "object", "additionalProperties": False, "required": ["type", "duration"],
+                   "properties": {"type": {"type": "string", "description": "{const: status}"},
+                                  "duration": {"type": "integer", "description": "{maximum: 5, minimum: 3}"},
+                                  "flag": {"type": "boolean", "description": "{minimum: 1}"}}},
+        "Buff": {"type": "object", "additionalProperties": False, "required": ["type", "duration"],
+                 "properties": {"type": {"type": "string", "description": "{const: buff}"},
+                                "duration": {"type": "integer", "description": "{maximum: 5, minimum: 2}"},
+                                "rate": {"type": "number", "description": "{exclusiveMaximum: 1}"}}}}}
+SKILLS, _ = GR.restore_const(SKILLS)
+assert BD.has_bounds(SKILLS) and not BD.has_bounds(QUEST)
+changes = []
+got = BD.clamp({"skills": [{"max_uses": 12, "effects": [
+    {"type": "status", "duration": 2, "flag": False},   # 選択肢が status に決まるので 3 へ
+    {"type": "buff", "duration": 2, "rate": 1.5},        # buff の範囲では 2 は内側。number の exclusive は触らない
+    {"type": "other", "duration": 0}]}],                  # 選択肢が決まらないので触らない
+    "tags": ["a", "b", "c"], "loose": -1}, SKILLS, SKILLS, changes)
+skill = got["skills"][0]
+assert skill["max_uses"] == 10, skill
+assert [e["duration"] for e in skill["effects"]] == [3, 2, 0], skill
+assert skill["effects"][0]["flag"] is False and skill["effects"][1]["rate"] == 1.5, skill
+assert got["tags"] == ["a", "b"] and got["loose"] == 0, got
+assert changes == ["12->10", "2->3", "items 3->2", "-1->0"], changes
+assert BD.clamp({"tags": ["a"]}, SKILLS, SKILLS, []) == {"tags": ["a"]}  # 下限に足りない配列は触らない
+
+# 送信口: 文字列にした欄も、読み戻した後に寄せる。寄せたことはログに出る
+class SkillApi(object):
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, self_, path, *args, **kwargs):
+        self.calls += 1
+        schema = kwargs["body"]["output_config"]["format"]["schema"]
+        if "anyOf" in json.dumps(schema["$defs"]["Skill"]):
+            raise RuntimeError("Error code: 400 - The compiled grammar is too large, which would cause ...")
+        reply = Message(json.dumps({"skills": [{"max_uses": 0, "effects": [
+            json.dumps({"type": "status", "duration": 9})]}], "tags": []}))
+        return kwargs["options"]["post_parser"](reply)
+
+
+MOD.CLAUDE_MODEL, MOD.CLAUDE_CACHE = "off", "off"
+ctx = Ctx()
+MOD.apply(ctx)
+parsed = []
+skill_api = SkillApi()
+ctx.hooks[CL.POST](skill_api, OPENAI, "/v1/messages",
+                   body={"model": "claude-haiku-5-5", "max_tokens": 100, "messages": [],
+                         "output_config": {"format": {"type": "json_schema", "schema": SKILLS}}},
+                   options={"post_parser": lambda message: parsed.append(json.loads(message.content[0].text))})
+assert skill_api.calls == 2, skill_api.calls
+assert parsed[0]["skills"][0] == {"max_uses": 1, "effects": [{"type": "status", "duration": 5}]}, parsed
+assert any("clamped to the type's range: 0->1, 9->5" in line for line in ctx.lines), ctx.lines
 MOD.CLAUDE_MODEL, MOD.CLAUDE_CACHE = "claude-opus-5-5", "5m"
 
 

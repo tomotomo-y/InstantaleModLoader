@@ -6,25 +6,78 @@
 （ローダは apply() の前に入口の定数へ書き込む。後から変えた値も読めるよう、控えない）。
 
 ゲームの同じ入口を 336 の中で何度も包まないよう、機能はここに登録し、入口が配る。
-選択肢を組み直した合図（`refresh_choice_buttons`）と押下（`on_button_press`）はローダの窓口 `choices`
-（TECH.md §3.3.14）を通して、本文（`add_text`）は入口が1枚だけ包んで配る。
+選択肢はローダの窓口 `choices`（TECH.md §3.3.14）を通す。自前のボタンは宣言型の口（`on_offer` / `on_claim` /
+`on_screen`）で組み直しのたびに状態から作り、ゲームの一覧を直すもの（判決の書き換え・掲示板の間引き）だけ
+`on_refresh` に残す。本文（`add_text`）は入口が1枚だけ包んで配る。
 """
 import os
 import sys
 
-from instantale_modloader import guards, ui
+from instantale_modloader import choices, guards, ui
 from instantale_modloader import state as loader_state
 
 LOG_BASENAME = "crime_overhaul.log"
 FUNCTIONS_MODULE = "scripts.functions"
+#: 人生の記録の文を作るゲーム自身の関数（`get_life_log_text`）のモジュール。
+LIFE_LOG_MODULE = "scripts.llm.context_manager"
 STATE_DIRNAME = "crime_overhaul"
 STORE_ATTR = "_instantale_crime_incentive"
-#: 押下を横取りする印（他の MOD と別のキー）。
+#: 版2までの自前のボタンの印のキー（他の MOD と別のキー）。いまは宣言型の口で組むので付けない。
+#: セーブから戻った前の版の印のボタンを片付けるためだけに残す（`drop_old_marks`）。
 MARK = "mod_crime_incentive_action"
 #: 施設の選択肢だと見なす目印（出口のマネージャ。`309_` と同じ）。
 FACILITY_MARK = "MovePhaseManager"
 #: ゲーム自身の衛兵戦を起こすときに `process_choice` へ渡す文字列（GAME.md §2.20）。
 GUARD_CHOICE_TEXT = "衛兵"
+
+
+def life_log_text(app, character, limit):
+    """ゲーム自身の作り方の人生の記録を、頼みに載せる文にする。読めなければ空。`limit` 字で切る。"""
+    module = sys.modules.get(LIFE_LOG_MODULE)
+    build = getattr(module, "get_life_log_text", None)
+    try:
+        value = build(app, character) if callable(build) else None
+    except Exception:
+        value = None
+    if not value:
+        return ""
+    text = str(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+#: 片付いた裏の仕事と処刑場からの脱出の控え（`state\` の周回の鍵の下）。
+#: 進行中の控え（`underworld` / `rescue`）は片付くと消すので、依頼人と「表に出さない依頼」の印はこちらに残す。
+PAST_KEY = "kept_past"
+
+
+def remember_past(bucket, quest_id, title, client="", name=""):
+    """片付いた依頼を `PAST_KEY` に残す。呼び側が錠を持ち、保存する。"""
+    past = bucket.get(PAST_KEY)
+    if not isinstance(past, dict):
+        past = bucket[PAST_KEY] = {}
+    past[str(quest_id)] = {"title": title or "", "client": str(client or ""), "name": name or ""}
+
+
+def past_of(app, bucket):
+    """`PAST_KEY` のうち、いまのセーブに同じ題で残っている依頼。`{依頼の id: 控え}`。
+
+    依頼の id は作り直した周回で使い回されうるので、題も見る（`rescue.is_ours` と同じ）。
+    """
+    past = bucket.get(PAST_KEY)
+    if not isinstance(past, dict):
+        return {}
+    found = {}
+    for quest_id, record in past.items():
+        if not isinstance(record, dict):
+            continue
+        quest = ui.quest_of(app, str(quest_id))
+        if quest is None:
+            continue
+        title = record.get("title")
+        if title and ui.quest_value(quest, "quest_title", "") != title:
+            continue
+        found[str(quest_id)] = record
+    return found
 
 
 def _store():
@@ -40,6 +93,29 @@ def is_facility_screen(buttons):
     """施設の選択肢か（出口のボタンがある）。"""
     return isinstance(buttons, (list, tuple)) and any(
         ui.spec_cls_name(entry) == FACILITY_MARK for entry in buttons)
+
+
+def drop_old_marks(buttons):
+    """前の版の印（`MARK`）の付いたボタンを片付ける。片付けた文言を返す。
+
+    版2までは自前のボタンを一覧に置き、ゲームのボタン（「大人しく捕まる」・掲示板の枠）にも印を付けていた。
+    ローダの印の付け直しで戻った分のうち、無害な spec の自前のボタンは外し、ゲームのボタンからは印だけ外す。
+    """
+    if not isinstance(buttons, list):
+        return []
+    dropped, kept = [], []
+    for entry in buttons:
+        if not isinstance(entry, dict) or MARK not in entry:
+            kept.append(entry)
+            continue
+        dropped.append(entry.get("text"))
+        if ui.spec_cls_name(entry) == ui.SAFE_CLS:
+            continue
+        entry.pop(MARK, None)
+        kept.append(entry)
+    if dropped:
+        buttons[:] = kept
+    return dropped
 
 
 class Env(object):
@@ -58,7 +134,12 @@ class Env(object):
             store["worlds"] = loader_state.WorldStore(ctx, STATE_DIRNAME, write=self.write)
         self.worlds = store["worlds"].rebind(ctx, self.write)
         self.refresh_handlers = []
-        self.press_handlers = []
+        self.offer_handlers = []
+        self.claim_handlers = []
+        self.screen_builders = {}
+        self.label_handlers = []
+        #: 窓口 `choices` の持ち主の名前（入口の `provide` が返す）。MOD だけの画面を開く・閉じるのに使う。
+        self.choices_owner = None
         self.text_filters = []
         #: 裁判へ持ち越す介入（衛兵の買収が突き返されたら `{"bribe": "caught"}`）。次の裁判が始まったら空にする。
         #: ロードを挟んでも続くよう、世界×主人公の控え（`carry_to_trial`）にも持つ（`carry` / `take_carry`）。
@@ -131,9 +212,34 @@ class Env(object):
         """選択肢を組み直した合図で `handler(app, buttons)` を呼ぶ（`buttons` はゲームの一覧そのもの）。"""
         self.refresh_handlers.append(handler)
 
-    def on_press(self, prefix, handler):
-        """印が `prefix` で始まる自前のボタンが押されたら `handler(app, 印)` を呼ぶ。"""
-        self.press_handlers.append((prefix, handler))
+    def on_offer(self, handler):
+        """組み直しのたびに `handler(app, view)` を呼び、返した `choices.Choice` の並びを画面に足す（窓口の `offer`）。"""
+        self.offer_handlers.append(handler)
+
+    def on_claim(self, handler):
+        """その画面を自前のボタンだけにするなら `handler(app, view)` が `Choice` の並びを返す（窓口の `claim`）。"""
+        self.claim_handlers.append(handler)
+
+    def on_screen(self, name, builder):
+        """MOD だけの画面 `name` のボタンを `builder(app, view, data)` で組む（窓口の `screens`）。"""
+        self.screen_builders[name] = builder
+
+    def on_labels(self, handler):
+        """前の版がセーブに焼いた自前のボタンの文言を `handler(app)` が返す（窓口の `labels`）。"""
+        self.label_handlers.append(handler)
+
+    def open_screen(self, app, name, data=None, repaint=True):
+        """MOD だけの画面を開く（下のゲームの一覧は窓口が残す）。"""
+        choices.open_screen(app, self.choices_owner, name, data, repaint_now=repaint)
+
+    def close_screen(self, app, repaint=True):
+        """336 の MOD だけの画面を閉じる。閉じたら真。"""
+        return choices.close_screen(app, self.choices_owner, repaint_now=repaint)
+
+    def screen_open(self, app, name):
+        """336 の MOD だけの画面 `name` が開いているか。"""
+        row = choices.opened(app)
+        return bool(row) and row.get("owner") == self.choices_owner and row.get("name") == name
 
     def on_text(self, handler):
         """本文へ出る1行ごとに `handler(文) -> (文, 出さないか)` を通す。"""
@@ -187,11 +293,10 @@ class Env(object):
 
     # ---------------------------------------------------- 画面の部品
     def back_to_shop(self, app, why):
-        """施設の選択肢に戻す（自前のボタンは外す。足し直すかは選択肢の合図の処理が決める）。"""
-        saved = [entry for entry in (getattr(app, "buttons", None) or [])
-                 if not self.screen.mark_of(entry)]
+        """施設の選択肢に戻す（MOD だけの画面を閉じて組み直す。自前のボタンは窓口が状態から組み直す）。"""
         self.write("back to the facility ({})".format(why))
-        self.screen.apply_buttons(app, saved, "back")
+        self.close_screen(app, repaint=False)
+        choices.repaint(app)
 
     def call_guards(self, app):
         """ゲーム自身の衛兵戦を起こす（強さはゲームのまま）。起こせなければ施設の選択肢に戻す。"""

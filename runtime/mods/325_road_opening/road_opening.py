@@ -98,6 +98,10 @@ TECH.md §3.2.3）。違いは3点:
 ボタン辞書の印で横取りする（印のキーは `mod_road_opening`。他の MOD と別）。
 
 遊び方の説明は DOC.md、検証の物差しは VERIFICATION.md §3.50。
+
+版8: `QuestStartManager.__init__`・`AreaMoveManager.__init__`・`add_text`・`random_quest_generator` のフックは、
+引数を受け取った形のまま元の関数へ渡す（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
+生成のプロンプトへの差し込みは、来た側に合わせて `area_description` と `quest_difficulty` を差し替える。
 """
 
 import datetime
@@ -106,8 +110,12 @@ import random
 import sys
 import time
 
-from instantale_modloader import choices, durations, ui
+from instantale_modloader import choices, durations, frames, loads, ui
 from instantale_modloader.state import UNKNOWN_WORLD, WorldStore
+
+# `random_quest_generator` の引数の並び（recon の signatures.json）。
+QUEST_GENERATOR_ARGS = ("world_overview", "settlement_name", "settlement_overview",
+                        "settlement_structure_description", "area_description", "quest_difficulty")
 
 
 LOG_BASENAME = "road_opening.log"
@@ -119,12 +127,15 @@ STATE_DIRNAME = "road_opening"
 #: 控えの置き場（`sys` の属性名）。注入し直しをまたいで残す。
 STATE_STORE_ATTR = "__instantale_road_opening_store__"
 
-#: 押下を横取りするための印。他の MOD と別のキーにすること。
+#: 自前のボタンに付ける印（ほかの MOD が見分けるため。窓口 `choices` の `marks`。押下の振り分けには使わない）。
+#: 他の MOD と別のキーにすること。
 MARK = "mod_road_opening"
 
-#: ボタン辞書に載せる対象の街の id。`mod_` で始めるのは、
-#: 他の MOD の掃除（`marked_by_a_mod`）に残骸と見なされないため。
+#: 自前のボタンに印として載せる対象の街の id（`marks`）。押下は窓口がボタンに持たせた処理が行き先を持つ。
 TARGET_KEY = "mod_road_opening_target"
+#: 候補の画面と手段の画面の名前（窓口 `choices` の MOD だけの画面）。
+CANDIDATES_SCREEN = "candidates"
+MEANS_SCREEN = "means"
 
 # ---------------------------------------------------------------- 設定（mod.json）
 # ここの定数だけが GUI から変えられる（ローダは入口モジュールのグローバルへ書き込む。
@@ -196,7 +207,7 @@ COMMISSION_TEXT = "{price}G を支払い、{target}への道の開削を委託�
 PAY_LABEL_NOW = "お金を支払い委託する（{price}G）"
 BACK_LABEL = "やめる"
 
-#: セーブから復元された残骸を見分けるための、こちらのラベルの前方一致（`prune_stale`）。
+#: 版6までがセーブに焼いた自前のボタンの文言の前方一致（ローダの窓口 `choices` の `labels`）。
 #: 汎用語（「やめる」）は入れない。既定の文言のもの（後方互換で残す）。使うのは `our_label_prefixes()`。
 OUR_LABEL_PREFIXES = (SEARCH_LABEL, "お金を支払い委託する（", "自ら切り拓く（")
 
@@ -472,6 +483,7 @@ def apply(ctx):
 
     log_path = ctx.out_path(LOG_BASENAME)
     write = ctx.logger(LOG_BASENAME)
+    owner = os.path.basename(getattr(ctx, "mod_dir", "") or "") or "road_opening"
     worlds = store["worlds"].rebind(ctx, write)
     screen = ui.Screen(ctx, write, tag="road opening", mark=MARK)
     save_soon = ui.saver(ctx, write, "road opening")
@@ -777,6 +789,7 @@ def apply(ctx):
         screen.when_idle(app, then, settle=SETTLE, proceed_on_timeout=True, tag="settle")
 
     def show_candidates(app):
+        """候補の画面を開く（窓口 `choices` の MOD だけの画面。ボタンは `candidates_screen` が組む）。"""
         origin = ui.current_area(app)
         if origin is None:
             write("search: no current area")
@@ -784,31 +797,44 @@ def apply(ctx):
         found = candidates_of(app, origin)
         if not found:
             screen.say(app, NO_CANDIDATE_TEXT)
-            screen.apply_buttons(app, None, "no candidates")
+            choices.repaint(app)
             return
-        entries = []
         for area, hops in found:
             offer = offer_of(app, origin, area, hops)
-            label = fmt(CANDIDATE_LABEL, name=area_name(area, "?"),
-                        price=ui.money(offer["price"]), difficulty=offer["difficulty"],
-                        hops=offer["hops"])
-            entry = screen.button(label, mark="pick",
-                                  extra={TARGET_KEY: ui.area_id_of(area)})
-            if entry is None:
-                write("search: cannot build a button (PhaseSpec unavailable)")
-                return
-            entries.append(entry)
             write("candidate: {!r}({}) hops={}{} price={} difficulty={} "
                   "(levels origin={} target={})".format(
                       area_name(area, "?"), ui.area_id_of(area), offer["hops"],
                       " isolated" if offer["isolated"] else "", offer["price"],
                       offer["difficulty"], offer["origin_level"], offer["target_level"]))
+        choices.open_screen(app, state["owner"], CANDIDATES_SCREEN)
+
+    def back_choice():
+        """「やめる」。ゲームの無害なボタンの写しで、押下はゲームへ流す（素の画面へ戻る）。"""
         back = screen.button(BACK_LABEL)
+        return choices.Choice(BACK_LABEL, base=back) if back is not None else None
+
+    def candidates_screen(app, _view, _data):
+        """候補のボタン（組み直しのたびに、いまの街から組む）。候補が無ければ閉じる（None）。"""
+        origin = ui.current_area(app)
+        found = candidates_of(app, origin) if origin is not None else []
+        if not found:
+            return None
+        out = []
+        for area, hops in found:
+            offer = offer_of(app, origin, area, hops)
+            label = fmt(CANDIDATE_LABEL, name=area_name(area, "?"),
+                        price=ui.money(offer["price"]), difficulty=offer["difficulty"],
+                        hops=offer["hops"])
+            target_id = ui.area_id_of(area)
+            out.append(choices.Choice(label, marks={MARK: "pick", TARGET_KEY: target_id},
+                                      on_press=_press("pick", target_id, label)))
+        back = back_choice()
         if back is not None:
-            entries.append(back)
-        screen.apply_buttons(app, entries, "candidates")
+            out.append(back)
+        return out
 
     def show_means(app, target_id):
+        """手段の画面を開く（委託・切り拓く・やめる。ボタンは `means_screen` が組む）。"""
         origin = ui.current_area(app)
         target = ui.world_areas(app).get(str(target_id))
         if origin is None or target is None:
@@ -819,28 +845,46 @@ def apply(ctx):
             # 候補には残す（選べば開通までの日数が分かる）。払うのも切り拓くのも断る。
             refuse_commissioned(app, target, waiting, "means")
             return
-        graph = build_graph(ui.world_areas(app))
-        offer = offer_of(app, origin, target, hops_between(graph, ui.area_id_of(origin),
-                                                           str(target_id)))
-        days = max(0, int(PAY_DAYS))
-        pay = screen.button(fmt(PAY_LABEL if days > 0 else PAY_LABEL_NOW,
-                                price=ui.money(offer["price"]), days=days),
-                            mark="pay", extra={TARGET_KEY: str(target_id)})
-        dungeon = screen.button(fmt(DUNGEON_LABEL, difficulty=offer["difficulty"]),
-                                mark="dungeon", extra={TARGET_KEY: str(target_id)})
-        back = screen.button(BACK_LABEL)
-        if pay is None or dungeon is None or back is None:
-            write("means: cannot build the buttons (PhaseSpec unavailable)")
-            return
+        offer = means_offer(app, origin, target, target_id)
         write("means: {!r} price={} difficulty={} hops={}".format(
             area_name(target, "?"), offer["price"], offer["difficulty"], offer["hops"]))
-        screen.apply_buttons(app, [pay, dungeon, back], "means")
+        choices.open_screen(app, state["owner"], MEANS_SCREEN, {"target": str(target_id)})
+
+    def means_offer(app, origin, target, target_id):
+        graph = build_graph(ui.world_areas(app))
+        return offer_of(app, origin, target, hops_between(graph, ui.area_id_of(origin),
+                                                          str(target_id)))
+
+    def means_screen(app, _view, data):
+        """手段のボタン。選んだ行き先は画面の控え（`data`）に持つ（ロードの後も同じ行き先の画面に戻る）。"""
+        target_id = str((data or {}).get("target") or "")
+        origin = ui.current_area(app)
+        target = ui.world_areas(app).get(target_id)
+        if origin is None or target is None:
+            return None
+        offer = means_offer(app, origin, target, target_id)
+        days = max(0, int(PAY_DAYS))
+        pay_label = fmt(PAY_LABEL if days > 0 else PAY_LABEL_NOW,
+                        price=ui.money(offer["price"]), days=days)
+        dungeon_label = fmt(DUNGEON_LABEL, difficulty=offer["difficulty"])
+        out = [choices.Choice(pay_label, marks={MARK: "pay", TARGET_KEY: target_id},
+                              on_press=_press("pay", target_id, pay_label)),
+               choices.Choice(dungeon_label, marks={MARK: "dungeon", TARGET_KEY: target_id},
+                              on_press=_press("dungeon", target_id, dungeon_label))]
+        back = back_choice()
+        if back is not None:
+            out.append(back)
+        return out
 
     def reopen_move_list(app):
-        """素の「他の土地へ行く」を開き直す（開いた道が並んでいるのを見せる）。"""
+        """素の「他の土地へ行く」を開き直す（開いた道が並んでいるのを見せる）。
+
+        手段の画面は先に閉じる（委託の後は一覧の形が変わらず、窓口の見張りでは閉じないため）。
+        """
+        choices.close_screen(app, state["owner"], repaint_now=False)
         display_cls = ui.cls_of("DisplayAreaMoveChoice")
         if display_cls is None:
-            screen.apply_buttons(app, None, "paid")
+            choices.repaint(app)
             return
         try:
             manager = display_cls(app)
@@ -1128,6 +1172,7 @@ def apply(ctx):
         return quest_id, ui.quest_of(app, quest_id)
 
     def open_acceptance(app, quest_id, title, target_name, difficulty):
+        choices.close_screen(app, state["owner"], repaint_now=False)   # 手段の画面を閉じて受注へ
         screen.say(app, FOUND_TEXT.format(title=title or "名も無い道", target=target_name))
         screen.say(app, DANGER_TEXT.format(difficulty=difficulty, target=target_name))
         choice_cls = ui.cls_of("QuestChoiceManager")
@@ -1257,92 +1302,92 @@ def apply(ctx):
     # ================================================================ フック
     @ctx.wrap("__main__:DisplayAreaMoveChoice.update_button_display", required=False)
     def move_choice_buttons(orig, self, *args, **kwargs):
-        """行き先が並ぶ前に開いた道を当て直し、並び終えた後に「新たな道を探す」を足す。
-
-        ゲームが `connections` を別の場所（骨格の辞書）から読んでいて開いた道が
-        並ばなかったときは、同じ形（`AreaMoveCofirmation` + `[target_area_id]`）の
-        ボタンをこちらで足し、WARN を残す（HANDOVER §6 の1）。
-        """
+        """行き先が並ぶ前に開いた道を当て直す。ボタンは窓口 `choices` の `offer` が組む（`move_list_offer`）。"""
         app = getattr(self, "app", None) or ui.find_app()
         try:
             if app is not None:
                 apply_roads(getattr(app, "world", None), worlds.playthrough(app), "list")
+                state["move_list"] = True
         except Exception:
             ctx.log_exc("road opening: cannot re-apply the roads before the list")
-        result = orig(self, *args, **kwargs)
-        try:
-            buttons = getattr(app, "buttons", None) if app is not None else None
-            if not isinstance(buttons, list):
-                return result
-            origin = ui.current_area(app)
-            if origin is None:
-                return result
-            origin_id = ui.area_id_of(origin)
-            areas = ui.world_areas(app)
-            listed = set()
-            for entry in buttons:
-                if ui.spec_cls_name(entry) == TOWN_CLS:
-                    argv = ui.spec_args(entry)
-                    if argv:
-                        listed.add(str(argv[0]))
-            at = len(buttons)
-            for index, item in enumerate(buttons):
-                if ui.spec_cls_name(item) == ui.SAFE_CLS:
-                    at = index
-                    break
-            for road in roads_of(worlds.playthrough(app)):
-                ends = {str(road.get("from")), str(road.get("to"))}
-                if origin_id not in ends:
-                    continue
-                other = (ends - {origin_id}).pop() if len(ends) == 2 else None
-                if other is None or other in listed or other not in areas:
-                    continue
-                entry = screen.button(area_name(areas[other], other),
-                                      cls_name=TOWN_CLS, args=[other])
-                if entry is None:
-                    break
-                buttons.insert(at, entry)
-                at += 1
-                listed.add(other)
-                write("WARN list: the game did not list the opened road to {!r}; "
-                      "added the button myself (the game reads connections from "
-                      "somewhere other than Area.connections)".format(other))
-            screen.prune_stale(buttons, our_label_prefixes())
-            if any(screen.mark_of(entry) for entry in buttons):
-                return result
-            if not candidates_of(app, origin):
+        return orig(self, *args, **kwargs)
+
+    def is_move_list(buttons):
+        """「他の土地へ行く」の一覧か。行き先（`AreaMoveCofirmation`）とゲームの「やめる」だけの画面。
+
+        行き先が1つも無い一覧は形で見分けられないので、一覧を組んだ印（`move_list`）も見る（押せば降りる）。
+        """
+        towns = [entry for entry in buttons if ui.spec_cls_name(entry) == TOWN_CLS]
+        rest = [entry for entry in buttons if ui.spec_cls_name(entry) != TOWN_CLS]
+        if any(ui.spec_cls_name(entry) != ui.SAFE_CLS for entry in rest):
+            return False
+        return bool(towns) or bool(state.get("move_list"))
+
+    def move_list_offer(app, view):
+        """一覧に「新たな道を探す」を「やめる」の手前に出す（窓口 `choices` の `offer`）。
+
+        ゲームが `connections` を別の場所（骨格の辞書）から読んでいて開いた道が
+        並ばなかったときは、同じ形（`AreaMoveCofirmation` + `[target_area_id]`）の
+        ボタンの写しをこちらで出し（押下はゲームへ流す）、WARN を残す（HANDOVER §6 の1）。
+        """
+        buttons = view.buttons
+        if not buttons or not is_move_list(buttons):
+            return None
+        origin = ui.current_area(app)
+        if origin is None:
+            return None
+        origin_id = ui.area_id_of(origin)
+        areas = ui.world_areas(app)
+        listed = {str((ui.spec_args(entry) or [None])[0]) for entry in buttons
+                  if ui.spec_cls_name(entry) == TOWN_CLS and ui.spec_args(entry)}
+        out = []
+        for road in roads_of(worlds.playthrough(app)):
+            ends = {str(road.get("from")), str(road.get("to"))}
+            if origin_id not in ends:
+                continue
+            other = (ends - {origin_id}).pop() if len(ends) == 2 else None
+            if other is None or other in listed or other not in areas:
+                continue
+            entry = screen.button(area_name(areas[other], other), cls_name=TOWN_CLS, args=[other])
+            if entry is None:
+                break
+            out.append(choices.Choice(entry["text"], base=entry, place=choices.before(ui.SAFE_CLS)))
+            listed.add(other)
+            write("WARN list: the game did not list the opened road to {!r}; "
+                  "added the button myself (the game reads connections from "
+                  "somewhere other than Area.connections)".format(other))
+        if not candidates_of(app, origin):
+            if state.get("no_candidates") != origin_id:
+                state["no_candidates"] = origin_id
                 write("list: no unlinked town from {!r}; not adding {!r}".format(
                     area_name(origin, origin_id), SEARCH_LABEL))
-                screen.apply_buttons(app, None, "list")
-                return result
-            entry = screen.button(SEARCH_LABEL, mark="search")
-            if entry is None:
-                return result
-            buttons.insert(at, entry)
-            screen.apply_buttons(app, None, "list")
-        except Exception:
-            ctx.log_exc("road opening: cannot add the search button")
-        return result
+            return out
+        state["no_candidates"] = None
+        out.append(choices.Choice(SEARCH_LABEL, place=choices.before(ui.SAFE_CLS), marks={MARK: "search"},
+                                  on_press=_press("search", None, SEARCH_LABEL)))
+        return out
 
-    def on_button_press(self, action):
-        """自前のボタンが押された（窓口 `choices` の `presses`。印で振り分けた後に呼ばれる）。"""
-        entry = choices.pressed()
-        if state["acting"] or state["generating"]:
-            # 前の押下がまだ動いている。連打の2発目は捨てる（支払いの二重を防ぐ）。
-            write("ignored {!r}: the previous press is still running".format(
-                entry.get("text") if isinstance(entry, dict) else None))
+    def look_at_press(_app, _entry, _index):
+        """どのボタンが押されても、一覧を組んだ印は降ろす（窓口の `intercept`。押下は握らない）。"""
+        state["move_list"] = False
+        return False
+
+    def _press(action, target_id, text):
+        """自前のボタンの押下（窓口がボタンに持たせる処理）。ゲームと同じ経路（`process_choice`）で動かす。"""
+        def on_press(app):
+            if state["acting"] or state["generating"]:
+                # 前の押下がまだ動いている。連打の2発目は捨てる（支払いの二重を防ぐ）。
+                write("ignored {!r}: the previous press is still running".format(text))
+                return None
+            write("pressed {!r} ({} target={})".format(text, action, target_id))
+            screen.start_phase(app, RoadPhase(app, action, target_id), text,
+                               fallback=lambda: run_action(app, action, target_id))
             return None
-        text = (entry.get("text") if isinstance(entry, dict) else None) or SEARCH_LABEL
-        target_id = entry.get(TARGET_KEY) if isinstance(entry, dict) else None
-        write("pressed {!r} ({} target={})".format(text, action, target_id))
-        screen.start_phase(self, RoadPhase(self, action, target_id), text,
-                           fallback=lambda: run_action(self, action, target_id))
-        return None
+        return on_press
 
-    @ctx.wrap("__main__:World.__init__", required=False, safe=True)
-    def world_loaded(orig, self, save_data_dict, app, *args, **kwargs):
+    def world_loaded(call):
         """セーブを読み込んだ直後、開いた道をこの世界へ当て直す（`318_` / `321_` と同型）。"""
-        result = orig(self, save_data_dict, app, *args, **kwargs)
+        self, save_data_dict, app = call.obj, call.save_data, call.app
         try:
             key = worlds.playthrough(app, save_data_dict)
             if key and key != UNKNOWN_WORLD:
@@ -1350,7 +1395,8 @@ def apply(ctx):
                 apply_roads(self, key, "load")
         except Exception:
             ctx.log_exc("road opening: cannot re-apply the roads on load")
-        return result
+
+    loads.on(owner, ctx, (loads.WORLD,), after=world_loaded, write=write)
 
     def refresh_choice_buttons(self, _buttons):
         """集落の選択肢に戻ったら、待っている移動を起こす（保険の経路。`307_` と同じ）。"""
@@ -1375,13 +1421,20 @@ def apply(ctx):
         except Exception:
             ctx.log_exc("road opening: cannot start the pending move")
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press})
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    # 一覧の「新たな道を探す」は `offer`、候補と手段は MOD だけの画面。集落に戻ったときの移動の起こし直しは `refresh`
+    state["owner"] = choices.provide(
+        ctx, screen, refresh=refresh_choice_buttons, offer=move_list_offer, intercept=look_at_press,
+        screens={CANDIDATES_SCREEN: candidates_screen, MEANS_SCREEN: means_screen},
+        labels=lambda app: our_label_prefixes())
 
     @ctx.wrap("__main__:QuestStartManager.__init__", required=False, safe=True)
-    def quest_start(orig, self, app, quest_type, quest_id, *args, **kwargs):
+    def quest_start(orig, self, *args, **kwargs):
         """道中のクエストが始まったら控えを本決まりにし、難易度と一文を書き直す。"""
         try:
+            # (app, quest_type, quest_id)。受け取った形のまま元の関数へ渡す。
+            app = frames.arg(args, kwargs, "app", 0)
+            quest_id = frames.arg(args, kwargs, "quest_id", 2)
             record = pending_of(app, "offered", "armed")
             if record is not None:
                 if str(quest_id) == record.get("quest_id"):
@@ -1396,7 +1449,7 @@ def apply(ctx):
                     drop_pending(app, "another quest started ({})".format(quest_id))
         except Exception:
             ctx.log_exc("road opening: cannot arm the road")
-        return orig(self, app, quest_type, quest_id, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:QuestEndManager.execute", required=False, safe=True)
     def quest_end(orig, self, *args, **kwargs):
@@ -1464,28 +1517,32 @@ def apply(ctx):
         return result
 
     @ctx.wrap("__main__:AreaMoveManager.__init__", required=False, safe=True)
-    def area_move(orig, self, app, target_area_id, mode, *args, **kwargs):
+    def area_move(orig, self, *args, **kwargs):
         """自分が起こしたのでない移動が始まったら、待っている道中は捨てる。"""
         try:
+            # (app, target_area_id, mode)。受け取った形のまま元の関数へ渡す。
+            app = frames.arg(args, kwargs, "app", 0)
+            mode = frames.arg(args, kwargs, "mode", 2)
             if not state["departing"] and pending_of(app, "offered", "armed") is not None:
                 drop_pending(app, "the player travelled by other means (mode={!r})"
                              .format(mode))
         except Exception:
             ctx.log_exc("road opening: cannot clear the pending road")
-        return orig(self, app, target_area_id, mode, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:InstantaleApp.add_text", required=False)
-    def add_text(orig, self, context, *args, **kwargs):
+    def add_text(orig, self, *args, **kwargs):
         """到着の移動中だけ、ゲームの「徒歩で目指す。長旅だ...」を伏せる（`307_` と同じ）。"""
         try:
             record = pending_of(self, "moving") if HIDE_TRAVEL_TEXT else None
+            context = frames.arg(args, kwargs, "context", 0)
             if record is not None and isinstance(context, str) \
                     and any(word in context for word in MUTED_MOVE_TEXTS):
                 write("muted while arriving: {!r}".format(context))
                 return None
         except Exception:
             ctx.log_exc("road opening: cannot filter the travel text")
-        return orig(self, context, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # 日数そのものはローダの関所が渡す（TECH.md §3.3.3）。
     # こちらは「到着の移動は何日か」を答える側に回る。
@@ -1517,46 +1574,46 @@ def apply(ctx):
         write("road: the road to {!r} takes {} day(s)".format(
             record.get("target_name"), granted))
 
-    owner = os.path.basename(getattr(ctx, "mod_dir", "") or "") or "road_opening"
     durations.claim_days(owner, days_wish, note=days_note, write=write)
     durations.install(ctx, write)
 
-    @ctx.wrap("__main__:InstantaleApp.elapse_days", required=False)
-    def elapse_days(orig, self, days, *args, **kwargs):
+    def after_days(call):
         """日数が進んだ後に、期日が来た委託を開く（`check_commissions`）。
 
-        日数そのものには触らない（それは関所の仕事）。
-        後処理は `orig` の**後**にしか置けないので、この包みだけは残る。
+        日数そのものには触らない（それは関所の `claim_days`）。後処理は同じ関所の `on_days` に預ける。
         """
-        result = orig(self, days, *args, **kwargs)
         try:
-            check_commissions(self, "days")
+            check_commissions(call.app, "days")
         except Exception:
             ctx.log_exc("road opening: cannot check the commissions")
-        return result
+
+    durations.on_days(owner, ctx, after=after_days, write=write)
 
     @ctx.wrap("scripts.llm.llm_manager_world_generate:random_quest_generator",
               required=False)
-    def random_quest_generator(orig, world_overview, settlement_name,
-                               settlement_overview, settlement_structure_description,
-                               area_description, quest_difficulty, *args, **kwargs):
-        """`area_description` に道の性質を、`quest_difficulty` に選んだ値を渡す。1回で使い切る。"""
+    def random_quest_generator(orig, *args, **kwargs):
+        """`area_description` に道の性質を、`quest_difficulty` に選んだ値を渡す。1回で使い切る。
+
+        引数は受け取った形（位置かキーワード）のまま渡し、2つだけを差し替える（TECH.md の規則の表）。
+        """
         mark = state["inject"]
         state["inject"] = None
         if mark is None or time.monotonic() - state["inject_at"] > INJECT_TTL:
             if mark is not None:
                 write("inject: stale marker, left untouched")
-            return orig(world_overview, settlement_name, settlement_overview,
-                        settlement_structure_description, area_description,
-                        quest_difficulty, *args, **kwargs)
+            return orig(*args, **kwargs)
+        area_description = frames.arg(args, kwargs, "area_description", QUEST_GENERATOR_ARGS)
+        quest_difficulty = frames.arg(args, kwargs, "quest_difficulty", QUEST_GENERATOR_ARGS)
         merged = (area_description or "") + road_brief(
             mark["origin"], mark["target"], mark["difficulty"])
         write("inject: area_description {} -> {} chars; difficulty {!r} -> {}".format(
             len(area_description or ""), len(merged), quest_difficulty,
             mark["difficulty"]))
-        result = orig(world_overview, settlement_name, settlement_overview,
-                      settlement_structure_description, merged,
-                      mark["difficulty"], *args, **kwargs)
+        args, kwargs, _ = frames.replace_arg(args, kwargs, "area_description",
+                                             QUEST_GENERATOR_ARGS, merged)
+        args, kwargs, _ = frames.replace_arg(args, kwargs, "quest_difficulty",
+                                             QUEST_GENERATOR_ARGS, mark["difficulty"])
+        result = orig(*args, **kwargs)
         if isinstance(result, dict):
             write("inject: generated {!r}".format(result.get("quest_title")))
         return result

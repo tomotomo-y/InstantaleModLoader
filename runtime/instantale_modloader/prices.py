@@ -27,7 +27,10 @@ import threading
 import weakref
 
 from . import durations
+from . import items as _items
+from . import loads
 from . import log_exc
+from . import state
 
 
 #: 関所を立てた行を最後に書いた中身。同じなら繰り返さない。
@@ -64,22 +67,364 @@ def game_inn_room(quality):
     return GAME_ROOM_PRICES.get(str(quality))
 
 
-def inn_room(app, quality, write=None):
-    """宿屋の部屋1回の値段。**分からなければ None**（呼ぶ側が別の道へ落とす）。
+def inn_room_base(app, quality, write=None):
+    """宿屋の部屋1回の値段のうち、段（`adjust_inn`）を掛ける前の額。分からなければ None。
 
-    知らない `quality` で None を返すのは、ゲームの更新で語彙が変わったときに
-    **当て推量の額を前払いしない**ため。0 と「分からない」は別の答えにする。
+    `declare(INN_ROOM, …)` の答え（`315_vacation_custom` の設定額）か、無ければゲームの値。
+    v1.15.0 までの `inn_room` の答えがこれ。
     """
     answer = durations.ask(INN_ROOM, app, write=write, quality=quality)
     if answer is None:
-        return game_inn_room(quality)
+        return _game_price_of(quality)
     price = answer.get("price")
     if isinstance(price, bool) or not isinstance(price, (int, float)):
         if write:
             write("WARN prices: inn_room from {!r} returned {!r}, not a number; "
                   "using the game's own value".format(source_of(INN_ROOM), price))
-        return game_inn_room(quality)
+        return _game_price_of(quality)
     return max(0, int(price))
+
+
+def inn_room(app, quality, write=None):
+    """宿屋の部屋1回の値段。**分からなければ None**（呼ぶ側が別の道へ落とす）。
+
+    知らない `quality` で None を返すのは、ゲームの更新で語彙が変わったときに
+    **当て推量の額を前払いしない**ため。0 と「分からない」は別の答えにする。
+
+    v1.15.1 から段（`adjust_inn`）を掛けた後の額を返す。ゲームが実際に引く額と同じ
+    （宿代の関所がその額になるよう前払いで合わせる）。
+    """
+    base = inn_room_base(app, quality, write=write)
+    if base is None:
+        return None
+    return _inn_layered(app, quality, base, write)
+
+
+# ---------------------------------------------------------------------------
+# 宿代の段と関所（TECH.md §3.3.4）
+# ---------------------------------------------------------------------------
+#
+# 宿代は2つの層で決まる。
+#
+#     declare(INN_ROOM, fn)   1枚だけ。部屋1回の額と呼び名（`315_vacation_custom` の設定）
+#     adjust_inn(owner, fn)   何枚でも乗る。その額へ倍率を掛ける（`338_town_incidents` の街の出来事）
+#
+# ゲームに効かせるのは関所（`install_inn`）の1か所で、v1.15.0 までは `315_` が自分で持っていた。
+# 段を置く MOD が増えると、`315_` が入っていないときに誰も効かせなくなるので、ローダへ移した。
+# 関所がすること（どれも `315_` の版から形を変えていない）:
+#
+# - 部屋のボタン（`VacationStartManager` の spec）の `text` を、呼び名と額で書き直す
+#   （素の呼び名で素の額なら、ゲームの文言のまま）。spec と `args` には触らない
+# - 手持ちが額に満たなければ、押した時点で断る（部屋選びは残る）
+# - ゲームが引く前に、差額ぶん所持金をずらす（前払い調整）。引かなかったビルドでは返す
+#
+# 部屋の見分けは `quality` の実値（`GAME_ROOM_PRICES`）。語彙が変わったビルドのために、
+# 画面のラベルの素の額と `quality` の対も控えて保険にする。どちらにも当たらなければ
+# 表示も額も全部ゲームのまま（表示だけ変わる食い違いを作らない）。
+
+#: 素のゲームの部屋の呼び名（`quality` の実値 → 名前。実測。GAME.md §2.17）。
+GAME_ROOM_NAMES = {"kennel": "犬小屋", "bunk": "簡易寝台", "private_room": "個室",
+                   "luxury_suite": "高級個室"}
+
+#: 部屋のボタンの既定の形（ゲーム自身の書式。通貨の表記は `ui.fill_template` が今のものへ直す）。
+ROOM_LABEL = "{name}({price}G)"
+
+#: 手持ちが宿代に足りないときの一言（ゲーム画面の文。`315_` の版と同じ）。
+INN_REFUSE_TEXT = "（{name}の宿代{price}Gに足りない ― 手持ち{gold}G）"
+
+INN_START = "VacationStartManager"
+_INN_ATTR = "_instantale_inn_prices"
+_INN_MARK = "_instantale_inn_room"
+_INN_OWNER = "prices:inn"
+
+
+def _inn_store():
+    found = getattr(sys, _INN_ATTR, None)
+    if not isinstance(found, dict) or not isinstance(found.get("adjust"), list):
+        found = {"adjust": [], "observed": {}, "ours": set(), "unknown": set(),
+                 "write": None, "generation": None, "installed": False}
+        setattr(sys, _INN_ATTR, found)
+    return found
+
+
+def adjust_inn(owner, fn, write=None):
+    """宿代へ乗せる段を足す。**同じ持ち主は1枚まで**（再注入で重ねない）。
+
+    `fn(app, quality, price)` は新しい額か、**触らないなら None** を返す。
+    `quality` はゲームの語彙（`kennel` / `bunk` / `private_room` / `luxury_suite`）、
+    `price` はそこまでの段を通した額。段は登録順に重なる。
+    段を置いた MOD は `install_inn(ctx, write)` も呼ぶ（呼ばないとゲームに効かない）。
+    """
+    if not callable(fn):
+        raise TypeError("adjust_inn() needs a callable, got {!r}".format(type(fn)))
+    name = str(owner or "")
+    with _LOCK:
+        layers = _inn_store()["adjust"]
+        fresh = name not in [layer[0] for layer in layers]
+        layers[:] = [layer for layer in layers if layer[0] != name]
+        layers.append((name, fn))
+    if write and fresh:
+        write("prices: {!r} adjusts the inn room price".format(name))
+
+
+def inn_price_sources():
+    """いま宿代を決めている持ち主。`("答えの持ち主", ["段の持ち主", ...])`。"""
+    with _LOCK:
+        return (source_of(INN_ROOM), [layer[0] for layer in _inn_store()["adjust"]])
+
+
+def forget_inn_prices(owner, write=None):
+    """その持ち主が置いた宿代の段を外す。外したら `["inn_room_adjust"]`。"""
+    name = str(owner or "")
+    with _LOCK:
+        layers = _inn_store()["adjust"]
+        if not any(layer[0] == name for layer in layers):
+            return []
+        layers[:] = [layer for layer in layers if layer[0] != name]
+    if write:
+        write("prices: {!r} no longer adjusts the inn room price".format(name))
+    return ["inn_room_adjust"]
+
+
+durations.on_forget(forget_inn_prices)
+
+
+def _quality_of_price(price):
+    for quality, value in GAME_ROOM_PRICES.items():
+        if value == price:
+            return quality
+    return None
+
+
+def canonical_quality(quality):
+    """ゲームの語彙の `quality`。語彙に無ければ、画面で控えた額から引く。当たらなければ None。"""
+    quality = str(quality)
+    if quality in GAME_ROOM_PRICES:
+        return quality
+    observed = _inn_store()["observed"].get(quality)
+    return _quality_of_price(observed) if observed is not None else None
+
+
+def _game_price_of(quality):
+    """ゲームがその部屋で引く額。画面のラベルで控えた額を先に、無ければ実測の表。"""
+    observed = _inn_store()["observed"].get(str(quality))
+    if observed is not None:
+        return observed
+    canon = canonical_quality(quality)
+    return GAME_ROOM_PRICES.get(canon) if canon is not None else None
+
+
+def _inn_layered(app, quality, price, write=None):
+    canon = canonical_quality(quality) or str(quality)
+    with _LOCK:
+        layers = list(_inn_store()["adjust"])
+    for owner, fn in layers:
+        try:
+            got = _price_number(fn(app, canon, price))
+        except Exception:
+            log_exc("prices: the inn adjust from {!r} failed".format(owner))
+            continue
+        if got is not None:
+            price = got
+    return max(0, int(round(price)))
+
+
+def _room_answer(app, quality, write=None):
+    """部屋1つの `{"price", "name", "label", "game_price", "game_name"}`。見分けられなければ None。"""
+    canon = canonical_quality(quality)
+    if canon is None:
+        return None
+    game_price = _game_price_of(quality)
+    if game_price is None:
+        return None
+    answer = durations.ask(INN_ROOM, app, write=write, quality=canon) or {}
+    name = answer.get("name")
+    label = answer.get("label")
+    price = inn_room(app, canon, write=write)
+    if price is None:
+        return None
+    return {"price": price, "game_price": game_price, "game_name": GAME_ROOM_NAMES[canon],
+            "name": name if isinstance(name, str) and name else GAME_ROOM_NAMES[canon],
+            "label": label if isinstance(label, str) and label else ROOM_LABEL}
+
+
+def _game_label(ui, canon, price):
+    return ui.rewrite_coins("{}({}G)".format(GAME_ROOM_NAMES[canon], price))
+
+
+def _relabel_room(ui, app, entry, write):
+    """部屋のボタン1つ。描かれる前に `text` だけ書き直し、素の額を対に控える。"""
+    argv = ui.spec_args(entry)
+    if not argv or len(argv) < 2:
+        return
+    quality = str(argv[1])
+    old = entry.get("text") or ""
+    store = _inn_store()
+    if old not in store["ours"]:
+        price = ui.parse_coin(old)
+        if price is None:
+            return                      # 額の無いラベル（まだ宿泊する 等）
+        canon = quality if quality in GAME_ROOM_PRICES else _quality_of_price(price)
+        if canon is None:
+            if quality not in store["unknown"]:
+                store["unknown"].add(quality)
+                if write:
+                    write("unknown room {!r} (quality {!r}); leaving it alone "
+                          "(the game may have changed its rooms)".format(old, quality))
+            return
+        # 素の額は、ゲームの書式で、しかも今の答えで自分が書く文言ではないものからだけ控える
+        # （ロードで戻ったボタンは保存したときに書いた文言のまま。自分の文言から読むと
+        # 設定した額を素の額と取り違え、前払いが狂った。`315_` の版で踏んだ）。
+        # ロードで戻った選択肢の組み直し（`choices.from_save`）では控えない。前の起動で段を掛けた文言は、保存の後に
+        # 設定や段が変わると「今の答えの文言」とも食い違い、ゲームの書式のまま素の額に見える
+        # （VERIFICATION.md §3.97「宿代」）。
+        from . import choices as _choices
+        answer = _room_answer(app, quality)
+        ours_now = answer is not None and old == ui.fill_template(
+            answer["label"], name=answer["name"], price=answer["price"])
+        if old == _game_label(ui, canon, price) and not ours_now \
+                and not _choices.from_save() \
+                and store["observed"].get(quality) != price:
+            store["observed"][quality] = price
+            if write:
+                write("room: quality {!r} shows {}G -> {}".format(quality, price, canon))
+    answer = _room_answer(app, quality)
+    if answer is None:
+        return
+    canon = canonical_quality(quality)
+    if answer["price"] == answer["game_price"] and answer["name"] == answer["game_name"]:
+        plain = _game_label(ui, canon, answer["game_price"])
+        if old != plain and ui.parse_coin(old) is not None:
+            entry["text"] = plain
+            if write:
+                write("label: {!r} -> {!r} ({}; back to the game's own)".format(old, plain, canon))
+        return
+    new = ui.fill_template(answer["label"], name=answer["name"], price=answer["price"])
+    if new != old:
+        entry["text"] = new
+        store["ours"].add(new)
+        if write:
+            write("label: {!r} -> {!r} ({})".format(old, new, canon))
+
+
+def install_inn(ctx, write=None):
+    """宿代の関所を立てる。宿代の答えか段を置いた MOD が `apply()` の中で呼ぶ。
+
+    何本の MOD が呼んでも、1つの世代につき包みは1組（`install` と同じ形）。
+    記録は最後に呼んだ MOD のログへ書く。
+    """
+    from . import choices as _choices
+    from . import ui as _ui
+    store = _inn_store()
+    store["write"] = write
+    screen = _ui.Screen(ctx, write, tag="inn price", mark="mod_inn_price")
+
+    def log(line):
+        target = store.get("write")
+        if target:
+            target(line)
+
+    def refresh(app, buttons):
+        try:
+            if isinstance(buttons, (list, tuple)):
+                for entry in buttons:
+                    if isinstance(entry, dict) and _ui.spec_cls_name(entry) == INN_START:
+                        _relabel_room(_ui, app, entry, log)
+        except Exception:
+            log_exc("prices: cannot relabel the inn rooms")
+
+    def intercept(app, entry, button_index):
+        """手持ちが宿代に満たないときは、押した時点で断る（部屋選びはそのまま残る）。"""
+        try:
+            if not isinstance(entry, dict) or _ui.spec_cls_name(entry) != INN_START:
+                return False
+            argv = _ui.spec_args(entry)
+            if not argv or len(argv) < 2:
+                return False
+            answer = _room_answer(app, argv[1])
+            if answer is None or answer["price"] == answer["game_price"]:
+                return False
+            gold = _ui.gold_of(app)
+            if gold is not None and gold < answer["price"]:
+                log("refused: {} price {} > gold {}".format(argv[1], answer["price"], gold))
+                screen.say(app, _ui.fill_template(INN_REFUSE_TEXT, name=answer["name"],
+                                                  price=answer["price"], gold=gold))
+                return True
+        except Exception:
+            log_exc("prices: inn price check failed")
+        return False
+
+    _choices.provide(ctx, screen, refresh=refresh, intercept=intercept, owner=_INN_OWNER)
+
+    generation = getattr(ctx, "generation", None)
+    if store.get("generation") == generation and store.get("installed"):
+        return
+    store["generation"] = generation
+    store["installed"] = True
+
+    def start_init(orig, self, app=None, months=None, quality=None, *args, **kwargs):
+        """`execute` には引数が来ないので、部屋をここで自分に控える（ゲームのデータには書かない）。"""
+        result = orig(self, app, months, quality, *args, **kwargs)
+        try:
+            setattr(self, _INN_MARK, str(quality))
+        except Exception:
+            pass
+        return result
+
+    def settle(app, window):
+        """宿泊の開始が終わった時点の帳尻。引き落としが本当に起きたかだけを見る。"""
+        before, prepaid, price = window["gold_before"], window["prepaid"], window["price"]
+        if prepaid is None:
+            return
+        after = _ui.gold_of(app)
+        if after is None:
+            log("WARN price: cannot re-read the gold; leaving it as is")
+        elif after == before - price:
+            log("price: charged {} in one deduction; gold {} -> {} ({})".format(
+                price, before, after, window["quality"]))
+        elif after == prepaid:
+            _ui.set_gold(app, before, on_error=lambda msg: log("WARN price: " + msg))
+            log("price: the game did not charge inside execute; gold back to {} ({}) "
+                "-- the charge happens elsewhere in this build; run 218_probe_vacation".format(
+                    before, window["quality"]))
+        else:
+            log("WARN price: gold ended at {} (adjusted {}, expected {}); leaving it as is "
+                "({})".format(after, prepaid, before - price, window["quality"]))
+
+    def start_execute(orig, self, *args, **kwargs):
+        """宿泊の開始の間だけ、宿代の前払い調整をする（連泊の `まだ宿泊する` も同じ窓を通る）。"""
+        app = getattr(self, "app", None) or _ui.find_app()
+        window = None
+        try:
+            quality = getattr(self, _INN_MARK, None)
+            answer = _room_answer(app, quality) if quality is not None else None
+            if answer is not None and answer["price"] != answer["game_price"]:
+                before = _ui.gold_of(app)
+                if before is not None:
+                    window = {"quality": quality, "gold_before": before, "prepaid": None,
+                              "price": answer["price"]}
+                    pre = before + answer["game_price"] - answer["price"]
+                    if _ui.set_gold(app, pre) is None:
+                        log("WARN price: cannot write the gold; not pre-adjusted")
+                    else:
+                        window["prepaid"] = pre
+                        log("price: gold {} -> {} before the game charges {} (ours is {}; "
+                            "one deduction, no refund)".format(
+                                before, pre, answer["game_price"], answer["price"]))
+        except Exception:
+            log_exc("prices: cannot pre-adjust the inn price")
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            if window is not None:
+                try:
+                    settle(app, window)
+                except Exception:
+                    log_exc("prices: cannot settle the inn price")
+
+    ctx.wrap("__main__:{}.__init__".format(INN_START), required=False, safe=True)(start_init)
+    ctx.wrap("__main__:{}.execute".format(INN_START), required=False)(start_execute)
+    log("prices: the inn price gate was declared")
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +465,13 @@ GAME_WRITE_TARGETS = (
      "generated/ready_made"),
 )
 
+#: 売買で持ち主が替わる地点（同じく `orig` の後）。ゲームは中で新しい持ち主の鍵の額を付け、
+#: 上の地点は通らない。組み直さないと、売った品を同じ窓でゲームの額で買い戻せた（VERIFICATION.md §3.121）。
+TRADE_TARGETS = (
+    ("__main__:InstantaleApp.buy_item", "bought"),
+    ("__main__:InstantaleApp.sell_item", "sold"),
+)
+
 #: 持ち物ひとまとまりを均す地点（同じく `orig` の後）。
 NORMALIZE_TARGET = "__main__:InstantaleApp.normalize_shop_inventory_prices"
 
@@ -135,8 +487,21 @@ SIGHT_TARGETS = (
 SAVE_TARGETS = ("__main__:InstantaleApp.save_game",
                 "save_world_json:write_obfuscated_json_file")
 
+#: 店の値切り。この間にゲームが品へ書いた額は、値切りで決まった額として固定する。
+HAGGLE_TARGET = "__main__:ShoppingNegotiateManager.execute"
+
 _ITEM_ATTR = "_instantale_item_prices"
 _ITEM_GATE_ATTR = "_instantale_item_prices_gate"
+
+#: 値切りで決まった額の控え（`state/prices/<世界×主人公>.json` の `haggled`）。
+HAGGLE_DIRNAME = "prices"
+_HAGGLE_STORE_ATTR = "_instantale_prices_store"
+_HAGGLE_KEY_OVERRIDE_ATTR = "_instantale_prices_key_override"
+_HAGGLE_OWNER = "prices:haggle"
+#: 控えておく品の数の上限。超えたら古いものから捨てる（店の入れ替えで消えた品が溜まらないように）。
+HAGGLE_LIMIT = 200
+_haggle_stores = state.SysWorldStore(_HAGGLE_STORE_ATTR, HAGGLE_DIRNAME,
+                                     _HAGGLE_KEY_OVERRIDE_ATTR)
 
 # 台帳と段の読み書きは保存の経路からも通るので錠を持つ。
 _LOCK = threading.RLock()
@@ -349,6 +714,283 @@ def _layers(registry, temporary):
             if temporary or not layer[2]]
 
 
+# ---------------------------------------------------------------------------
+# 値切りで決まった額（TECH.md §5.9）
+# ---------------------------------------------------------------------------
+#
+# 売買の窓の入力欄で値切ると、ゲームは LLM が返した額（`new_offer`）を品の `買価` / `売価` へ
+# 直に書く（店主の逆提示でも書く）。書くのは `ShoppingNegotiateManager.execute` の中で、
+# 関所の地点を通らないうえ、同じ処理の中で保存が走る。関所は保存の前後に額を組み直すので、
+# 値切った額はその場で式と段の額へ戻っていた（VERIFICATION.md §3.121）。
+#
+# 素のゲームでは、その額は店を出ても読み直してもセーブに残り、売買で持ち主が変わって
+# ゲームが付け直すまで効く。関所もそれに合わせる。
+#
+# - 値切りの間にゲームが書き換えた額（関所が書いた額ではないもの）を、その品の固定の額にする
+# - 固定した鍵には式も段も掛けず、保存の前後も外さない（店主が事情を見て決めた最後の額）
+# - 品の額が固定から動いたら外す（売買で鍵が替わった・ゲームが付け直した）
+# - 固定は周回の控えに持ち、ロードの後も品の id で同じ品へ当てる
+
+def _pins():
+    """`{"key": 周回の鍵, "bucket": 控え, "items": {品の id: {...}}, "dirty": 書くか}`。"""
+    registry = _item_registry()
+    found = registry.get("pins")
+    if not isinstance(found, dict) or not isinstance(found.get("items"), dict):
+        found = {"key": None, "bucket": None, "items": {}, "dirty": False}
+        registry["pins"] = found
+    return found
+
+
+def _load_pins(key):
+    """その周回の固定を読む（錠の中で呼ぶ）。控えが無ければ（ゲーム抜きの検査）手元だけで持つ。"""
+    pins = _pins()
+    if key == pins["key"]:
+        return pins
+    _save_pins()
+    bucket = None
+    found = _haggle_stores.store()
+    if found is not None and key and key != state.UNKNOWN_WORLD:
+        try:
+            bucket = found.load(key)
+        except Exception:
+            log_exc("prices: cannot read the haggled prices of {!r}".format(key))
+            bucket = None
+    items = bucket.get("haggled") if isinstance(bucket, dict) else None
+    if not isinstance(items, dict):
+        items = {}
+        if isinstance(bucket, dict):
+            bucket["haggled"] = items
+    for ident in [ident for ident, entry in items.items() if not isinstance(entry, dict)]:
+        items.pop(ident, None)
+    pins.update(key=key, bucket=bucket, items=items, dirty=False)
+    return pins
+
+
+def _pins_for(app):
+    """いまの周回の固定（錠の中で呼ぶ）。周回が読めなければ今持っているもの。"""
+    if app is None:
+        return _pins()
+    try:
+        key = state.playthrough_key(app)
+    except Exception:
+        return _pins()
+    return _load_pins(key)
+
+
+def _save_pins():
+    """変わった固定を書く（錠の中で呼ぶ。書いている間に固定が動かないように）。"""
+    pins = _pins()
+    if not pins.get("dirty"):
+        return
+    pins["dirty"] = False
+    found = _haggle_stores.store()
+    if found is None or not isinstance(pins.get("bucket"), dict):
+        return
+    try:
+        found.save(pins["key"], pins["bucket"])
+    except Exception:
+        log_exc("prices: cannot write the haggled prices of {!r}".format(pins["key"]))
+
+
+def _find_app():
+    try:
+        from . import ui
+        return ui.find_app()
+    except Exception:
+        return None
+
+
+def _item_id(item):
+    field, _attributes = read_item(item)
+    ident = field("id")
+    if ident is None or isinstance(ident, bool) or ident == "":
+        return None
+    return str(ident)
+
+
+def _owner_key(app, obtainer):
+    """持ち主の見分け。主人公は `player`、ほかは人物の id。分からなければ None。"""
+    if obtainer is None:
+        return None
+    if app is not None and obtainer is getattr(app, "player", None):
+        return "player"
+    ident = getattr(obtainer, "id", None)
+    return None if ident is None or isinstance(ident, bool) else str(ident)
+
+
+def _inventory_items(obtainer):
+    inventory = getattr(obtainer, "inventory", None)
+    if isinstance(inventory, dict):
+        return list(inventory.values())
+    if isinstance(inventory, (list, tuple)):
+        return list(inventory)
+    return []
+
+
+def _pin(item, key, price, events):
+    """値切りで決まった額を固定する（錠の中で呼ぶ）。"""
+    ident = _item_id(item)
+    if ident is None:
+        return
+    haggle = _item_registry().get("haggle") or {}
+    app = haggle.get("app")
+    field, _attributes = read_item(item)
+    day = None
+    try:
+        from . import ui
+        day = ui.game_day(app) if app is not None else None
+    except Exception:
+        day = None
+    pins = _pins()
+    items = pins["items"]
+    items.pop(ident, None)              # 入れ直して並びの新しい側へ
+    items[ident] = {"key": key, "price": int(round(price)),
+                    "owner": _owner_key(app, field("obtainer")), "day": day}
+    while len(items) > HAGGLE_LIMIT:
+        items.pop(next(iter(items)))
+    pins["dirty"] = True
+    events.append("prices: haggled {} {} {} is kept ({})".format(
+        _name_of(item), key, int(round(price)), ident))
+
+
+def _catch_haggle(item, attributes, known, events):
+    """値切りの最中なら、ゲームが書き換えた額を固定する（錠の中で呼ぶ）。
+
+    比べるのは値切りの前に控えた額と、関所が最後に書いた額。どちらとも違えばゲームが書いた。
+    関所が値切りの最中に組み直した額（段の答えが変わった・保存の前後）は固定しない。
+    """
+    haggle = _item_registry().get("haggle")
+    if not isinstance(haggle, dict):
+        return
+    entry = haggle["before"].get(id(item))
+    if entry is None or entry[0] is not item:
+        return
+    before = entry[1]
+    written = (known or {}).get("written") or {}
+    for key in ITEM_PRICE_KEYS:
+        if key not in attributes or before.get(key) is None:
+            continue
+        current = _price_number(attributes.get(key))
+        if current is None or abs(current - before[key]) < 0.5:
+            continue
+        mine = written.get(key)
+        if mine is not None and abs(current - mine) < 0.5:
+            continue
+        before[key] = current           # 同じ書き換えを2度数えない
+        _pin(item, key, current, events)
+
+
+def _pinned(item, attributes, events):
+    """固定の額 `{鍵: 額}`。品の額が固定から動いていたら外す（錠の中で呼ぶ）。"""
+    pins = _pins()
+    items = pins["items"]
+    if not items:
+        return {}
+    ident = _item_id(item)
+    entry = items.get(ident) if ident is not None else None
+    if not isinstance(entry, dict):
+        return {}
+    key = entry.get("key")
+    price = _price_number(entry.get("price"))
+    current = (_price_number(attributes.get(key))
+               if key in ITEM_PRICE_KEYS and key in attributes else None)
+    if price is not None and current is not None and abs(current - price) < 0.5:
+        return {key: price}
+    items.pop(ident, None)
+    pins["dirty"] = True
+    events.append("prices: the haggled price of {} was released ({} is now {}; {})".format(
+        _name_of(item), key, attributes.get(key) if key in attributes else "gone", ident))
+    return {}
+
+
+def haggled(item):
+    """その品の値切りで決まった額 `{鍵: 額}`。固定が無ければ空（検査と別 MOD の読み口）。"""
+    with _LOCK:
+        entry = _pins()["items"].get(_item_id(item) or "")
+        if not isinstance(entry, dict):
+            return {}
+        return {entry.get("key"): entry.get("price")}
+
+
+def _haggle_begin(app):
+    """値切りの前の額を控える。控えたら True（入れ子・重なりは外側に任せる）。"""
+    if app is None:
+        app = _find_app()
+    with _LOCK:
+        registry = _item_registry()
+        if registry.get("haggle") is not None:
+            return False
+        _pins_for(app)
+        obtainers = [o for o in (registry.get("trade") or ()) if o is not None]
+        player = getattr(app, "player", None)
+        if player is not None and not any(o is player for o in obtainers):
+            obtainers.append(player)
+        # 売買の窓の相手と主人公の持ち物に、関所が値付けした品（台帳）も足す
+        # （注入し直した直後など、窓の相手を控えていないときの拾い）。
+        candidates = [item for obtainer in obtainers for item in _inventory_items(obtainer)]
+        candidates.extend(item for item, _entry in registry["ledger"].touched())
+        before = {}
+        for item in candidates:
+            if id(item) in before:
+                continue
+            _field, attributes = read_item(item)
+            values = {key: _price_number(attributes.get(key))
+                      for key in ITEM_PRICE_KEYS if key in attributes}
+            if values:
+                before[id(item)] = (item, values)
+        registry["haggle"] = {"before": before, "app": app}
+    return True
+
+
+def _haggle_end():
+    """値切りが済んだ。関所を通らなかった品も、ゲームが書き換えていれば固定する。"""
+    events = []
+    with _LOCK:
+        registry = _item_registry()
+        haggle = registry.get("haggle")
+        try:
+            if isinstance(haggle, dict):
+                ledger = registry["ledger"]
+                for item, _values in list(haggle["before"].values()):
+                    _field, attributes = read_item(item)
+                    known = ledger.get(item)
+                    _catch_haggle(item, attributes, known if isinstance(known, dict) else None,
+                                  events)
+        finally:
+            registry["haggle"] = None
+        _save_pins()
+        write = registry.get("write")
+    if write:
+        for line in events:
+            write(line)
+
+
+def _note_trade(app, left, right):
+    """売買の窓を開いた。相手と主人公を控え、もう持っていない品の固定を片付ける。"""
+    events = []
+    with _LOCK:
+        registry = _item_registry()
+        registry["trade"] = (left, right)
+        pins = _pins_for(app)
+        items = pins["items"]
+        for obtainer in (left, right):
+            owner = _owner_key(app, obtainer)
+            if owner is None or not items:
+                continue
+            held = {_item_id(item) for item in _inventory_items(obtainer)}
+            for ident, entry in list(items.items()):
+                if entry.get("owner") == owner and ident not in held:
+                    items.pop(ident, None)
+                    pins["dirty"] = True
+                    events.append("prices: the haggled price of {} was released "
+                                  "(no longer held by {})".format(ident, owner))
+        _save_pins()
+        write = registry.get("write")
+    if write:
+        for line in events:
+            write(line)
+
+
 def _axis_prices(item, attributes, registry, ledger, from_game, write):
     """段を乗せる前の軸 `{鍵: 額}` と、記録に出す軸の名前。
 
@@ -403,6 +1045,7 @@ def _apply_one(item, why, from_game, temporary=True):
     if not attributes:
         return 0
     notes = []
+    events = []
     write = None
     with _LOCK:
         registry = _item_registry()
@@ -416,6 +1059,11 @@ def _apply_one(item, why, from_game, temporary=True):
             # 組み直しは `saving` の戻しが控えのある品を全部やり直す。
             temporary = False
         ledger = registry["ledger"]
+        # 値切りの額は組み直す前に見る（値切りの中の保存が戻す前に固定する）。
+        known = ledger.get(item)
+        _catch_haggle(item, attributes, known if isinstance(known, dict) else None, events)
+        pinned = _pinned(item, attributes, events)
+        _save_pins()
         axis_prices, axis = _axis_prices(item, attributes, registry, ledger,
                                          from_game, write)
         layers = _layers(registry, temporary)
@@ -425,6 +1073,9 @@ def _apply_one(item, why, from_game, temporary=True):
         changed = 0
         for key in ITEM_PRICE_KEYS:
             if key not in attributes:
+                continue
+            if key in pinned:
+                known["written"][key] = float(pinned[key])
                 continue
             price = axis_prices.get(key)
             if price is None:
@@ -457,6 +1108,9 @@ def _apply_one(item, why, from_game, temporary=True):
     if base_write is not None:
         for line in notes:
             base_write(line)
+    if write:
+        for line in events:
+            write(line)
     return changed
 
 
@@ -505,13 +1159,26 @@ def install(ctx, write=None):
     値段に触る MOD が `apply()` の中で呼ぶ。何本の MOD が呼んでも、
     1つの世代につき関所は1つ（`durations.install` と同じ形。TECH.md §5.8）。
 
-    ここが8つの対象を1枚だけ包む。**地点ごとの `orig` の前後はここが引き受ける**
+    ここがゲームの値段に触る対象を1枚だけ包む（対象は `item_gate()["targets"]`）。**地点ごとの `orig` の前後はここが引き受ける**
     ので、式を置く側も段を置く側も層のことを考えなくてよい。
     """
     from . import patch as _patch
     _patch.note_gate_writer("prices", write)
     with _LOCK:
         _item_registry()["write"] = write
+    # 値切りの固定の控え。state の置き場と JSON の読み書きを持たない ctx（ゲーム抜きの検査）なら手元だけで持つ。
+    if getattr(ctx, "state_dir", None) and all(
+            callable(getattr(ctx, name, None)) for name in ("read_json", "write_json")):
+        _haggle_stores.bind(ctx, write)
+
+    def world_before(call):
+        """世界を組み立てる前に、その周回の固定を読む（ロードで作られる品へ当てるため）。"""
+        key = state.playthrough_key_of_dict(getattr(call, "save_data", None),
+                                            state.UNKNOWN_WORLD)
+        with _LOCK:
+            _load_pins(key)
+
+    loads.on(_HAGGLE_OWNER, ctx, (loads.WORLD,), before=world_before, write=write)
     generation = getattr(ctx, "generation", None)
     done = item_gate()
     if done is not None and done.get("generation") == generation:
@@ -531,12 +1198,25 @@ def install(ctx, write=None):
 
             ctx.wrap(target, required=False, safe=True)(priced)
         else:
-            def generated(orig, self, *args, _why=why, **kwargs):
+            # 戻り値は入口で違う（`(Item, 鍵)` か None）。品は `items.made_item` で取り出す。
+            def generated(orig, self, *args, _why=why,
+                          _entry=target.rsplit(".", 1)[-1], **kwargs):
                 result = orig(self, *args, **kwargs)
-                _apply_one(result, _why, from_game=True)
+                _apply_one(_items.made_item(_entry, result, args, kwargs), _why,
+                           from_game=True)
                 return result
 
             ctx.wrap(target, required=False, safe=True)(generated)
+        targets.append(target)
+
+    for target, why in TRADE_TARGETS:
+        def traded(orig, self, *args, _why=why, **kwargs):
+            item = args[0] if args else next(iter(kwargs.values()), None)
+            result = orig(self, *args, **kwargs)
+            _apply_one(item, _why, from_game=True)
+            return result
+
+        ctx.wrap(target, required=False, safe=True)(traded)
         targets.append(target)
 
     def normalize(orig, self, shop_obtainer=None, player_obtainer=None,
@@ -555,6 +1235,7 @@ def install(ctx, write=None):
     def twin_window(orig, self, left_inventory_obtainer=None,
                     right_inventory_obtainer=None, left_label_text=None,
                     situation=None, *args, **kwargs):
+        _note_trade(self, left_inventory_obtainer, right_inventory_obtainer)
         if _wants_sight():
             _apply_inventory(left_inventory_obtainer, "window/left",
                              from_game=False)
@@ -593,6 +1274,9 @@ def install(ctx, write=None):
         stripped = 0
         if depth == 0:
             try:
+                # 注入し直した直後は固定をまだ読んでいない。剥がす前に周回へ合わせる。
+                with _LOCK:
+                    _pins_for(_find_app())
                 stripped = _rewrite_touched(temporary=False, why="save/strip")
             except Exception:
                 log_exc("prices: could not strip temporary prices before saving")
@@ -617,6 +1301,27 @@ def install(ctx, write=None):
     for target in SAVE_TARGETS:
         ctx.wrap(target, required=False, safe=True)(saving)
         targets.append(target)
+
+    # ---- 値切り ------------------------------------------------------------
+    # 前の額を控えて通し、ゲームが書き換えた額を固定する。中の保存で戻す前の固定は
+    # `_apply_one` が受け持ち、ここは関所を通らなかった品を拾う。
+    def haggle(orig, self, *args, **kwargs):
+        began = False
+        try:
+            began = _haggle_begin(getattr(self, "app", None))
+        except Exception:
+            log_exc("prices: cannot note the prices before haggling")
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            if began:
+                try:
+                    _haggle_end()
+                except Exception:
+                    log_exc("prices: cannot keep the haggled prices")
+
+    ctx.wrap(HAGGLE_TARGET, required=False, safe=True)(haggle)
+    targets.append(HAGGLE_TARGET)
 
     setattr(sys, _ITEM_GATE_ATTR, {"generation": generation,
                                    "targets": list(targets)})

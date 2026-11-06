@@ -71,12 +71,16 @@ r"""闘技場の相手の強さと懸賞金を設定で決める。
 `331_facility_investment` が建てた闘技場も本物の闘技場も同じに扱う（どちらもゲームの経路）。
 既出の闘士を頼み文に足す一文は 331 と同じ文面で、
 どちらも既に入っていれば足さない（読む順ではこちらが外側の包みで、先に足す）。
+
+版9: 難易度の関数・`generate_enemy_data`・試合の始め・`remove_party_member`・`add_text` のフックは、
+引数を受け取った形のまま元の関数へ渡す（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
+難易度と懸賞金の文は来た側に合わせて差し替える。
 """
 
 import sys
 import time
 
-from instantale_modloader import choices, defeat, frames, llm, ui
+from instantale_modloader import choices, defeat, frames, llm, loads, ui
 
 LOG_BASENAME = "colosseum_custom.log"
 MARK = "_mod_colosseum_custom"
@@ -496,17 +500,20 @@ def apply(ctx):
 
     def install_enemy_number(name):
         @ctx.wrap("scripts.functions:{}".format(name), required=False, safe=True)
-        def enemy_number(orig, enemy_tier=None, quest_difficulty=None, *args, **kwargs):
+        def enemy_number(orig, *args, **kwargs):
             """相手の**実際の強さ**。レベルも能力値もこの難易度1つから決まる。
 
-            引数名は本体と同じにする（キーワードで渡されても二重にならない。版6）。
+            引数は (enemy_tier, quest_difficulty)。受け取った形のまま渡し、`quest_difficulty` だけを
+            来た側に合わせて差し替える（版6 は引数名を本体に揃えた。版9 から名前で受けない）。
             """
-            difficulty = quest_difficulty
             try:
+                quest_difficulty = frames.arg(args, kwargs, "quest_difficulty", 1)
                 difficulty = adjust_in_window(ui.find_app(), quest_difficulty, name)
+                if difficulty is not quest_difficulty:
+                    args, kwargs, _ = frames.replace_arg(args, kwargs, "quest_difficulty", 1, difficulty)
             except Exception:
                 ctx.log_exc("colosseum: cannot adjust {}".format(name))
-            return orig(enemy_tier, difficulty, *args, **kwargs)
+            return orig(*args, **kwargs)
 
     for _name in ENEMY_NUMBER_FNS:
         install_enemy_number(_name)
@@ -521,14 +528,14 @@ def apply(ctx):
 
     @ctx.wrap("__main__:ColosseumMatchStart.generate_enemy_data", required=False,
               safe=True)
-    def generate_enemy_data(orig, self, enemy_id=None, *args, **kwargs):
+    def generate_enemy_data(orig, self, *args, **kwargs):
         """施設に焼かれる格も、こちらが決めた値へ揃える。
 
         ここで保存された `data.rank` は次の試合以降も残る。
         懸賞金はこの値では決まらない。上限で下げた試合でも、素の格の額が出た
         （素なら格65 → 40 に下げても 393。GAME.md §2.11）。
         """
-        result = orig(self, enemy_id, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         try:
             opened = window()
             data = result.get("data") if isinstance(result, dict) else None
@@ -589,7 +596,7 @@ def apply(ctx):
 
     # ------------------------------------------------------------ 試合の始め
     @ctx.wrap("__main__:ColosseumMatchStart.execute", required=False, safe=True)
-    def match_start(orig, self, choice_text="", *args, **kwargs):
+    def match_start(orig, self, *args, **kwargs):
         """1試合ぶんの札を戻し、相手を仕込む窓を開ける。"""
         app = getattr(self, "app", None) or ui.find_app()
         state["survived"] = False
@@ -600,7 +607,7 @@ def apply(ctx):
             ctx.log_exc("colosseum: cannot keep the lawfulness")
         open_window(app)
         try:
-            return orig(self, choice_text, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         except Exception:
             close_window()
             raise
@@ -623,27 +630,27 @@ def apply(ctx):
     defeat.declare(OWNER, ctx, spare)
 
     # ---------------------------------------------- 負けて手配されないように
-    def after_load(orig, self, *args, **kwargs):
+    def before_load(call):
         """ロード（と新しく始めたとき）。試合ごとの控えを作り直す。
 
         試合の途中のセーブから再開すると `ColosseumMatchStart.execute` を通らない（§3.63 #10e の実機）。
         前の試合の控えが残ると、負けの切り上げを済ませた印で次の負けをゲームオーバーにしたり、
-        前の世界の手配度を書き戻したりした。闘技場の戦闘の途中なら、ここで手配度を控え直す。
+        前の世界の手配度を書き戻したりした。闘技場の戦闘の途中なら、ロードの後に手配度を控え直す。
+        前後ともローダの窓口 `loads` から呼ばれる（TECH.md §3.3.21）。
         """
         state["survived"] = False
         state["fallen"].clear()
         state["lawful_guard"] = None
         close_window()
-        result = orig(self, *args, **kwargs)
+
+    def after_load(call):
         try:
-            if getattr(self, "in_colosseum_battle", False):
-                guard_lawfulness(self)
+            if getattr(call.obj, "in_colosseum_battle", False):
+                guard_lawfulness(call.obj)
         except Exception:
             ctx.log_exc("colosseum: cannot keep the lawfulness after the load")
-        return result
 
-    for _target in ("__main__:InstantaleApp.load_game_new", "__main__:InstantaleApp.start_game"):
-        ctx.wrap(_target, required=False, safe=True)(after_load)
+    loads.on(OWNER, ctx, (loads.LOAD, loads.NEW_GAME), before=before_load, after=after_load, write=write)
 
     def guard_lawfulness(app):
         """申し込んだ時点のこの土地の手配度を控える（逃げて終わったら、下がった分を戻すため）。
@@ -715,7 +722,7 @@ def apply(ctx):
     choices.provide(ctx, screen, after=refresh_choice_buttons)
 
     @ctx.wrap("__main__:InstantaleApp.remove_party_member", required=False, safe=True)
-    def remove_party_member(orig, self, member_id=None, *args, **kwargs):
+    def remove_party_member(orig, self, *args, **kwargs):
         """闘技場の試合で一覧から外される仲間の値を控える（試合の終わりに戻すため）。
 
         主人公はローダの `defeat` が控えて切り上げで戻す。仲間は試合の終わり方の前後で戻す。
@@ -725,6 +732,7 @@ def apply(ctx):
         逃げる者も同じ入口を通るが、そちらはゲームが戻すので、控えても使われない。
         """
         try:
+            member_id = frames.arg(args, kwargs, "member_id", 0)
             if SURVIVE_DEFEAT and getattr(self, "in_colosseum_battle", False):
                 party = getattr(self, "party", None)
                 if isinstance(party, dict) and member_id in party \
@@ -736,7 +744,7 @@ def apply(ctx):
                                        for name in MEMBER_PLACE_ATTRS)}
         except Exception:
             ctx.log_exc("colosseum: cannot keep a member leaving the party")
-        return orig(self, member_id, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     def hand_over_fallen(app):
         """倒れた仲間を体力 1 にして預かりへ入れ、ゲームに一覧へ戻させる（主人公と同じ手）。"""
@@ -761,14 +769,12 @@ def apply(ctx):
         fallen = state.get("fallen") or {}
         if not fallen:
             return
-        party = getattr(app, "party", None)
-        escaped = getattr(app, "escaped_member_in_battle", None)
+        # 戻し方はローダの語彙（`107_` / `147_` / 窓口 `defeat` と同じ1つ）。
+        back, _missing = ui.put_back_party(
+            app, [(member_id, kept["value"]) for member_id, kept in fallen.items()])
         for member_id, kept in list(fallen.items()):
             value = kept["value"]
-            if isinstance(party, dict) and member_id not in party:
-                party[member_id] = value
-                if isinstance(escaped, dict):
-                    escaped.pop(member_id, None)
+            if member_id in back:
                 write("WARN fallen: {}: the game did not bring {} back; put back by hand".format(
                     where, member_id))
             else:
@@ -806,13 +812,14 @@ def apply(ctx):
 
     # -------------------------------------------------------------- 懸賞金
     @ctx.wrap("__main__:InstantaleApp.add_text", required=False, safe=True)
-    def add_text(orig, self, context=None, *args, **kwargs):
+    def add_text(orig, self, *args, **kwargs):
         """懸賞金の文の額を、こちらが払う額に書き換える。
 
         試合の終わりの間（`state["reward"]`）だけ働く。
         書き換えられた回だけ、後で所持金の差額を足す（食い違わせないため）。
         """
         pending = state.get("reward")
+        context = frames.arg(args, kwargs, "context", 0)
         if pending and isinstance(context, str) and REWARD_MARK in context:
             try:
                 base = ui.parse_coin(context)
@@ -821,7 +828,7 @@ def apply(ctx):
                     rewritten = replace_amount(context, base, want)
                     if rewritten is not None:
                         pending["base"], pending["want"] = base, want
-                        context = rewritten
+                        args, kwargs, _ = frames.replace_arg(args, kwargs, "context", 0, rewritten)
                         write("reward: {} -> {} (x{:.2f})".format(
                             base, want, pending["mult"]))
                     else:
@@ -829,7 +836,7 @@ def apply(ctx):
                             context))
             except Exception:
                 ctx.log_exc("colosseum: cannot rewrite the prize")
-        return orig(self, context, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     def settle(app, before):
         """ゲームが入れた額と、こちらが言った額の差を埋める。"""

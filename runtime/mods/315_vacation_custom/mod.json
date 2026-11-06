@@ -10,7 +10,7 @@
     "en": "Choose how long a stay lasts (1-2 weeks or 1-6 months, optionally scaled by the player's age), and change the names and prices of all four rooms at inns. Defaults are the game's own values; behavior is untouched until you edit them",
     "ja": "宿の宿泊期間を選択式で変えられる（1〜2週間・1〜6ヵ月。年齢による加算のON/OFF付き）。部屋4つの名前と宿代も変更できる。既定は素のゲームの値のままで、変えた項目だけが効く"
   },
-  "version": "7",
+  "version": "9",
   "author": "R01/Flossian",
   "settings": {
     "STAY_LENGTH": {
@@ -31,8 +31,8 @@
         "en": "Stay length"
       },
       "note": {
-        "ja": "「デフォルト」でゲームのまま（素のゲームは年齢で3〜6ヵ月に変わる変動式）。週単位は部屋代1回ぶんの短期滞在になる。年齢による加算がONだと、選んだ期間に30代+1・40代+2・50代以上+3（週/月）が足される",
-        "en": "デフォルト keeps the game's own period (the game varies it from 3 to 6 months by age). Week-length stays cost one room fee. With the age bonus on, the chosen length grows by +1/+2/+3 (weeks or months) in your 30s/40s/50s+"
+        "ja": "「デフォルト」でゲームのまま（素のゲームは年齢で3ヵ月から長くなる変動式。測った中では49歳で7ヵ月）。週単位は部屋代1回ぶんの短期滞在になる。年齢による加算がONだと、選んだ期間に30代+1・40代+2・50代以上+3（週/月）が足される",
+        "en": "デフォルト keeps the game's own period (the game lengthens it with age from 3 months; 7 months at age 49 in testing). Week-length stays cost one room fee. With the age bonus on, the chosen length grows by +1/+2/+3 (weeks or months) in your 30s/40s/50s+"
       }
     },
     "AGE_SCALING": {
@@ -191,12 +191,12 @@
       "type": "bool",
       "default": true,
       "label": {
-        "ja": "週単位のときAIの描写も揃える",
-        "en": "Fix the AI narration for week stays"
+        "ja": "AIに渡す文も設定に揃える",
+        "en": "Match the text sent to the AI to these settings"
       },
       "note": {
-        "ja": "ONだと、週単位の宿泊のあいだAIに渡す文の「数ヵ月の宿泊」を実際の期間に直す。切ると描写だけが「数ヶ月にわたる滞在」と言い続ける（ゲームが月数を文に焼き込んでいるため）。月単位の宿泊では何もしない",
-        "en": "While a week-length stay is running, rewrites 数ヵ月の宿泊 in the text sent to the AI so the narration matches. Off keeps the game's wording, which says 'several months' even for a two-week stay. Month stays are untouched"
+        "ja": "ONだと、週単位の描写の「数ヵ月の宿泊」、宿の主が話す期間・部屋の名前・宿代、宿の主の宿泊の記憶を今の設定に揃える。切ると描写と宿の主だけが素の期間と値段を言い続ける（ゲームが文に焼き込んでいるため）",
+        "en": "Makes the week-stay narration, the period, room names and prices the innkeeper mentions, and the innkeeper's memory of your stays follow these settings. Off keeps the game's wording, so they keep stating the game's own period and prices. Japanese game text only"
       }
     }
   }

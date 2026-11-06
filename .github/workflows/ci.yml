@@ -87,6 +87,29 @@ jobs:
       - name: compileall
         run: python -m compileall -q runtime tools -x "(mods.9[0-9][0-9]_|test_wip_)"
 
+      # 使っていない import・代入したまま使っていない変数・未定義名。1件でもあれば失敗にする。
+      # 未定義名は compileall も check_mods も拾わず、フックの中なら注入してその経路を遊ぶまで出ない。
+      # 使っていない import は動きに害は無いが、残っていると触るたびに「前からあるものか」を
+      # 確かめ直すことになるので、0件を保つ（TECH.md §2.5）。
+      # pyflakes には除外の指定が無いので、出力の行を落とす。外すのは tools/drive（ゲームの中で
+      # exec するスクリプトで、`app` などはゲーム側が渡す名前）と、上と同じ 9xx・test_wip_。
+      # 版は固定する（上げると判定が変わりうるので、上げるときは手元で runtime と tools を通してから）。
+      # 最後の `exit 0` は、除外した行のぶんで pyflakes が返した終了コードを引き継がないため。
+      - name: pyflakes
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pyflakes==4.0.3
+          $found = @(python -m pyflakes runtime tools 2>&1 | Where-Object {
+            $_ -notmatch '^tools[\\/]drive[\\/]' -and
+            $_ -notmatch '^runtime[\\/]mods[\\/]9[0-9][0-9]_' -and
+            $_ -notmatch 'test_wip_' })
+          if ($found) {
+            $found | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host "  ok    pyflakes"
+          exit 0
+
       # デコレータの対象と引数の食い違い、mod.json の entry、load_order の
       # 突き合わせ。構文が正しくてもゲームを落とすものはここで捕まる。
       # 同梱 MOD は `--strict`（note も失敗に数える。TECH.md §2.3）。手元では
@@ -102,6 +125,12 @@ jobs:
 
       - name: list_mods --check
         run: python tools/list_mods.py --check
+
+      # 検証の記録は1節1ファイル（docs/verification/）で、VERIFICATION.md と
+      # VERIFICATION_LOG.md の目次は生成物。節を足して生成し忘れると目次から漏れる。
+      # ソースと docs の `VERIFICATION.md §3.x` が実在する節を指しているかも見る。
+      - name: build_verification --check
+        run: python tools/build_verification.py --check
 
       # tools/tests/test_*.py は全てゲーム不要（偽のゲームを差し込んで走る）。
       # **1本でも落ちたら失敗**。除外一覧は置かない ― 一度置くと、そこに
@@ -173,7 +202,8 @@ jobs:
       # 配布物に LICENSE / NOTICE が入っていなければ、それは配れない zip。
       # make_dist.bat 自身も欠けていれば止まるが、**組み上がった中身**を
       # 見るのはここだけ。make_dist.bat は「全部の zip に入れる」と言っているので、
-      # 3本とも見る（loader 単体・mods 単体の欠けは full を見ても分からない）。
+      # 3本とも見る（full・lite・assets）。lite には大きいアセットと指紋の控え（runtime/assets.json）が無く、
+      # assets はアセットと控えと LICENSE / NOTICE だけで、控えの指紋は zip の名前と同じ。
       # 名前は版から組む。手元に古い版の zip が残っていても、そちらを検査しない。
       - name: zip の中身
         shell: pwsh
@@ -190,17 +220,23 @@ jobs:
                           Sort-Object -Unique)
           # docs\ に在るものは全部配布物に入る。名前を並べて写していた頃、
           # 足した文書が並びから漏れても誰も気付かなかった（VERIFICATION_LOG.md）。
-          $docs = @(Get-ChildItem docs/*.md | Sort-Object Name | ForEach-Object { "docs/$($_.Name)" })
+          $docs = @(Get-ChildItem docs/*.md | Sort-Object Name | ForEach-Object { "docs/$($_.Name)" }) +
+                  @(Get-ChildItem docs/verification/*.md | Sort-Object Name |
+                    ForEach-Object { "docs/verification/$($_.Name)" })
           $loader = @('LICENSE', 'NOTICE', 'InstantaleModLoader.bat', 'tools/gui.py',
                       'runtime/instantale_modloader/__init__.py',
                       'runtime/mods/_template/mod.json') + $docs
+          $assetDirs = @('runtime/mods/128_item_image_variety/images/', 'runtime/mods/128_item_image_variety/data/')
+          $assetZip = @(Get-ChildItem (Join-Path dist $ver) -Filter "InstantaleModLoader-$ver-assets-*.zip")
+          if ($assetZip.Count -ne 1) { Write-Host "  assets の zip が1本でない: $($assetZip.Count)"; exit 1 }
+          $digest = ($assetZip[0].Name -replace '^.*-assets-([0-9a-f]+)\.zip$', '$1')
           $packages = @(
-            @{ zip = "InstantaleModLoader-$ver-full.zip"; mods = 'runtime/mods/'
-               want = $loader + @('runtime/mods/load_order.json'); deny = @() },
-            @{ zip = "InstantaleModLoader-$ver.zip"; mods = $null
-               want = $loader; deny = @('runtime/mods/load_order.json') },
-            @{ zip = "InstantaleMods-$ver.zip"; mods = ''
-               want = @('LICENSE', 'NOTICE'); deny = @('load_order.json', '_template/mod.json') }
+            @{ zip = "InstantaleModLoader-$ver-full.zip"; mods = 'runtime/mods/'; assets = $true
+               want = $loader + @('runtime/mods/load_order.json', 'runtime/assets.json'); deny = @() },
+            @{ zip = "InstantaleModLoader-$ver-lite.zip"; mods = 'runtime/mods/'; assets = $false
+               want = $loader + @('runtime/mods/load_order.json'); deny = @('runtime/assets.json') },
+            @{ zip = $assetZip[0].Name; mods = $null; assets = $true; only = $true
+               want = @('LICENSE', 'NOTICE', 'runtime/assets.json'); deny = @('tools/gui.py', 'runtime/mods/load_order.json') }
           )
 
           $bad = 0
@@ -225,6 +261,23 @@ jobs:
             foreach ($leak in @($rel | Where-Object { $userCopies -contains ($_ -split '/')[-1] })) {
               Write-Host "    手元版が入っている: $leak"; $bad++
             }
+            $inAssets = @($rel | Where-Object { $r = $_; @($assetDirs | Where-Object { $r.StartsWith($_) }).Count -gt 0 })
+            if ($p.assets -and $inAssets.Count -eq 0) { Write-Host "    大きいアセットが入っていない"; $bad++ }
+            if (-not $p.assets -and $inAssets.Count -gt 0) { Write-Host "    大きいアセットが入っている: $($inAssets[0])"; $bad++ }
+            if ($p.only) {
+              $extra = @($rel | Where-Object { $inAssets -notcontains $_ -and @('LICENSE', 'NOTICE', 'runtime/assets.json') -notcontains $_ })
+              if ($extra) { Write-Host "    アセットの外のファイル: $($extra[0])"; $bad++ }
+            }
+            if ($rel -contains 'runtime/assets.json') {
+              $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $path).Path)
+              try {
+                $entry = $archive.Entries | Where-Object { ($_.FullName -split '/', 2)[-1] -eq 'runtime/assets.json' }
+                $reader = New-Object IO.StreamReader($entry.Open())
+                $manifest = $reader.ReadToEnd() | ConvertFrom-Json
+                $reader.Dispose()
+              } finally { $archive.Dispose() }
+              if ($manifest.digest -ne $digest) { Write-Host "    指紋が assets の zip の名前と違う: $($manifest.digest) / $digest"; $bad++ }
+            }
             if ($null -ne $p.mods) {
               $pattern = '^' + [regex]::Escape($p.mods) + '[^/_][^/]*/mod\.json$'
               $count = @($rel | Where-Object { $_ -match $pattern }).Count
@@ -233,7 +286,7 @@ jobs:
             }
           }
           if ($bad) { exit 1 }
-          Write-Host "  ok    3本とも中身が揃っている"
+          Write-Host "  ok    3本とも中身が揃っている（アセットの指紋 $digest）"
 
       # 配った tools が配布物の中で動くか。一覧（make_dist.bat）は許可制なので、
       # 配ったファイルが読む tools\ のモジュールを入れ忘れると、配布物でだけ

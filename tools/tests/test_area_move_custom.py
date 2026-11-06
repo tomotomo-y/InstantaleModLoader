@@ -45,6 +45,7 @@ if RUNTIME_DIR not in sys.path:
 import instantale_modloader as ml                      # noqa: E402
 from instantale_modloader import state as mstate       # noqa: E402
 from instantale_modloader import durations            # noqa: E402
+from instantale_modloader import choices              # noqa: E402
 
 
 def find_mod(suffix):
@@ -102,6 +103,8 @@ class World:
     def __init__(self, areas):
         self.areas = areas
         self.name = "テスト世界"
+        # 人物が揃った世界（窓口 `choices` は人物が 0 人の間をロードの途中と見て MOD の選択肢を組まない）
+        self.characters = {"1": object()}
 
 
 class Player:
@@ -146,7 +149,11 @@ class AreaMoveManager:
             # 実測の文言（217_）。
             # **金額はゲームの運賃で焼き込まれ、
             # mod が料金をいくらに直しても 1000 のまま**という実挙動を真似る。
-            self.app.add_text("{}ゴールドを支払った。快適な旅だ...".format(GAME_FARE))
+            if getattr(self.app, "keyword_text", False):
+                # キーワード引数で出すビルド（314 版7 は受け取った形のまま文言を差し替える）。
+                self.app.add_text(context="{}ゴールドを支払った。快適な旅だ...".format(GAME_FARE))
+            else:
+                self.app.add_text("{}ゴールドを支払った。快適な旅だ...".format(GAME_FARE))
             # 支払い直後にゲームが所持金の表示を描き直す瞬間の値。
             # **ここが既に差し引き後の正しい値**でないと、
             # 「文言は500なのに画面は
@@ -432,14 +439,14 @@ def setup(configure=None, double_elapse=False, roads=None):
     if os.path.exists(LOG_PATH):
         os.remove(LOG_PATH)
 
+    choices.reset()                       # 前の検査の窓口の登録を持ち越さない
     module = load_mod()
     if configure is not None:
         configure(module)
     ctx = FakeCtx(OUT_DIR)
     module.apply(ctx)
     install(ctx.hooks, (
-        ("__main__:AreaMoveCofirmation.update_button_display", confirm_cls,
-         "update_button_display"),
+        ("__main__:InstantaleApp.refresh_choice_buttons", app_cls, "refresh_choice_buttons"),
         ("__main__:InstantaleApp.on_button_press", app_cls, "on_button_press"),
         ("__main__:AreaMoveManager.__init__", move_cls, "__init__"),
         ("__main__:AreaMoveManager.execute", move_cls, "execute"),
@@ -599,6 +606,31 @@ check("文言の金額も実際の引き落としに揃う",
 check("ゲームの言う1000は出ない",
       not any("1000ゴールド" in t for t in app.texts), app.texts)
 check("エラーなし", not ctx.errors, ctx.errors)
+store = getattr(sys, module.SETTINGS_STORE_ATTR)
+loads = []
+plain_load = store.load
+
+
+def counting_load(*args, **kwargs):
+    loads.append(args)
+    return plain_load(*args, **kwargs)
+
+
+store.load = counting_load
+try:
+    app.add_text("宿の主人がこちらを見た。")
+    check("移動の窓の外の本文では設定を読み直さない（版7）", loads == [], loads)
+    press(app, CARRIAGE_300)
+    check("  → 移動を始めるときは読み直す（この世界では読み込みが走る）", len(loads) > 0, loads)
+finally:
+    store.load = plain_load
+
+module, ctx, app, confirm_cls, move_cls = setup(configure=fare_only)
+app.keyword_text = True
+press(app, CARRIAGE_300)
+check("キーワード引数の文言も実際の引き落としに揃う",
+      "300ゴールドを支払った。快適な旅だ..." in app.texts
+      and not any("1000ゴールド" in t for t in app.texts), app.texts)
 
 print("[料金] 手持ちが素の運賃未満でも乗れる（手持ち600・設定300）")
 module, ctx, app, confirm_cls, move_cls = setup(configure=fare_only)
@@ -610,13 +642,18 @@ check("300だけ引かれる", app.player.gold == 300, app.player.gold)
 check("支払いの瞬間から差し引き後の値", app.gold_after_payment == 300,
       app.gold_after_payment)
 
-print("[料金] ラベルを組み直さないビルドでも素の運賃を見失わない")
+print("[料金] 組み直しのたびにゲームの文言から付け直す（ゲームのボタンは書き換えない）")
 module, ctx, app, confirm_cls, move_cls = setup(configure=fare_only)
-hook = ctx.hooks["__main__:AreaMoveCofirmation.update_button_display"]
-hook(lambda self: None, confirm_cls(app, "9"))   # 組み直し無しでもう一度来る
+app.refresh_choice_buttons(reset_page=True)
+app.refresh_choice_buttons(reset_page=True)
 CLOCK.settle()
-check("自分の書いた300Gを読み直しても表示は同じ", texts_of(app)[1] == CARRIAGE_300,
+check("組み直しても表示は同じ（増えない）", texts_of(app) == [WALK_TEXT, CARRIAGE_300, "やめる"],
       texts_of(app))
+check("窓口が差し替えた写しで出す", choices.ours(app.buttons[1]) and app.buttons[1]["spec"].args[1] == CARRIAGE_MODE,
+      app.buttons[1])
+check("ゲームのボタンは素の文言のまま（保存の間は窓口が元のボタンに戻す）",
+      [e["text"] for e in choices.strip(app.buttons)[0]] == [WALK_TEXT, CARRIAGE_TEXT, "やめる"],
+      choices.strip(app.buttons))
 app.player.gold = 600
 press(app, CARRIAGE_300)
 check("前払い調整が素の運賃(1000)基準のまま効く",

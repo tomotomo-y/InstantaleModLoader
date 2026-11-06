@@ -11,7 +11,7 @@ QuestStart・End・RetireManager / HUD / Clock を差し込み、次を確認す
   押下   … 印で横取りしてゲームの経路（`process_choice`）に乗せる。
            `PhaseSpec` に自前クラス名を書かない
   難易度 … 移動元と移動先の**間**から選ばれ、生成にもクエスト辞書にも同じ値が入る
-           （`world.quests` と `world_dict['quests']` の両方）
+           （`world.quests` と `save_data_dict['quests']` の両方）
   生成   … `area_description` に道中の性質が足され、元の記述は残る
   受注   … ゲーム本来の受注画面（`QuestChoiceManager`）へ渡す
   踏破   … クリアしただけでは動かず、**集落の画面に戻ってから**移動が起きる
@@ -42,6 +42,7 @@ if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
 import instantale_modloader as ml                      # noqa: E402
+from instantale_modloader import choices              # noqa: E402
 
 
 def find_mod(suffix):
@@ -101,6 +102,8 @@ class World:
         self.areas = areas
         self.quests = quests
         self.name = "テスト世界"
+        # 人物が揃った世界（窓口 `choices` は人物が 0 人の間をロードの途中と見て MOD の選択肢を組まない）
+        self.characters = {"1": object()}
 
 
 class Player:
@@ -271,8 +274,8 @@ class DisplayQuestChoice:
     #: ゲーム自身が付ける難易度。
     #: mod がこれを自分の値で上書きする。
     game_difficulty = 4
-    #: 生成の直後に `world_dict['quests']` にも現れるか。
-    #: **実機では現れなかった**（`1 store(s)`）ので、既定は False。
+    #: 生成の直後に `save_data_dict['quests']` にも現れるか。
+    #: 実機では測っていないので、後から現れる側（False）を既定にする。
     in_both_stores = False
 
     def __init__(self, app):
@@ -286,7 +289,14 @@ class DisplayQuestChoice:
         return None
 
     def generate_random_quest(self):
-        if self.app.generator_hook is not None:
+        if self.app.generator_hook is not None and getattr(self.app, "keyword_generator", False):
+            # ゲームがキーワード引数で呼ぶ版（307 版7 は受け取った形のまま渡す）。
+            self.app.generator_hook(world_overview="世界の概要", settlement_name="風鳴りの村",
+                                    settlement_overview="静かな農村",
+                                    settlement_structure_description="丘陵地帯",
+                                    area_description="風が吹き抜ける丘陵地帯。",
+                                    quest_difficulty=type(self).game_difficulty)
+        elif self.app.generator_hook is not None:
             self.app.generator_hook("世界の概要", "風鳴りの村", "静かな農村",
                                     "丘陵地帯", "風が吹き抜ける丘陵地帯。",
                                     type(self).game_difficulty)
@@ -297,16 +307,16 @@ class DisplayQuestChoice:
                       neighboring_settlement_id="7")
         self.app.world.quests[new_id] = quest
         if type(self).in_both_stores:
-            self.app.world_dict["quests"][new_id] = {
+            self.app.save_data_dict["quests"][new_id] = {
                 "id": new_id, "quest_title": type(self).next_title,
                 "request_summary": type(self).next_summary,
                 "difficulty": type(self).game_difficulty}
         return quest
 
     def register_in_save(self, quest_id):
-        """`world_dict['quests']` に後から現れる（実機の並びを真似る）。"""
+        """`save_data_dict['quests']` に後から現れる（遅いほうの並びを真似る）。"""
         quest = self.app.world.quests[str(quest_id)]
-        self.app.world_dict["quests"][str(quest_id)] = {
+        self.app.save_data_dict["quests"][str(quest_id)] = {
             "id": str(quest_id), "quest_title": quest.quest_title,
             "request_summary": type(self).next_summary,
             "difficulty": type(self).game_difficulty}
@@ -317,6 +327,7 @@ class InstantaleApp:
         self.world = world
         self.world_dict = {"world_data": {"world_name": "テスト世界"},
                            "quests": {}}
+        self.save_data_dict = {"quests": {}}
         self.player = Player(world.areas["7"])
         self.buttons = []
         self.display_button_map = None
@@ -619,6 +630,7 @@ def setup(configure=None, levels=None, keep_state=False, mod=None):
 
     install_fake_functions(levels if levels is not None else AREA_LEVELS)
 
+    choices.reset()                       # 前の検査の窓口の登録を持ち越さない
     module = mod if mod is not None else load_mod()
     if configure is not None:
         configure(module)
@@ -641,15 +653,18 @@ def setup(configure=None, levels=None, keep_state=False, mod=None):
     world = World({"7": Area("7", "風鳴りの村"), "9": Area("9", "陽光の砦")},
                   {"39": Quest(id="39", quest_title="水底の警備")})
     app = app_cls(world)
-    app.world_dict["quests"] = {"39": {"id": "39"}}
+    app.save_data_dict["quests"] = {"39": {"id": "39"}}
     main.current_app = app
 
     raw = ctx.hooks.get(
         "scripts.llm.llm_manager_world_generate:random_quest_generator")
 
-    def plain_generator(world_overview, settlement_name, settlement_overview,
-                        structure, area_description, difficulty, *a, **kw):
+    def plain_generator(*args, **kwargs):
+        # 位置でもキーワードでも受け、渡ってきた形も控える。
+        area_description = kwargs["area_description"] if "area_description" in kwargs else args[4]
+        difficulty = kwargs["quest_difficulty"] if "quest_difficulty" in kwargs else args[5]
         app.generated.append((area_description, difficulty))
+        app.__dict__.setdefault("generated_shapes", []).append((len(args), sorted(kwargs)))
         return {"quest_title": board_cls.next_title}
 
     def generator(*args, **kwargs):
@@ -758,9 +773,13 @@ entry = road_entry(app)
 check("自前のクラス名を PhaseSpec に書かない",
       entry["spec"].to_dict()["cls_name"] == "JustSetButtonToNormalPhase",
       entry["spec"].to_dict())
-check("印はこの mod のもの", entry.get("mod_road_action") == "road", entry)
-check("画面も塗り直す", app.hud.painted and "危険な道を行く" in app.hud.painted[-1],
-      app.hud.painted[-1:])
+check("窓口のボタン（押下は窓口がボタンに持たせた処理を呼ぶ）", choices.ours(entry), entry)
+check("ほかの MOD が見分ける印はこの mod のもの", entry.get("mod_road_action") == "road", entry)
+check("ゲームの組み直しの中で組む（画面へ運ぶ一覧に出る）", "危険な道を行く" in app.to_display_buttons,
+      app.to_display_buttons)
+check("保存の前に外すと確認画面のゲームのボタンだけになる",
+      [e.get("text") for e in choices.strip(app.buttons)[0]] == [WALK_TEXT, CARRIAGE_TEXT, "やめる"],
+      choices.strip(app.buttons))
 show_confirmation(app, confirm_cls)
 check("開き直しても二重にならない",
       [t for t in [e.get("text") for e in app.buttons]
@@ -777,8 +796,12 @@ restored = [{"text": mod.ROAD_LABEL,
              "spec": PhaseSpec("JustSetButtonToNormalPhase", [])}]
 check("印の落ちた自前ボタンを残骸として掴む",
       screen.prune_stale(restored, mod.OUR_LABELS) == [mod.ROAD_LABEL], restored)
-check("確認画面の掃除が仕掛けてある",
-      "prune_stale(buttons, OUR_LABELS)" in open(MOD, encoding="utf-8").read())
+check("前の版の残骸の文言を窓口に渡している",
+      list(mod.OUR_LABELS) == list(choices._labels()), choices._labels())
+app.buttons = restored + [{"text": "やめる", "spec": PhaseSpec("JustSetButtonToNormalPhase", [])}]
+app.refresh_choice_buttons(reset_page=True)
+check("組み直しで前の版の残骸を外す", [e.get("text") for e in app.buttons] == ["やめる"],
+      [e.get("text") for e in app.buttons])
 
 # 他 MOD の生きているボタン（印のキーだけが違う）を巻き込まないこと。
 foreign = [{"text": mod.ROAD_LABEL, "mod_pardon_action": "open",
@@ -928,18 +951,37 @@ classes[1](app).register_in_save(quest_id)
 classes[4](app, "settlement_quest", quest_id).execute("受ける")
 CLOCK.settle()
 check("**セーブ側の辞書にも**同じ値が入る（受注の時点で揃える）",
-      app.world_dict["quests"][quest_id]["difficulty"] == rolled,
-      app.world_dict["quests"][quest_id])
+      app.save_data_dict["quests"][quest_id]["difficulty"] == rolled,
+      app.save_data_dict["quests"][quest_id])
 check("クエスト辞書に独自キーを足さない",
-      set(app.world_dict["quests"][quest_id])
+      set(app.save_data_dict["quests"][quest_id])
       <= {"id", "quest_title", "request_summary", "difficulty"},
-      app.world_dict["quests"][quest_id])
+      app.save_data_dict["quests"][quest_id])
+check("雛形（`world_dict['quests']`）には書かない",
+      app.world_dict["quests"] == {}, app.world_dict["quests"])
 
 mod, ctx, app, classes = setup(
     configure=lambda m: setattr(m, "DIFFICULTY_MODE", "destination"))
 show_confirmation(app, classes[0])
 press(app, "危険な道を行く")
 check("destination なら移動先に合わせる", app.generated[-1][1] == 9, app.generated)
+
+mod, ctx, app, classes = setup(
+    configure=lambda m: setattr(m, "DIFFICULTY_MODE", "destination"))
+app.keyword_generator = True
+show_confirmation(app, classes[0])
+press(app, "危険な道を行く")
+check("キーワード引数で呼ばれても難易度を差し替える",
+      app.generated and app.generated[-1][1] == 9, app.generated)
+check("  → 道中の性質も area_description に足す",
+      app.generated and app.generated[-1][0].startswith("風が吹き抜ける丘陵地帯。")
+      and len(app.generated[-1][0]) > len("風が吹き抜ける丘陵地帯。"), app.generated)
+check("  → 受け取った形のまま渡す（位置引数に直さない）",
+      getattr(app, "generated_shapes", None) == [(0, ["area_description", "quest_difficulty",
+                                                       "settlement_name", "settlement_overview",
+                                                       "settlement_structure_description",
+                                                       "world_overview"])],
+      getattr(app, "generated_shapes", None))
 
 mod, ctx, app, classes = setup(
     configure=lambda m: setattr(m, "DIFFICULTY_MODE", "harder"))
@@ -979,8 +1021,8 @@ classes[1](app).register_in_save(quest_id)
 classes[4](app, "settlement_quest", quest_id).execute("受ける")
 CLOCK.settle()
 check("**セーブ側の辞書にも**入る",
-      "移動します" in app.world_dict["quests"][quest_id]["request_summary"],
-      app.world_dict["quests"][quest_id])
+      "移動します" in app.save_data_dict["quests"][quest_id]["request_summary"],
+      app.save_data_dict["quests"][quest_id])
 check("二重に足さない（受注でもう一度呼んでも1回だけ）",
       getattr(app.world.quests[quest_id], "request_summary").count("移動します") == 1,
       getattr(app.world.quests[quest_id], "request_summary"))
@@ -1016,8 +1058,8 @@ check("  → LLM の本文は残す",
       summary_of(app, quest_id) == "涸れ谷を抜けて隣の土地へ至る。",
       summary_of(app, quest_id))
 check("  → セーブ側からも消す",
-      "移動します" not in app.world_dict["quests"][quest_id]["request_summary"],
-      app.world_dict["quests"][quest_id])
+      "移動します" not in app.save_data_dict["quests"][quest_id]["request_summary"],
+      app.save_data_dict["quests"][quest_id])
 check("  → 記録に残す", "note: removed the arrival line" in read_log(),
       read_log()[-500:])
 
@@ -1133,7 +1175,7 @@ quest_id = new_quest_id(app)
 # ここで注入し直し（新しい層は控えをファイルから読む）。
 mod2, ctx2, app2, classes2 = setup(keep_state=True)
 app2.world.quests[quest_id] = app.world.quests[quest_id]
-app2.world_dict["quests"][quest_id] = app.world_dict["quests"].get(quest_id, {})
+app2.save_data_dict["quests"][quest_id] = app.save_data_dict["quests"].get(quest_id, {})
 classes2[4](app2, "settlement_quest", quest_id).execute("受ける")
 CLOCK.settle()
 LootPhaseManager(app2).execute("漁る")

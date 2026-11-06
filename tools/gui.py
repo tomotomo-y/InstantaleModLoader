@@ -37,6 +37,7 @@ GUI 側で条件判定を書き直すと `watch.bat` と挙動がずれるため
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import math
@@ -63,6 +64,7 @@ import logrotate                                 # noqa: E402
 import watcher                                   # noqa: E402
 import instantale_modloader as ml                # noqa: E402
 from instantale_modloader import config as C     # noqa: E402
+from instantale_modloader import drift as D      # noqa: E402
 
 RUNTIME_DIR = os.path.join(ROOT, "runtime")
 MODS_DIR = os.path.join(RUNTIME_DIR, "mods")
@@ -102,6 +104,9 @@ RELEASES_API = ("https://api.github.com/repos/Flossian/InstantaleModLoader"
                 "/releases?per_page=30")
 # 更新の zip を落とすときの、1回の読みを待つ上限（秒）。全体の所要時間の上限ではない。
 UPDATE_TIMEOUT = 30
+# 大きいアセット（128_ の絵と辞書）の指紋の控え。full と assets の zip に入り、lite には入らない（make_dist.bat）。
+# 手元に在るのは、いま入っているアセットの指紋。
+ASSETS_MANIFEST = os.path.join(RUNTIME_DIR, "assets.json")
 # 上書きで消えないもの。確認の文に出す（zip に入らないので展開は触らない）。
 UPDATE_KEEPS = ("settings\\・state\\・local\\・手元で足した MOD\n"
                 "（書き換えた *.default.txt / *.default.json は "
@@ -125,6 +130,7 @@ SHIPPED_DEFAULTS = {
         "f05e2814b84ba9487a87e9671e6d2210a3ad4d6d",
         "d5b1ad61282b3607246d9237e9c10cc5c12682ac",
         "321d4fb19f0f2ad1a8e6f0af64f0829eb7716c63",
+        "cd5d840b44a381d37d7c7322b79f143935ba9a4f",     # v1.20.0
     },
     "npc.default.json": {                               # 120_
         "3986fdec474b1280e5acf34f6727b3706a8ebc71",     # v1.3.1
@@ -132,6 +138,11 @@ SHIPPED_DEFAULTS = {
     },
     "seeds.default.json": {                             # 132_
         "285b98a366715f380345f9de53a9da29357187b0",     # v1.10.0
+        "953f661242a0386c611af7ffc92a3c4b8f08398e",     # v1.16.0（説明欄を直す前）
+        "32365bacaed81311de5166f4eefaa14d245843aa",     # v1.16.0
+    },
+    "incidents.default.json": {                         # 338_
+        "76a134d36f37e00dae3b1d51f9cc78ea53b3a253",     # v1.16.0
     },
 }
 
@@ -171,9 +182,51 @@ def _vtuple(ver: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", ver))
 
 
-def newer_release(current: str = ml.__version__) -> tuple[str, str] | None:
-    """GitHub の最新 Release が今より新しければ (版, full zip の URL)。無ければ None。
+def local_assets_digest(path: str = ASSETS_MANIFEST) -> str | None:
+    """手元のアセットの指紋（`runtime\\assets.json` の digest）。無い・読めないなら None。
 
+    手元のファイルは数えも測りもしない。`128_` は要らない分類の絵と辞書を消してよいことにしていて、
+    手元を見ると、消した人が更新のたびに full を落とす（消した絵も戻る）。
+    絵が欠けて戻したいときは `assets.json` を消せば、次の更新は full になる（README §3.6）。
+    """
+    data = ml.read_json(path, default=None)
+    digest = data.get("digest") if isinstance(data, dict) else None
+    return digest if isinstance(digest, str) and digest else None
+
+
+def pick_package(assets: list, local_digest: str | None) -> dict | None:
+    """Release の添付から落とす zip を選ぶ: `{"kind", "url", "size"}`。full が無ければ None。
+
+    アセットの zip（`…-assets-<指紋>.zip`）の指紋が手元と同じで、lite が在れば lite。
+    それ以外（手元に指紋が無い・違う・lite が無い・アセットの zip の指紋が2種類以上）は full。
+    """
+    full = lite = None
+    remotes = set()
+    for asset in assets or []:
+        name = str(asset.get("name", ""))
+        if name.endswith("-full.zip"):
+            full = asset
+        elif name.endswith("-lite.zip"):
+            lite = asset
+        else:
+            m = re.search(r"-assets-([0-9a-f]+)\.zip$", name)
+            if m:
+                remotes.add(m.group(1))
+    if full is None:
+        return None
+    chosen, kind = full, "full"
+    # 指紋が2種類以上（前の版のアセットの zip の消し忘れ）なら、どれが今の版のものか分からないので full。
+    if lite is not None and len(remotes) == 1 and local_digest in remotes:
+        chosen, kind = lite, "lite"
+    return {"kind": kind, "url": chosen["browser_download_url"], "size": int(chosen.get("size") or 0)}
+
+
+def newer_release(current: str = ml.__version__,
+                  local_digest: str | None = None) -> tuple[str, dict] | None:
+    """GitHub の最新 Release が今より新しければ (版, 落とす zip)。無ければ None。
+
+    落とす zip は `pick_package`（アセットが変わっていなければ lite、変わっていれば full）。
+    `local_digest` を渡さなければ手元の `runtime\\assets.json` を読む。
     ネットが無い・API の形が違う・版が数字でない、はどれも例外のまま返す。
     呼ぶ側（別スレッド）が握って黙る。
     """
@@ -183,10 +236,15 @@ def newer_release(current: str = ml.__version__) -> tuple[str, str] | None:
     ver = str(data["tag_name"]).lstrip("v")
     if _vtuple(ver) <= _vtuple(current):
         return None
-    for asset in data.get("assets", []):
-        if asset["name"].endswith("-full.zip"):
-            return ver, asset["browser_download_url"]
-    return None
+    if local_digest is None:
+        local_digest = local_assets_digest()
+    package = pick_package(data.get("assets", []), local_digest)
+    return (ver, package) if package else None
+
+
+def _mb(size: int) -> str:
+    """確認の文に出す大きさ（MB、小数1桁）。"""
+    return "{:.1f}MB".format(size / 2 ** 20)
 
 
 def pick_notes(releases: list, since: str | None,
@@ -321,13 +379,14 @@ def markdown_runs(body: str) -> list[tuple[str, tuple[str, ...]]]:
 
 
 def extract_release(zip_path: str, dest: str = ROOT) -> int:
-    """full zip を dest へ上書き展開して、書いたファイルの数を返す。
+    """Release の zip（full か lite）を dest へ上書き展開して、書いたファイルの数を返す。
 
     zip の頭一段（`InstantaleModLoader-<ver>/`）は剥がす。
     zip に無いものは消さない ― 手元で作っている MOD を巻き込むので。
     書き換えられた `*.default.*` は上書きの前に手元の名前へ改名して残す（`keep_edited_default`）。
     新しい版で無くなった MOD は、配る側がデバッグモード限定か読み込まない形にして
-    出す約束（消す判断をここでしない）。
+    出す約束（消す判断をここでしない）。ただし改名した MOD（`ml.RENAMED_MODS`）の古いフォルダは、
+    新しい名前のフォルダが届いたら消し、入切を新しい名前へ移す（`ml.drop_renamed`）。
 
     開発の作業ツリーで押すと、配布物の中身で作業中の変更が上書きされる
     （実際に起きた。git で戻せるが、戻す前に何を失ったか見ること）。
@@ -355,7 +414,11 @@ def extract_release(zip_path: str, dest: str = ROOT) -> int:
             os.makedirs(os.path.dirname(carried), exist_ok=True)
             if not ml.write_json(carried, old_order, indent=2):
                 raise OSError("cannot write {}".format(carried))
-        for info in z.infolist():
+        # アセットの指紋（`runtime/assets.json`）は最後に書く。
+        # 先に書いて途中で落ちると、絵と辞書が古いまま指紋だけ新しくなり、次の更新から lite が選ばれて直らない。
+        members = sorted(z.infolist(),
+                         key=lambda i: i.filename.split("/")[1:] == ["runtime", "assets.json"])
+        for info in members:
             parts = info.filename.split("/")[1:]
             if info.is_dir() or not parts or ".." in parts:
                 continue
@@ -369,6 +432,8 @@ def extract_release(zip_path: str, dest: str = ROOT) -> int:
             count += 1
     if old_order is not None:
         carry_order(order_file, old_order)
+    # 引き継ぎの後に呼ぶ（`carry_order` は古いフォルダを手で足した MOD として末尾へ足す）。
+    ml.drop_renamed(os.path.dirname(order_file))
     try:
         os.remove(carried)
     except OSError:
@@ -379,11 +444,10 @@ def extract_release(zip_path: str, dest: str = ROOT) -> int:
 #: 更新の展開の前に控える順序ファイルの写し（`out\` の下）。展開を終えたら消す。
 UPDATE_ORDER_NAME = "update_order.json"
 
-
 def _read_order(path: str):
     """順序ファイルを `{"order", "disabled"}` で読む。無い・読めなければ None。"""
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:         # 手で直して BOM が付いても読む
             data = json.load(fh)
     except (OSError, ValueError):
         return None
@@ -800,7 +864,7 @@ def check_images(master: tk.Misc) -> tuple[tk.PhotoImage, tk.PhotoImage]:
 
 def _read_json(path: str):
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:    # 手で直して BOM が付いても読む
             return json.load(fh)
     except Exception:
         return None
@@ -912,9 +976,25 @@ def read_mods() -> dict:
             "local": name in local,
             # MOD 同梱の道具（`323_` §4）。GUI はボタンを出して別プロセスで開くだけ。
             "tool": manifest.get("tool"),
+            # 記録の置き場所（`state/` からの相対）。行の右クリックの「state/ を開く」が開く先。
+            "state": manifest.get("state") or [],
         })
     return {"mods": mods, "disabled": disabled, "problems": found["problems"],
             "debug_mode": bool(found.get("debug_mode"))}
+
+
+def state_targets(mod: dict) -> list[tuple[str, str]]:
+    """MOD の記録のうち、いま在るもの: `(宣言の相対パス, 実パス)` の並び。
+
+    宣言だけ在って中身が無い（まだ遊んでいない）ものは数えない。
+    開いても空のフォルダが出るだけなので、項目を押せなくする方が伝わる。
+    """
+    found = []
+    for rel in mod.get("state") or []:
+        path = os.path.join(STATE_DIR, *rel.split("/"))
+        if os.path.exists(path):
+            found.append((rel, path))
+    return found
 
 
 def write_order(names: list[str], disabled: set[str]) -> None:
@@ -948,6 +1028,20 @@ def write_config(data: dict) -> None:
     """
     os.makedirs(SETTINGS_DIR, exist_ok=True)
     ml.write_json(CONFIG_PATH, data, indent=2)
+
+
+def warning_until(until, now: datetime.datetime | None = None) -> tuple[bool, str]:
+    """期限付きの警告の `(まだ出すか, 「… まで表示」)`。期限が読めなければ `(True, "")`。
+
+    ローダは期限を注入のときにしか見ないので、注入し直さないまま期限を過ぎた status.json の行もここで落とす。
+    """
+    try:
+        moment = datetime.datetime.fromisoformat(str(until))
+    except (TypeError, ValueError):
+        return True, ""
+    if (now or datetime.datetime.now()) >= moment:
+        return False, ""
+    return True, "{:%Y-%m-%d %H:%M} まで表示".format(moment)
 
 
 def update_config(**values) -> None:
@@ -1543,7 +1637,7 @@ class App(ttk.Frame):
         "on": "この MOD を適用するかどうか。クリックで切り替え（Space キーでも同じ）",
         "order": "上から適用される順番。無効なものには番号を振りません",
         "kind": "修正 = 本体の挙動を直す ／ 計測 = 読み取り専用の記録（開発者向け）\n"
-                "追加 = 新しい機能 ／ 取込済 = 本体が同じ修正を取り込んだもの\n"
+                "追加 = 新しい機能 ／ 取込済 = 本体か別の MOD が同じ修正を取り込んだもの\n"
                 "基盤 = 他より先に動く土台 ／ 開発中 = 未公開（手元だけ）",
         "name_ja": "行をドラッグすると適用順を変えられます",
         "dir": "MOD の実体（runtime\\mods\\ のフォルダ名）。ログや load_order.json は\n"
@@ -1571,9 +1665,9 @@ class App(ttk.Frame):
         self.drag: str | None = None      # ドラッグ中の mod のフォルダ名
         self.dirty = False
         self.busy = False
-        # 新しい版（版, full zip の URL）。
+        # 新しい版（版, 落とす zip。`pick_package` の dict）。
         # `update` と名付けると tkinter の `Misc.update()` を覆うので別の名前にする。
-        self.available_update: tuple[str, str] | None = None
+        self.available_update: tuple[str, dict] | None = None
         self._status_text = ""            # 状態表示に今出ている文言
         self.shown_count = 0              # 絞り込みの結果、一覧に出ている数
         # デバッグモード。
@@ -1603,8 +1697,13 @@ class App(ttk.Frame):
         # 次に開いたときに画面いっぱいの「普通の窓」になってしまうので分けて持つ。
         self.geom = master.geometry()
 
+        # 改名した MOD の古いフォルダは一覧を読む前に消す。
+        # 前の版の GUI の「更新」と、zip の手での展開は古いフォルダを残すので、ここで片付ける。
+        dropped = ml.drop_renamed(MODS_DIR)
         self._build()
         self.reload()
+        if dropped:
+            self._set_status("名前の変わった MOD の古いフォルダを消しました: {}".format("、".join(dropped)))
         threading.Thread(target=self._check_update, daemon=True).start()
         threading.Thread(target=self._check_notes, args=(read_config(),),
                          daemon=True).start()
@@ -1961,7 +2060,7 @@ class App(ttk.Frame):
         伏せる理由は3つあり、扱いは同じ（`discover()` の `hide`）:
 
           debug       計測用。開発者以外には意味が無い
-          superseded  ゲーム本体が同じ修正を取り込んだので降ろした
+          superseded  ゲーム本体か別の MOD が同じ修正を取り込んだので降ろした
           wip         開発中（9xx）。まだ配る形が決まっていない
 
         `local/` の mod はここに**入らない**（TECH.md §2.6.2）。
@@ -2166,6 +2265,9 @@ class App(ttk.Frame):
         self.row_menu.add_command(label="一番下へ", command=lambda: self._move_to(-1))
         self.row_menu.add_separator()
         self.row_menu.add_command(label="フォルダを開く", command=self.open_mod_dir)
+        # 記録は MOD のフォルダではなく `state/` に在り、名前もフォルダ名と違う
+        # （`320_guild_adventurer_recruit` → `adventurer_recruit`）。探さずに行けるように。
+        self.row_menu.add_command(label="state/ を開く", command=self.open_mod_state)
 
     def _sync_mod_menu(self) -> None:
         """メニューバーの「MOD」を開く直前に、押せる項目だけを押せる状態にする。"""
@@ -2193,6 +2295,9 @@ class App(ttk.Frame):
         self.row_menu.entryconfigure(
             "設定…",
             state="normal" if (mod and mod["settings"]) else "disabled")
+        self.row_menu.entryconfigure(
+            "state/ を開く",
+            state="normal" if (mod and state_targets(mod)) else "disabled")
         try:
             self.row_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2254,6 +2359,11 @@ class App(ttk.Frame):
         skipped = (self.status.get("patches") or {}).get("skipped") or []
         if skipped:
             msg += " ｜ この実行では通らない経路のフック {} 件".format(len(skipped))
+        # 画面を開くまで来ないモジュール宛て（ローダの `ON_DEMAND_MODULES`）。
+        # 待ちの途中ではないので「段階適用の途中」にも ⚠ にも出さず、件数だけ出す。
+        on_demand = (self.status.get("patches") or {}).get("on_demand") or []
+        if on_demand:
+            msg += " ｜ 画面を開いたときに当たるフック {} 件".format(len(on_demand))
         if self.dirty:
             msg += " ｜ 順序と有効/無効の変更は未保存"
         self._set_status(msg)
@@ -2308,6 +2418,39 @@ class App(ttk.Frame):
             else:
                 lines.append("前回の注入で対象が見つからなかったフック {} 件"
                              "（ゲームが更新された可能性があります）".format(len(unresolved)))
+        # 名前は残っているのに効かなくなったもの（ローダの drift.py。詳しくは modloader.log の drift: の行）。
+        # 確かめて直すのは作る側なので、デバッグモードのときだけ出す（普段の遊びでは不安を煽るだけ）
+        drift = (self.status.get("drift") or {}) if self.debug_mode else {}
+        update = drift.get("update")
+        # 更新されたことと引数の変化は、recon が見つけてから期限（`drift.REPORT_DAYS`）までの表示。期限の日時も出す。
+        # `until` の無い status.json（期限を書く前のローダ）は、見つけた日時からローダと同じ式で出す
+        fallback = D.report_until(update) if update else None
+        update_shown, update_until = warning_until((update or {}).get("until") or fallback)
+        if update and update_shown:
+            # 引数の変化が0件でも出す（中身だけの更新でも、前と同じに動くかを確かめる合図）
+            lines.append("ゲームが更新されました（{} から。{} に検出{}）。"
+                         "MOD が前と同じに動くか確かめてください".format(
+                             update.get("since") or "前の版", str(update.get("detected_at") or "?")[:10],
+                             "。" + update_until if update_until else ""))
+        lost = drift.get("lost") or []
+        if lost:
+            healed = sum(1 for item in lost if item.get("healed"))
+            lines.append("遊んでいる途中でゲームが関数を差し替え、MOD の処理が外れた箇所 {} 件"
+                         "（うち付け直した {} 件）".format(len(lost), healed))
+        signatures = [item for item in drift.get("signatures") or []
+                      if warning_until(item.get("until") or fallback)[0]]
+        if signatures:
+            # 1回の注入で出る変化は同じ recon の比べから来るので、期限は揃っている。早い方を出す
+            untils = sorted(text for text in (warning_until(item.get("until") or fallback)[1]
+                                              for item in signatures) if text)
+            lines.append("MOD が手を入れている箇所のうち、前の版から引数が変わった・無くなったもの {} 件"
+                         "（MOD が想定どおりに動かないおそれがあります{}）".format(
+                             len(signatures), "。" + untils[0] if untils else ""))
+        rewrites = drift.get("rewrites") or []
+        if rewrites:
+            lines.append("前の版では効いていたプロンプトの書き換えが、今の版で効いていない MOD {} 件"
+                         "（ゲームのプロンプトが変わった可能性があります）".format(
+                             len({item.get("label") for item in rewrites})))
         self.warn.configure(text="\n".join("⚠ " + line for line in lines))
 
     def _refresh(self, keep: str | None = None) -> None:
@@ -2837,6 +2980,40 @@ class App(ttk.Frame):
         os.makedirs(STATE_DIR, exist_ok=True)
         self._open(STATE_DIR)
 
+    def open_mod_state(self) -> None:
+        """選んでいる MOD の記録（`mod.json` の "state"）を開く。2つ以上在れば選ばせる。"""
+        mod = self._selected()
+        if not mod:
+            self._set_status("一覧から MOD を選択してください")
+            return
+        targets = state_targets(mod)
+        if not targets:
+            self._set_status("この MOD の記録はまだありません" if mod.get("state")
+                             else "この MOD は記録を持ちません")
+            return
+        if len(targets) == 1:
+            self._reveal(targets[0][1])
+            return
+        # ボタン・行の右クリック・メニューバーのどこから来ても、指している所に出す。
+        menu = tk.Menu(self, tearoff=0)
+        for rel, path in targets:
+            menu.add_command(label="state/" + rel, command=lambda p=path: self._reveal(p))
+        x, y = self.winfo_pointerxy()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _reveal(self, path: str) -> None:
+        """フォルダならそれを開き、ファイルなら入っているフォルダを開いて選んだ状態にする。"""
+        if os.path.isdir(path):
+            self._open(path)
+            return
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        except Exception as exc:
+            messagebox.showerror("開けませんでした", f"{type(exc).__name__}: {exc}")
+
     def _open(self, path: str) -> None:
         try:
             os.startfile(path)              # type: ignore[attr-defined]
@@ -3165,19 +3342,24 @@ class App(ttk.Frame):
     def _update(self) -> None:
         if self.busy or not self.available_update:
             return
-        ver, url = self.available_update
+        ver, package = self.available_update
+        if package["kind"] == "lite":
+            what = ("絵と辞書（大きいアセット）は変わっていないので、\n"
+                    "それを除いた版（{}）を落とします。".format(_mb(package["size"])))
+        else:
+            what = "全部入りの版（{}）を落とします。".format(_mb(package["size"]))
         if not messagebox.askokcancel(
                 "更新",
                 "v{} をダウンロードしてこのフォルダへ上書きし、\n"
-                "このウィンドウを開き直します。\n\n"
+                "このウィンドウを開き直します。\n{}\n\n"
                 "{} は残ります。\n"
                 "新しい版に無くなった MOD のフォルダも消しません。".format(
-                    ver, UPDATE_KEEPS)):
+                    ver, what, UPDATE_KEEPS)):
             return
-        self._start(self._update_worker, url)
+        self._start(self._update_worker, package["url"])
 
     def _update_worker(self, url: str) -> None:
-        """別スレッド。full zip を out\\ へ落として展開し、開き直しを頼む。
+        """別スレッド。full か lite の zip を out\\ へ落として展開し、開き直しを頼む。
 
         動いている .py を上書きしても平気（Windows は .py をロックしない。
         読み込み済みのものはメモリの上で動いている）。

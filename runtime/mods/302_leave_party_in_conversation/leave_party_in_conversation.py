@@ -82,16 +82,19 @@ id の配列）。
 ここに別れた旨を書いておけば会話の要約・ライフログに「別れた」ことがそのまま残る。
 引数の意味を推測しなくて済むうえ、記録も正しくなる。
 
-## 自前のクラス名を PhaseSpec に書かない
+## ボタンはローダの窓口が組む
 
-`301_` と同じ理由（セーブに焼かれて mod 無しの次回起動で落ちる）。
-自前ボタンには無害な `JustSetButtonToNormalPhase` を持たせ、
-押下はボタン辞書の印で横取りする。
-印のキーは `301_` と別にすること（`mod_action` を共有すると、
-向こうの `on_button_press` が知らない action を握り潰してしまう）。
+「ここで別れる」と確認の画面は、ローダの窓口 `choices` の宣言型の口に預ける（TECH.md §3.3.14）。
+ボタンは組み直しのたびに名簿と画面から作り直し、押下は窓口がボタンに持たせた処理を呼ぶ。
+確認の画面は MOD だけの画面（`open_screen`）で、下の会話のボタンは窓口が書き換えずに残す。
+確認の画面で保存しても、ロードの後に確認の画面へ戻る。「やめておく」で会話のボタンに戻る。
+
+版6: 選択肢の描画の追跡（`InstanTaleHUD.update_button_texts` の包み）を外した。
+「塗っているのは HUD 側」と分かって目的を果たした後は上限 0 で切ってあり、
+ボタンの文字が変わるたびに何もせず素通しする層だけが残っていた（GAME.md §2.3）。
+見張りのフック4本は、引数を受け取った形のまま元の関数へ渡す（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
 """
 
-import sys
 import time
 
 from instantale_modloader import choices, frames, ui
@@ -105,10 +108,8 @@ CONFIRM_QUESTION = "{name}とはここで別れることになる。よいか？
 CONFIRM_LABEL = "ああ、ここで別れよう"
 CANCEL_LABEL = "やめておく"
 
-# セーブから復元された残骸を見分けるための、こちらのラベル一覧。
-# `PhaseSpec.to_dict()` は text と spec しか書かないので印は落ちる。
-# 落ちたものは `has_leave_button()` が自分のものと見なせず、
-# タイトル戻り・ロード・再注入のあとにボタンが二重に出る（`301_` で実際に起きた）。
+# 版4までがセーブに焼いたボタンの文言（窓口が、無害な spec で印の無いものを外す）。
+# 版4までは自前のボタンを一覧に物として置いていたので、セーブに文言と spec が残った。
 # `CANCEL_LABEL` はここに入れない。
 # 「やめておく」はこの MOD 固有の文言ではなく、`309_` も同じ文字列を確認画面に出す。
 # 他 MOD の印は `ui.Screen` 側で見分けるようになった（`marked_by_a_mod`）が、
@@ -159,14 +160,6 @@ SETTLE = 0.4
 # 署名が変わったときだけ書くので、量は増えない。
 TRACE_SCREENS = True
 
-# 選択肢の描画が誰の変化で起きているかを見るための上限付きトレース。
-# 既定では切ってある。
-# これで「監視対象は HUD 側のプロパティであって
-# `app.to_display_buttons` ではない」と分かり、目的を果たしたため。
-# 加えて読み込み中の文字送り（'.' '..' '...'）で1秒に数本出るので普段は邪魔になる。
-# 描画の経路をもう一度確かめたくなったら 40 くらいを入れる。
-PAINT_TRACE_LIMIT = 0
-
 # 注入時に「`method_1` を持つマネージャ」と、その定義行の対応表を書き出すか。
 # 既定オフ。
 # `method_1 (instantale.py:6602)` は `QuestEndManager` と確定しており（GAME.md
@@ -178,26 +171,23 @@ DUMP_PHASE_MAP = False
 # NPC は普段から動くので、置き直しの記録はこの窓の中だけに絞る。
 RECENT_REMOVE_WINDOW = 5.0
 
-# ボタン辞書に付ける印。
-# `301_` の "mod_action" とは別のキーにすること。
-MARK = "mod_party_action"
+# 確認の画面の名前（窓口 `choices` の MOD だけの画面）。
+CONFIRM_SCREEN = "confirm"
 
-# 自前ボタンに持たせる無害な spec は `ui.SAFE_CLS`（`JustSetButtonToNormalPhase`）。
-# mod 無しで押されても選択肢が戻るだけ。
+# 自前のボタンに付ける印。ほかの MOD がこのボタンを見分けるのに使う（`404_` はパーティー会話の間このキーで落とす）。
+# 押下の振り分けには使わない（窓口がボタンに持たせた処理を呼ぶ）。
+MARK = "mod_party_action"
 
 
 def apply(ctx):
     log_path = ctx.out_path(LOG_BASENAME)
     state = {
-        "saved_buttons": None,   # 確認画面を出す前のボタン。やめる で戻す
-        "end_button": None,      # そのときの「会話を終了する」ボタン（辞書）
-        "pending": None,         # 確認待ちの相手 id
+        "owner": None,           # 窓口 `choices` の持ち主の名前（`provide` が返す）
         "leaving": False,        # 二重実行よけ
         "watching": None,        # remove_party_member 実行中の見張り
         "last_skip": None,       # ボタンを出さなかった理由（ログの重複よけ）
         "last_screen": None,     # 直近に記録した会話画面の署名（同上）
         "censused": False,       # app の持ち物を書き出したか（1回きり）
-        "paint_traces": 0,       # 描画トレースの本数（上限で打ち切る）
         "recent_remove": None,   # ゲーム本来の解散の直後を見張る印 (id, 時刻)
     }
 
@@ -208,19 +198,10 @@ def apply(ctx):
     # `instantale_modloader.ui` に集約してある（`300_` / `301_` と共有）。
     # ここで確かめた「描画は HUD 側を直接呼ぶ」「差し替えは次のフレーム」もそこに入っているので、他の
     # mod からも同じものが使える。
-    screen = ui.Screen(ctx, write, tag="party leave", mark=MARK)
+    screen = ui.Screen(ctx, write, tag="party leave")
 
     spec_cls_name = ui.spec_cls_name
     say = screen.say
-
-    def button(text, mark=None, member_id=None):
-        # `member_id` は押されたときに誰の話か分かるようボタン自身に持たせる。
-        # ゲームは text と spec しか見ないので足しても害は無い。
-        extra = {"mod_party_member": member_id} if member_id is not None else None
-        return screen.button(text, mark=mark, extra=extra)
-
-    def apply_buttons(app, entries, tag):
-        screen.apply_buttons(app, entries, tag)
 
     def schedule(fn, delay=SETTLE):
         screen.schedule(fn, delay)
@@ -353,9 +334,6 @@ def apply(ctx):
     # ボタンを読むだけで相手が分かるという発見はこの mod のもの）。
     conversation_partner = ui.conversation_partner
 
-    def has_leave_button(buttons):
-        return any(isinstance(b, dict) and b.get(MARK) for b in buttons)
-
     # ============================================================ 自前のフェーズ
     class LeavePhase(object):
         """`app.process_choice` に渡してゲームと同じ経路を通すためのフェーズ。
@@ -394,12 +372,9 @@ def apply(ctx):
             restore_buttons(app)
 
     def restore_buttons(app):
-        saved = state["saved_buttons"]
-        state["saved_buttons"] = None
-        state["pending"] = None
-        if saved is None:
-            return
-        apply_buttons(app, saved, "restore")
+        """確認の画面を閉じて会話のボタンに戻す（会話のボタンは窓口が書き換えずに残している）。"""
+        if not choices.close_screen(app, state["owner"]):
+            choices.repaint(app)
 
     # ============================================================ 確認を挟む
     def ask_confirmation(app, member_id):
@@ -409,15 +384,7 @@ def apply(ctx):
             write("confirm: refused ({})".format(reason or "not a party member"))
             say(app, FAILED_TEXT)
             return
-        confirm = button(CONFIRM_LABEL, mark="leave", member_id=member_id)
-        cancel = button(CANCEL_LABEL, mark="cancel")
-        if confirm is None or cancel is None:
-            write("confirm: could not build the buttons")
-            say(app, FAILED_TEXT)
-            return
-        state["pending"] = member_id
-        state["saved_buttons"] = list(getattr(app, "buttons", []) or [])
-        apply_buttons(app, [confirm, cancel], "confirm")
+        choices.open_screen(app, state["owner"], CONFIRM_SCREEN, {"member": member_id})
         say(app, CONFIRM_QUESTION.format(name=name_of(app, member_id)))
         write("confirm: asking about {!r} ({})".format(name_of(app, member_id), member_id))
 
@@ -451,11 +418,11 @@ def apply(ctx):
             return
 
         state["leaving"] = True
-        # 押す前の選択肢は手元に控えてから外す。
-        # 会話を閉じられなかったとき（終了ボタンを組めない・要約が返らない）に
-        # 戻す先がここにしか無い。先に捨てると、画面にはこの MOD の
-        # 2つのボタンだけが残り、「やめておく」も効かなくなる。
-        saved = state["saved_buttons"]
+        # 「会話を終了する」は確認の画面の下のゲームの一覧に残っている（窓口は書き換えない）
+        _partner, end_entry = conversation_partner(choices.game_buttons(app))
+        # 閉じに行く前に確認の画面を閉じる。閉じられなかったとき（終了ボタンを組めない・要約が返らない）は、
+        # 組み直すと会話のボタンに戻る
+        choices.close_screen(app, state["owner"], repaint_now=False)
         try:
             name = name_of(app, member_id)
             write("=" * 78)
@@ -464,22 +431,16 @@ def apply(ctx):
             write("leave: party before = {} ({})".format(party_ids(app),
                                                          describe_stores(app)))
 
-            # 確認画面に切り替えた時点で「会話を終了する」ボタンは画面から消えている。
-            # だから押された時に控えておいたものを使う。
-            end_entry = state["end_button"]
-            state["saved_buttons"] = None
             end_conversation_then(
                 app, end_entry, name,
-                lambda a: finish_leave(a, member_id, character, facility, node, name),
-                saved=saved)
+                lambda a: finish_leave(a, member_id, character, facility, node, name))
         except Exception:
             # 会話を閉じに行く前に投げた回。「実行中」の印を戻さないと
             # 以後ずっと別れられなくなる（`abort` と同じ後始末）。
             ctx.log_exc("leave party: cannot start the farewell")
             state["leaving"] = False
             say(app, FAILED_TEXT)
-            if saved is not None:
-                apply_buttons(app, saved, "restore after failure")
+            choices.repaint(app)
 
     # ------------------------------------------------ どこへ置くか（配置ルール）
     def choose_destination(app, character):
@@ -588,7 +549,7 @@ def apply(ctx):
             return None, None
         return value, None
 
-    def end_conversation_then(app, end_entry, name, follow_up, saved=None):
+    def end_conversation_then(app, end_entry, name, follow_up):
         """会話をゲーム自身の経路で閉じてから `follow_up` を走らせる。
 
         閉じ方そのものは `ui.Screen.end_conversation` に移した（`301_` と共有）。
@@ -605,13 +566,8 @@ def apply(ctx):
             # でないと以後ずっと別れられなくなる。
             state["leaving"] = False
             # 画面も戻す。
-            # 会話が閉じなかった場合ゲームは組み直さないので、
-            # 押す前の選択肢を自分で描き直さないと確認画面から出られない。
-            if saved is not None:
-                try:
-                    apply_buttons(app, saved, "restore after abort")
-                except Exception:
-                    ctx.log_exc("leave party: cannot restore the buttons")
+            # 会話が閉じなかった場合ゲームは組み直さないので、組み直して会話のボタンを塗る。
+            choices.repaint(app)
 
         screen.end_conversation(app, end_entry, follow_up,
                                 end_text=END_TEXT_TEMPLATE.format(name=name),
@@ -669,8 +625,6 @@ def apply(ctx):
             ctx.log_exc("party leave: finishing the farewell failed")
         finally:
             state["leaving"] = False
-            state["pending"] = None
-            state["end_button"] = None
 
     def repaint_party(app, name):
         """仲間欄を塗り直す。手段は `ui.Screen.paint_party`（ゲーム自身の2つ）。"""
@@ -754,83 +708,60 @@ def apply(ctx):
                       describe_stores(app)))
 
     # ================================================================ フック
-    def refresh_choice_buttons(self, _buttons):
-        """会話相手が仲間なら「ここで別れる」を「会話を終了する」の手前に足す（窓口 `choices` から、組み直しの前に）。
+    def offer(app, view):
+        """会話相手が仲間なら「ここで別れる」を「会話を終了する」の手前に出す（窓口 `choices` が組み直しのたびに呼ぶ）。
 
         判定は文字列ではなく spec のクラス名と `args[0]`（相手の id）。
         表記や言語設定に依存せず、仲間以外との会話には出ない。
         """
-        try:
-            buttons = getattr(self, "buttons", None)
-            if isinstance(buttons, list):
-                member_id, end_entry = conversation_partner(buttons)
-                # 確認画面（自前ボタンが並んでいる状態）も記録する。
-                # 表示と中身が食い違ったときに、どちらが古いのかを後から見るため。
-                trace_screen(self, buttons, member_id)
-            if isinstance(buttons, list):
-                # 印を失った自前ボタンの残骸を先に落とす（`ui.Screen.prune_stale`）。
-                # 落としてから差し直すので、二重化も「押しても無反応」も消える。
-                screen.prune_stale(buttons, OUR_LABELS)
-            if isinstance(buttons, list) and not has_leave_button(buttons):
-                if member_id and is_member(self, member_id):
-                    reason = blocking_reason(self, member_id)
-                    if reason is None:
-                        entry = button(LEAVE_LABEL, mark="confirm",
-                                       member_id=member_id)
-                        if entry is not None:
-                            # 「会話を終了する」の手前に置く（終了は最後に残す）。
-                            # 位置探しは同一性で行う。
-                            # 辞書の == 比較に頼ると同じ文字列の別ボタンを掴みうる。
-                            at = len(buttons)
-                            for index, existing in enumerate(buttons):
-                                if existing is end_entry:
-                                    at = index
-                                    break
-                            buttons.insert(at, entry)
-                            write("added {!r} to the conversation with {!r} ({} buttons)"
-                                  .format(LEAVE_LABEL, name_of(self, member_id),
-                                          len(buttons)))
-                    elif state["last_skip"] != (member_id, reason):
-                        # 同じ理由を毎フレーム書かない。
-                        # 場面が変わったときだけ残す。
-                        state["last_skip"] = (member_id, reason)
-                        write("not offering the farewell to {!r}: {}".format(
-                            name_of(self, member_id), reason))
-        except Exception:
-            ctx.log_exc("party leave: cannot add the farewell button")
+        member_id = view.partner
+        trace_screen(app, view.buttons, member_id)
+        if not member_id or not is_member(app, member_id):
+            return None
+        reason = blocking_reason(app, member_id)
+        if reason is not None:
+            if state["last_skip"] != (member_id, reason):
+                # 同じ理由を毎フレーム書かない。
+                # 場面が変わったときだけ残す。
+                state["last_skip"] = (member_id, reason)
+                write("not offering the farewell to {!r}: {}".format(name_of(app, member_id), reason))
+            return None
+        return [choices.Choice(LEAVE_LABEL, place=choices.before("ConversationEndManager"), marks={MARK: "confirm"},
+                               on_press=lambda app: press(app, "confirm", member_id, LEAVE_LABEL))]
 
-    def on_button_press(self, action):
-        """自前のボタンが押された（窓口の `presses`）。
+    def confirm_screen(app, view, data):
+        """確認の画面（窓口 `choices` の MOD だけの画面）。その仲間との会話でなくなったら閉じる（None）。"""
+        member_id = (data or {}).get("member")
+        if not member_id or view.partner != member_id or not is_member(app, member_id) \
+                or blocking_reason(app, member_id) is not None:
+            write("confirm: closed ({!r} is no longer the party member in this talk)".format(member_id))
+            return None
+        trace_screen(app, view.buttons, member_id)
+        return [choices.Choice(CONFIRM_LABEL, on_press=lambda app: press(app, "leave", member_id, CONFIRM_LABEL)),
+                choices.Choice(CANCEL_LABEL, on_press=lambda app: press(app, "cancel", member_id, CANCEL_LABEL))]
 
-        印のキーは `301_` と別（`MARK`）。
-        共有すると、向こうが知らない action を握り潰してしまう。
-        """
-        entry = choices.pressed() or {}
-        member_id = entry.get("mod_party_member") or state["pending"]
-        text = entry.get("text") or LEAVE_LABEL
+    def press(app, action, member_id, text):
+        """自前のボタンが押された（窓口が押されたボタンの処理として呼ぶ）。"""
         write("pressed {!r} ({}) member={!r}".format(text, action, member_id))
-        if action == "confirm":
-            # 確認画面に移ると「会話を終了する」が画面から消えるので、
-            # いま控えておく。
-            # 閉じるときの引数はここからしか取れない。
-            _partner, end_entry = conversation_partner(getattr(self, "buttons", None))
-            state["end_button"] = end_entry
         # 直接やらずにゲームの経路（process_choice）に乗せる。
         # でないと画面が塗り替わらない（LeavePhase の説明）。
-        start_phase(self, action, member_id, text)
+        start_phase(app, action, member_id, text)
         return None
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press})
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    state["owner"] = choices.provide(ctx, screen, offer=offer, screens={CONFIRM_SCREEN: confirm_screen},
+                                     labels=OUR_LABELS)
 
     # ------------------------------------------------- 見張り（読み取りのみ）
     @ctx.wrap("__main__:InstantaleApp.move_npc_to_facility", required=False)
-    def move_npc_to_facility(orig, self, character_id, *args, **kwargs):
+    def move_npc_to_facility(orig, self, *args, **kwargs):
         """こちらの解散処理の最中にゲームが自分で置き直したかを見る。
 
         置いたのなら二重に動かさない。
         見張っていないときは何もしない。
         """
+        # (character_id, character_instance, target_facility, ...)。受け取った形のまま渡す。
+        character_id = frames.arg(args, kwargs, "character_id", 0)
         watching = state["watching"]
         if watching is not None and str(character_id) == watching["member_id"]:
             watching["watch"]["moved"] = True
@@ -843,13 +774,14 @@ def apply(ctx):
             if (recent is not None and recent[0] == str(character_id)
                     and time.monotonic() - recent[1] <= RECENT_REMOVE_WINDOW):
                 state["recent_remove"] = None
+                target = frames.arg(args, kwargs, "target_facility", 2)
                 write("observed: the game placed {!r} at {!r} after its own removal"
-                      .format(character_id, facility_name(self, args[1])
-                              if len(args) > 1 else "?"))
-        return orig(self, character_id, *args, **kwargs)
+                      .format(character_id, facility_name(self, target)
+                              if target is not None else "?"))
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:InstantaleApp.remove_party_member", required=False)
-    def remove_party_member(orig, self, member_id, *args, **kwargs):
+    def remove_party_member(orig, self, *args, **kwargs):
         """誰が・どこから外されたかを記録する。値は一切変えない。
 
         ゲーム本来の解散（死別・クエストクリア）がどの関数から呼ばれているかはソースが読めない以上ここでしか分からない。
@@ -857,38 +789,22 @@ def apply(ctx):
         次にそれが起きたときに経路が確定する。
         """
         if state["watching"] is not None:
-            return orig(self, member_id, *args, **kwargs)   # こちらの解散
+            return orig(self, *args, **kwargs)   # こちらの解散
+        member_id = frames.arg(args, kwargs, "member_id", 0)
         before = party_ids(self)
         write("=" * 78)
         write("remove_party_member({!r} {!r}) from {}".format(
             member_id, name_of(self, str(member_id)), caller()))
         # 直後にゲームが置き直すかどうかを見るための印（短命）。
         state["recent_remove"] = (str(member_id), time.monotonic())
-        result = orig(self, member_id, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         write("remove_party_member: party {} -> {}".format(before, party_ids(self)))
         return result
 
-    @ctx.wrap("scripts.hud.new_hud:InstanTaleHUD.update_button_texts", required=False)
-    def update_button_texts(orig, self, instance, value, *args, **kwargs):
-        """選択肢の描画が誰の変化で起きているかを見る。読むだけ。
-
-        `to_display_buttons` を入れ替えても画面が変わらなかったので、
-        そもそもこの関数が呼ばれているのかを確かめる。
-        ゲーム自身がメニューを変えたときに呼ばれ、
-        こちらが変えたときに呼ばれないなら、
-        監視の対象がこちらの触っている属性ではない、ということになる。
-
-        出過ぎないよう上限を設ける（文字送りで1文字ずつ呼ばれる可能性がある）。
-        """
-        if state["paint_traces"] < PAINT_TRACE_LIMIT:
-            state["paint_traces"] += 1
-            write("hud.update_button_texts({}) <- {}".format(
-                repr_value(value), type(instance).__name__))
-        return orig(self, instance, value, *args, **kwargs)
-
     @ctx.wrap("__main__:InstantaleApp.add_party_member", required=False)
-    def add_party_member(orig, self, character_id, *args, **kwargs):
-        result = orig(self, character_id, *args, **kwargs)
+    def add_party_member(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
+        character_id = frames.arg(args, kwargs, "character_id", 0)
         try:
             label, ids = pick_store(self)
             if label is None:
@@ -906,11 +822,12 @@ def apply(ctx):
         return result
 
     @ctx.wrap("__main__:InstantaleApp.process_party_member_choice", required=False)
-    def process_party_member_choice(orig, self, character_id, *args, **kwargs):
+    def process_party_member_choice(orig, self, *args, **kwargs):
         """仲間の label から入る経路。どこへ繋がるかを1行残すだけ。"""
+        character_id = frames.arg(args, kwargs, "character_id", 0)
         write("process_party_member_choice({!r} {!r}) | {}".format(
             character_id, name_of(self, str(character_id)), describe_stores(self)))
-        return orig(self, character_id, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # 呼び出し元の記録は `frames.caller` / `frames.owner_of` に移した
     # （`203_` やクラッシュ記録からも同じものが使える）。要点は2つ:

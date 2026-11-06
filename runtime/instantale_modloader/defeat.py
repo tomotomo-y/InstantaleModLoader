@@ -22,7 +22,7 @@
 
 切り上げた戦闘の残りの手（`handle_battle_situation` / `reduce_status_turns_and_log`）は飛ばす
 （一覧から消えた敵を引いて `KeyError` でワーカースレッドが死んだ）。
-切り上げた直後の敵の欄の更新の 0 除算（`new_hud.py:2306`）は、10 秒の間だけ握る（戦闘の欄が畳まれた後に走った）。
+切り上げた直後の敵の欄の更新の 0 除算（`new_hud.py:2307`）は、10 秒の間だけ握る（戦闘の欄が畳まれた後に走った）。
 倒れた仲間は扱わない（一覧へ戻すかは MOD が決める。`334_` の `hand_over_fallen`）。
 逃走の終わり方なので、ゲームは衛兵戦と同じくその土地の手配度を 10 下げる（GAME.md §2.20。戻すかは MOD が決める）。
 
@@ -154,10 +154,8 @@ def _ensure_player_back(app):
     if removed is None:
         _write("WARN defeat: the player is not in the party and cannot be put back")
         return
-    party[PLAYER_KEY] = removed
-    escaped = getattr(app, "escaped_member_in_battle", None)
-    if isinstance(escaped, dict):
-        escaped.pop(PLAYER_KEY, None)
+    # 戻し方は `ui.put_back_party`（`107_` / `147_` / `334_` と同じ1つ。主人公は一覧の先頭へ）。
+    ui.put_back_party(app, [(PLAYER_KEY, removed)])
     _write("WARN defeat: the game did not bring the player back; put back by hand")
 
 

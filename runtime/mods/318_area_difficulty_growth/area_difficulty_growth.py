@@ -8,7 +8,7 @@
 
 この MOD が動かすのは1つの数だけ:
 
-    world.quests[id].difficulty          その依頼の難易度（0..76）
+    world.quests[id].difficulty          その依頼の難易度（0..上限。上限は既定 76、設定で 100 まで）
 
 ゲーム自身の項目なので、セーブに MOD 独自の鍵は増えない（TECH.md §6.4）。
 
@@ -121,17 +121,25 @@
 世界名だけの鍵では、主人公が死んで同じ世界で作り直すと前の主人公のクリア回数と素の難易度（`base`）を引き継ぎ、
 `base` の依頼 id が今の遊びの別の依頼を指していた。
 世界名だけの控えは、見つかったときに遊んでいる主人公の周回へ移す（ローダの `adopt`）。
+
+版7: 掲示板・受注・生成のフックは、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。生成へ渡す難易度は来た側に合わせて差し替える。
 """
 
+import os
 import random
 import sys
 import threading
 import time
 
-from instantale_modloader import ui
+from instantale_modloader import frames, loads, ui
 from instantale_modloader.state import UNKNOWN_WORLD, WorldStore
 
 LOG_BASENAME = "area_difficulty.log"
+
+# `random_quest_generator` の引数の並び（recon の signatures.json）。
+QUEST_GENERATOR_ARGS = ("world_overview", "settlement_name", "settlement_overview",
+                        "settlement_structure_description", "area_description", "quest_difficulty")
 STATE_DIRNAME = "area_difficulty"
 
 # グローバルの `random` から引くとゲーム自身の乱数列がずれる（TECH.md §6.1）。
@@ -141,10 +149,12 @@ _RNG = random.Random()
 #: 生成が始まらなかった回の印を、次の生成が拾わないための時限。
 INJECT_TTL = 300.0
 
-#: ゲーム自身の難易度の上限（`scripts.functions.QUEST_DIFFICULTY_VALUE_MAX`）。
-#: 引けなかったときの落とし先で、引ければそちらが優先。
-GAME_DIFFICULTY_MAX = 76
+#: ゲーム自身の難易度の下限（`scripts.functions.QUEST_DIFFICULTY_VALUE_MIN`）。引けなかったときの落とし先。
 GAME_DIFFICULTY_MIN = 0
+#: 設定の上限で上げられる天井。難易度 100 で敵のレベルがゲームの上限（Lv101。`get_enemy_exp_lvl`）に届く。
+#: ゲーム自身の定数（`QUEST_DIFFICULTY_VALUE_MAX` = 76）は天井にしない。76 を超えた依頼もゲームはそのまま使い、
+#: 敵だけが強くなる（報酬・才能点・品の値段と強さは 76 の値で止まる。VERIFICATION.md §3.112）。
+DIFFICULTY_CEILING = 100
 
 #: `QuestChoiceManager(app, quest_type, quest_id)` が `world.quests` を引く `quest_type`。
 #: 掲示板の通常依頼はこれで来る（GAME.md §2.9.1）。
@@ -211,15 +221,12 @@ def apply(ctx):
         return max(0, min(max_bonus(), record["bonus"]))
 
     def limits():
-        """難易度の下限・上限。ゲームの値と設定の低いほうを採る。"""
+        """難易度の下限・上限。下限はゲームの値、上限は設定（`DIFFICULTY_CEILING` まで）。"""
         functions = sys.modules.get("scripts.functions")
         low = getattr(functions, "QUEST_DIFFICULTY_VALUE_MIN", None) if functions else None
-        high = getattr(functions, "QUEST_DIFFICULTY_VALUE_MAX", None) if functions else None
         if not isinstance(low, int) or isinstance(low, bool):
             low = GAME_DIFFICULTY_MIN
-        if not isinstance(high, int) or isinstance(high, bool):
-            high = GAME_DIFFICULTY_MAX
-        return low, min(high, max(low, int(DIFFICULTY_LIMIT)))
+        return low, min(DIFFICULTY_CEILING, max(low, int(DIFFICULTY_LIMIT)))
 
     # ------------------------------------------------------------ 控え
     #
@@ -285,9 +292,10 @@ def apply(ctx):
     def live_store(world):
         """難易度を読み書きする先 ＝ **生きた一覧だけ**（`world.quests`）。
 
-        `ui.quest_stores` は雛形（`app.world_dict['quests']`）も返すが、
-        そちらへ書くと世界のファイルに焼かれて、
-        同じ世界で新しく始めた別のキャラクタにまで乗る（GAME.md §2.9.1）。
+        `ui.quest_stores` はセーブの中身（`app.save_data_dict['quests']`）も返すが、
+        この MOD は上げた難易度をセーブに残さない（MOD を外せば素のまま。GAME.md §2.9.1）。
+        雛形（`app.world_dict['quests']`）へ書くと世界のファイルに焼かれて、
+        同じ世界で新しく始めた別のキャラクタにまで乗る。
         生きた一覧が引けないビルドでは、雛形しか無いので諦めて一度だけ知らせる。
 
         `app` ではなく `world` を受けるのは、`World.__init__` を包む場面では
@@ -491,8 +499,7 @@ def apply(ctx):
         return None
 
     # ------------------------------------------------------------ フック
-    @ctx.wrap("__main__:World.__init__", required=False, safe=True)
-    def world_loaded(orig, self, save_data_dict, app, *args, **kwargs):
+    def world_loaded(call):
         """セーブを読み込んだ。**その場で世界じゅうの土地を寄せ直す。**
 
         難易度はセーブに残らないので、ここが素へ戻った状態の始点になる。
@@ -502,7 +509,7 @@ def apply(ctx):
         世界の鍵はセーブの辞書から取る。
         この時点では `app.world` がまだ埋まっていない（いま作っている最中）。
         """
-        result = orig(self, save_data_dict, app, *args, **kwargs)
+        self, save_data_dict, app = call.obj, call.save_data, call.app
         try:
             key = worlds.playthrough(app, save_data_dict)
             if key and key != UNKNOWN_WORLD:
@@ -510,7 +517,8 @@ def apply(ctx):
                 write("load: 周回 {!r} を寄せ直した（{}件）".format(key, touched))
         except Exception:
             ctx.log_exc("area difficulty: ロード直後に寄せ直せなかった")
-        return result
+
+    loads.on(os.path.basename(getattr(ctx, "mod_dir", "") or "") or "318_area_difficulty_growth", ctx, (loads.WORLD,), after=world_loaded, write=write)
 
     @ctx.wrap("__main__:QuestEndManager.execute", required=False, safe=True)
     def quest_end(orig, self, *args, **kwargs):
@@ -551,20 +559,21 @@ def apply(ctx):
         return result
 
     @ctx.wrap("__main__:DisplayQuestChoice.__init__", required=False, safe=True)
-    def board(orig, self, app, *args, **kwargs):
+    def board(orig, self, *args, **kwargs):
         """掲示板を開いた。並べる前に、いま居る土地を寄せ直す。
 
         普段はロードの時点で寄せてあるので何も起きない。
         効くのは設定を変えた直後と、`ROLLBACK` を入れた後。
         """
         try:
+            app = frames.arg(args, kwargs, "app", 0)
             area_id = ui.area_id_of(ui.current_area(app))
             if area_id:
                 reconcile(getattr(app, "world", None), worlds.playthrough(app),
                           area_id, "board")
         except Exception:
             ctx.log_exc("area difficulty: 掲示板で寄せ直せなかった")
-        return orig(self, app, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:DisplayQuestChoice.generate_random_quest",
               required=False, safe=True)
@@ -608,7 +617,7 @@ def apply(ctx):
         return result
 
     @ctx.wrap("__main__:QuestChoiceManager.__init__", required=False, safe=True)
-    def quest_choice(orig, self, app, quest_type, quest_id, *args, **kwargs):
+    def quest_choice(orig, self, *args, **kwargs):
         """受注の直前。その依頼の土地を寄せ直してから受けさせる。
 
         掲示板を通らずに受ける経路（`301_` の会話からの受注、
@@ -618,10 +627,14 @@ def apply(ctx):
         それ以外は `story_quests` の id で、`world.quests` を同じ id で引くと
         関係の無い通常依頼（とその土地）を指してしまう。
         """
+        # (app, quest_type, quest_id)。受け取った形のまま渡し、ここでは読むだけ。
+        app = frames.arg(args, kwargs, "app", 0)
+        quest_type = frames.arg(args, kwargs, "quest_type", 1)
+        quest_id = frames.arg(args, kwargs, "quest_id", 2)
         if quest_type != SETTLEMENT_QUEST_TYPE:
             write("accept: quest_type {!r} の依頼 {} は通常依頼ではない（寄せ直さない）"
                   .format(quest_type, quest_id))
-            return orig(self, app, quest_type, quest_id, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         try:
             world = getattr(app, "world", None)
             store = live_store(world) or {}
@@ -631,22 +644,22 @@ def apply(ctx):
                 reconcile(world, worlds.playthrough(app), area_id, "accept")
         except Exception:
             ctx.log_exc("area difficulty: 受注の前に寄せ直せなかった")
-        return orig(self, app, quest_type, quest_id, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("scripts.llm.llm_manager_world_generate:random_quest_generator",
               required=False, safe=True)
-    def random_quest_generator(orig, world_overview, settlement_name,
-                               settlement_overview, settlement_structure_description,
-                               area_description, quest_difficulty, *args, **kwargs):
+    def random_quest_generator(orig, *args, **kwargs):
         """頼み文へ渡す難易度に、その土地の上昇量を乗せる。
 
         出力スキーマにも呼び出し側にも影響しない（数を1つ差し替えるだけ）。
         印は1回で使い切るので、上昇量ゼロの土地の生成は素通しする。
         `307_` は自分の難易度を持っているので、
         こちらが乗せた値はあちらが上書きする（あちらが内側）。
+        引数は受け取った形（位置かキーワード）のまま渡し、難易度だけを差し替える（TECH.md の規則の表）。
         """
         bonus = state["inject"]
         state["inject"] = None
+        quest_difficulty = frames.arg(args, kwargs, "quest_difficulty", QUEST_GENERATOR_ARGS)
         raised = quest_difficulty
         if (bonus and isinstance(quest_difficulty, int)
                 and not isinstance(quest_difficulty, bool)
@@ -656,9 +669,9 @@ def apply(ctx):
             if raised != quest_difficulty:
                 write("search: 頼み文へ渡す難易度 {} -> {}".format(
                     quest_difficulty, raised))
-        return orig(world_overview, settlement_name, settlement_overview,
-                    settlement_structure_description, area_description,
-                    raised, *args, **kwargs)
+                args, kwargs, _ = frames.replace_arg(args, kwargs, "quest_difficulty",
+                                                     QUEST_GENERATOR_ARGS, raised)
+        return orig(*args, **kwargs)
 
     ctx.log("area difficulty growth: +{}..{} per clear, up to +{} (limit {}), "
             "scope={}{}; log goes to out/{}".format(

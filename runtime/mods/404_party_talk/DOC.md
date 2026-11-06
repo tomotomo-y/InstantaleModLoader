@@ -36,7 +36,7 @@
   写しとファイルの追記へ落ちる（空の履歴から組み直さない）
 - 会話は本体のものなので、終わり方も本体と同じ。「会話を終了する」は
   この MOD の間だけ「話し合いを終了する」と表示される
-- この会話の間は「ここで別れる」（`302_`）と「＜アイテムの受け渡し＞」（`402_`）は出ない。
+- この会話の間は「ここで別れる」（`302_`）と「＜アイテムの受け渡し＞」（`402_`）など、ほかの MOD の選択肢は出ない。
   どちらも相手1人との会話に向けた選択肢で、全員と話している場面では相手が定まらないため
 - この会話では自由記述で何を頼んでもゲームの状態は変わらない
   （移動・売買・戦闘・アイテム操作は起きない。仲間が態度で応じるだけ）
@@ -92,7 +92,7 @@
 | 立ち絵が並ばない | `party_talk.log` に `portrait added` が無い。`WARN character_image not found` なら HUD の相手枠が引けていない |
 | 会話を終えても仲間の枠が残る | `portraits removed` が出ていない。`modloader.log` の `party talk: cannot remove` を見る。タイトルへ戻れば消える |
 | 会話を終えても npc_profiles が変わらない | `party_talk.log` の終了付近を見る。`memory split skipped: empty transcript` は台本を取り逃がしている。`memory split:` のあと `npc_profile.log` の `extract queued (group)` を待つ |
-| パーティー会話中に「ここで別れる」「＜アイテムの受け渡し＞」が出る | `party_talk.log` に `hid the party-only choices` が無い。302 / 402 の印のキーが変わっている（`HIDDEN_MARK_KEYS`） |
+| パーティー会話中に「ここで別れる」「＜アイテムの受け渡し＞」が出る | 版11で、パーティー会話の画面をこの MOD の選択肢だけにする形（ローダの窓口 `choices` の `claim`）にした。出るなら `modloader.log` の `choices:` の行を見る |
 | `structured -> None; fallback no-structure` | 構造化出力を使えないモデル。`no-structure` で読めていれば動く。読めなければ `WARN fallback unreadable` |
 
 ## 出どころ

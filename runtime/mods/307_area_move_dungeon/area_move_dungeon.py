@@ -44,11 +44,12 @@
 実測値は「どれが徒歩か」の照合にだけ使い、
 当たらなければ文字列 → 並び順の順に下がる（`world.pick_option`）。
 
-## 自前のクラス名を `PhaseSpec` に書かない
+## ボタンはローダの窓口が組む
 
-ボタンはセーブに焼かれうる（`PhaseSpec.to_dict()`）。
-無害な既存クラスを持たせ、押下は
-`on_button_press` を包んでボタン辞書の印で横取りする。
+「危険な道を行く」はローダの窓口 `choices` の宣言型の口（`offer`）に預ける（TECH.md §3.3.14）。
+確認画面が組み直されるたびに窓口が足し、押下は窓口がボタンに持たせた処理を呼ぶ。
+ボタンはセーブに残らない（窓口が保存の間だけ外す）。
+ほかの MOD が見分けられるよう、印（`MARK` = mod_road_action）を `marks` で付ける。
 印のキーは他の MOD と別にすること（`301_`=mod_action / `302_`=mod_party_action /
 `305_`=mod_mini_action / ここ=mod_road_action）。
 
@@ -99,19 +100,29 @@
 `STAMINA_MIN_PERCENT` を下回っていたら押された時点で断る。
 クエストの生成にも世界のデータにも一切触らない。
 読めなかったときは通す（値が読めないことを理由に遊びを止めない。WARN は残す）。
+
+## 版7
+
+`QuestStartManager.__init__`・`add_text`・`AreaMoveManager.__init__`・`random_quest_generator` のフックは、
+引数を受け取った形のまま元の関数へ渡す（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
+生成のプロンプトへの差し込みは、来た側（位置かキーワード）に合わせて `area_description` と `quest_difficulty` を差し替える。
 """
 
 import os
 import random
 import time
 
-from instantale_modloader import choices, durations, ui
+from instantale_modloader import choices, durations, frames, ui
 
 from . import world
 from .journey import Journey
 
 
 LOG_BASENAME = "road_travel.log"
+
+# `random_quest_generator` の引数の並び（recon の signatures.json）。
+QUEST_GENERATOR_ARGS = ("world_overview", "settlement_name", "settlement_overview",
+                        "settlement_structure_description", "area_description", "quest_difficulty")
 
 # 進行中の道中の控え。
 # セーブには書かない。
@@ -122,21 +133,14 @@ STATE_BASENAME = "road_travel.json"
 # 確認画面に足すボタンの文字列。
 ROAD_LABEL = "危険な道を行く"
 
-# セーブから復元された残骸を見分けるための、
-# こちらのラベル一覧（`ui.Screen.prune_stale`）。
-# `PhaseSpec.to_dict()` は text と spec しか書かないので印は落ちる。
-# 落ちたものは下の印による重複判定をすり抜け、
-# 同じボタンが2つ並んで復元された方は押しても無反応になる（`301_` で実際に起きた）。
-# ここは実機で観測した症状ではなく、保険。
-# `301_` / `309_` が踏んだのは `refresh_choice_buttons`（ゲームが組んだ一覧を塗り直すだけ）で、
-# こちらは徒歩・馬車が並び終えた後。
-# 確認画面がそのつど一覧を組み直すビルドなら残骸はゲーム自身が消している。
-# 組み直さないビルドがあっても壊れないよう、同じ掃除を通しておく。
+# 版5までがセーブに焼いた自前のボタンの文言（ローダの窓口 `choices` の `labels`。無害な spec で印の無いものを外す）。
+# 版5までは自前のボタンを一覧に物として置いていたので、セーブに文言と spec が残りえた。
 # 掃除に使う文言はこちらにしか無いものだけ（汎用語を入れると他
 # MOD やゲームのボタンを巻き込む。`302_` の項を参照）。
 OUR_LABELS = (ROAD_LABEL,)
 
-# 押下を横取りするための印。
+# 「危険な道を行く」に付ける印（ほかの MOD が見分けるため。窓口 `choices` の `marks`）。
+# 押下の振り分けには使わない（窓口がボタンに持たせた処理を呼ぶ）。
 # 他の MOD と別のキーにすること。
 MARK = "mod_road_action"
 
@@ -405,8 +409,8 @@ def apply(ctx):
             screen.say(app, REFUSE_TEXT)
             screen.say(app, refusal)
             # 確認画面はそのまま残っている。
-            # 塗り直して徒歩・馬車を選べる状態に戻す。
-            screen.apply_buttons(app, None, "refused")
+            # 組み直して塗り、徒歩・馬車を選べる状態に戻す。
+            choices.repaint(app)
             return
 
         options = state["options"] or world.move_options(getattr(app, "buttons", None))
@@ -561,7 +565,7 @@ def apply(ctx):
     def write_difficulty(app, quest_id, difficulty, first=False):
         """選んだ難易度を両方の格納先へ書く（片方だけだと表示と保存がずれる）。
 
-        生成した直後は `world_dict['quests']` にまだ現れていないことがある。
+        生成した直後はセーブの中身（`save_data_dict['quests']`）にまだ現れていないことがある。
         だから受注の時点でもう一度書く。
         同じ値を書くだけなので何度でも安全。
         """
@@ -711,61 +715,28 @@ def apply(ctx):
         arrived_check(app)
 
     # ================================================================ フック
-    @ctx.wrap("__main__:AreaMoveCofirmation.update_button_display", required=False)
-    def confirmation_buttons(orig, self, *args, **kwargs):
-        """徒歩・馬車が並び終えた後に「危険な道を行く」を1つ足す。
+    def offer(app, view):
+        """移動の確認画面に「危険な道を行く」を1つ出す（窓口 `choices` の `offer`。組み直しのたびに呼ばれる）。
 
         ゲームが作った移動のボタンには一切触らない。
-        読むだけ（`args` を控える）。
+        読むだけ（`args` を控える）。置くのは「やめる」の手前。無ければ末尾。
         """
-        result = orig(self, *args, **kwargs)
-        try:
-            app = getattr(self, "app", None) or ui.find_app()
-            if app is None:
-                return result
-            buttons = getattr(app, "buttons", None)
-            if not isinstance(buttons, list):
-                write("confirm: app.buttons is {}; leaving it alone".format(
-                    type(buttons).__name__))
-                return result
-            options = world.move_options(buttons)
-            if not options:
-                return result       # 移動の確認画面ではない（or 構成が変わった）
-            write("confirm: options {}".format(
-                [(entry.get("text"), opts) for entry, opts in options]))
-            state["options"] = options
-            # **印を失った自前ボタンの残骸を先に落とす**（`ui.Screen.prune_stale`）。
-            # 移動の確認画面だと分かってから（`options` が取れてから）呼ぶ。
-            screen.prune_stale(buttons, OUR_LABELS)
-            if any(screen.mark_of(entry) for entry in buttons):
-                return result       # 既に在る（開き直しても二重にしない）
-            entry = screen.button(ROAD_LABEL, mark="road")
-            if entry is None:
-                write("confirm: cannot build the button (PhaseSpec unavailable)")
-                return result
-            # 「やめる」の手前。
-            # 無ければ末尾。
-            at = len(buttons)
-            for index, item in enumerate(buttons):
-                if ui.spec_cls_name(item) == ui.SAFE_CLS:
-                    at = index
-                    break
-            buttons.insert(at, entry)
-            # ここはゲームが並べ終えた直後。
-            # 描画はもう済んでいるので、次のフレームで塗り直す（`app.buttons` は直接いじったので
-            # entries=None）。
-            screen.apply_buttons(app, None, "confirm")
-        except Exception:
-            ctx.log_exc("road travel: cannot add the road button")
-        return result
+        options = world.move_options(view.buttons)
+        if not options:
+            return None             # 移動の確認画面ではない（or 構成が変わった）
+        seen = [(entry.get("text"), opts) for entry, opts in options]
+        if state.get("offered") != seen:
+            state["offered"] = seen
+            write("confirm: options {}".format(seen))
+        state["options"] = options
+        return [choices.Choice(ROAD_LABEL, place=choices.before(ui.SAFE_CLS), marks={MARK: "road"},
+                               on_press=on_press)]
 
-    def on_button_press(self, action):
-        """自前のボタンが押された（窓口 `choices` の `presses`）。"""
-        entry = choices.pressed()
-        text = (entry.get("text") if isinstance(entry, dict) else None) or ROAD_LABEL
-        write("pressed {!r} ({})".format(text, action))
-        screen.start_phase(self, RoadPhase(self), text,
-                           fallback=lambda: start_road(self, text))
+    def on_press(app):
+        """「危険な道を行く」が押された（窓口がボタンに持たせる処理）。"""
+        write("pressed {!r}".format(ROAD_LABEL))
+        screen.start_phase(app, RoadPhase(app), ROAD_LABEL,
+                           fallback=lambda: start_road(app, ROAD_LABEL))
         return None
 
     def refresh_choice_buttons(self, _buttons):
@@ -799,11 +770,12 @@ def apply(ctx):
         except Exception:
             ctx.log_exc("road travel: cannot start the pending move")
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press})
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    # 「危険な道を行く」は `offer`。集落に戻ったときの移動の起こし直しは状態の更新なので `refresh`
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons, offer=offer, labels=OUR_LABELS)
 
     @ctx.wrap("__main__:QuestStartManager.__init__", required=False)
-    def quest_start(orig, self, app, quest_type, quest_id, *args, **kwargs):
+    def quest_start(orig, self, *args, **kwargs):
         """道中のクエストが実際に始まったら控えを本決まりにする。
 
         受注しなかった（「やめる」を押した）道は、
@@ -814,6 +786,10 @@ def apply(ctx):
         `observe_quest` が `app.current_quest_data` を見て後から埋める。
         """
         try:
+            # (app, quest_type, quest_id)。受け取った形のまま元の関数へ渡す。
+            app = frames.arg(args, kwargs, "app", 0)
+            quest_type = frames.arg(args, kwargs, "quest_type", 1)
+            quest_id = frames.arg(args, kwargs, "quest_id", 2)
             journey.sync()
             record = road_of(app, "offered", "armed")
             if record is not None:
@@ -831,7 +807,7 @@ def apply(ctx):
                     drop_road(app, "another quest started ({})".format(quest_id))
         except Exception:
             ctx.log_exc("road travel: cannot arm the road")
-        return orig(self, app, quest_type, quest_id, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:QuestEndManager.execute", required=False)
     def quest_end(orig, self, *args, **kwargs):
@@ -901,7 +877,7 @@ def apply(ctx):
         return result
 
     @ctx.wrap("__main__:InstantaleApp.add_text", required=False)
-    def add_text(orig, self, context, *args, **kwargs):
+    def add_text(orig, self, *args, **kwargs):
         """到着の移動中だけ、ゲームの「徒歩で目指す。長旅だ...」を伏せる。
 
         危険な道は道中をクエストとして踏破しているので、
@@ -914,6 +890,7 @@ def apply(ctx):
         """
         try:
             record = journey.record
+            context = frames.arg(args, kwargs, "context", 0)
             if HIDE_TRAVEL_TEXT and isinstance(context, str) \
                     and isinstance(record, dict) \
                     and record.get("stage") == "moving" \
@@ -922,7 +899,7 @@ def apply(ctx):
                 return None
         except Exception:
             ctx.log_exc("road travel: cannot filter the travel text")
-        return orig(self, context, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # `elapse_days` はこちらでは包まない。包むのはローダの関所1枚だけで
     # （TECH.md §3.3.3）、ここは「この道は何日か」を答える側に回る。
@@ -978,47 +955,51 @@ def apply(ctx):
     durations.install(ctx, write)
 
     @ctx.wrap("__main__:AreaMoveManager.__init__", required=False)
-    def area_move(orig, self, app, target_area_id, mode, *args, **kwargs):
+    def area_move(orig, self, *args, **kwargs):
         """自分が起こしたのでない移動が始まったら、待っている道は捨てる。
 
         普通に徒歩・馬車で移動してしまったなら、その道はもう関係が無い。
         """
         try:
+            # (app, target_area_id, mode)。受け取った形のまま元の関数へ渡す。
+            app = frames.arg(args, kwargs, "app", 0)
+            mode = frames.arg(args, kwargs, "mode", 2)
             journey.sync()
             if not state["departing"] and road_of(app) is not None:
                 drop_road(app, "the player travelled by other means "
                           "(mode={!r})".format(mode))
         except Exception:
             ctx.log_exc("road travel: cannot clear the road")
-        return orig(self, app, target_area_id, mode, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # ---------------------------------------- 生成プロンプトに道中の性質を差し込む
     @ctx.wrap("scripts.llm.llm_manager_world_generate:random_quest_generator",
               required=False)
-    def random_quest_generator(orig, world_overview, settlement_name,
-                               settlement_overview, settlement_structure_description,
-                               area_description, quest_difficulty, *args, **kwargs):
+    def random_quest_generator(orig, *args, **kwargs):
         """`area_description` に道中の性質を、`quest_difficulty` に選んだ値を渡す。
 
         印は1回で使い切るので、掲示板から普通に作られた依頼は素通しする。
+        引数は受け取った形（位置かキーワード）のまま渡し、2つだけを差し替える（TECH.md の規則の表）。
         """
         mark = state["inject"]
         state["inject"] = None
         if mark is None or time.monotonic() - state["inject_at"] > INJECT_TTL:
             if mark is not None:
                 write("inject: stale marker, left untouched")
-            return orig(world_overview, settlement_name, settlement_overview,
-                        settlement_structure_description, area_description,
-                        quest_difficulty, *args, **kwargs)
+            return orig(*args, **kwargs)
 
+        area_description = frames.arg(args, kwargs, "area_description", QUEST_GENERATOR_ARGS)
+        quest_difficulty = frames.arg(args, kwargs, "quest_difficulty", QUEST_GENERATOR_ARGS)
         merged = (area_description or "") + road_brief(
             mark["origin"], mark["target"], mark["difficulty"])
         write("inject: area_description {} -> {} chars; difficulty {!r} -> {}".format(
             len(area_description or ""), len(merged), quest_difficulty,
             mark["difficulty"]))
-        result = orig(world_overview, settlement_name, settlement_overview,
-                      settlement_structure_description, merged,
-                      mark["difficulty"], *args, **kwargs)
+        args, kwargs, _ = frames.replace_arg(args, kwargs, "area_description",
+                                             QUEST_GENERATOR_ARGS, merged)
+        args, kwargs, _ = frames.replace_arg(args, kwargs, "quest_difficulty",
+                                             QUEST_GENERATOR_ARGS, mark["difficulty"])
+        result = orig(*args, **kwargs)
         if isinstance(result, dict):
             write("inject: generated {!r}".format(result.get("quest_title")))
         return result

@@ -404,6 +404,17 @@ def main():
                  len(app2.buttons))[1] == len(labels))
     ok &= check("spec は無害な既存クラス",
                 all(ui.spec_cls_name(e) == ui.SAFE_CLS for e in app2.buttons))
+    from instantale_modloader import choices as choices_mod
+    painted = []
+    saved_paint = (modfacility.repaint_when_idle, choices_mod.repaint)
+    modfacility.repaint_when_idle = lambda app, screen=None: painted.append("idle")
+    choices_mod.repaint = lambda app: painted.append("now")
+    try:
+        app2.buttons = []
+        modfacility.maintain_buttons(app2)
+    finally:
+        modfacility.repaint_when_idle, choices_mod.repaint = saved_paint
+    ok &= check("足したら塗り直しを頼む（挿しただけだと画面の添字が古いまま）", len(painted) == 1)
 
     print("下位の画面: 移動のボタンが無く空でもない画面には混ぜない")
     app2.player.location = rebuilt
@@ -471,6 +482,24 @@ def main():
     ok &= check("出口はこちらの最後（`会話する` の前）",
                 texts == ["滞在する", "売上を受け取る", "外に出る", "会話する"])
     # 伏せるものが無い画面では `replaces` は効かない（その場所が無い）。
+    # 伏せた後の塗り直し（ゲームが一覧を組み直さない `choices.repaint` など）でも、代わりのボタンは伏せた場所のまま。
+    # 伏せたゲームの選択肢は一覧から消えたまま残るので、2回目には伏せる物が無い
+    modfacility.register("916_inn", facility_id=fid,
+                         choices=[{"key": "free_stay", "label": "無料で泊まる", "replaces": "DisplayVacationChoice",
+                                   "on": lambda info: None}],
+                         hide=["DisplayVacationChoice"])
+    app2.player.location = rebuilt
+    app2.buttons = [{"text": "宿泊する(3ヵ月)", "spec": PhaseSpec("DisplayVacationChoice", [3])},
+                    {"text": "売買する", "spec": PhaseSpec("ShoppingStartManagerRemake", [])},
+                    {"text": "会話する", "spec": PhaseSpec("DisplayTalkChoice", [])}]
+    modfacility.maintain_buttons(app2)
+    once = [e.get("text") for e in app2.buttons]
+    modfacility.maintain_buttons(app2)
+    twice = [e.get("text") for e in app2.buttons]
+    ok &= check("伏せた後の塗り直しでも、代わりのボタンは伏せた場所のまま",
+                once.index("無料で泊まる") < once.index("売買する") and twice == once)
+    modfacility.unregister("916_inn", fid)
+
     # 素の店の並び（売買する / 出る / 会話する）に混ぜたときは、
     # ゲームの操作の後、移動と会話の前に入る。
     app2.buttons = [{"text": "売買する", "spec": PhaseSpec("ShoppingStartManagerRemake", [])}] \
@@ -571,7 +600,7 @@ def main():
                 isinstance(getattr(app2, "started", (None,))[0], MovePhaseManager))
     ok &= check("印の無いボタンは素通し",
                 not modfacility.press(app2, 0, screen=screen)
-                if app2.buttons and not screen.mark_of(app2.buttons[0])
+                if app2.buttons and not modfacility._ours(app2.buttons[0])
                 else True)
 
     print("文言: 層の文言が変われば、在るボタンの文言も更新する")
@@ -887,7 +916,7 @@ def main():
     app2.buttons = game_buttons(("宿屋", "2"))
     modfacility.maintain_buttons(app2, screen=screen)
     ok &= check("施設の画面には道を足す",
-                any(screen.mark_of(e) for e in app2.buttons))
+                any(modfacility._ours(e) for e in app2.buttons))
     app2.buttons = [dict(e) for e in talk_list]
     modfacility.maintain_buttons(app2, screen=screen)
     ok &= check("会話相手の一覧に道を混ぜない",
@@ -942,7 +971,7 @@ def main():
     app2.buttons = [dict(e) for e in arena_top]
     modfacility.maintain_buttons(app2, screen=screen)
     exits = [e for e in app2.buttons
-             if str(screen.mark_of(e) or "").startswith("exit	")]
+             if modfacility._ours(e) and e.get("text") == modfacility.DEFAULT_EXIT_LABEL]
     ok &= check("敵が居なければ出口が出る（残骸）", bool(exits))
     ok &= check("旗そのものは下ろさない", app2.in_colosseum_battle is True)
     ok &= check("旗の名前はそのまま読める",

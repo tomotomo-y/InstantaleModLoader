@@ -2,14 +2,17 @@
 """ゲームが知らないクラウドモデルを使う。**送信直前にモデル名を差し替える**。
 
 OpenAI API と Claude API の両方に対応する。
-差し替え先は設定画面の一覧から選ぶ（一覧に無い名前は「一覧に無いモデル」の欄に書く）。
+差し替え先は、Claude は設定画面の一覧から選び、一覧に無い名前は「一覧に無いモデル」の欄に書く。
+一覧に載せるのは、ゲームの一覧（main_026）に無いモデルだけ（ゲームが公式に選べるモデルは外した。版6）。
+OpenAI の差し替え先はゲームの一覧に全部入ったので、欄に名前を書いたときだけ差し替える。
 
 ## ファイルの分け方
 
     cloud_model_override.py   入口。設定の定数・ログ・apply()
     openai_side.py            OpenAI API 宛ての直し・キャッシュ・包み
     claude_side.py            Claude API 宛ての直し・キャッシュ・包み
-    claude_grammar.py         Claude API で型の文法が大きすぎて断られたときの迂回
+    claude_grammar.py         Claude API で型の文法が大きすぎて断られたときの迂回・SDK が外した const を戻す
+    claude_bounds.py          Claude API の応答の数を、SDK が外した型の範囲に寄せる
     prefix_cache.py           キャッシュの印をどこに置くか（両方が使う）
 
 設定の定数は入口に置く（ローダが値を書き込むのは入口のモジュールで、
@@ -51,7 +54,9 @@ SDK が呼び出し側の dict をそのまま握っている場合に、
 
 ゲームの設定画面には、ゲームが選んだモデルが出る（差し替え先は出ない）。
 実際に送っているモデルが分かるよう、タイトル画面の右上に `LLM: <表示名> / effort: <推論量>` を1行出す。
-推論量は実際に送る値（OpenAI で keep ならゲームが組む値に読み替えを通したもの）。
+推論量は実際に送る値（keep ならゲームが組む値に読み替えを通したもの。Claude でゲームが付けないモデルは
+API の既定を「high（既定）」のように出す）。
+`TITLE_MODEL_UNSWAPPED` をオンにすると、差し替えていないときもゲームが選んだモデルとゲームが組む推論量を出す。
 どの LLM が選ばれているかは `config.json` から読む（`llm.game_choice`。切り替えるとゲームが起動し直すので、
 注入の時に1回読めば足りる）。
 置き方は `126_` と同じローダの部品（`ui.on_title_screen` / `ui.corner_label`）で、
@@ -80,10 +85,8 @@ OFF = "off"
 # AST で突き合わせる。TECH.md §3.8.3）。
 
 # ------------------------------------------------------------------ OpenAI API
-# 実際に送るモデル。
-OPENAI_MODEL = "gpt-6-luna"
-
-# 一覧に無いモデル名。空でなければ OPENAI_MODEL より優先する。
+# 実際に送るモデル（一覧に無いモデル名）。空なら差し替えない。
+# 一覧（版5までの OPENAI_MODEL）は、差し替え先が全部ゲームの一覧（main_026）に入ったので外した。
 OPENAI_CUSTOM = ""
 
 # 推論量。"keep" はゲームが組み立てた値のまま。
@@ -95,7 +98,7 @@ OPENAI_EFFORT = "keep"
 OPENAI_CACHE = "stable"
 
 # ------------------------------------------------------------------ Claude API
-# 実際に送るモデル。既定は差し替えない（ゲームの一覧に claude-sonnet-5 が在る）。
+# 実際に送るモデル。既定は差し替えない。一覧はゲームの一覧（main_026）に無いモデルだけ。
 CLAUDE_MODEL = "off"
 
 # 一覧に無いモデル名。空でなければ CLAUDE_MODEL より優先する。
@@ -118,6 +121,10 @@ LOG_LIMIT = 3
 # タイトル画面の右上に、実際に送っているモデルを出すか。
 # 出すのは、ゲームが API キーでクラウドを使っていて、そのプロバイダをこの MOD で差し替えているときだけ。
 TITLE_MODEL = True
+
+# 差し替えていないときも、ゲームが選んだモデルと推論量を出すか（TITLE_MODEL がオンのときだけ効く）。
+# 素のゲームの画面に足すことになるので、既定は出さない。
+TITLE_MODEL_UNSWAPPED = False
 
 #: タイトル画面に足すラベルの印と、右上に積む中での並び（`126_` の版の行が 0）。
 TITLE_LABEL_ATTR = ui.MOD_WIDGET_PREFIX + "cloud_model"
@@ -176,7 +183,7 @@ def model_names(mod_dir):
             settings = json.load(fh).get("settings") or {}
     except Exception:
         return names
-    for key in ("OPENAI_MODEL", "CLAUDE_MODEL"):
+    for key in ("CLAUDE_MODEL",):
         for model, label in ((settings.get(key) or {}).get("value_labels") or {}).items():
             text = label.get("ja") if isinstance(label, dict) else label
             if isinstance(text, str) and text:
@@ -184,37 +191,36 @@ def model_names(mod_dir):
     return names
 
 
-#: 推論量が keep で、送る値がこの MOD から分からないとき（Claude）に出す言葉。
-EFFORT_KEEP_TEXT = "ゲームのまま"
-
-
 def title_text(choice, openai_target, claude_target, names,
-               openai_effort="keep", claude_effort="keep"):
+               openai_effort="keep", claude_effort="keep", unswapped=False):
     """タイトル画面に出す1行（`LLM: <表示名> / effort: <推論量>`）。出さないときは None。
 
-    出すのは、ゲームが API キーでクラウドを使っていて（`llm.game_choice`）、
+    出すのは、ゲームが API キーでクラウド（OpenAI API / Claude API）を使っていて（`llm.game_choice`）、
     そのプロバイダの差し替え先がこの MOD で決まっているときだけ。
+    `unswapped` なら、差し替えていないときもゲームが選んだモデルとゲームが組む推論量を出す
+    （推論量の設定は差し替えるときだけ効くので、そのときは keep として読む）。
     推論量は実際に送る値（各ファイルの `sent_effort`）。送らない経路なら付けない。
     """
     if not choice or choice.get("inference") != llm.CLOUD_API_KEY:
         return None
     provider = choice.get("provider")
-    if provider == PROVIDER_OPENAI and openai_target:
-        target = openai_target
-        effort = openai_side.sent_effort(target, choice.get("model"), openai_effort)
-    elif provider == PROVIDER_CLAUDE and claude_target:
-        target = claude_target
-        effort = claude_side.sent_effort(target, claude_effort)
+    game_model = choice.get("model") or ""
+    if provider == PROVIDER_OPENAI and (openai_target or unswapped and game_model):
+        target = openai_target or game_model
+        effort = openai_side.sent_effort(target, game_model, openai_effort if openai_target else "keep")
+    elif provider == PROVIDER_CLAUDE and (claude_target or unswapped and game_model):
+        target = claude_target or game_model
+        effort = claude_side.sent_effort(target, claude_effort if claude_target else "keep", game_model)
     else:
         return None
     text = "LLM: " + names.get(target, target)
     if effort:
-        text += " / effort: " + (EFFORT_KEEP_TEXT if effort == "keep" else effort)
+        text += " / effort: " + effort
     return text
 
 
 def apply(ctx):
-    openai_target = _pick(OPENAI_CUSTOM, OPENAI_MODEL)
+    openai_target = _pick(OPENAI_CUSTOM, OFF)
     openai_effort = _setting(OPENAI_EFFORT, "keep")
     openai_cache = _setting(OPENAI_CACHE, "keep")
     claude_target = _pick(CLAUDE_CUSTOM, CLAUDE_MODEL)
@@ -228,8 +234,8 @@ def apply(ctx):
     claude_side.install(ctx, claude_target, claude_effort, claude_cache, log)
 
     # タイトル画面の右上。出さないときも包んでおき、注入し直す前の1行を外す（設定を切ったときに残さない）。
-    shown = title_text(llm.game_choice(), openai_target, claude_target,
-                       model_names(ctx.mod_dir), openai_effort, claude_effort) if TITLE_MODEL else None
+    shown = title_text(llm.game_choice(), openai_target, claude_target, model_names(ctx.mod_dir),
+                       openai_effort, claude_effort, unswapped=TITLE_MODEL_UNSWAPPED) if TITLE_MODEL else None
 
     def decorate(screen):
         if shown is None:

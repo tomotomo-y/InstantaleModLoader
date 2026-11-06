@@ -201,6 +201,10 @@ def setup(settings=None, mod_dir=MOD_DIR):
     for key, value in (settings or {}).items():
         setattr(mod, key, value)
     ctx = FakeCtx(os.path.join(HERE, os.pardir, os.pardir, "out", "test"), mod_dir)
+    # ロードと新規開始の前後はローダの窓口 `loads` が1つの世代に1枚だけ包む。
+    # 偽の ctx を作り直すたびに前の登録と包みの印を忘れさせ、この ctx に包みを渡す
+    from instantale_modloader import gates
+    gates.reset_all()
     mod.apply(ctx)
     install(ctx.hooks, char_cls, world_cls, app_cls)
     return mod, ctx, app
@@ -428,6 +432,32 @@ check("改名後の名前も重複していない",
 check("素データの名前も書き換わる",
       app.save_data_dict["npcs"]["11"]["name"] == second.name,
       app.save_data_dict["npcs"]["11"])
+
+# 突き合わせで控えを舐めている間に、別の人物の登録が控えに書き足しても落ちない（版9。起動の当て直しの種まきと
+# ゲームのスレッドの人物の登録が重なり、`dictionary changed size during iteration` で種まきが落ちた。実機）
+real_too_close = mod.too_close
+interleaved = {"done": False}
+
+
+def too_close_while_someone_is_born(left, right):
+    if not interleaved["done"]:
+        interleaved["done"] = True
+        born(app, "12", "オルドリン", category="old man")     # 舐めている途中に控えへ1人足す
+    return real_too_close(left, right)
+
+
+mod.too_close = too_close_while_someone_is_born
+try:
+    raised = None
+    try:
+        third = born(app, "13", "セラフィナ", category="young woman")
+    except RuntimeError as exc:
+        raised = exc
+finally:
+    mod.too_close = real_too_close
+check("控えを舐めている途中に書き足されても落ちない（人物の生成の包みで握られる例外も出ない）",
+      raised is None and interleaved["done"] and not any("'13'" in line for line in ctx.errors),
+      (raised, ctx.errors))
 check("項目の並びは動かない",
       list(app.save_data_dict["npcs"]["11"]) == ["name", "id", "category"],
       list(app.save_data_dict["npcs"]["11"]))
@@ -568,6 +598,24 @@ app.world_dict["npcs"]["51"] = {"name": "エルミナ", "id": "51"}
 app.load_game_new()
 late = app.world.generate_character("50", app.save_data_dict["npcs"]["50"])
 check("素データにだけ居た古参は改名されない", late.name == "バルガス", late.name)
+
+# 素データの人物を舐めている間に、ゲームのスレッドが人物を足しても種まきが落ちない（版9 の直しの残り。後半のループ）
+mod2, ctx2, app2 = setup({"ALWAYS_RENAME": True, "EPITHET_CHANCE": 0})
+
+
+class BornWhileRead(dict):
+    """名前を読まれた瞬間に、ゲームが素データへ1人足す（種まきとゲームの人物の登録が重なった）。"""
+
+    def get(self, key, default=None):
+        if key == "name" and "61" not in app2.save_data_dict["npcs"]:
+            app2.save_data_dict["npcs"]["61"] = {"name": "オルドリン", "id": "61"}
+        return dict.get(self, key, default)
+
+
+app2.save_data_dict["npcs"]["60"] = BornWhileRead(name="ガレス", id="60")
+app2.load_game_new()
+check("素データを舐めている途中に人物が足されても、種まきが落ちない",
+      "61" in app2.save_data_dict["npcs"] and not any("seeding" in line for line in ctx2.errors), ctx2.errors)
 check("`world_dict` 側の古参も控える", "51" in app.save_data_dict["npcs"] or True)
 # 新顔の名前は名簿に無いものにする。名簿の名前（前は「セラフィナ」）だと、引き直しが同じ名前を
 # 引いた回（女性名 600 件の1件）だけ「付け直されていない」と見えて落ちた（CI で1度）
@@ -686,6 +734,49 @@ check("ロード中の NPC を前の世界の名前との衝突で改名しな�
       app.world.characters["40"].name == "ヴァルガス"
       and app.save_data_dict["npcs"]["40"]["name"] == "ヴァルガス",
       (app.world.characters["40"].name, app.save_data_dict["npcs"]["40"]))
+
+# ============================================================ 一括生成（版8）
+print("\n-- 一括生成で書かれる住人 --")
+mod, ctx, app = setup({"EPITHET_CHANCE": 0})
+write_hook = ctx.hooks.get("save_area_json:write_area_data_to_world_dict")
+bulk_hook = ctx.hooks.get("__main__:InstantaleApp.run_world_bulk_generation")
+check("書き込みと一括生成の本体を包む", write_hook is not None and bulk_hook is not None)
+
+bulk_world = {"world_data": {"name": "一括の世界"},
+              "npcs": {"4": {"name": "セリム・オーウェン", "id": "4", "category": "young man"}}}
+
+
+def write_area(world_dict, area_id):
+    """ゲームが街を作るときと同じく、素データの npcs に住人を足す。"""
+    added = {"12": [("11", "セリム", "young man"), ("13", "ガルド", "old man"), ("14", "ミラ", "young woman")],
+             "13": [("31", "ガルド・ソレイル", "middle-aged man")]}[area_id]
+    for cid, name, category in added:
+        world_dict["npcs"][cid] = {"name": name, "id": cid, "category": category}
+    return None
+
+
+def run_bulk(self, *args, **kwargs):
+    write_hook(write_area, bulk_world, "12")
+    write_hook(write_area, bulk_world, "13")
+
+
+bulk_hook(run_bulk, app, "path", None, None)
+names = {cid: entry["name"] for cid, entry in bulk_world["npcs"].items()}
+check("先に居た住人と重複する新しい住人を名簿の名前に直す",
+      names["11"] != "セリム" and names["11"] in ROSTER_NAMES, names)
+check("重複しない新しい住人と、先に居た住人はそのまま",
+      names["4"] == "セリム・オーウェン" and names["13"] == "ガルド" and names["14"] == "ミラ", names)
+check("別の街の書き込みでも、先に書いた街の住人と突き合わせる",
+      names["31"] != "ガルド・ソレイル" and names["31"] in ROSTER_NAMES, names)
+check("直した名前どうしも重ならない", len(set(names.values())) == len(names), names)
+check("素データの項目の並びは動かない",
+      list(bulk_world["npcs"]["11"]) == ["name", "id", "category"], list(bulk_world["npcs"]["11"]))
+
+# 遊んでいる間の書き込みは、今までどおり人物を組み立てるところで裁く（ここでは触らない）
+live_world = {"npcs": {"4": {"name": "セリム・オーウェン", "id": "4"}}}
+write_hook(write_area, live_world, "12")
+check("一括生成の外の書き込みは触らない", live_world["npcs"]["11"]["name"] == "セリム",
+      live_world["npcs"]["11"])
 
 print("\n{} check(s) failed".format(len(failures)) if failures else "\nall ok")
 sys.exit(1 if failures else 0)

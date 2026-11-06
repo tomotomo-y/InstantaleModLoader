@@ -47,8 +47,12 @@ if RUNTIME_DIR not in sys.path:
 
 import instantale_modloader as ml                      # noqa: E402
 from instantale_modloader import durations            # noqa: E402
+from instantale_modloader import gates                # noqa: E402
+from instantale_modloader import holdings as holdings_window, hudicons  # noqa: E402
 from instantale_modloader import llm as loader_llm    # noqa: E402
 from instantale_modloader import modfacility            # noqa: E402
+from instantale_modloader import choices                # noqa: E402
+from instantale_modloader import confinement            # noqa: E402
 from instantale_modloader import modnpc                 # noqa: E402
 from instantale_modloader import state as loader_state  # noqa: E402
 
@@ -934,8 +938,11 @@ def setup(configure=None, keep_state=False, gold=100000):
     os.makedirs(OUT_DIR, exist_ok=True)
     if os.path.exists(LOG_PATH):
         os.remove(LOG_PATH)
+    # 窓口 `choices` の置き場（開いた画面・印の控え）は `sys` に在って注入をまたぐ。前の検査の画面を持ち越さない
+    choices.reset()
     if not keep_state:
-        for folder in (STATE_DIR, FACILITY_STATE_DIR, NPC_STATE_DIR):
+        for folder in (STATE_DIR, os.path.join(OUT_DIR, "state", choices.STATE_DIRNAME),
+                       FACILITY_STATE_DIR, NPC_STATE_DIR):
             if os.path.isdir(folder):
                 for name in os.listdir(folder):
                     os.remove(os.path.join(folder, name))
@@ -951,6 +958,9 @@ def setup(configure=None, keep_state=False, gold=100000):
                  modnpc.INSTALLED_ATTR, modnpc.STORE_ATTR):
         if hasattr(sys, attr):
             delattr(sys, attr)
+    # 窓口の関所（日数・ロード・着いた後）も1つの世代に1枚なので、ctx を作り直すたびに忘れさせる
+    # （残すと2回目の ctx に包みが渡らず、日数の後の精算が呼ばれない）。
+    gates.reset_all()
 
     module = load_mod()
     if configure is not None:
@@ -1039,6 +1049,25 @@ check("印は mod_ で始まる", module.MARK.startswith("mod_"), module.MARK)
 check("PhaseSpec に自前のクラス名を書かない",
       entry["spec"].to_dict()["cls_name"] == "JustSetButtonToNormalPhase",
       entry["spec"].to_dict())
+
+print("[窓口の画面で保存して読み直す]")
+game_office = [e for e in app.buttons if e.get("text") != module.OFFICE_LABEL]
+app.press(module.OFFICE_LABEL)
+CLOCK.settle()
+desk = app.labels()
+app.save_game()
+check("窓口の画面で保存すると、セーブには役場のゲームの選択肢だけが残る",
+      app.saved_buttons[-1] == [e.get("text") for e in game_office], (app.saved_buttons[-1], desk))
+check("保存の後も窓口の画面のまま", app.labels() == desk, app.labels())
+app.buttons = [dict(e) for e in game_office]           # ロード: セーブの一覧が戻り、メモリの控えは消えた
+choices._store()["opened"].clear()
+app.refresh_choice_buttons(True)
+CLOCK.settle()
+check("読み直しても窓口の画面に戻る", app.labels() == desk, app.labels())
+app.press(module.CANCEL_LABEL)
+CLOCK.settle()
+check("やめると役場の選択肢に戻る（戻り先を失わない）", app.has(module.OFFICE_LABEL)
+      and not app.has("借りる"), app.labels())
 
 print("[契約]")
 app.press(module.OFFICE_LABEL)
@@ -1333,6 +1362,27 @@ record = contract_of(module, app)
 check("飛んだ期の分はまとめて払う",
       app.player.gold == gold_before - module.RENT_PRICE * 3, app.player.gold)
 
+print("[家と施設の窓]")
+_side = holdings_window.collect(app).get(holdings_window.HOUSES) or {}
+_card = (_side.get("cards") or [{}])[0]
+check("窓の家の札: 賃貸の札・目盛り・家賃・保管庫",
+      _card.get("badge") == ("賃貸", "warn") and _card.get("meter", {}).get("left") == "契約の始め"
+      and ("家賃", "{}G／1期 {}日".format(ml.ui.money(module.RENT_PRICE), term)) in _card.get("rows", [])
+      and ("保管庫", "1品") in _card.get("rows", []) and not _card.get("cautions"), _card)
+check("窓の家の側: 軒数", _side.get("count") == 1 and _side.get("income") is None, _side)
+check("窓の家の札: 大家・管理人の名前は出さない（ゲームの中に出てこない人のため）",
+      not any(head in ("大家", "管理人") for head, _text in _card.get("rows", [])), _card.get("rows"))
+hudicons.notify(holdings_window.ICON_KEY, on=False)
+_left = contract_of(module, app).get("due") - app.world.days_elapsed
+app.elapse_days(_left - 3)
+CLOCK.settle()
+check("期限の知らせが出ると「家と施設」の行に知らせの印",
+      bool(hudicons._store()["attention"].get(holdings_window.ICON_KEY)), hudicons._store()["attention"])
+_card = ((holdings_window.collect(app).get(holdings_window.HOUSES) or {}).get("cards") or [{}])[0]
+check("窓の家の札: 期限が近いと赤い目盛りと注意の行",
+      _card.get("meter", {}).get("tone") == "bad" and _card.get("meter", {}).get("right") == "次の支払い（あと3日）"
+      and _card.get("cautions") and _card["cautions"][0][0].startswith("契約はあと3日で切れる"), _card)
+
 print("[期限切れ]")
 app.go(places["office"])
 app.player.gold = 0
@@ -1348,6 +1398,11 @@ check("入口の道も外れる",
       places["entrance"].connections)
 check("保管庫の中身は役場が預かる", len(data.get("seized") or {}) == 1,
       data.get("seized"))
+_side = holdings_window.collect(app).get(holdings_window.HOUSES) or {}
+check("窓: 家が無くなり、役場の預かりの札だけが残る",
+      _side.get("count") == 0 and len(_side.get("cards") or []) == 1
+      and _side["cards"][0].get("name") == "役場の預かり" and _side["cards"][0].get("frame") == "warn"
+      and ("預けてある品", "1品") in _side["cards"][0].get("rows", []), _side)
 
 print("[引き取り]")
 app.player.gold = 10000
@@ -1395,6 +1450,28 @@ check("出た後に建物が消える",
       list(places["node"].facilities))
 check("控えからも契約が消える", contract_of(module, app) is None, read_state())
 
+print("[閉じ込められている間]")
+module, ctx, app, places, classes = setup()
+rent(app, module)
+app.go(places["office"])
+_gold = app.player.gold
+_confined = {"why": None}
+confinement.reset()
+confinement.declare("336_crime_overhaul", ctx, lambda a: _confined["why"])
+app.elapse_days(contract_of(module, app).get("term"))
+CLOCK.settle()
+check("閉じ込められていなければ家賃を払う", app.player.gold == _gold - module.RENT_PRICE
+      and not (contract_of(module, app) or {}).get("lapsed"), app.player.gold)
+_gold = app.player.gold
+_confined["why"] = "牢に入っている"
+app.elapse_days(contract_of(module, app).get("term"))
+CLOCK.settle()
+check("閉じ込められている間は家賃を引かない", app.player.gold == _gold, (_gold, app.player.gold))
+check("借りている家の契約が打ち切られる", contract_of(module, app) is None, read_state())
+check("打ち切った知らせ", any(module.CONFINED_TEXT.split("{")[0] in text for text in app.texts), app.texts[-3:])
+check("ログに閉じ込めの理由", "while confined (牢に入っている; 336_crime_overhaul)" in read_log(), read_log()[-300:])
+confinement.reset()
+
 print("[取り残されたとき]")
 module, ctx, app, places, classes = setup()
 # 版12 までの期限切れが作っていた形。街から消えた施設に立ち、選択肢が1つも無い。
@@ -1430,17 +1507,13 @@ CLOCK.settle()
 app.streaming = True                       # ここから本文が流れ続ける
 app.press(module.RELEASE_LABEL)            # 解約。戻すのは `screen.say` の直後
 CLOCK.settle()
-check("本文が流れている間は窓口を足さない", not app.has(module.OFFICE_LABEL),
-      app.labels())
+# 窓口のボタンはゲームの組み直しの中で窓口 `choices` が組む（割り込んで塗り直さない）ので、本文が流れていても出る。
+# 版44までは流れている間は足さずに手が空くのを待ち、待ちが漏れると窓口が消えたままになった（VERIFICATION.md §3.62）
+check("本文が流れている間も、戻した役場の選択肢に窓口が出る", app.has(module.OFFICE_LABEL), app.labels())
 check("戻す先はゲームの選択肢", EXIT_TEXT in app.labels(), app.labels())
 app.finish_text()
-check("手が空いたら窓口が戻る", app.has(module.OFFICE_LABEL), app.labels())
 check("窓口は1つだけ",
       len([t for t in app.labels() if t == module.OFFICE_LABEL]) == 1, app.labels())
-app.facility_screen()
-CLOCK.settle()
-check("見張りは残らない", not module_state(module).get("retry"),
-      module_state(module).get("retry"))
 
 print("[世界ごとに分ける]")
 OTHER_WORLD = "もう一つの世界"
@@ -1477,6 +1550,7 @@ app.world_dict = {"world_data": {"name": OTHER_WORLD},
                   "index": {"facility": 40, "npc": 5, "item": 30}}
 app.save_data_dict = save_b
 world_b = classes["world"](save_b, app)
+world_b.characters["player"] = app.player     # 人物が揃った世界（窓口は 0 人の間を読み込みの途中と見る）
 app.world = world_b
 area_b = world_b.areas["0"]
 node_b = area_b.nodes["0"]
@@ -1923,6 +1997,8 @@ def reload_world(app, classes, module):
             "name": name, "id": fid, "description": "", "facility_type": kind,
             "tier": None, "owner": None, "connections": list(conn),
             "config": {"level_of_detail": 0}})
+    # 人物が揃った世界（窓口 `choices` は人物が 0 人の間をロードの途中と見て MOD の選択肢を組まない）
+    fresh.characters["player"] = app.player
     app.world = fresh
     app.player.current_area = area
     app.player.location = node.facilities["3"]

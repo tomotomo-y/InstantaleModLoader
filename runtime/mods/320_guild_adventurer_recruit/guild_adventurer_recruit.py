@@ -70,6 +70,9 @@ REJECTED_MAX 件まで控え、頼み文の「使えない名前」に並べる�
 MODを外しても消えない（DOC.md に明記）。
 増えすぎない根拠はボタンの出る条件そのもの ―
 一覧が RECRUIT_MIN 人以下のときしか募集できない。
+
+版6: 一覧の `execute` のフック2本は、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
 """
 
 import sys
@@ -85,7 +88,7 @@ RECRUIT_COUNT = 1   # 1回の募集で作る人数（1人ごとにLLM生成1回�
 # ---- 設定にしない定数 ----------------------------------------------------
 RECRUIT_LABEL = "冒険者を募集する"
 LIST_TEXT = "冒険者達と話す"        # 開き直しの choice_text。判定には使わない
-MARK = "mod_recruit_action"         # ボタンの印。MODごとに別の文字列（ui.MARK_PREFIX）
+MARK = "mod_recruit_action"         # 版4までの募集ボタンの印。前の版の印のボタンを落とすためだけに残す
 MANAGER_NAME = "mod_adventurer_recruit"   # LLM記録の分かれ目（output_data/）
 RECRUIT_TIMEOUT = 90.0              # LLM 1問の待ち。無期限にしない（GAME.md §2.12）
 RECRUIT_MAX_TOKENS = 800
@@ -132,7 +135,7 @@ PROMPT = (
 
 def apply(ctx):
     write = ctx.logger("adventurer_recruit.log")
-    state = {"armed": False, "recruiting": False}
+    state = {"armed": False, "recruiting": False, "offered": None}
     screen = ui.Screen(ctx, write, tag="adventurer recruit", mark=MARK)
     store = getattr(sys, STATE_STORE_ATTR, None)
     if not isinstance(store, dict):
@@ -143,48 +146,51 @@ def apply(ctx):
     # ================================================== 冒険者一覧の見分け
     @ctx.wrap("__main__:DisplayAdventurerTalkChoice.execute",
               required=False, safe=True)
-    def adventurer_list_execute(orig, self, choice_text, *args, **kwargs):
+    def adventurer_list_execute(orig, self, *args, **kwargs):
         state["armed"] = True
-        return orig(self, choice_text, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:DisplayTalkChoice.execute", required=False, safe=True)
-    def talk_list_execute(orig, self, choice_text, *args, **kwargs):
+    def talk_list_execute(orig, self, *args, **kwargs):
         # 「会話する」の一覧は冒険者一覧と同じ形なので、明示的に旗を下ろす。
         state["armed"] = False
-        return orig(self, choice_text, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
-    def offer(app, buttons):
-        """一覧なら、人数が閾値以下のとき募集ボタンを差す。"""
+    def offer(app, view):
+        """冒険者の一覧なら、人数が閾値以下のとき「やめる」の手前に募集ボタンを出す（窓口 `choices` の `offer`）。"""
         if not state["armed"]:
-            return
+            return None
+        buttons = view.buttons
         names = [ui.spec_cls_name(entry) for entry in buttons]
         if any(name in OTHER_SCREEN_SPECS for name in names):
-            state["armed"] = False
-            return
-        if any(screen.mark_of(entry) is not None for entry in buttons):
-            return                      # もう差してある
+            return None
         at = screen.back_button_index(buttons)
         if at is None:
-            return                      # 「やめる」が無い＝一覧が組み上がっていない
+            return None                 # 「やめる」が無い＝一覧が組み上がっていない
         count = names.count("ConversationStartManager")
         if count > RECRUIT_MIN or state["recruiting"]:
-            return
-        entry = screen.button(RECRUIT_LABEL, mark="recruit")
-        if entry is None:
-            return
-        buttons.insert(at, entry)
-        write("offered {!r} (adventurers listed: {})".format(
-            RECRUIT_LABEL, count))
+            return None
+        if state.get("offered") != count:
+            state["offered"] = count
+            write("offered {!r} (adventurers listed: {})".format(RECRUIT_LABEL, count))
+        return [choices.Choice(RECRUIT_LABEL, place=choices.at(at), on_press=on_button_press)]
 
     def refresh_choice_buttons(self, _buttons):
+        """組み直しの前（窓口の `refresh`）。冒険者の一覧でない画面に来たら旗を下ろす。"""
         try:
             buttons = getattr(self, "buttons", None)
-            if isinstance(buttons, list):
-                # 印を失った残骸（セーブから復元された自前ボタン）を先に落とす。
-                screen.prune_stale(buttons, [RECRUIT_LABEL])
-                offer(self, buttons)
+            if not isinstance(buttons, list):
+                return
+            # 版4までの印の付いた募集ボタン（窓口が印を付け直したもの）。いまは窓口が組むので落とす
+            old = [entry for entry in buttons if isinstance(entry, dict) and entry.get(MARK)]
+            if old:
+                buttons[:] = [entry for entry in buttons if not any(entry is d for d in old)]
+                write("dropped {} recruit button(s) with the older mark".format(len(old)))
+            if state["armed"] and any(ui.spec_cls_name(entry) in OTHER_SCREEN_SPECS for entry in buttons):
+                state["armed"] = False
+                state["offered"] = None
         except Exception:
-            ctx.log_exc("adventurer recruit: cannot offer the button")
+            ctx.log_exc("adventurer recruit: cannot look at the choices")
 
     # ================================================== 押されたら募集する
     class RecruitPhase(object):
@@ -200,19 +206,17 @@ def apply(ctx):
         def execute(self, choice_text):
             return recruit(self.app)
 
-    def on_button_press(self, action):
-        """自前のボタンが押された（窓口 `choices` の `presses`）。"""
-        entry = choices.pressed()
+    def on_button_press(self):
+        """募集ボタンが押された（窓口がボタンに持たせた処理として呼ぶ）。"""
         if state["recruiting"]:
             return None                 # 連打。生成中は無反応でよい
-        write("pressed {!r}".format(entry.get("text")))
-        screen.start_phase(self, RecruitPhase(self),
-                           entry.get("text") or RECRUIT_LABEL,
+        write("pressed {!r}".format(RECRUIT_LABEL))
+        screen.start_phase(self, RecruitPhase(self), RECRUIT_LABEL,
                            fallback=lambda: recruit(self))
         return None
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"": on_button_press})
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons, offer=offer, labels=(RECRUIT_LABEL,))
 
     # ================================================== 土地の水準を読む
     def difficulty_for(app, area):

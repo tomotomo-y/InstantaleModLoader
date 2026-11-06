@@ -38,7 +38,14 @@ MIT で配っているが、著作権表示（LICENSE の Copyright 行）は提
         403_npc_social_memory
         404_party_talk          （提供を受けたものを共同で仕上げた）
         405_regional_economy    （提供を受けたものを共同で仕上げた）
-        406_gemini_user_role_fix
+        406_user_role_fix       （提供を受けたものを共同で仕上げた）
+        407_npc_starting_equipment
+        408_visual_changes_based_on_equipment
+
+  * わさの 様
+        409_fix_crafted_item_type   （提供を受けたものを共同で仕上げた）
+        410_weapon_skill_chance     （提供を受けたものを共同で仕上げた）
+        411_equipment_bonuses （提供を受けたものを共同で仕上げた）
 
 **MOD そのものの提供とは別に、既にあるこちらの MOD へ機能の提案（PR）を
 頂いたものがある。** MOD 自体はこちらの著作物だが、取り込んだコードの
@@ -75,6 +82,27 @@ MIT で配っているが、著作権表示（LICENSE の Copyright 行）は提
 提供する側がライセンスを明示していない場合は、取り込む前にこの条件でよいかを
 確かめる。**確かめられないものは同梱しない**（配った後では直せないため）。
 手順は docs/CONTRIBUTING.md にある。
+
+--------------------------------------------------------------------------
+生成 AI で作った画像
+--------------------------------------------------------------------------
+
+**128_item_image_variety の images/ の下の絵（武器・防具と服と装身具・消耗品・素材・道具など）は、
+作者が画像生成 AI で作った一枚絵から切り出し・縮小・減色したもの。** ほかの同梱物と同じく MIT で配る。
+生成 AI の出力にどこまで著作権が生じるかは国によって扱いが異なる。
+ここでは、作者が持つ範囲を超えて権利を主張しない。
+元の一枚絵はリポジトリの assets/item_images/ に置いてあり、同じく MIT で扱う（配布の zip には入れていない）。
+同じ MOD の data/ の下の数値（絵を選ぶための埋め込み）は、ゲームに同梱の文の埋め込みモデル
+（all-MiniLM-L6-v2、Apache License 2.0）で、作者が書いた説明文から計算したもの。モデルの重みは含めない。
+
+--------------------------------------------------------------------------
+第三者のもの
+--------------------------------------------------------------------------
+
+**131_sharp_portrait の models/face_detection_yunet_2023mar.onnx は、本プロジェクトの著作物ではない。**
+OpenCV の顔検出モデル YuNet（opencv_zoo、https://github.com/opencv/opencv_zoo）で、
+著作権は Shiqi Yu にあり、MIT License で配られている。
+同じフォルダの LICENSE.yunet.txt がその原文（著作権表示を含む）で、モデルと一緒に配る。
 
 --------------------------------------------------------------------------
 MIT が及ばないもの
@@ -151,7 +179,11 @@ AUTHORS OF THE BUNDLED MODS
                              403_npc_social_memory,
                              404_party_talk (finished jointly),
                              405_regional_economy (finished jointly),
-                             406_gemini_user_role_fix
+                             406_user_role_fix (finished jointly),
+                             407_npc_starting_equipment,
+                             408_visual_changes_based_on_equipment
+
+    わさの (Wasano)          409_fix_crafted_item_type (finished jointly)
 
   Separately, some mods of this project's own took in a proposed improvement
   (a pull request) from an outside author. The mod itself is this project's
@@ -181,6 +213,28 @@ INBOUND LICENSE FOR CONTRIBUTIONS
   If a contribution arrives without a stated license, that is settled before
   it is bundled. Anything that cannot be settled is not bundled, because it
   cannot be undone once shipped. See docs/CONTRIBUTING.md.
+
+AI-GENERATED IMAGES
+  The images under images/ in 128_item_image_variety (weapons, armor,
+  clothing and jewelry, consumables, materials, tools and more) were cut out,
+  scaled and recoloured from sprite sheets
+  the author made with an image-generation AI. They ship under the MIT
+  License like everything else here. How far copyright subsists in AI output
+  differs between jurisdictions; this project claims no rights beyond those
+  the author holds. The original sheets are kept in assets/item_images/ in
+  the repository under the same terms; they are not part of the release zips.
+  The numbers under data/ in the same mod (embeddings used to pick images)
+  were computed from the author's captions with the sentence-embedding model
+  bundled with the game (all-MiniLM-L6-v2, Apache License 2.0); the model
+  weights are not included.
+
+THIRD-PARTY FILES
+  models/face_detection_yunet_2023mar.onnx in 131_sharp_portrait is not this
+  project's work. It is YuNet, OpenCV's face detection model from opencv_zoo
+  (https://github.com/opencv/opencv_zoo), Copyright (c) 2020 Shiqi Yu,
+  distributed under the MIT License. Its license text, including the
+  copyright notice, is LICENSE.yunet.txt in the same folder and ships with
+  the model.
 
 NOT COVERED
   Instantale itself, its executables, its assets (images, audio, text), and

@@ -310,7 +310,7 @@ def main():
     R.begin_mod("200_beta.py")
     try:
         @ctx.patch("fakegame:targt_a")      # typo
-        def _typo(x):
+        def _typo_patch(x):
             return x
         check(False, "打ち間違えた patch が通ってしまった")
     except LookupError:
@@ -330,7 +330,7 @@ def main():
           and s["counts"]["mods"] == 2 and s["counts"]["conflicts"] == 1,
           "集計が台帳と一致: {}".format(s["counts"]))
     check(set(s) == {"counts", "by_target", "by_mod", "conflicts", "deferred",
-                     "skipped", "unresolved"},
+                     "on_demand", "skipped", "unresolved"},
           "summary の項目: {}".format(sorted(s)))
 
     print("-- 報告の見え方 --")
@@ -379,6 +379,54 @@ def main():
               "ローカル専用でない保留はクラウドでも降ろさない")
     finally:
         sys.modules.pop(cloud_mod, None)
+
+    print("=== 画面を開くまで来ないモジュールは段階適用の待ちに数えない ===")
+    # 世界の一括生成のモジュールは「開始／再開」を押すまで import されない。
+    # 待ちに数えると GUI が「段階適用の途中」と言い続け、1時間で諦めると後から開いた画面で当たらない。
+    import threading
+    import time
+    screen_mod = ml.ON_DEMAND_MODULES[0]
+    sys.modules.pop(screen_mod, None)
+    sys.modules.pop("fake_never_comes", None)
+    R._entries.append((R.DEFERRED, screen_mod + ":WorldBulkScreen.update_progress",
+                       "241_fake", screen_mod))
+    R._entries.append((R.DEFERRED, "fake_never_comes:f", "241_fake", "fake_never_comes"))
+    check(R.mark_on_demand(ml.ON_DEMAND_MODULES) == 1, "一覧のモジュール宛てだけ on_demand へ移す")
+    check(not [e for e in R.entries(R.DEFERRED) if e[3] == screen_mod],
+          "  → deferred には残らない（GUI の「段階適用の途中」に数えない）")
+    check([e[3] for e in R.entries(R.ON_DEMAND)] == [screen_mod],
+          "  → detail（待つモジュール）はそのまま: {}".format(R.entries(R.ON_DEMAND)))
+    check(R.summary()["counts"]["on_demand"] == 1, "summary に件数が出る")
+    check(any(line.startswith("on demand (1)") for line in R.format_report()),
+          "報告では deferred と別の節に出る")
+
+    saved = (ml.DEFERRED_POLL, ml.DEFERRED_TIMEOUT, ml.boot, ml._state["deferred_boots"])
+    reboots = []
+    ml.DEFERRED_POLL = 0.01
+    ml.DEFERRED_TIMEOUT = 0.05
+    ml.boot = lambda out: reboots.append(out)
+    watcher = threading.Thread(
+        target=ml._deferred_loop,
+        args=(out_dir, ml._state.get("generation"), [screen_mod, "fake_never_comes"]),
+        daemon=True)
+    try:
+        watcher.start()
+        time.sleep(0.4)
+        check(watcher.is_alive(), "時間切れの後も、画面のモジュールは見張り続ける")
+        gave_up = [e for e in R.entries(R.SKIPPED) if e[3].startswith("fake_never_comes")]
+        check(len(gave_up) == 1 and "gave up" in gave_up[0][3],
+              "起動の段階適用の分は時間切れで諦める: {}".format(gave_up))
+        check([e[3] for e in R.entries(R.ON_DEMAND)] == [screen_mod],
+              "  → 画面のモジュール宛ては諦めない")
+        sys.modules[screen_mod] = types.ModuleType(screen_mod)
+        watcher.join(5)
+        check(not watcher.is_alive() and len(reboots) == 1,
+              "画面のモジュールが来たら当て直す: {}".format(reboots))
+    finally:
+        ml.DEFERRED_POLL, ml.DEFERRED_TIMEOUT, ml.boot, ml._state["deferred_boots"] = saved
+        sys.modules.pop(screen_mod, None)
+    check(R.settle_deferred([screen_mod], "re-apply limit reached") == 1,
+          "当て直しの上限では on_demand も降ろす")
 
     print("=== MOD 専用のログ（ctx.logger）===")
     # 同じ7行が42本の MOD に写されていて、
@@ -548,6 +596,33 @@ def main():
         check(LLM.ask(ctx, "mod_q", [{"role": "user", "content": "x"}],
                       timeout=1.0) is None,
               "プロバイダが落ちても例外を通さない（None に倒す）")
+
+        # ゲームの送り口は timeout で待ちを打ち切らない（main_026 の実測）。ask も打ち切らず、過ぎたらログに出す
+        # （遅い環境で MOD の働きが毎回消えないように。VERIFICATION.md §3.101）
+        import time as _time
+
+        def slow(manager_name, message, max_tokens=None, timeout=None):
+            _time.sleep(0.6)
+            return "遅い答え"
+
+        manager.send_request_with_no_structure = slow
+        errors = []
+        logged = []
+        real_log = ctx.log
+        ctx.log = lambda msg, level="INFO": logged.append((level, msg))
+        try:
+            got = LLM.ask(ctx, "mod_q", [{"role": "user", "content": "x"}], timeout=0.2, errors=errors)
+        finally:
+            ctx.log = real_log
+        check(got == "遅い答え" and not errors,
+              "timeout 秒を過ぎても打ち切らず、返事を受け取る: {!r} {}".format(got, errors))
+        warns = [msg for level, msg in logged if level == "WARN"]
+        check(len(warns) == 2 and "still waiting" in warns[0] and "returned after" in warns[1],
+              "過ぎたときと返ったときに WARN を出す: {}".format(warns))
+        errors = []
+        manager.send_request_with_no_structure = angry
+        LLM.ask(ctx, "mod_q", [{"role": "user", "content": "x"}], timeout=1.0, errors=errors)
+        check(errors and isinstance(errors[0], RuntimeError), "送り口の例外は今までどおり errors へ: {}".format(errors))
     finally:
         sys.modules.pop(unknown, None)
         sys.modules.pop(LLM.MANAGER_MODULE, None)
@@ -641,6 +716,27 @@ def main():
     finally:
         sys.modules.pop("fakegame_loading", None)
     check(P.await_module("sys") is sys, "読み込み済みならそのまま返す")
+
+    # `__main__` は読み込み中の印を持たない。組み上がった（`InstantaleApp` の実体が在る）かで見る
+    real_main = sys.modules["__main__"]
+    building = types.ModuleType("__main__")
+    sys.modules["__main__"] = building
+    try:
+        check(P.await_module("__main__", "FreeInputStart") is None
+              and "__main__:FreeInputStart" in P.pending_owners(),
+              "__main__ を組み上げている途中でクラスがまだ無ければ None で、そのクラスを待つ")
+
+        class InstantaleApp(object):
+            pass
+        building.InstantaleApp = InstantaleApp
+        building.instantale_app = InstantaleApp()
+        check(P.await_module("__main__", "FreeInputStart") is building,
+              "組み上がった後は欠けていても返す（欠けは本物の問題）")
+        check(P.still_loading("__main__") is False, "still_loading: 組み上がった __main__ は途中ではない")
+        del building.instantale_app
+        check(P.still_loading("__main__") is True, "still_loading: 組み上がる前の __main__ は途中")
+    finally:
+        sys.modules["__main__"] = real_main
 
     print("=== on_ready(delay): 走る前に次の boot が来たら古い世代は走らない ===")
     # delay の間に注入し直す・遅れた当て直しが走る並び。
@@ -970,8 +1066,7 @@ def main():
         check(off["manifests"].get("200_probe"),
               "名乗りは残す（GUI が「消えた」ように見せない）")
         # 伏せたのは設定ではなくローダなので、**報告に出してはいけない**。
-        # 「無効化されています」「記載の無い MOD」「無効な
-        # MOD を指している」のどれで出ても、
+        # 「記載の無い MOD」で出ると、
         # 画面から見れば身に覚えのない警告になる。
         noisy = [line for line in off["problems"] + off["notes"] if "200_probe" in line]
         check(not noisy, "伏せた MOD は報告に出さない: {}".format(noisy or "出ていない"))
@@ -1000,14 +1095,20 @@ def main():
         check("100_fix" in ml.discover(dist_mods)["order"],
               "印の無い MOD は切っていても動く")
         # 切る（disabled）のと伏せる（debug）のは別物。
-        # 切ったものは**必ず見せる**。
+        # 切ったものは disabled に出るが、警告にはしない（切るのは普通の使い方）。
         put_order({"order": ["100_fix", "200_probe", "300_feature"],
                    "disabled": ["100_fix"]})
+        put_mod("300_feature", {"entry": "m.py", "after": ["100_fix"]})
         both = ml.discover(dist_mods)
         check("100_fix" in both["disabled"] and "100_fix" not in both["order"],
               "切ったものは disabled に出る（伏せたものとは別扱い）")
-        check(any("100_fix" in line for line in both["problems"] + both["notes"]),
-              "切ったことは報告する（`disabled` で切ったので見せる）")
+        noisy = [line for line in both["problems"] + both["notes"] if "100_fix" in line]
+        check(not noisy, "切ったことも、切った相手を after で指していることも報告しない: {}"
+              .format(noisy or "出ていない"))
+        put_mod("300_feature", {"entry": "m.py", "after": ["100_missing"]})
+        check(any("100_missing" in line for line in ml.discover(dist_mods)["problems"]),
+              "実体の無い名前を指していれば報告する（書き間違い）")
+        put_mod("300_feature", {"entry": "m.py", "after": ["200_probe"]})
 
         # -- 開発中の MOD（9xx）。読む条件は「順序ファイルに名前がある」かつ
         #    「デバッグモード」の2つ（TECH.md §2.6）。
@@ -1140,7 +1241,7 @@ def main():
 
     @P.wrap("fakegame:risky", safe=True)
     def after_orig(orig, x):
-        result = orig(x)
+        orig(x)
         raise RuntimeError("壊れた（orig を呼んだ後）")
 
     calls.clear()
@@ -1500,6 +1601,41 @@ def main():
     reverted = P.revert_all()
     check(reverted == 3 and victim.legacy is legacy_target,
           "剥がした後の revert_all も失敗せず全部戻す: {}".format(reverted))
+
+    print("=== 印を写し取ったゲームの包みはこちらの層と見なさない（is_ours）===")
+    # main_026 の言語の包み（`localized_request`）は `functools.wraps` で、包んだ関数の `__dict__` を写す。
+    # こちらの包みを包むと、印も `__original__` も写る（VERIFICATION.md §3.100）。
+    import functools
+    P.set_generation("gen_copy")
+    raw_sender = victim.sender = lambda m: ("raw", m)
+
+    @P.wrap("fakegame:sender")
+    def hook_sender(orig, m):
+        return ("hook",) + orig(m)
+    ours = victim.sender
+
+    def localize(fn):
+        @functools.wraps(fn)
+        def localized(m):
+            return ("localized",) + fn(m)
+        return localized
+    copy = localize(ours)
+    check(getattr(copy, P.PATCH_MARK, None) == "fakegame:sender",
+          "前提: 写しにもこちらの印が写っている")
+    check(P.is_ours(ours) and not P.is_ours(copy), "こちらの包みは真、写しは偽")
+    victim.sender = copy                           # ゲームが作り直して写しを置いた
+    check(P.unwrap_ours(copy) is copy, "unwrap_ours は写しを素の関数として返す")
+    P.set_generation("gen_copy2")
+    check(P.unwrap_ours(copy) is copy,
+          "世代が変わっても写しの __original__ をたどらない（言語の包みを剥がさない）")
+
+    @P.wrap("fakegame:sender")
+    def hook_again(orig, m):
+        return ("again",) + orig(m)
+    check(victim.sender("x") == ("again", "localized", "hook", "raw", "x"),
+          "写しの上に重ね、写しが包んだ層も残る: {}".format(victim.sender("x")))
+    P.revert_all()
+    check(victim.sender is raw_sender, "戻すと素の関数に戻る")
 
     print("=== 同梱 mod は全て名乗っている ===")
     mods_dir = os.path.join(_ROOT, "runtime", "mods")

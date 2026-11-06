@@ -10,10 +10,10 @@
     "en": "Prevents crimes committed by NPCs or third parties from being attributed to the player",
     "ja": "NPCや第三者の犯罪を主人公の犯罪として扱う誤判定を防ぐ"
   },
-  "version": "4",
+  "version": "5",
   "author": "yoshinari/tomotomo-y",
   "after": [
-    "105_fix_schema_compact",
-    "111_llm_prompt_replace"
+    "111_llm_prompt_replace",
+    "127_llm_response_speed"
   ]
 }

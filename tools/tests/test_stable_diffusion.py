@@ -1,0 +1,2143 @@
+# -*- coding: utf-8 -*-
+"""343_stable_diffusion をゲーム抜きで通す。
+
+    python tools/tests/test_stable_diffusion.py
+
+見ているのは、この MOD が自分で決めている所だけ。
+
+  倍率   … 短辺の目標と長辺の上限で決まる。縮めない・比を変えない・64 の倍数
+  既定   … すべて実測したゲームの値。既定のままの項目は書き換えない
+  当て先 … バックエンドを名指しせず、生きたパイプラインの型から出口を引く
+  印     … 種類は入口（敵か立ち絵か）、段は上の層の関数から
+  書換   … 種類ごとの寸法と段ごとのサンプラー。位置引数でも通る
+  一族   … diffusers 系は引数名を読み替え、当てられない項目は落とす
+  建つ前 … import の直後に材料（チェックポイント・TAESD・VAE・LoRA）を差し替える
+"""
+import importlib.util
+import inspect
+import io
+import json
+import os
+import sys
+import tempfile
+import types
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir, "runtime"))
+MODS_DIR = os.path.join(RUNTIME_DIR, "mods")
+if RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, RUNTIME_DIR)
+
+import instantale_modloader as ml            # noqa: E402
+
+MOD_DIR = os.path.join(MODS_DIR, "343_stable_diffusion")
+MANIFEST_PATH = os.path.join(MOD_DIR, "mod.json")
+with io.open(MANIFEST_PATH, encoding="utf-8") as fh:
+    MANIFEST = json.load(fh)
+MOD_PATH = os.path.join(MOD_DIR, MANIFEST["entry"])
+
+failures = []
+
+
+def check(name, cond, detail=""):
+    print(("  ok   " if cond else "  FAIL ") + name
+          + ((" -- " + str(detail)) if detail and not cond else ""))
+    if not cond:
+        failures.append(name)
+
+
+# `from . import sizes` が通るよう、パッケージとして読み込む（`131_` の検査と同じ）。
+spec = importlib.util.spec_from_file_location(
+    "stable_diffusion_under_test", MOD_PATH, submodule_search_locations=[MOD_DIR])
+MOD = importlib.util.module_from_spec(spec)
+sys.modules["stable_diffusion_under_test"] = MOD
+spec.loader.exec_module(MOD)
+SZ = MOD.sizes          # 寸法と系統の計算は本体と道具で共有している
+
+
+# ---------------------------------------------------------------- 偽ゲーム
+class Ctx(object):
+    """ローダの `ctx` の代わり。`wrap` は対象ごとに関数を控えるだけ。"""
+
+    _mod = None
+
+    def __init__(self, out_dir, settings):
+        self.out_dir = out_dir
+        self.state_dir = os.path.join(out_dir, "state")
+        self.game_dir = out_dir          # 本物の ctx はゲームの exe の在る場所
+        self.runtime_dir = os.path.join(out_dir, "runtime")   # settings\ はこの隣
+        self.mod_dir = MOD_DIR           # 宣言（mod.json）を読む場所
+        self.settings = settings
+        self.hooks = {}
+        self.errors = []
+        self.notes = []
+        self.warnings = []
+        self.generation = "test"
+
+    def out_path(self, *parts):
+        path = os.path.join(self.out_dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def setting(self, name):
+        return self.settings[name]
+
+    def logger(self, name, **kw):
+        real = ml.ModContext.logger(self, name, **kw)
+
+        def write(message):
+            self.notes.append(str(message))
+            return real(message)
+        return write
+
+    def warner(self, tag):
+        def warn(key, message):
+            self.warnings.append((key, message))
+        return warn
+
+    def log(self, message, level="INFO"):
+        pass
+
+    def log_exc(self, message):
+        self.errors.append(message)
+
+    def refresh_status(self):
+        pass
+
+    def superseded(self):
+        return False
+
+    def on_ready(self, fn, key=None, delay=0):
+        return True            # Clock は無いので積むだけ
+
+    def wrap(self, target, required=True, safe=False, alias_scan=True):
+        def decorate(fn):
+            self.hooks[target] = fn
+            return fn
+        return decorate
+
+
+class Pipe(object):
+    """sdcpp 系の出口（引数の並びは実機の署名と同じ）。"""
+
+    def generate_image(self, prompt, negative_prompt="", width=512, height=512,
+                       cfg_scale=7.0, scheduler="default", sample_method="euler_a",
+                       sample_steps=20, seed=-1):
+        return {"width": width, "height": height, "cfg_scale": cfg_scale,
+                "scheduler": scheduler, "sample_method": sample_method,
+                "sample_steps": sample_steps, "prompt": prompt,
+                "negative_prompt": negative_prompt, "seed": seed}
+
+
+class OVPipe(object):
+    """diffusers 系の出口（引数名が違う）。"""
+
+    def __call__(self, prompt, negative_prompt="", width=512, height=512,
+                 num_inference_steps=5, guidance_scale=1.0):
+        return {"width": width, "height": height,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "prompt": prompt, "negative_prompt": negative_prompt}
+
+
+MANAGER = "image_generation.fakebackend.stable_diffusion_manager"
+CREATURE = "image_generation.fakebackend.image_generation_creature"
+
+
+def fake_backend(manager=MANAGER, creature=CREATURE, pipe=None):
+    """`managers()` と `creature_modules()` が拾う形の偽モジュールを置く。"""
+    mod = types.ModuleType(manager)
+    mod.txt2img_pipe = Pipe() if pipe is None else pipe
+    mod.load_sd_pipeline = lambda: None
+    mod.model_path_anime = "runtime/models/sd15/checkpoints/sotemix_v30.safetensors"
+    mod.taesd_path = "runtime/models/sd15/taesd/diffusion_pytorch_model.safetensors"
+    mod.vae_path = "runtime/models/sd15/vae/vae.safetensors"
+    mod.lora_dir = "runtime/models/sd15/lora"
+    for fn in MOD.STAGE_FUNCS:
+        setattr(mod, fn, lambda *a, **kw: None)
+    sys.modules[manager] = mod
+
+    entry = types.ModuleType(creature)
+    for fn in MOD.KIND_FUNCS:
+        setattr(entry, fn, lambda *a, **kw: None)
+    sys.modules[creature] = entry
+    return mod, entry
+
+
+def cleanup(*names):
+    for name in names:
+        sys.modules.pop(name, None)
+    sys.meta_path[:] = [f for f in sys.meta_path
+                        if getattr(f, MOD.OBSERVER_MARK, None) is None]
+    MOD.MARKS.kind = None
+    MOD.MARKS.func = None
+
+
+def fresh(_state_dir=None, **settings):
+    values = {key: MANIFEST["settings"][key]["default"]
+              for key in MANIFEST["settings"]}
+    values.update(settings)
+    ctx = Ctx(tempfile.mkdtemp(prefix="stable_diffusion_test_"), values)
+    if _state_dir:
+        ctx.state_dir = _state_dir      # 規則の置き場（`state\`）を差し替える
+    MOD.apply(ctx)
+    return ctx
+
+
+def observer():
+    found = [f for f in sys.meta_path if getattr(f, MOD.OBSERVER_MARK, None)]
+    return found[0] if found else None
+
+
+# ---------------------------------------------------------------- 倍率
+print("倍率（短辺の目標と長辺の上限）")
+check("ゲームの値のままなら 1.0", SZ.size_scale("portrait", 512, 1024) == 1.0)
+check("短辺だけ上げても長辺の上限で止まる",
+      SZ.size_scale("portrait", 832, 1024) == 1.0,
+      SZ.size_scale("portrait", 832, 1024))
+check("長辺も上げれば短辺の目標どおり",
+      SZ.size_scale("portrait", 832, 1664) == 1.625,
+      SZ.size_scale("portrait", 832, 1664))
+check("先に当たるのは小さいほう",
+      SZ.size_scale("portrait", 1024, 1280) == 1.25,
+      SZ.size_scale("portrait", 1024, 1280))
+check("下げても縮めない", SZ.size_scale("portrait", 256, 512) == 1.0)
+check("知らない種類は 1.0", SZ.size_scale("item", 2048, 2048) == 1.0)
+
+print("丸め")
+check("64 の倍数へ丸める", SZ.round_side(300) == 320, SZ.round_side(300))
+check("片辺は 2048 で止める", SZ.round_side(9999) == SZ.MAX_SIDE)
+check("1.0 は触らない", SZ.scaled(512, 1024, 1.0) is None)
+check("1.625 倍（比を保つ）", SZ.scaled(512, 1024, 1.625) == (832, 1664),
+      SZ.scaled(512, 1024, 1.625))
+check("1段目も同じ比で上がる", SZ.scaled(256, 512, 1.625) == (448, 832),
+      SZ.scaled(256, 512, 1.625))
+check("上限に当たったら倍率を下げる（歪ませない）",
+      SZ.scaled(512, 1024, 4.0) == (1024, 2048), SZ.scaled(512, 1024, 4.0))
+check("整数でない寸法は触らない", SZ.scaled(None, 512, 2.0) is None)
+
+print("既定値")
+for key in MANIFEST["settings"]:
+    check("{} の既定値がコードと mod.json で同じ".format(key),
+          getattr(MOD, key) == MANIFEST["settings"][key]["default"])
+check("サンプラーの既定は実測したゲームの値",
+      SZ.GAME_SAMPLER["stage1"] == (MOD.STAGE1_METHOD, MOD.STAGE1_STEPS,
+                                     MOD.STAGE1_CFG, MOD.STAGE1_SCHEDULER)
+      and SZ.GAME_SAMPLER["stage2"] == (MOD.STAGE2_METHOD, MOD.STAGE2_STEPS,
+                                         MOD.STAGE2_CFG, MOD.STAGE2_SCHEDULER)
+      and SZ.GAME_SAMPLER["lcm"] == (MOD.LCM_METHOD, MOD.LCM_STEPS,
+                                      MOD.LCM_CFG, MOD.LCM_SCHEDULER))
+
+# ---------------------------------------------------------------- 当て先
+print("当て先（バックエンドを名指ししない）")
+mod, entry = fake_backend()
+ctx = fresh(PORTRAIT_SHORT=832, PORTRAIT_MAX_LONG=1664, STAGE1_STEPS=28)
+exit_target = "{}:Pipe.generate_image".format(Pipe.__module__)
+check("出口を生きたパイプラインの型から引いた", exit_target in ctx.hooks, sorted(ctx.hooks))
+for fn in MOD.STAGE_FUNCS:
+    check("段の印 {} を包んだ".format(fn), "{}:{}".format(MANAGER, fn) in ctx.hooks)
+for fn in MOD.KIND_FUNCS:
+    check("種類の印 {} を包んだ".format(fn), "{}:{}".format(CREATURE, fn) in ctx.hooks)
+check("モジュール名を決め打ちしていない",
+      not any("sdcpp" in t for t in ctx.hooks), sorted(ctx.hooks))
+
+# ---------------------------------------------------------------- 印と書換
+print("印（種類と段）")
+pipe = mod.txt2img_pipe
+hook = ctx.hooks[exit_target]
+
+
+def run(kind=None, func=None, **kwargs):
+    MOD.MARKS.kind = kind
+    MOD.MARKS.func = func
+    return hook(Pipe.generate_image, pipe, **kwargs)
+
+
+seen_kind = {}
+ctx.hooks["{}:generate_enemy_image".format(CREATURE)](
+    lambda *a, **kw: seen_kind.update(kind=MOD.MARKS.kind))
+check("入口を通ると種類の印が立つ", seen_kind.get("kind") == "enemy", seen_kind)
+check("入口を出ると印が戻る", MOD.MARKS.kind is None, MOD.MARKS.kind)
+
+seen_func = {}
+ctx.hooks["{}:image_to_image_anime".format(MANAGER)](
+    lambda *a, **kw: seen_func.update(func=MOD.MARKS.func))
+check("上の層を通ると関数の印が立つ", seen_func.get("func") == "image_to_image_anime", seen_func)
+
+print("段の決め方（関数で決め打ちしない）")
+check("lcm の関数は LCM の段（種類は見ない）",
+      MOD.stage_of("generate_image_real_lcm") == "lcm")
+check("img2img は2段目", MOD.stage_of("image_to_image_anime") == "stage2")
+check("それ以外は1段目", MOD.stage_of("generate_image_anime") == "stage1")
+check("関数が分からなければ段も決めない", MOD.stage_of(None) is None)
+
+
+def _wrapped_twice(fn):
+    """ローダの包みの形（`__original__` の連鎖）を2層まねる。"""
+    def outer(*a, **kw):
+        return fn(*a, **kw)
+    outer.__original__ = fn
+
+    def outermost(*a, **kw):
+        return outer(*a, **kw)
+    outermost.__original__ = outer
+    return outermost
+
+
+check("署名は前の世代の包みを剥がして読む",
+      "width" in inspect.signature(MOD.unwrapped(_wrapped_twice(Pipe.generate_image))).parameters)
+
+print("寸法とサンプラーの書き換え")
+got = run("portrait", "generate_image_anime", prompt="p", width=256, height=512)
+check("立ち絵の1段目が目標の比で上がる", (got["width"], got["height"]) == (448, 832), got)
+check("既定と違う項目だけ書き換わる（steps）", got["sample_steps"] == 28, got)
+check("既定のままの項目は触らない（method / cfg / scheduler）",
+      got["sample_method"] == "euler_a" and got["cfg_scale"] == 7.0
+      and got["scheduler"] == "default", got)
+check("プロンプトは触らない", got["prompt"] == "p")
+
+got = run("portrait", "image_to_image_anime", prompt="p", width=512, height=1024)
+check("立ち絵の2段目も同じ比で上がる", (got["width"], got["height"]) == (832, 1664), got)
+
+got = run("enemy", "generate_image_anime", prompt="p", width=256, height=512)
+check("敵は別の設定（既定なので触らない）",
+      (got["width"], got["height"]) == (256, 512), got)
+
+got = run("background", "generate_image_real_lcm", prompt="p", width=1024, height=512)
+check("背景も既定なので触らない", (got["width"], got["height"]) == (1024, 512), got)
+
+got = run("enemy", "generate_image_real_lcm", prompt="p", width=512, height=512)
+check("敵は正方形 512x512 が素（既定なので触らない）",
+      (got["width"], got["height"]) == (512, 512), got)
+check("敵の素は正方形として持っている", SZ.GAME_SIZE["enemy"] == (512, 512),
+      SZ.GAME_SIZE["enemy"])
+check("敵の短辺を上げれば正方形のまま上がる",
+      SZ.scaled(512, 512, SZ.size_scale("enemy", 768, 768)) == (768, 768),
+      SZ.size_scale("enemy", 768, 768))
+
+MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_anime"
+got = hook(Pipe.generate_image, pipe, "p", "n", 256, 512)
+check("位置引数で来ても書き換わる", (got["width"], got["height"]) == (448, 832), got)
+
+print("系統の見分け（中身で決める）")
+import struct as _struct  # noqa: E402
+
+
+def fake_checkpoint(names, suffix):
+    """safetensors のヘッダだけを持つ偽のチェックポイント。"""
+    head = json.dumps({n: {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}
+                       for n in names}).encode("utf-8")
+    path = os.path.join(tempfile.mkdtemp(prefix="ckpt_"), "model" + suffix)
+    with io.open(path, "wb") as fh:
+        fh.write(_struct.pack("<Q", len(head)))
+        fh.write(head)
+        fh.write(bytes(2))
+    return path
+
+
+sd15_path = fake_checkpoint(["cond_stage_model.transformer.x",
+                             "model.diffusion_model.input_blocks.0.0.weight"], ".safetensors")
+sdxl_path = fake_checkpoint(["conditioner.embedders.1.model.text_projection",
+                             "model.diffusion_model.label_emb.0.0.weight"], ".safetensors")
+check("SD1.5 を中身で見分ける", SZ.family_of(sd15_path) == "sd15", SZ.family_of(sd15_path))
+check("SDXL を中身で見分ける", SZ.family_of(sdxl_path) == "sdxl", SZ.family_of(sdxl_path))
+check("読めないファイルは None", SZ.family_of(__file__) is None)
+check("無いファイルは None", SZ.family_of(sd15_path + ".missing") is None)
+
+print("無難な寸法（助言の計算。値は動かさない）")
+check("SDXL に 512x1024 は小さいので上げる",
+      SZ.safe_size(512, 1024, "sdxl") == (704, 1344), SZ.safe_size(512, 1024, "sdxl"))
+check("上げた先は下限（0.9 メガピクセル）を割らない",
+      704 * 1344 >= SZ.SDXL_MIN_PIXELS, 704 * 1344)
+check("下げた先は上限（1.1 メガピクセル）を超えない",
+      SZ.safe_size(1024, 2048, "sd15")[0] * SZ.safe_size(1024, 2048, "sd15")[1]
+      <= SZ.SD15_MAX_PIXELS, SZ.safe_size(1024, 2048, "sd15"))
+check("SDXL の 1024x2048 はそのまま", SZ.safe_size(1024, 2048, "sdxl") is None)
+check("SD1.5 の 1024x2048 は下げる",
+      SZ.safe_size(1024, 2048, "sd15") is not None, SZ.safe_size(1024, 2048, "sd15"))
+check("SD1.5 の素（512x1024）はそのまま", SZ.safe_size(512, 1024, "sd15") is None)
+check("系統が分からなければ触らない", SZ.safe_size(512, 1024, None) is None)
+
+print("プロンプトの規則（元 MOD の ini の節に当たる）")
+RB = MOD.rulebook
+RULES = {
+    "lora_map": [{"enabled": True, "from": "LCM_LoRA_Weights_SD15", "to": "off"},
+                 {"enabled": True, "from": "oldStyle", "to": "newStyle:0.7"}],
+    "remove": [{"enabled": True, "kind": "portrait", "target": "prompt",
+                "text": "medieval, watercolor"}],
+    "replace": [{"enabled": True, "kind": "background", "target": "prompt",
+                 "text": "cyberpunk, {prompt}, neon"}],
+    "add": [{"enabled": True, "kind": "portrait", "target": "prompt",
+             "when": "1boy/male/man", "text": "<lora:maleStyle:0.8>"},
+            {"enabled": True, "kind": "portrait", "target": "prompt",
+             "when": "!1boy/!male/!man", "text": "<lora:femaleStyle:0.8>"},
+            {"enabled": False, "kind": "portrait", "target": "prompt",
+             "text": "切った行"},
+            {"enabled": True, "kind": "any", "target": "negative",
+             "text": "bad hands"}],
+    "skip_upscale": [{"enabled": True, "kind": "any", "when": "pixel art/sprite"}],
+}
+check("条件は単語境界つき（male は female に当たらない）",
+      RB.matches("male", "a female knight") is False)
+check("条件は / でどれか1つ", RB.matches("1boy/male/man", "a young man") is True)
+check("! は含まれないことが条件", RB.matches("!male", "a female knight") is True)
+check("! は全部満たす必要がある",
+      RB.matches("!male/!man", "a young man") is False)
+check("空の条件はいつも成立", RB.matches("", "なんでも") is True)
+
+check("除去は区画単位の完全一致",
+      RB.remove_tags("solo, medieval, watercolor painting, 1boy",
+                     "medieval, watercolor") == "solo, watercolor painting, 1boy",
+      RB.remove_tags("solo, medieval, watercolor painting, 1boy", "medieval, watercolor"))
+GAME_NEG = "photoreal, (nsfw, worst quality, low quality:1.4), thighs, nude"
+check("重みの括弧の中の区画も当たる（先頭の括弧は次の区画へ）",
+      RB.remove_tags(GAME_NEG, "nsfw")
+      == "photoreal, (worst quality, low quality:1.4), thighs, nude",
+      RB.remove_tags(GAME_NEG, "nsfw"))
+check("括弧の末尾の区画を消すと :重み) は前の区画へ",
+      RB.remove_tags(GAME_NEG, "low quality")
+      == "photoreal, (nsfw, worst quality:1.4), thighs, nude",
+      RB.remove_tags(GAME_NEG, "low quality"))
+check("真ん中の区画はそのまま落ちる",
+      RB.remove_tags(GAME_NEG, "worst quality")
+      == "photoreal, (nsfw, low quality:1.4), thighs, nude",
+      RB.remove_tags(GAME_NEG, "worst quality"))
+check("括弧が閉じた1区画は丸ごと消える",
+      RB.remove_tags("a, (nsfw:1.4), b", "nsfw") == "a, b",
+      RB.remove_tags("a, (nsfw:1.4), b", "nsfw"))
+check("指定側に飾りが付いていても本体で比べる",
+      RB.remove_tags(GAME_NEG, "(nsfw:1.2)")
+      == "photoreal, (worst quality, low quality:1.4), thighs, nude")
+check("括弧の中身を全部消すと括弧ごと消える",
+      RB.remove_tags(GAME_NEG, "nsfw, worst quality, low quality")
+      == "photoreal, thighs, nude",
+      RB.remove_tags(GAME_NEG, "nsfw, worst quality, low quality"))
+check("付け替え（off で外す）",
+      RB.remap_lora("a, <lora:LCM_LoRA_Weights_SD15:1>, b",
+                    [("LCM_LoRA_Weights_SD15", "off")]) == "a, , b",
+      RB.remap_lora("a, <lora:LCM_LoRA_Weights_SD15:1>, b", [("LCM_LoRA_Weights_SD15", "off")]))
+check("付け替え（名前と重みを差し替え）",
+      RB.remap_lora("<lora:oldStyle:1>", [("oldStyle", "newStyle:0.7")])
+      == "<lora:newStyle:0.7>")
+check("知らない名前は触らない",
+      RB.remap_lora("<lora:keepMe:1>", [("other", "off")]) == "<lora:keepMe:1>")
+
+got = RB.rewrite(RULES, "portrait", "prompt",
+                 "solo, medieval, 1boy, watercolor, silver hair",
+                 "solo, medieval, 1boy, watercolor, silver hair")
+check("立ち絵: 除去と条件つき追加が当たる",
+      got == "solo, 1boy, silver hair, <lora:maleStyle:0.8>", got)
+check("切った行は当たらない", "切った行" not in (got or ""))
+got = RB.rewrite(RULES, "portrait", "prompt",
+                 "solo, young woman, watercolor", "solo, young woman, watercolor")
+check("条件が反対なら別の行が当たる", "femaleStyle" in (got or ""), got)
+got = RB.rewrite(RULES, "background", "prompt",
+                 "outdoor, <lora:LCM_LoRA_Weights_SD15:1>, masterpiece",
+                 "outdoor, <lora:LCM_LoRA_Weights_SD15:1>, masterpiece")
+check("背景: 置換に {prompt} が埋まり、付け替えの穴も塞がる",
+      got == "cyberpunk, outdoor, masterpiece, neon", got)
+got = RB.rewrite(RULES, "enemy", "negative", "worst quality", "worst quality")
+check("ネガティブ側にも当たる（any の行）", got == "worst quality, bad hands", got)
+check("当たる行が無ければ触らない",
+      RB.rewrite(RB.empty(), "portrait", "prompt", "a, b", "a, b") is None)
+check("skip の条件", RB.skip_upscale(RULES, "portrait", "pixel art of a cat") is True
+      and RB.skip_upscale(RULES, "portrait", "a cat") is False)
+
+print("規則がフック越しに効く")
+rules_dir = tempfile.mkdtemp(prefix="stable_diffusion_rules_")
+os.makedirs(os.path.join(rules_dir, RB.STATE_DIRNAME))
+io.open(RB.rules_path(rules_dir), "w", encoding="utf-8").write(
+    json.dumps(RULES, ensure_ascii=False))
+ctx_rules = fresh(PORTRAIT_SHORT=832, PORTRAIT_MAX_LONG=1664, _state_dir=rules_dir)
+MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_anime"
+got = ctx_rules.hooks[exit_target](
+    Pipe.generate_image, pipe, prompt="solo, medieval, 1boy, watercolor",
+    width=256, height=512)
+check("出口でプロンプトが書き換わる",
+      got["prompt"] == "solo, 1boy, <lora:maleStyle:0.8>", got["prompt"])
+check("同じ回に寸法も当たる", (got["width"], got["height"]) == (448, 832), got)
+got = ctx_rules.hooks[exit_target](
+    Pipe.generate_image, pipe, prompt="pixel art of a hero",
+    width=256, height=512)
+check("skip の条件に当たると寸法を触らない",
+      (got["width"], got["height"]) == (256, 512), got)
+MOD.MARKS.kind, MOD.MARKS.func = None, "generate_image_anime"
+got = ctx_rules.hooks[exit_target](
+    Pipe.generate_image, pipe, prompt="solo, medieval, 1boy, watercolor",
+    negative_prompt="worst quality", width=256, height=512)
+check("種類が分からない回は種類つきの行を当てない（立ち絵の除去が掛からない）",
+      got["prompt"] == "solo, medieval, 1boy, watercolor", got["prompt"])
+check("種類が分からなくても any の行は当たる",
+      got["negative_prompt"] == "worst quality, bad hands", got["negative_prompt"])
+check("種類が分からない回は寸法も触らない", (got["width"], got["height"]) == (256, 512))
+
+print("長辺の上限は1枚ごとに当てる")
+ctx_cap = fresh(ENEMY_SHORT=1024, ENEMY_MAX_LONG=1024)
+MOD.MARKS.kind, MOD.MARKS.func = "enemy", "generate_image_real_lcm"
+got = ctx_cap.hooks[exit_target](Pipe.generate_image, pipe, prompt="p", width=512, height=512)
+check("正方形の敵は倍率どおり（512 -> 1024）", (got["width"], got["height"]) == (1024, 1024), got)
+got = ctx_cap.hooks[exit_target](Pipe.generate_image, pipe, prompt="p", width=768, height=512)
+check("huge の敵（768x512）も長辺は上限の 1024 で止まり、比は保つ",
+      (got["width"], got["height"]) == (1024, 704), got)
+check("上限を当てても縮めはしない（倍率 1.0 の種類は触らない）",
+      SZ.scaled(768, 512, 1.0, 512) is None)
+check("上限なしは今までどおり倍率だけ", SZ.scaled(768, 512, 2.0) == (1536, 1024),
+      SZ.scaled(768, 512, 2.0))
+check("上限より短い1段目には効かない（立ち絵 256x512 を 1.625 倍）",
+      SZ.scaled(256, 512, 1.625, 1664) == (448, 832), SZ.scaled(256, 512, 1.625, 1664))
+
+print("LoRA タグ")
+ctx_lora = fresh(STRIP_LORA=True)
+MOD.MARKS.kind, MOD.MARKS.func = "background", "generate_image_real_lcm"
+got = ctx_lora.hooks[exit_target](
+    Pipe.generate_image, pipe,
+    prompt="masterpiece, outdoor, , <lora:LCM_LoRA_Weights_SD15:1>, best quality",
+    width=1024, height=512)
+check("タグを外す", "<lora:" not in got["prompt"], got["prompt"])
+check("本文は残し、穴も塞ぐ", got["prompt"] == "masterpiece, outdoor, best quality",
+      got["prompt"])
+check("既定では外さない",
+      "<lora:" in ctx.hooks[exit_target](
+          Pipe.generate_image, pipe,
+          prompt="a, <lora:X:1>, b", width=1024, height=512)["prompt"])
+
+SDXL_RULES = {
+    "lora_map": [{"enabled": True, "from": "LCM_LoRA_Weights_SD15",
+                  "to": "LCM_LoRA_SDXL:1.0"}],
+    "add": [{"enabled": True, "kind": "portrait", "target": "prompt",
+             "text": "<lora:styleXL:0.6>"}],
+}
+sdxl_rules_dir = tempfile.mkdtemp(prefix="stable_diffusion_sdxl_rules_")
+os.makedirs(os.path.join(sdxl_rules_dir, RB.STATE_DIRNAME))
+io.open(RB.rules_path(sdxl_rules_dir), "w", encoding="utf-8").write(
+    json.dumps(SDXL_RULES, ensure_ascii=False))
+ctx_keep = fresh(STRIP_LORA=True, _state_dir=sdxl_rules_dir)
+MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_real_lcm"
+got = ctx_keep.hooks[exit_target](
+    Pipe.generate_image, pipe,
+    prompt="1boy, <lora:LCM_LoRA_Weights_SD15:1>, <lora:GameOnly:1>, solo",
+    width=512, height=1024)
+check("外すのはゲームが入れたタグだけ（付け替えた先と規則で足したものは残る）",
+      got["prompt"] == "1boy, <lora:LCM_LoRA_SDXL:1.0>, solo, <lora:styleXL:0.6>",
+      got["prompt"])
+
+print("安全弁（SDXL）")
+ctx_safe = fresh(_state_dir=sdxl_rules_dir)
+MOD.FAMILY.update({"name": "sdxl", "path": "fake"})
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_real_lcm"
+    got = ctx_safe.hooks[exit_target](
+        Pipe.generate_image, pipe,
+        prompt="1boy, <lora:LCM_LoRA_Weights_SD15:1>, solo", width=512, height=1024)
+    check("SDXL: 素のままの LCM の段は euler_a / 24 / 5.0 になる",
+          (got["sample_method"], got["sample_steps"], got["cfg_scale"])
+          == ("euler_a", 24, 5.0), got)
+    check("SDXL: ゲームのタグは外し、規則で足したタグは残す",
+          got["prompt"] == "1boy, <lora:LCM_LoRA_SDXL:1.0>, solo, <lora:styleXL:0.6>",
+          got["prompt"])
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "image_to_image_anime"
+    got = ctx_safe.hooks[exit_target](
+        Pipe.generate_image, pipe, prompt="1boy, solo", width=512, height=1024)
+    check("SDXL: 2段目（dpmpp2m / 15 / 7.0）は壊れないので触らない",
+          got["sample_steps"] == 20 and got["cfg_scale"] == 7.0, got)
+    ctx_safe_off = fresh(MODEL_SAFETY="off", _state_dir=sdxl_rules_dir)
+    MOD.MARKS.kind, MOD.MARKS.func = "background", "generate_image_real_lcm"
+    got = ctx_safe_off.hooks[exit_target](
+        Pipe.generate_image, pipe, prompt="a, <lora:LCM_LoRA_Weights_SD15:1>, b",
+        width=1024, height=512)
+    check("off なら何もしない", "<lora:LCM_LoRA_SDXL" in got["prompt"]
+          and got["sample_steps"] == 20, got)
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+
+ctx_off = fresh()
+check("設定が全部既定なら1つも書き換えない",
+      ctx_off.hooks[exit_target](Pipe.generate_image, pipe, prompt="p",
+                                 width=256, height=512)["width"] == 256)
+GAME_PROMPT = "full-body, masterpiece,high quality, detailed face, medieval"
+check("規則が空ならプロンプトのカンマも均さない（ゲームの本文は空白無しで来る）",
+      ctx_off.hooks[exit_target](
+          Pipe.generate_image, pipe, prompt=GAME_PROMPT,
+          width=256, height=512)["prompt"] == GAME_PROMPT)
+check("規則が空なら rewrite は None",
+      RB.rewrite(RB.empty(), "portrait", "prompt", GAME_PROMPT, GAME_PROMPT) is None)
+check("当たる規則があるときは付け替えの穴を塞ぐ（tidy は残す）",
+      RB.rewrite({"lora_map": [{"enabled": True, "from": "X", "to": "off"}]},
+                 "portrait", "prompt", "a, <lora:X:1>, b", "a, <lora:X:1>, b")
+      == "a, b")
+
+# ---------------------------------------------------------------- 一族の差
+print("diffusers 系")
+cleanup(MANAGER, CREATURE)
+ov = OVPipe()
+fake_backend(pipe=ov)
+ctx_ov = fresh(BACKGROUND_SHORT=768, BACKGROUND_MAX_LONG=1536,
+               LCM_STEPS=8, LCM_CFG=2.0, LCM_METHOD="euler")
+ov_target = "{}:OVPipe.__call__".format(OVPipe.__module__)
+check("diffusers 系の出口も引けた", ov_target in ctx_ov.hooks, sorted(ctx_ov.hooks))
+MOD.MARKS.kind, MOD.MARKS.func = "background", "generate_image_real_lcm"
+got = ctx_ov.hooks[ov_target](OVPipe.__call__, ov, prompt="p", width=1024, height=512)
+check("既定では寸法を触らない（作り直しで RAM を使い切るため）",
+      (got["width"], got["height"]) == (1024, 512), got)
+check("触らなかったと警告が出る",
+      any(key == "diffusers-resize" for key, _ in ctx_ov.warnings), ctx_ov.warnings)
+
+ctx_ov2 = fresh(BACKGROUND_SHORT=768, BACKGROUND_MAX_LONG=1536, DIFFUSERS_RESIZE=True)
+MOD.MARKS.kind, MOD.MARKS.func = "background", "generate_image_real_lcm"
+got2 = ctx_ov2.hooks[ov_target](OVPipe.__call__, ov, prompt="p", width=1024, height=512)
+check("設定を入にすれば当たる", (got2["width"], got2["height"]) == (1536, 768), got2)
+check("steps と cfg は名前を読み替えて当たる",
+      got["num_inference_steps"] == 8 and got["guidance_scale"] == 2.0, got)
+check("方式は当てられないと警告して落とす",
+      any(key == "diffusers-sample_method" for key, _ in ctx_ov.warnings),
+      ctx_ov.warnings)
+ctx_ov3 = fresh(_state_dir=rules_dir)
+MOD.MARKS.kind, MOD.MARKS.func = "enemy", "generate_image_real_lcm"
+got3 = ctx_ov3.hooks[ov_target](OVPipe.__call__, ov, prompt="p",
+                                negative_prompt="worst quality", width=512, height=512)
+check("ネガティブの書き換えは diffusers 系にも同じ名前で届く",
+      got3["negative_prompt"] == "worst quality, bad hands", got3)
+check("届く項目に「当てられない」の警告を出さない",
+      not any(key == "diffusers-negative_prompt" for key, _ in ctx_ov3.warnings),
+      ctx_ov3.warnings)
+
+# ---------------------------------------------------------------- 建つ前
+print("建つ前の差し替え")
+cleanup(MANAGER, CREATURE)
+fresh(CHECKPOINT_PATH="runtime/models/sdxl/checkpoints/illustrious.safetensors",
+      TAESD_PATH="runtime/models/sdxl/taesd/taesdxl.safetensors",
+      LORA_DIR="runtime/models/sdxl/lora")
+target, _ = fake_backend("image_generation.fake2.stable_diffusion_manager",
+                         "image_generation.fake2.image_generation_creature")
+observer()._after(target.__name__, target)
+check("チェックポイントを差し替えた",
+      target.model_path_anime.endswith("illustrious.safetensors"),
+      target.model_path_anime)
+check("TAESD を差し替えた", target.taesd_path.endswith("taesdxl.safetensors"),
+      target.taesd_path)
+check("LoRA の置き場を差し替えた", target.lora_dir == "runtime/models/sdxl/lora",
+      target.lora_dir)
+check("空のままの材料は触らない", target.vae_path.endswith("vae.safetensors"),
+      target.vae_path)
+
+print("建てるたびに書く（同じプロセスで2回目のワールド選択）")
+cleanup("image_generation.fake2.stable_diffusion_manager",
+        "image_generation.fake2.image_generation_creature")
+again, _ = fake_backend("image_generation.fake2.stable_diffusion_manager",
+                        "image_generation.fake2.image_generation_creature")
+ctx_again = fresh(CHECKPOINT_PATH="runtime/models/sdxl/checkpoints/second.safetensors")
+build_target = "image_generation.fake2.stable_diffusion_manager:load_sd_pipeline"
+check("load_sd_pipeline を包んだ", build_target in ctx_again.hooks, sorted(ctx_again.hooks))
+built = []
+ctx_again.hooks[build_target](lambda: built.append(again.model_path_anime))
+check("建てる直前に材料が書き換わっている（import は走っていない）",
+      built == ["runtime/models/sdxl/checkpoints/second.safetensors"], built)
+
+print("建つ前に出口を包む・建てている間の注入し直し（版26）")
+
+
+class EarlySD(object):
+    """sdcpp の manager がモジュール変数に持つクラスの代わり。"""
+
+    def generate_image(self, prompt, negative_prompt="", width=512, height=512,
+                       cfg_scale=7.0, scheduler="default", sample_method="euler_a",
+                       sample_steps=20, seed=-1):
+        return {"width": width, "height": height, "prompt": prompt}
+
+
+class LatePipe(object):
+    """建ってから初めて型が分かる出口（diffusers 系の `__call__`）。"""
+
+    def __call__(self, prompt, negative_prompt="", width=512, height=512,
+                 num_inference_steps=5, guidance_scale=1.0):
+        return {"width": width, "height": height, "prompt": prompt}
+
+
+EarlySD.__module__ = LatePipe.__module__ = "fake_sdcpp.stable_diffusion"
+cleanup("image_generation.fake2.stable_diffusion_manager",
+        "image_generation.fake2.image_generation_creature")
+early_mod, _ = fake_backend("image_generation.fake5.stable_diffusion_manager",
+                            "image_generation.fake5.image_generation_creature", pipe=None)
+early_mod.txt2img_pipe = None
+early_mod.StableDiffusion = EarlySD
+ctx_early = fresh(PORTRAIT_SHORT=832, PORTRAIT_MAX_LONG=1664)
+early_target = "fake_sdcpp.stable_diffusion:EarlySD.generate_image"
+check("パイプラインが無くても manager のクラスから出口を包む", early_target in ctx_early.hooks,
+      sorted(t for t in ctx_early.hooks if "fake_sdcpp" in t))
+check("ありふれた __call__ はクラスからは包まない",
+      not any(t.endswith(".__call__") for t in ctx_early.hooks if "fake_sdcpp" in t))
+MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_anime"
+got = ctx_early.hooks[early_target](EarlySD.generate_image, EarlySD(), prompt="p", width=256, height=512)
+check("建つ前に包んだ出口でも寸法が当たる", (got["width"], got["height"]) == (448, 832), got)
+
+ctx_new = fresh()                          # 建てている間に注入し直した
+ctx_early.superseded = lambda: True
+late_target = "fake_sdcpp.stable_diffusion:LatePipe.__call__"
+early_build = "image_generation.fake5.stable_diffusion_manager:load_sd_pipeline"
+ctx_early.hooks[early_build](lambda: setattr(early_mod, "txt2img_pipe", LatePipe()))
+check("用済みの包みが建て終えたら、いちばん新しい apply() が出口を包む",
+      late_target in ctx_new.hooks and late_target not in ctx_early.hooks,
+      (late_target in ctx_new.hooks, late_target in ctx_early.hooks))
+cleanup("image_generation.fake5.stable_diffusion_manager",
+        "image_generation.fake5.image_generation_creature")
+
+print("種類ごとのプリセット（版26）")
+
+
+class KindBinding(object):
+    """ゲームの包みの `sd_cpp`（DLL の関数）の代わり。登録されている進み具合のコールバックを持つ。"""
+    callback = None
+
+    @staticmethod
+    def sd_set_progress_callback(callback, data):
+        KindBinding.callback = callback
+
+
+class KindSD(object):
+    """sdcpp の部品の代わり。建てた数と、どの材料で建ったかを返す。
+
+    描くと、ゲームの包みと同じく進み具合のコールバックを登録したまま残す（Python の側は消える）。
+    それが残ったまま建てると、実機と同じく access violation で落ちる。
+    """
+    built = 0
+
+    def __init__(self, model_path="", taesd_path="", vae_path="", lora_model_dir="",
+                 vae_tiling=False, diffusion_flash_attn=False):
+        if KindBinding.callback is not None:
+            raise OSError("exception: access violation writing 0x0000000000000000")
+        KindSD.built += 1
+        self.model_path, self.taesd_path = model_path, taesd_path
+        self.vae_path, self.lora_model_dir = vae_path, lora_model_dir
+        self.flash = diffusion_flash_attn
+
+    @property
+    def model(self):
+        # sdcpp の部品はモデルが読めていないと、ここで AssertionError になる（実機 2026-10-26）
+        assert self.model_path and "broken" not in self.model_path
+        return self.model_path
+
+    def generate_image(self, prompt, negative_prompt="", width=512, height=512,
+                       cfg_scale=7.0, scheduler="default", sample_method="euler_a",
+                       sample_steps=20, seed=-1):
+        KindBinding.sd_set_progress_callback("消えたコールバック", None)
+        return {"model": self.model_path, "taesd": self.taesd_path, "flash": self.flash,
+                "width": width, "height": height, "cfg_scale": cfg_scale,
+                "scheduler": scheduler, "sample_method": sample_method,
+                "sample_steps": sample_steps, "prompt": prompt}
+
+
+KindSD.__module__ = "fake_kind.stable_diffusion"
+sys.modules["fake_kind.stable_diffusion"] = types.ModuleType("fake_kind.stable_diffusion")
+sys.modules["fake_kind.stable_diffusion"].sd_cpp = KindBinding
+GAME_SOTE = "runtime/models/sd15/checkpoints/sote.safetensors"
+GAME_INIT = {"model_path": GAME_SOTE, "taesd_path": "runtime/models/sd15/taesd/t.safetensors",
+             "vae_path": "runtime/models/sd15/vae/v.safetensors",
+             "lora_model_dir": "runtime/models/sd15/lora", "diffusion_flash_attn": True}
+kind_mod, _ = fake_backend("image_generation.fake6.stable_diffusion_manager",
+                           "image_generation.fake6.image_generation_creature", pipe=None)
+kind_mod.StableDiffusion = KindSD
+kind_mod.txt2img_pipe = KindSD(**GAME_INIT)
+setattr(kind_mod, MOD.GAME_ATTR, {"model_path_anime": GAME_SOTE,
+                                   "taesd_path": GAME_INIT["taesd_path"],
+                                   "vae_path": GAME_INIT["vae_path"],
+                                   "lora_dir": GAME_INIT["lora_model_dir"]})
+kind_dir = tempfile.mkdtemp(prefix="stable_diffusion_kind_")
+MOD.presets.save_custom(kind_dir, "XL", {"CHECKPOINT_PATH": sdxl_path, "TAESD_PATH": "xl_taesd.safetensors",
+                                "PORTRAIT_SHORT": 704, "PORTRAIT_MAX_LONG": 1408,
+                                "LCM_METHOD": "dpmpp2m", "LCM_STEPS": 25, "LCM_CFG": 6.0,
+                                "LCM_SCHEDULER": "karras", "STRIP_LORA": True})
+MOD.presets.save_custom(kind_dir, "SAME", {"CHECKPOINT_PATH": "", "TAESD_PATH": "", "VAE_PATH": "",
+                                  "LORA_DIR": "", "LCM_STEPS": 30})
+os.makedirs(os.path.join(kind_dir, RB.STATE_DIRNAME), exist_ok=True)
+RB.save(kind_dir, {"add": [{"enabled": True, "kind": "any", "target": "prompt", "model": "sdxl",
+                            "text": "xl rule"}]})
+ctx_kind = fresh(_state_dir=kind_dir, KIND_PRESETS=True, PORTRAIT_PRESET="XL",
+                 ENEMY_PRESET="SAME", BACKGROUND_PRESET="")
+ctx_kind.game_dir = os.path.dirname(sd15_path)
+kind_exit = "fake_kind.stable_diffusion:KindSD.generate_image"
+kind_init = "fake_kind.stable_diffusion:KindSD.__init__"
+check("部品の作りを控えるために __init__ も包む", kind_init in ctx_kind.hooks,
+      sorted(t for t in ctx_kind.hooks if "fake_kind" in t))
+game_pipe = kind_mod.txt2img_pipe
+ctx_kind.hooks[kind_init](lambda self, **kw: None, game_pipe, **GAME_INIT)
+check("ゲームが建てたときの引数を部品のクラスに控える",
+      getattr(KindSD, MOD.INIT_ATTR, None) == GAME_INIT, getattr(KindSD, MOD.INIT_ATTR, None))
+MOD.MARKS.building = True
+ctx_kind.hooks[kind_init](lambda self, **kw: None, game_pipe, model_path="other")
+MOD.MARKS.building = False
+check("343 が自分で建てる部品は控えを上書きしない",
+      getattr(KindSD, MOD.INIT_ATTR, None) == GAME_INIT)
+MOD.FAMILY.update({"name": "sd15", "path": GAME_SOTE})
+built_before = KindSD.built
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_real_lcm"
+    game_pipe.generate_image(prompt="ゲームが先に描いた絵")   # コールバックが残る
+    got = ctx_kind.hooks[kind_exit](KindSD.generate_image, game_pipe,
+                                    prompt="young man, <lora:LCM_LoRA_Weights_SD15:1>",
+                                    width=512, height=1024)
+    check("ゲームが描いた後でも、残ったコールバックを外して部品を建てる",
+          KindSD.built == built_before + 1
+          and not any(key.startswith("kind-preset-build") for key, _m in ctx_kind.warnings),
+          (KindSD.built, built_before, ctx_kind.warnings))
+    check("割り当てた種類はプリセットのチェックポイントの部品で描く",
+          got["model"] == sdxl_path and got["taesd"] == "xl_taesd.safetensors", got)
+    check("部品はゲームと同じ作り（控えた引数）で建てる", got["flash"] is True, got)
+    check("寸法とサンプラーはプリセットの値",
+          (got["width"], got["height"]) == (704, 1408)
+          and (got["sample_method"], got["sample_steps"], got["cfg_scale"], got["scheduler"])
+          == ("dpmpp2m", 25, 6.0, "karras"), got)
+    check("LoRA タグの除去はプリセットの値（SDXL でゲームの LCM LoRA を外す）",
+          "<lora:" not in got["prompt"], got["prompt"])
+    check("規則のモデルの条件は描く部品のモデルで選ぶ（sdxl の行が当たる）",
+          got["prompt"].endswith("xl rule"), got["prompt"])
+    ctx_kind.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="again",
+                              width=512, height=1024)
+    check("部品は1回だけ建てて使い回す", KindSD.built == built_before + 1,
+          (KindSD.built, built_before))
+    MOD.MARKS.kind = "background"
+    got = ctx_kind.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="castle",
+                                    width=1024, height=512)
+    check("割り当てが無い種類はゲームの部品とこの画面の設定で描く",
+          got["model"] == GAME_SOTE and (got["width"], got["height"]) == (1024, 512)
+          and got["prompt"] == "castle", got)
+    MOD.MARKS.kind = "enemy"
+    got = ctx_kind.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="wolf",
+                                    width=512, height=512)
+    check("材料がゲームと同じプリセットはゲームの部品で描く（建てない）",
+          got["model"] == GAME_SOTE and KindSD.built == built_before + 1, (got, KindSD.built))
+    check("材料が同じでも値はプリセットのもの", got["sample_steps"] == 30, got)
+    ctx_kind.settings["PORTRAIT_PRESET"] = "NOPE"
+    ctx_missing = fresh(_state_dir=kind_dir, KIND_PRESETS=True, PORTRAIT_PRESET="NOPE")
+    MOD.MARKS.kind = "portrait"
+    got = ctx_missing.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="p",
+                                       width=512, height=1024)
+    check("プリセットが見つからなければ、この画面の設定で描いて知らせる",
+          got["model"] == GAME_SOTE
+          and any(key.startswith("kind-preset-missing") for key, _m in ctx_missing.warnings),
+          (got, ctx_missing.warnings))
+    ctx_off = fresh(_state_dir=kind_dir, KIND_PRESETS=False, PORTRAIT_PRESET="XL")
+    got = ctx_off.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="p",
+                                   width=512, height=1024)
+    check("使う設定が切なら、割り当てが残っていても使わない",
+          got["model"] == GAME_SOTE and (got["width"], got["height"]) == (512, 1024), got)
+    MOD.presets.save_custom(kind_dir, "XL2", {"CHECKPOINT_PATH": sd15_path,
+                                               "TAESD_PATH": "other_taesd.safetensors"})
+    ctx_swap = fresh(_state_dir=kind_dir, KIND_PRESETS=True, PORTRAIT_PRESET="XL2")
+    got = ctx_swap.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="p",
+                                    width=512, height=1024)
+    cache = KindSD.__dict__.get(MOD.PIPES_ATTR) or {}
+    check("割り当てを替えると、どこにも割り当てられていない部品は外す",
+          got["model"] == sd15_path and len(cache) == 1
+          and [os.path.basename(k[0]) for k in cache] == [os.path.basename(sd15_path)],
+          [k[0] for k in cache])
+    # ゲームのモデルが分からないまま（控えが空）なら建てない
+    setattr(kind_mod, MOD.GAME_ATTR, {})
+    MOD.presets.save_custom(kind_dir, "EMPTY", {"CHECKPOINT_PATH": "", "TAESD_PATH": "x.safetensors"})
+    built_now = KindSD.built
+    ctx_empty = fresh(_state_dir=kind_dir, KIND_PRESETS=True, BACKGROUND_PRESET="EMPTY")
+    MOD.MARKS.kind = "background"
+    got = ctx_empty.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="p",
+                                     width=1024, height=512)
+    check("チェックポイントが空でゲームのモデルも分からなければ、建てずにこの画面の設定で描く",
+          got["model"] == GAME_SOTE and KindSD.built == built_now
+          and any(key.startswith("kind-preset-no-model") for key, _m in ctx_empty.warnings),
+          (got, KindSD.built, ctx_empty.warnings))
+    # 建てた部品にモデルが入っていなければ使わない
+    broken = os.path.join(kind_dir, "broken_model.safetensors")
+    io.open(broken, "wb").write(b"x")
+    MOD.presets.save_custom(kind_dir, "BROKEN", {"CHECKPOINT_PATH": broken})
+    ctx_broken = fresh(_state_dir=kind_dir, KIND_PRESETS=True, BACKGROUND_PRESET="BROKEN")
+    got = ctx_broken.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="p",
+                                      width=1024, height=512)
+    cache = KindSD.__dict__.get(MOD.PIPES_ATTR) or {}
+    check("建てた部品にモデルが入っていなければ使わず、この画面の設定で描く",
+          got["model"] == GAME_SOTE and not any("broken" in k[0] for k in cache)
+          and any(key.startswith("kind-preset-build") for key, _m in ctx_broken.warnings),
+          (got, [k[0] for k in cache], ctx_broken.warnings))
+    built_now = KindSD.built
+    got = ctx_broken.hooks[kind_exit](KindSD.generate_image, game_pipe, prompt="p",
+                                      width=1024, height=512)
+    check("建てられなかった部品は、同じプロセスでは建て直さない",
+          got["model"] == GAME_SOTE and KindSD.built == built_now, (got, KindSD.built, built_now))
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+    MOD.MARKS.kind, MOD.MARKS.func = None, None
+cleanup("image_generation.fake6.stable_diffusion_manager",
+        "image_generation.fake6.image_generation_creature")
+
+print("ゲームの元のモデルの控え（版26）")
+ctrl_mod, _ = fake_backend("image_generation.fake7.stable_diffusion_manager",
+                           "image_generation.fake7.image_generation_creature", pipe=None)
+ctrl_mod.model_path_anime = ""              # 読み込まれた直後は空
+ctx_ctrl = fresh(CHECKPOINT_PATH=sdxl_path)
+build7 = "image_generation.fake7.stable_diffusion_manager:load_sd_pipeline"
+ctx_ctrl.hooks[build7](lambda: None)
+kept = getattr(ctrl_mod, MOD.GAME_ATTR, {})
+check("空の値は控えない", "model_path_anime" not in kept, kept)
+ctrl_mod.model_path_anime = GAME_SOTE        # ゲームが建てる直前に設定のモデルを入れる
+ctx_ctrl.hooks[build7](lambda: None)
+kept = getattr(ctrl_mod, MOD.GAME_ATTR, {})
+check("ゲームが入れた値は、343 が書き換える前に控える",
+      kept.get("model_path_anime") == GAME_SOTE and ctrl_mod.model_path_anime == sdxl_path, kept)
+ctx_ctrl.hooks[build7](lambda: None)
+check("343 の値は控えにしない（ゲームの値のまま）",
+      getattr(ctrl_mod, MOD.GAME_ATTR, {}).get("model_path_anime") == GAME_SOTE)
+cleanup("image_generation.fake7.stable_diffusion_manager",
+        "image_generation.fake7.image_generation_creature")
+
+print("差し替えが届いていないと知らせる（既に建っている回）")
+
+
+def only_fake(name):
+    """偽のバックエンドを1つだけ残す。
+
+    `attach()` は載っている manager を全部見るので、前の節の偽が残っていると
+    警告が複数回数えられる（本物の `ctx.warner` は同じ鍵を1度しか出さないが、
+    ここの偽 `Ctx` は素直に全部溜める）。
+    """
+    for key in [k for k in sys.modules
+                if "image_generation.fake" in k or k in (MANAGER, CREATURE)]:
+        sys.modules.pop(key, None)
+    return fake_backend(name + ".stable_diffusion_manager",
+                        name + ".image_generation_creature")
+
+
+late, _ = only_fake("image_generation.fake6")
+late.model_path_anime = sd15_path             # ゲームが建てた SD1.5
+MOD.FAMILY.update({"name": None, "path": None})
+ctx_late = fresh(CHECKPOINT_PATH=sdxl_path)   # 建った後に注入した形
+gap = [message for key, message in ctx_late.warnings if key == "material-gap"]
+check("既に建っているのに設定が別のモデルを指していたら警告する", len(gap) == 1, ctx_late.warnings)
+check("警告に起動し直しと、選び直しでは駄目なことが出る",
+      gap and "起動し直" in gap[0] and "選び直しても建て直らない" in gap[0], gap)
+check("警告に両方の系統が出る（いま sd15 / 設定 sdxl）",
+      gap and "sd15" in gap[0] and "sdxl" in gap[0], gap)
+
+quiet, _ = only_fake("image_generation.fake7")
+quiet.txt2img_pipe = None                     # まだ建っていない
+ctx_quiet = fresh(CHECKPOINT_PATH=sdxl_path)
+check("まだ建っていなければ警告しない（次に建つときに効く）",
+      not any(key == "material-gap" for key, _ in ctx_quiet.warnings), ctx_quiet.warnings)
+only_fake("image_generation.fake8")
+ctx_same = fresh()
+check("差し替えていなければ警告しない",
+      not any(key == "material-gap" for key, _ in ctx_same.warnings), ctx_same.warnings)
+for _name in ("image_generation.fake6", "image_generation.fake7", "image_generation.fake8"):
+    cleanup(_name + ".stable_diffusion_manager", _name + ".image_generation_creature")
+fake_backend()                                # 後ろの節が使う偽を戻す
+
+print("用済みの apply() は当て直さない（包みが重ならない）")
+cleanup("image_generation.fake5.stable_diffusion_manager",
+        "image_generation.fake5.image_generation_creature")
+stale_mod, _ = fake_backend("image_generation.fake5.stable_diffusion_manager",
+                            "image_generation.fake5.image_generation_creature")
+ctx_old = fresh(PORTRAIT_SHORT=832, PORTRAIT_MAX_LONG=1664)
+old_build = "image_generation.fake5.stable_diffusion_manager:load_sd_pipeline"
+check("生きている間は当て直す", old_build in ctx_old.hooks, sorted(ctx_old.hooks)[:3])
+wrapped_before = len(ctx_old.hooks)
+ctx_old.superseded = lambda: True
+cleanup()                     # 印だけ戻す（モジュールは残す）
+ctx_old.hooks[old_build](lambda: None)
+check("用済みになったら load_sd_pipeline の包みからは当て直さない",
+      len(ctx_old.hooks) == wrapped_before, (wrapped_before, len(ctx_old.hooks)))
+check("用済みの apply() は建てる直前にも書かない",
+      stale_mod.model_path_anime.endswith("sotemix_v30.safetensors"),
+      stale_mod.model_path_anime)
+cleanup("image_generation.fake5.stable_diffusion_manager",
+        "image_generation.fake5.image_generation_creature")
+
+print("用済みの観測者は書かない")
+cleanup("image_generation.fake2.stable_diffusion_manager",
+        "image_generation.fake2.image_generation_creature")
+stale, _ = fake_backend("image_generation.fake2.stable_diffusion_manager",
+                        "image_generation.fake2.image_generation_creature")
+ctx_stale = fresh(CHECKPOINT_PATH="runtime/models/sdxl/checkpoints/stale.safetensors")
+ctx_stale.superseded = lambda: True
+observer()._after(stale.__name__, stale)
+check("自分の apply() が用済みなら材料を触らない",
+      stale.model_path_anime.endswith("sotemix_v30.safetensors"), stale.model_path_anime)
+lib = types.ModuleType("diffusers.models.something")
+observer()._after(lib.__name__, lib)
+check("manager でないモジュールでは何もしない（例外も出ない）", not ctx_stale.errors)
+
+cleanup("image_generation.fake2.stable_diffusion_manager",
+        "image_generation.fake2.image_generation_creature")
+fresh(DISABLE_TAESD=True)
+target, _ = fake_backend("image_generation.fake3.stable_diffusion_manager",
+                         "image_generation.fake3.image_generation_creature")
+observer()._after(target.__name__, target)
+check("TAESD を切ると空になる", target.taesd_path == "", target.taesd_path)
+
+cleanup("image_generation.fake3.stable_diffusion_manager",
+        "image_generation.fake3.image_generation_creature")
+keep, _ = fake_backend("image_generation.fake4.stable_diffusion_manager",
+                       "image_generation.fake4.image_generation_creature")
+fresh()
+observer()._after(keep.__name__, keep)
+check("既定なら材料を触らない",
+      keep.taesd_path.endswith("diffusion_pytorch_model.safetensors")
+      and keep.model_path_anime.endswith("sotemix_v30.safetensors"), keep.taesd_path)
+
+print("モデルの置き場とダウンロード")
+import importlib.util as _ilu  # noqa: E402
+import shutil as _shutil  # noqa: E402
+import time  # noqa: E402
+if MOD_DIR not in sys.path:
+    sys.path.insert(0, MOD_DIR)          # assets は道具と同じく隣（sizes）を素の名前で import する
+_spec = _ilu.spec_from_file_location("assets_under_test",
+                                     os.path.join(MOD_DIR, "assets.py"))
+AS = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(AS)
+
+store = tempfile.mkdtemp(prefix="stable_diffusion_models_")
+made = AS.ensure_dirs(store)
+check("系統ごとに4つのフォルダを作る", len(made) == 8, made)
+check(r"置き場は state\stable_diffusion\models\<系統>\<種類>",
+      AS.dir_of(store, "sdxl", "taesd").endswith(
+          os.path.join("stable_diffusion", "models", "sdxl", "taesd")),
+      AS.dir_of(store, "sdxl", "taesd"))
+check("同じ並びを2回作っても増えない", AS.ensure_dirs(store) == [])
+
+_shutil.copyfile(sdxl_path, os.path.join(AS.dir_of(store, "sdxl", "checkpoints"), "x.safetensors"))
+# Stable Cascade の Stage C（ゲームの stable-diffusion.cpp が読めない）。後から置いたので一番新しい。
+cascade = fake_checkpoint(["clip_txt_mapper.weight", "clf.1.weight", "down_downscalers.0.1.weight"],
+                          ".safetensors")
+_cascade_at = os.path.join(AS.dir_of(store, "sdxl", "checkpoints"), "stageC.safetensors")
+_shutil.copyfile(cascade, _cascade_at)
+os.utime(_cascade_at, (time.time() + 60, time.time() + 60))
+io.open(os.path.join(AS.dir_of(store, "sdxl", "checkpoints"), "読まない.txt"),
+        "w", encoding="utf-8").write("x")
+check("モデルの拡張子だけ数える",
+      AS.files_in(store, "sdxl", "checkpoints") == ["stageC.safetensors", "x.safetensors"],
+      AS.files_in(store, "sdxl", "checkpoints"))
+check("中身がその系統でないチェックポイントを見分ける（Stable Cascade）",
+      AS.foreign(store, "sdxl") == ["stageC.safetensors"], AS.foreign(store, "sdxl"))
+check("一番新しいものを絶対パスで引ける（系統の違うものは新しくても選ばない）",
+      AS.newest(store, "sdxl", "checkpoints").endswith("x.safetensors"),
+      AS.newest(store, "sdxl", "checkpoints"))
+check("無ければ空", AS.newest(store, "sd15", "taesd") == "")
+check("置き場の説明が系統ごとに出て、読めないチェックポイントも出る",
+      len(AS.describe(store)) == 3 and "sdxl" in AS.describe(store)[1]
+      and "stageC.safetensors" in AS.describe(store)[2], AS.describe(store))
+
+print(r"v1.18.0 の置き場（state\models\）からの移動と読み替え")
+moving = tempfile.mkdtemp(prefix="stable_diffusion_move_")
+_old_ckpt = os.path.join(moving, "models", "sdxl", "checkpoints", "old.safetensors")
+os.makedirs(os.path.dirname(_old_ckpt))
+_shutil.copyfile(sdxl_path, _old_ckpt)
+_both = os.path.join(moving, "models", "sdxl", "taesd", "same.safetensors")
+os.makedirs(os.path.dirname(_both))
+io.open(_both, "w").write("old")
+_new_both = os.path.join(AS.root_dir(moving), "sdxl", "taesd", "same.safetensors")
+os.makedirs(os.path.dirname(_new_both))
+io.open(_new_both, "w").write("new")
+moved = AS.migrate(moving)
+check("古い置き場のファイルを新しい置き場の同じ所へ移す",
+      os.path.isfile(os.path.join(AS.dir_of(moving, "sdxl", "checkpoints"), "old.safetensors"))
+      and not os.path.exists(_old_ckpt), moved)
+check("同じ名前が新しい置き場に在れば上書きしない",
+      io.open(_new_both).read() == "new" and os.path.isfile(_both), moved)
+check("空になったフォルダは消し、残したファイルのフォルダは残す",
+      not os.path.isdir(os.path.join(moving, "models", "sdxl", "checkpoints"))
+      and os.path.isdir(os.path.dirname(_both)))
+check("古い置き場が無ければ何もしない", AS.migrate(tempfile.mkdtemp()) == [])
+check("古い置き場を指す絶対パスを新しい置き場へ読み替える",
+      AS.relocate(_old_ckpt, moving)
+      == os.path.join(AS.dir_of(moving, "sdxl", "checkpoints"), "old.safetensors"),
+      AS.relocate(_old_ckpt, moving))
+check("それ以外のパスはそのまま（ゲームの相対パス・空・別の場所）",
+      AS.relocate("runtime/models/sd15/checkpoints/a.safetensors", moving)
+      == "runtime/models/sd15/checkpoints/a.safetensors"
+      and AS.relocate("", moving) == ""
+      and AS.relocate(os.path.join(moving, "modelsX", "a"), moving)
+      == os.path.join(moving, "modelsX", "a"))
+check("設定の並びはパスの項目だけ読み替える",
+      AS.relocate_values({"CHECKPOINT_PATH": _old_ckpt, "PORTRAIT_SHORT": 704}, moving)
+      == {"CHECKPOINT_PATH": AS.relocate(_old_ckpt, moving), "PORTRAIT_SHORT": 704})
+
+
+class _Response(object):
+    """ダウンロードの応答の代わり（通信しない）。"""
+
+    def __init__(self, body):
+        self._body = body
+        self._at = 0
+
+    def read(self, size):
+        chunk = self._body[self._at:self._at + size]
+        self._at += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+dest = os.path.join(AS.dir_of(store, "sdxl", "taesd"), "taesdxl.safetensors")
+ok, message = AS.download("https://例", dest,
+                          opener=lambda _url, _timeout: _Response(b"x" * (2 * 1024 * 1024)))
+check("ダウンロードすると置き場に入る", ok and os.path.isfile(dest), message)
+check("書き途中のファイルを残さない", not os.path.isfile(dest + ".part"))
+
+ok, message = AS.download("https://例", dest + "2",
+                          opener=lambda _url, _timeout: _Response(b"<html>error</html>"))
+check("小さすぎる応答は失敗にする", not ok and "小さすぎ" in message, message)
+check("失敗したら置き場を汚さない", not os.path.isfile(dest + "2"))
+
+ok, message = AS.download("https://例", dest + "3",
+                          opener=lambda _url, _timeout: (_ for _ in ()).throw(IOError("切断")))
+check("繋がらないときも例外を投げない", not ok and "ダウンロードできませんでした" in message, message)
+check("手で入れる案内に URL と置き場と名前が出る",
+      all(part in AS.manual_steps(AS.DOWNLOADS[("sdxl", "taesd")],
+                                  AS.dir_of(store, "sdxl", "taesd"))
+          for part in ("https://", "taesd", "diffusion_pytorch_model.safetensors")))
+
+print("プリセット（SD1.5 / SDXL）")
+if MOD_DIR not in sys.path:
+    sys.path.insert(0, MOD_DIR)          # presets は道具と同じく隣を素の名前で import する
+import presets as PR  # noqa: E402
+
+sd15_values, sd15_notes = PR.resolve("sd15", store)
+check("SD1.5 プリセットは元の sd15.ini の値（832 / 1216、euler_a / 24 / 5.0）",
+      sd15_values["PORTRAIT_SHORT"] == 832 and sd15_values["PORTRAIT_MAX_LONG"] == 1216
+      and sd15_values["STAGE2_METHOD"] == "euler_a" and sd15_values["STAGE2_STEPS"] == 24
+      and sd15_values["STAGE2_CFG"] == 5.0, sd15_values)
+check("SD1.5 プリセットは材料と LoRA 除去を空に戻す",
+      sd15_values["CHECKPOINT_PATH"] == "" and sd15_values["TAESD_PATH"] == ""
+      and sd15_values["STRIP_LORA"] is False and sd15_values["LCM_METHOD"] == "lcm"
+      and not sd15_notes, (sd15_values, sd15_notes))
+sdxl_values, sdxl_notes = PR.resolve("sdxl", store)
+check("SDXL プリセットは元の sdxl.ini の値（1024 / 2048、背景 704 / 1408）",
+      sdxl_values["PORTRAIT_SHORT"] == 1024 and sdxl_values["PORTRAIT_MAX_LONG"] == 2048
+      and sdxl_values["BACKGROUND_SHORT"] == 704 and sdxl_values["BACKGROUND_MAX_LONG"] == 1408,
+      sdxl_values)
+check("SDXL プリセットは実測で要ると分かった2つを足す（LoRA 除去と LCM の段）",
+      sdxl_values["STRIP_LORA"] is True
+      and (sdxl_values["LCM_METHOD"], sdxl_values["LCM_STEPS"], sdxl_values["LCM_CFG"])
+      == ("euler_a", 24, 5.0), sdxl_values)
+check("SDXL プリセットは置き場の一番新しいチェックポイントを指す（x.safetensors）",
+      sdxl_values["CHECKPOINT_PATH"].endswith("x.safetensors"), sdxl_values["CHECKPOINT_PATH"])
+check("SDXL プリセットは読めないチェックポイントを選ばなかったと注記する",
+      any("stageC.safetensors" in note for note in sdxl_notes), sdxl_notes)
+check("SDXL プリセットは置き場の TAESD を指す（ダウンロードで置いたもの）",
+      sdxl_values["TAESD_PATH"].endswith("taesdxl.safetensors"), sdxl_values["TAESD_PATH"])
+empty_store = tempfile.mkdtemp(prefix="stable_diffusion_empty_")
+sdxl_values, sdxl_notes = PR.resolve("sdxl", empty_store)
+check("置き場に無ければ空のまま注記が出る",
+      sdxl_values["CHECKPOINT_PATH"] == "" and len(sdxl_notes) == 2
+      and all("無い" in note for note in sdxl_notes), sdxl_notes)
+check("プリセットの値は全部 mod.json に宣言がある",
+      all(name in MANIFEST["settings"] for name in sdxl_values),
+      [name for name in sdxl_values if name not in MANIFEST["settings"]])
+
+print("カスタムプリセット（版26）")
+custom_dir = tempfile.mkdtemp(prefix="stable_diffusion_custom_")
+check("無ければ空", PR.load_custom(custom_dir) == [])
+ckpt = fake_checkpoint(["conditioner.embedders.1.model.x"], ".safetensors")
+ok1 = PR.save_custom(custom_dir, "WAI 1段", {"CHECKPOINT_PATH": ckpt, "PORTRAIT_SHORT": 704,
+                                            "STRIP_LORA": True}, now="t1")
+ok2 = PR.save_custom(custom_dir, "SD1.5", {"CHECKPOINT_PATH": "", "PORTRAIT_SHORT": 832}, now="t2")
+ok3 = PR.save_custom(custom_dir, "WAI 1段", {"CHECKPOINT_PATH": ckpt, "PORTRAIT_SHORT": 768,
+                                            "STRIP_LORA": True}, now="t3")
+rows = PR.load_custom(custom_dir)
+check("名前を付けて残し、同じ名前は並びの位置を保って置き換える",
+      ok1 and ok2 and ok3 and [r["name"] for r in rows] == ["WAI 1段", "SD1.5"]
+      and rows[0]["values"]["PORTRAIT_SHORT"] == 768 and rows[0]["saved"] == "t3", rows)
+check("型は保つ（数は数、真偽は真偽）",
+      isinstance(rows[0]["values"]["PORTRAIT_SHORT"], int) and rows[0]["values"]["STRIP_LORA"] is True)
+check("名前が空なら残さない", PR.save_custom(custom_dir, "  ", {}) is False)
+got, notes = PR.custom_values(PR.find_custom(custom_dir, "WAI 1段"),
+                              ["CHECKPOINT_PATH", "PORTRAIT_SHORT", "STRIP_LORA", "LCM_STEPS"])
+check("いまの項目だけ入れ、無い項目はいまの値のまま（注記する）",
+      set(got) == {"CHECKPOINT_PATH", "PORTRAIT_SHORT", "STRIP_LORA"}
+      and any("LCM_STEPS" in note for note in notes), (got, notes))
+got, notes = PR.custom_values({"name": "x", "values": {"OLD_KEY": 1, "CHECKPOINT_PATH": ckpt}},
+                              ["CHECKPOINT_PATH"])
+check("いまの版に無い項目は入れない（注記する）",
+      got == {"CHECKPOINT_PATH": ckpt} and any("OLD_KEY" in note for note in notes), notes)
+gone = os.path.join(custom_dir, "nowhere", "missing.safetensors")
+got, notes = PR.custom_values({"name": "x", "values": {"CHECKPOINT_PATH": gone, "TAESD_PATH": ""}},
+                              ["CHECKPOINT_PATH", "TAESD_PATH"])
+check("見当たらないチェックポイントは注記する（入れることは止めない）",
+      got["CHECKPOINT_PATH"] == gone and any("見つかりません" in note for note in notes), notes)
+check("消す", PR.delete_custom(custom_dir, "SD1.5")
+      and [r["name"] for r in PR.load_custom(custom_dir)] == ["WAI 1段"])
+check("無い名前は消せない", PR.delete_custom(custom_dir, "SD1.5") is False)
+io.open(PR.custom_path(custom_dir), "w", encoding="utf-8").write("{壊れた")
+check("壊れたファイルは空として読む", PR.load_custom(custom_dir) == [])
+
+print("元 MOD の ini の取り込み")
+_spec = _ilu.spec_from_file_location("iniimport_under_test",
+                                     os.path.join(MOD_DIR, "iniimport.py"))
+INI = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(INI)
+
+SAMPLE = """
+; コメント行は読まない（元 MOD と同じ扱い）
+[upscale]
+enabled=1
+goal_short=832
+max_long=1216
+round=64
+goal_short_landscape=704
+max_long_landscape=1408
+;enabled_square=0
+skip_if = pixel art/sprite
+skip_if_portrait = chibi
+
+[lora_map]
+LCM_LoRA_Weights_SD15 = off
+oldStyle = newStyle:0.7
+
+[lora_add]
+portrait  = <lora:myChar:0.7>, masterpiece
+landscape = scenery
+
+[negative_add]
+portrait = bad hands
+
+[lora_add_if]
+rule1 = portrait | 1boy/male/man | <lora:maleStyle:0.8>
+rule2 = square | !boss | <lora:mob:0.5>
+
+[prompt_remove]
+portrait = medieval, watercolor
+
+[prompt_replace]
+landscape = cyberpunk, {prompt}
+
+[sampler]
+portrait_method = dpm++2mv2
+portrait_steps = 24
+portrait_cfg = 5.0
+landscape_method = euler_a
+landscape_steps = 20
+"""
+
+settings, imported, notes = INI.convert(INI.parse(SAMPLE))
+check("解像度が種類ごとに写る",
+      settings["PORTRAIT_SHORT"] == 832 and settings["PORTRAIT_MAX_LONG"] == 1216
+      and settings["BACKGROUND_SHORT"] == 704 and settings["BACKGROUND_MAX_LONG"] == 1408
+      and settings["ENEMY_SHORT"] == 832, settings)
+check("サンプラーの名前を読み替える（dpm++2mv2 -> dpmpp2mv2）",
+      settings["STAGE1_METHOD"] == "dpmpp2mv2" and settings["STAGE2_METHOD"] == "dpmpp2mv2",
+      settings.get("STAGE1_METHOD"))
+check("portrait のサンプラーは1段目と2段目の両方へ",
+      settings["STAGE1_STEPS"] == 24 and settings["STAGE2_STEPS"] == 24)
+check("landscape のサンプラーは LCM の段へ",
+      settings["LCM_METHOD"] == "euler_a" and settings["LCM_STEPS"] == 20)
+check("コメントアウトされた行は読まない（enabled_square=0 は効かない）",
+      "ENEMY_SHORT" in settings)
+
+check("付け替えは元の綴りのまま",
+      imported["lora_map"][0]["from"] == "LCM_LoRA_Weights_SD15",
+      imported["lora_map"])
+check("種類の対応（landscape は背景、square は敵）",
+      any(r["kind"] == "background" and r["text"] == "scenery" for r in imported["add"])
+      and any(r["kind"] == "enemy" for r in imported["add"] if r.get("when")),
+      imported["add"])
+check("ネガティブ側は target で分かれる",
+      any(r["target"] == "negative" and r["text"] == "bad hands" for r in imported["add"]))
+check("条件つきの行は when と名前を持つ",
+      any(r.get("when") == "1boy/male/man" and r.get("name") == "rule1"
+          for r in imported["add"]), imported["add"])
+check("除去と置き換え",
+      imported["remove"][0]["text"] == "medieval, watercolor"
+      and imported["replace"][0]["text"] == "cyberpunk, {prompt}")
+check("skip は全体と種類別の両方",
+      sorted(r["kind"] for r in imported["skip_upscale"]) == ["any", "portrait"],
+      imported["skip_upscale"])
+check("読み替えの注記が出る", any("1段目と2段目" in note for note in notes), notes)
+check("取り込んだ規則がそのまま使える",
+      RB.rewrite(imported, "portrait", "prompt",
+                 "solo, medieval, 1boy, watercolor",
+                 "solo, medieval, 1boy, watercolor")
+      == "solo, 1boy, <lora:myChar:0.7>, masterpiece, <lora:maleStyle:0.8>",
+      RB.rewrite(imported, "portrait", "prompt", "solo, medieval, 1boy, watercolor",
+                 "solo, medieval, 1boy, watercolor"))
+
+print("道具画面の固定行（窓抜き）")
+# 固定行に欄の無い種類の行は画面に出ず、保存の組み直しで落ちる。
+# ini の `any = …` は kind=any の行になるので、any の欄が要る。
+_spec = _ilu.spec_from_file_location("stable_diffusion_tool_under_test",
+                                     os.path.join(MOD_DIR, "tool.py"))
+TOOL = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(TOOL)
+_rule_kinds = [kind for kind, _label in TOOL.RULE_LABELS]
+check("追加・除去・置き換えの固定行は規則の全種類を持つ",
+      sorted(_rule_kinds) == sorted(RB.KINDS), _rule_kinds)
+_, any_rules, _ = INI.convert(INI.parse(
+    "[negative_add]\nany = bad hands\n[prompt_remove]\nany = nsfw\n"
+    "[prompt_replace]\nany = {prompt}, x\n"))
+_shown = [(section, row["text"]) for section in ("add", "remove", "replace")
+          for row in any_rules[section]
+          if row["kind"] in _rule_kinds
+          and TOOL.find_row(any_rules[section], section, row["kind"], row["target"]) is row]
+check("取り込んだ any の行は固定行に出る（保存で消えない）",
+      sorted(_shown) == [("add", "bad hands"), ("remove", "nsfw"),
+                         ("replace", "{prompt}, x")], _shown)
+
+print("モデルで絞る（版26）")
+NOVA = ("sdxl", os.path.join("state", "models", "sdxl", "checkpoints", "novaAnimeXL_ilV190.safetensors"))
+PONY = ("sdxl", os.path.join("x", "ponyDiffusionV6XL.safetensors"))
+SOTE = ("sd15", os.path.join("runtime", "models", "sd15", "checkpoints", "sotemix_v30.safetensors"))
+check("空のモデルの条件はいつも成立", RB.model_matches("", SOTE) is True)
+check("sdxl は系統で比べる", RB.model_matches("sdxl", NOVA) and not RB.model_matches("sdxl", SOTE))
+check("ほかの語はファイル名の部分一致（大文字小文字を問わない）",
+      RB.model_matches("novaanime", NOVA) and not RB.model_matches("novaanime", PONY))
+check("! で除く", RB.model_matches("sdxl/!pony", NOVA) and not RB.model_matches("sdxl/!pony", PONY))
+check("系統が読めない回は sdxl に当たらない", RB.model_matches("sdxl", (None, None)) is False)
+check("系統が読めない回も ! だけの条件は成立", RB.model_matches("!sdxl", (None, None)) is True)
+check("拡張子は比べない", RB.model_matches("safetensors", NOVA) is False)
+MODEL_RULES = {
+    "add": [{"enabled": True, "kind": "any", "target": "prompt", "model": "sdxl", "text": "xl"},
+            {"enabled": True, "kind": "any", "target": "prompt", "text": "all"}],
+    "replace": [{"enabled": True, "kind": "portrait", "target": "prompt",
+                 "when": "woman", "text": "1girl, {prompt}"}],
+}
+check("モデルの付いた行はそのモデルのときだけ",
+      RB.rewrite(MODEL_RULES, "enemy", "prompt", "a", "a", NOVA) == "a, xl, all"
+      and RB.rewrite(MODEL_RULES, "enemy", "prompt", "a", "a", SOTE) == "a, all")
+check("モデルを渡さなければ絞らない（道具画面の一覧）",
+      RB.rewrite(MODEL_RULES, "enemy", "prompt", "a", "a") == "a, xl, all")
+check("置換にも when が効く",
+      RB.rewrite(MODEL_RULES, "portrait", "prompt", "young woman", "young woman", SOTE)
+      == "1girl, young woman, all"
+      and RB.rewrite(MODEL_RULES, "portrait", "prompt", "young man", "young man", SOTE)
+      == "young man, all")
+check("skip もモデルで絞る",
+      RB.skip_upscale({"skip_upscale": [{"enabled": True, "kind": "any", "model": "sd15",
+                                         "when": "sprite"}]}, "portrait", "sprite", NOVA) is False)
+
+print("プロンプトの雛形（版26）")
+import profiles as PF  # noqa: E402
+GAME_PORTRAIT = ("full-body, masterpiece,high quality, detailed face, watercolor, standing,"
+                 " middle-aged man, graying hair, empty background,black background,wallpaper")
+GAME_BG = "masterpiece, best quality, watercolor, highly detailed, indoor, dark stone prison cell"
+GAME_ENEMY = ("masterpiece,high quality,full body,creature,(wolf:1.1), a grey dire wolf,"
+              "(plain background,black background:1.1)")
+check("雛形の行の項目は規則の書式に在る",
+      all(set(row) <= set(RB.SECTIONS[section]) | {"enabled", "profile"}
+          for profile in PF.PROFILES for section, row in PF.rows_of(profile["key"], "m")),
+      [(section, row) for profile in PF.PROFILES for section, row in PF.rows_of(profile["key"], "m")
+       if not set(row) <= set(RB.SECTIONS[section]) | {"enabled", "profile"}])
+check("モデルの条件はチェックポイントのファイル名（無ければ sdxl）",
+      PF.model_condition(NOVA[1]) == "novaAnimeXL_ilV190" and PF.model_condition("") == "sdxl")
+ill = PF.put(RB.empty(), "illustrious", "novaAnimeXL_ilV190")
+check("入れ直しても行は増えない",
+      PF.put(ill, "illustrious", "novaAnimeXL_ilV190") == ill)
+both = PF.put(ill, "illustrious", "otherXL")
+check("別のモデルに入れた同じ雛形は残る",
+      len(both["add"]) == 2 * len(ill["add"]), (len(both["add"]), len(ill["add"])))
+check("元の規則は書き換えない", RB.empty()["add"] == [])
+got = RB.rewrite(ill, "portrait", "prompt", GAME_PORTRAIT, GAME_PORTRAIT, NOVA)
+check("Illustrious: 画質の印が頭に来る",
+      got.startswith("masterpiece, best quality, amazing quality, very aesthetic, absurdres, full body, 1boy"),
+      got)
+check("Illustrious: wallpaper と empty background と full-body を外す",
+      all(tag not in RB.split_tags(got) for tag in ("wallpaper", "empty background", "full-body",
+                                                   "high quality")), got)
+check("Illustrious: 画材のタグは括弧を逃がして足す", got.endswith(r"watercolor \(medium\)"), got)
+got = RB.rewrite(ill, "portrait", "prompt", "young woman, watercolor", "young woman, watercolor", NOVA)
+check("Illustrious: 女性は 1girl（1boy は付かない）", "1girl" in got and "1boy" not in got, got)
+got = RB.rewrite(ill, "background", "prompt", GAME_BG, GAME_BG, NOVA)
+check("Illustrious: 背景に no humans, scenery、indoor は indoors に",
+      "no humans, scenery" in got and "indoors" in RB.split_tags(got)
+      and "indoor" not in RB.split_tags(got), got)
+check("Illustrious: 別のモデルでは当たらない",
+      RB.rewrite(ill, "portrait", "prompt", GAME_PORTRAIT, GAME_PORTRAIT, SOTE) is None)
+pony = PF.put(RB.empty(), "pony", "ponyDiffusionV6XL")
+got = RB.rewrite(pony, "portrait", "prompt", GAME_PORTRAIT, GAME_PORTRAIT, PONY)
+check("Pony: 画質の印は score_9 の形", got.startswith("score_9, score_8_up, score_7_up, source_anime"), got)
+got = RB.rewrite(pony, "enemy", "negative", "worst quality", "worst quality", PONY)
+check("Pony: 否定に score_6 以下", "score_6, score_5, score_4" in got, got)
+for game_neg in ("photoreal, (nsfw, worst quality, low quality:1.4), thighs, nude, (zombie, sketch, comic)",
+                 "photoreal, (worst quality, low quality:1.4), nsfw, interlocked fingers, nipples"):
+    got = RB.rewrite(pony, "portrait", "negative", game_neg, game_neg, PONY)
+    check("Pony: ゲームの否定の 1.4 倍の画質の語を重み無しにする（{}）".format(game_neg[:30]),
+          ":1.4" not in got and "nsfw" in RB.split_tags(got)
+          and "worst quality" in RB.split_tags(got)
+          and ("(zombie, sketch, comic)" in got) == ("(zombie, sketch, comic)" in game_neg), got)
+got = RB.rewrite(ill, "portrait", "negative", "(nsfw, worst quality, low quality:1.4)",
+                 "(nsfw, worst quality, low quality:1.4)", NOVA)
+check("Illustrious: 重みは触らない（Pony だけの手当て）", ":1.4" in got, got)
+ANIMAGINE = ("sdxl", "animagineXL40_v4Opt.safetensors")
+ani = PF.put(RB.empty(), "animagine", "animagineXL40_v4Opt")
+got = RB.rewrite(ani, "portrait", "prompt", GAME_PORTRAIT, GAME_PORTRAIT, ANIMAGINE)
+check("Animagine: 立ち絵は 1boy / 1girl から始まり、画質の印は最後",
+      got.split(", ")[0] in ("1boy", "1girl")
+      and got.endswith("masterpiece, high score, great score, absurdres")
+      and "full body" in RB.split_tags(got) and "best quality" not in got, got)
+got = RB.rewrite(ani, "enemy", "prompt", GAME_ENEMY, GAME_ENEMY, ANIMAGINE)
+check("Animagine: 敵も画質の印は最後で、ゲームの画質の語と creature は外れる",
+      got.endswith("masterpiece, high score, great score, absurdres")
+      and got.count("masterpiece") == 1 and "creature" not in RB.split_tags(got), got)
+got = RB.rewrite(ani, "background", "prompt", GAME_BG, GAME_BG, ANIMAGINE)
+check("Animagine: 背景は no humans, scenery から始まり、画質の印は最後",
+      got.startswith("no humans, scenery") and got.endswith("absurdres"), got)
+got = RB.rewrite(ani, "portrait", "negative", "worst quality", "worst quality", ANIMAGINE)
+check("Animagine: 否定に low score, bad score", "low score, bad score, average score" in got, got)
+HUGE_NEG = ("nsfw,human,girl,women,people,(worst quality, low quality:1.4),  multiple characters, "
+            "(sketch, comic, anime), detailed background")
+got = RB.rewrite(ani, "enemy", "negative", HUGE_NEG, HUGE_NEG, ANIMAGINE)
+check("Animagine: huge の敵の否定から detailed background を外す（絵が崩れるため）",
+      "detailed background" not in got and "sketch" in got, got)
+got = RB.rewrite(ani, "enemy", "prompt", GAME_ENEMY, GAME_ENEMY, ANIMAGINE)
+check("Animagine: 代わりに敵へ simple background を足し、画質の印は最後のまま",
+      "simple background" in RB.split_tags(got) and got.endswith("absurdres"), got)
+got = RB.rewrite(ill, "enemy", "negative", HUGE_NEG, HUGE_NEG, NOVA)
+check("Illustrious: detailed background は外さない（Animagine だけの手当て）",
+      "detailed background" in got, got)
+
+print("雛形がフック越しに効く（全文は1回だけ出す）")
+prof_dir = tempfile.mkdtemp(prefix="stable_diffusion_profile_")
+os.makedirs(os.path.join(prof_dir, RB.STATE_DIRNAME))
+RB.save(prof_dir, ill)
+ctx_prof = fresh(_state_dir=prof_dir)
+MOD.FAMILY.update({"name": "sdxl", "path": NOVA[1]})
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_anime"
+    got = ctx_prof.hooks[exit_target](Pipe.generate_image, pipe, prompt=GAME_PORTRAIT,
+                                      width=256, height=512)
+    check("出口で雛形が当たる", got["prompt"].startswith("masterpiece, best quality"), got["prompt"])
+    ctx_prof.hooks[exit_target](Pipe.generate_image, pipe, prompt=GAME_PORTRAIT,
+                                width=256, height=512)
+    shown = [line for line in ctx_prof.notes if line.startswith("  prompt [portrait/stage1] 前:")]
+    check("書き換えの前後の全文は種類と段ごとに1回だけ", len(shown) == 1, shown)
+    MOD.FAMILY.update({"name": "sd15", "path": SOTE[1]})
+    got = ctx_prof.hooks[exit_target](Pipe.generate_image, pipe, prompt=GAME_PORTRAIT,
+                                      width=256, height=512)
+    check("SD1.5 に戻すと雛形は当たらない", got["prompt"] == GAME_PORTRAIT, got["prompt"])
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+
+print("道具画面のモデル別の行（窓抜き）")
+mixed = PF.put({"add": [{"enabled": True, "kind": "portrait", "target": "prompt", "text": "plain"}],
+                "remove": [], "replace": [], "skip_upscale": [], "lora_map": []},
+               "illustrious", "novaAnimeXL_ilV190")
+check("固定行はモデル別の行を拾わない",
+      TOOL.find_row(mixed["add"], "add", "portrait", "prompt")["text"] == "plain")
+check("固定行は when 付きの置換を拾わない",
+      TOOL.find_row(ill["replace"], "replace", "portrait", "prompt") is None)
+rows = TOOL.model_rows(mixed)
+check("モデル別のタブは雛形の行だけを持つ",
+      len(rows) == sum(len(ill[name]) for name in TOOL.MODEL_TAB_SECTIONS)
+      and all(row["section"] in TOOL.MODEL_TAB_SECTIONS for row in rows), len(rows))
+back = TOOL.split_model_rows(rows)
+check("タブの行は節へ戻せる（印も残る）",
+      all(back[name] == [row for row in mixed[name] if TOOL.by_model(row)]
+          for name in TOOL.MODEL_TAB_SECTIONS))
+
+print("語の置き換えと Danbooru のタグとの照合（版26）")
+import tagbook as TB  # noqa: E402
+TAG_CSV = "\n".join([
+    'plate,0,44749,"dish,plates"',
+    'plate_armor,0,2580,',
+    'armor,0,210293,armour',
+    'outdoors,0,537892,"outdoor,outside"',
+    'watercolor_(medium),5,14950,"watercolor,watercolour"',
+    'wolf,0,90000,wolves',
+    'black_background,0,80815,/blackbg',
+    'standing,0,900000,',
+    'shengtian,4,1000,quiet',
+    'some_artist,1,500,ink',
+])
+BOOK = TB.parse(io.StringIO(TAG_CSV))
+check("一般とメタのタグだけを数える（絵師とキャラは外す）",
+      "plate" in BOOK.tags and "watercolor_(medium)" in BOOK.tags
+      and "shengtian" not in BOOK.tags and "some_artist" not in BOOK.tags)
+check("キャラの別名は通さない（quiet はタグにならない）", BOOK.lookup("quiet") is None)
+check("別名は正しいタグへ", BOOK.lookup("Outdoor") == ("alias", "outdoors"))
+check("空白と下線と括弧の逃がしを同じに見る",
+      BOOK.lookup(r"watercolor \(medium\)") == ("tag", "watercolor_(medium)")
+      and BOOK.lookup("plate armor") == ("tag", "plate_armor"))
+check("書く形は空白と逃がした括弧", TB.display("watercolor_(medium)") == r"watercolor \(medium\)")
+check("紛れた語は複数語の言い方の中のよく使われるタグだけ",
+      BOOK.hidden("battle-worn plate mail") == ["plate"] and BOOK.hidden("plate") == [])
+
+WORDS = [("plate mail", "plate armor"), ("chain mail", "chainmail")]
+check("語句を区画の中で置き換える（大文字小文字を問わない）",
+      RB.replace_words("young man, battle-worn Plate Mail, grim", WORDS)
+      == "young man, battle-worn plate armor, grim")
+check("単語境界つき（breastplate mail には当たらない）",
+      RB.replace_words("breastplate mail", WORDS) == "breastplate mail")
+check("置換先が空なら語句を消し、空の区画は括弧の対応を保って落とす",
+      RB.replace_words("a, (plate mail:1.2), b", [("plate mail", "")]) == "a, b"
+      and RB.replace_words("(x, plate mail:1.2), b", [("plate mail", "")]) == "(x:1.2), b",
+      (RB.replace_words("a, (plate mail:1.2), b", [("plate mail", "")]),
+       RB.replace_words("(x, plate mail:1.2), b", [("plate mail", "")])))
+check("当たらなければ本文をそのまま返す（カンマを均さない）",
+      RB.replace_words("a,b", WORDS) == "a,b")
+check("LoRA のタグは触らない",
+      RB.replace_words("<lora:plate mail:1>", WORDS) == "<lora:plate mail:1>")
+ENEMY = "full body,creature,(wolf:1.1), a huge grey dire wolf,(plain background,black background:1.1), <lora:X:1>"
+check("alias は別名だけ直す",
+      RB.check_tags("outdoor, watercolor, dark foggy path", BOOK, "alias")
+      == r"outdoors, watercolor \(medium\), dark foggy path")
+check("alias はタグでない区画を外さず、括弧と LoRA も保つ",
+      RB.check_tags("outdoor," + ENEMY, BOOK, "alias") == "outdoors, " + ENEMY.replace(",", ", ").replace(",  ", ", "),
+      RB.check_tags("outdoor," + ENEMY, BOOK, "alias"))
+check("drop は外した（知らない方法の行は何もしない）",
+      "drop" not in RB.TAG_MODES and RB.check_tags("outdoor," + ENEMY, BOOK, "drop") == "outdoor," + ENEMY)
+check("一覧が無ければ何もしない", RB.check_tags("outdoor", None, "alias") == "outdoor")
+check("紛れた語の知らせ",
+      RB.tag_notes("standing, battle-worn plate mail", BOOK) == [("battle-worn plate mail", ["plate"])])
+TAG_RULES = {"words": [{"enabled": True, "kind": "any", "target": "prompt",
+                        "from": "plate mail", "to": "plate armor"}],
+             "tags": [{"enabled": True, "kind": "any", "target": "prompt", "mode": "alias",
+                       "model": "sdxl"}],
+             "replace": [{"enabled": True, "kind": "any", "target": "prompt",
+                          "text": "masterpiece, very aesthetic, outdoor, {prompt}"}]}
+got = RB.rewrite(TAG_RULES, "portrait", "prompt", "standing, outdoor, battle-worn plate mail",
+                 "standing, outdoor, battle-worn plate mail", NOVA, BOOK)
+check("照合はゲームの本文だけ（規則が足す語は直さない）",
+      got == "masterpiece, very aesthetic, outdoor, standing, outdoors, battle-worn plate armor", got)
+got = RB.rewrite(TAG_RULES, "portrait", "prompt", "standing, outdoor", "standing, outdoor", SOTE, BOOK)
+check("照合の行もモデルで絞る（SD1.5 では直さない）",
+      got == "masterpiece, very aesthetic, outdoor, standing, outdoor", got)
+got = RB.rewrite(TAG_RULES, "portrait", "prompt", "standing, outdoor", "standing, outdoor", NOVA, None)
+check("一覧が無ければ照合は飛ばす", got.endswith("standing, outdoor"), got)
+ill_tags = PF.put(RB.empty(), "illustrious", "novaAnimeXL_ilV190")
+check("Illustrious の雛形は語の置き換えを持ち、照合（alias）は持たない",
+      [r["from"] for r in ill_tags["words"]] == ["plate mail", "chain mail"]
+      and ill_tags["tags"] == [])
+got = RB.rewrite(ill_tags, "portrait", "prompt", GAME_PORTRAIT + ", battle-worn plate mail",
+                 GAME_PORTRAIT + ", battle-worn plate mail", NOVA, BOOK)
+check("雛形で plate mail が plate armor になる", "battle-worn plate armor" in got
+      and "plate mail" not in got, got)
+
+print("タグの照合がフック越しに効く（知らせは1回だけ）")
+tag_dir = tempfile.mkdtemp(prefix="stable_diffusion_tags_")
+os.makedirs(os.path.join(tag_dir, RB.STATE_DIRNAME))
+hook_rules = dict(ill_tags, tags=[{"enabled": True, "kind": "any", "target": "prompt",
+                                   "mode": "alias", "model": "sdxl"}])
+RB.save(tag_dir, hook_rules)
+io.open(TB.path_of(tag_dir), "w", encoding="utf-8").write(TAG_CSV)
+ctx_tags = fresh(_state_dir=tag_dir)
+MOD.FAMILY.update({"name": "sdxl", "path": NOVA[1]})
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "enemy", "generate_image_real_lcm"
+    for _ in range(2):
+        got = ctx_tags.hooks[exit_target](
+            Pipe.generate_image, pipe, prompt="outdoor, battle-worn plate mail, a big wolf pack",
+            width=512, height=512)
+    check("出口で語の置き換えと alias が当たる",
+          "outdoors" in got["prompt"] and "plate armor" in got["prompt"], got["prompt"])
+    notes = [line for line in ctx_tags.notes if line.startswith("danbooru:")]
+    check("タグに無い言い方の知らせは言い方ごとに1回", len(notes) == 2, notes)
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+words_dir = tempfile.mkdtemp(prefix="stable_diffusion_words_")
+os.makedirs(os.path.join(words_dir, RB.STATE_DIRNAME))
+RB.save(words_dir, ill_tags)                 # 雛形のまま（語の置き換えだけ、照合なし）
+io.open(TB.path_of(words_dir), "w", encoding="utf-8").write(TAG_CSV)
+ctx_words = fresh(_state_dir=words_dir)
+MOD.FAMILY.update({"name": "sdxl", "path": NOVA[1]})
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "enemy", "generate_image_real_lcm"
+    got = ctx_words.hooks[exit_target](
+        Pipe.generate_image, pipe, prompt="outdoor, battle-worn plate mail, a big wolf pack",
+        width=512, height=512)
+    check("雛形のままなら置き換えだけ当たり、別名は直さない",
+          "plate armor" in got["prompt"] and "outdoors" not in got["prompt"], got["prompt"])
+    check("置き換えだけの回もタグに無い言い方を知らせる",
+          len([line for line in ctx_words.notes if line.startswith("danbooru:")]) == 2, ctx_words.notes)
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+os.remove(TB.path_of(words_dir))
+ctx_words2 = fresh(_state_dir=words_dir)
+MOD.FAMILY.update({"name": "sdxl", "path": NOVA[1]})
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "enemy", "generate_image_real_lcm"
+    got = ctx_words2.hooks[exit_target](Pipe.generate_image, pipe, prompt="battle-worn plate mail",
+                                        width=512, height=512)
+    check("一覧が無くても置き換えは当たり、無いという知らせは出さない",
+          "plate armor" in got["prompt"]
+          and not any(key == "tagbook-missing" for key, _m in ctx_words2.warnings), ctx_words2.warnings)
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+os.remove(TB.path_of(tag_dir))
+ctx_none = fresh(_state_dir=tag_dir)
+MOD.FAMILY.update({"name": "sdxl", "path": NOVA[1]})
+try:
+    MOD.MARKS.kind, MOD.MARKS.func = "enemy", "generate_image_real_lcm"
+    got = ctx_none.hooks[exit_target](Pipe.generate_image, pipe, prompt="outdoor",
+                                      width=512, height=512)
+    check("一覧が無ければ alias は当たらず、知らせが出る",
+          "outdoors" not in got["prompt"]
+          and any(key == "tagbook-missing" for key, _m in ctx_none.warnings), ctx_none.warnings)
+finally:
+    MOD.FAMILY.update({"name": None, "path": None})
+
+print("検証の種の印（版26）")
+ctx_seed = fresh()
+MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_anime"
+MOD.MARKS.seed = 1234
+try:
+    got = ctx_seed.hooks[exit_target](Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+    check("種の印があればその種で描く", got.get("seed") == 1234, got)
+finally:
+    MOD.MARKS.seed = None
+got = ctx_seed.hooks[exit_target](Pipe.generate_image, pipe, prompt="p", width=256, height=512, seed=-1)
+check("印が無ければゲームの種のまま", got.get("seed", -1) == -1, got)
+
+print("生成のたびに読み直す（ホットリロード）")
+from instantale_modloader import config as _config  # noqa: E402
+
+cleanup(MANAGER, CREATURE)
+fake_backend()
+ctx_hot = fresh()
+hot_hook = ctx_hot.hooks[exit_target]
+check("場所が控えられていれば読み直しが効く状態", ctx_hot.notes and not any(
+    "hot reload: off" in note for note in ctx_hot.notes), ctx_hot.notes[-3:])
+MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_anime"
+got = hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("最初は既定のまま", (got["width"], got["height"]) == (256, 512), got)
+
+store = _config.store_path(ctx_hot.runtime_dir)
+os.makedirs(os.path.dirname(store), exist_ok=True)
+io.open(store, "w", encoding="utf-8").write(json.dumps(
+    {"343_stable_diffusion": {"PORTRAIT_SHORT": 832, "PORTRAIT_MAX_LONG": 1664,
+                           "STAGE1_STEPS": "28"}}))
+got = hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("設定ファイルを書き換えると次の生成から効く（注入し直し不要）",
+      (got["width"], got["height"]) == (448, 832), got)
+check("値はローダの型変換を通る（文字列の '28' が int に）",
+      got["sample_steps"] == 28, got["sample_steps"])
+check("読み直したとログに出る", any(note.startswith("reloaded settings") for note in ctx_hot.notes),
+      ctx_hot.notes[-2:])
+
+notes_before = len(ctx_hot.notes)
+hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("変わっていなければ読み直さない（ログも増えない）",
+      not any(note.startswith("reloaded") for note in ctx_hot.notes[notes_before:]))
+
+io.open(store, "w", encoding="utf-8").write(json.dumps(
+    {"343_stable_diffusion": {"PORTRAIT_SHORT": 832, "PORTRAIT_MAX_LONG": 1664,
+                           "STAGE1_STEPS": "not a number"}}))
+got = hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("読めない値は既定に倒れ、他の項目は生きたまま",
+      got["sample_steps"] == 20 and (got["width"], got["height"]) == (448, 832), got)
+
+os.remove(store)
+got = hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("設定ファイルが消えれば既定に戻る", (got["width"], got["height"]) == (256, 512), got)
+
+rules_live = RB.rules_path(ctx_hot.state_dir)
+os.makedirs(os.path.dirname(rules_live), exist_ok=True)
+io.open(rules_live, "w", encoding="utf-8").write(json.dumps(
+    {"add": [{"enabled": True, "kind": "any", "target": "prompt", "text": "hot"}]}))
+got = hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("規則も次の生成から効く", got["prompt"] == "p, hot", got["prompt"])
+os.remove(rules_live)
+got = hot_hook(Pipe.generate_image, pipe, prompt="p", width=256, height=512)
+check("規則のファイルが消えれば何もしない", got["prompt"] == "p", got["prompt"])
+check("読み直しで例外が出ていない", not ctx_hot.errors, ctx_hot.errors)
+
+print("積み上げ")
+before = len([f for f in sys.meta_path if getattr(f, MOD.OBSERVER_MARK, None)])
+fresh()
+fresh()
+after = len([f for f in sys.meta_path if getattr(f, MOD.OBSERVER_MARK, None)])
+check("注入し直しても観測者は1つ", before == 1 and after == 1, (before, after))
+check("関係の無い import は素通し（spec を作らない）",
+      observer().find_spec("json") is None)
+check("フックの中で例外が出ていない", not ctx.errors, ctx.errors)
+
+print("用済みの観測者は包まない")
+# 観測者を外すのは次の apply() だけ。343 を切って注入し直しても残るので、
+# 用済みになった後は名前が合うモジュールでも他の finder に聞かず素通しする。
+import importlib.machinery  # noqa: E402
+
+
+class _Finder(object):
+    calls = []
+
+    def find_spec(self, name, path=None, target=None):
+        if not name.startswith("diffusers.probe_"):
+            return None
+        _Finder.calls.append(name)
+        loader = types.SimpleNamespace(create_module=lambda spec: None,
+                                       exec_module=lambda module: None)
+        return importlib.machinery.ModuleSpec(name, loader)
+
+
+finder = _Finder()
+sys.meta_path.append(finder)
+try:
+    ctx_live = fresh()
+    spec = observer().find_spec("diffusers.probe_live")
+    check("生きている間は名前が合うモジュールのローダを包む",
+          spec is not None and isinstance(spec.loader, MOD._LoaderProxy), spec)
+    ctx_live.superseded = lambda: True
+    del _Finder.calls[:]
+    check("用済みになったら包まない", observer().find_spec("diffusers.probe_stale") is None)
+    check("用済みになったら他の finder にも聞かない", _Finder.calls == [], _Finder.calls)
+finally:
+    sys.meta_path.remove(finder)
+
+cleanup("image_generation.fake4.stable_diffusion_manager",
+        "image_generation.fake4.image_generation_creature")
+
+print("描き直し（img2img）と続けて描く（txt2img→img2img）の部品")
+I2I = MOD.img2img
+defaults = {key: MANIFEST["settings"][key]["default"] for key in MANIFEST["settings"]}
+got = I2I.derive(defaults)
+check("既定では img2img も txt2img→img2img も使わない",
+      got["img2img_on"] is False and got["chain_on"] is False and got["chain_auto"] == set()
+      and I2I.enabled(got) == [], got)
+check("種類ごとの設定は、使う設定を見ずに全種類組む（どの種類を描き直すかはゲームが決める）",
+      sorted(got["redraw"]) == sorted(I2I.KINDS) == sorted(got["chain"])
+      and got["redraw"]["enemy"] == {"preset": "", "strength": 0.5}
+      and got["chain"]["enemy"] == {"first": "", "second": "", "strength": 0.6}, got)
+got = I2I.derive(dict(defaults, IMG2IMG=True, IMG2IMG_PORTRAIT_PRESET=" XL ", IMG2IMG_ENEMY_STRENGTH=0))
+check("プリセット名の空白は落とし、強さが 0 なら既定",
+      got["redraw"]["portrait"] == {"preset": "XL", "strength": 0.5}
+      and got["redraw"]["enemy"] == {"preset": "", "strength": 0.5}, got["redraw"])
+check("img2img を使うなら、ボタンに img2img が出る", I2I.enabled(got) == ["img2img"])
+check("強さは 0 以下なら既定、1 を超えたら 1、読めなければ既定",
+      (I2I.strength_of(0, 0.5), I2I.strength_of(2.5, 0.5), I2I.strength_of("x", 0.6),
+       I2I.strength_of(0.7, 0.5)) == (0.5, 1.0, 0.6, 0.7))
+got = I2I.derive(dict(defaults, CHAIN=True, CHAIN_BACKGROUND_SECOND="B"))
+check("txt2img→img2img を使うなら、ボタンに出る（通常の生成は種類ごとの入切）",
+      I2I.enabled(got) == ["chain"] and got["chain_auto"] == set()
+      and got["chain"]["background"] == {"first": "", "second": "B", "strength": 0.6}, got)
+check("通常の生成でも使うも、使う設定（CHAIN）が切なら組まない",
+      I2I.derive(dict(defaults, CHAIN_PORTRAIT_AUTO=True))["chain_auto"] == set())
+check("設定名は mod.json と live の読み直しの両方に在る",
+      all(name in MANIFEST["settings"] for name in I2I.NAMES)
+      and all(name in MOD.hot.HOT_NAMES for name in I2I.NAMES))
+check("種類ごとの入切（前の形の設定名）は mod.json に残っていない",
+      not any(name in MANIFEST["settings"] for name in
+              ("IMG2IMG_PORTRAIT", "IMG2IMG_ENEMY", "IMG2IMG_BACKGROUND",
+               "CHAIN_PORTRAIT", "CHAIN_ENEMY", "CHAIN_BACKGROUND")))
+
+check("立ち絵の今の絵は characters の下の背景を抜いた絵",
+      I2I.source_path("W", "portrait", "world", "Zeno")
+      == os.path.join("W", "world", "characters", "Zeno", "no_bg_image.png"))
+check("敵は monsters の base_image、背景は backgrounds の image",
+      I2I.source_path("W", "enemy", "w", "wolf").endswith(os.path.join("monsters", "wolf", "base_image.png"))
+      and I2I.source_path("W", "background", "w", "inn").endswith(os.path.join("backgrounds", "inn", "image.png")))
+check("名前が文字列でなければ name の属性を使う",
+      I2I.source_path("W", "background", "w", types.SimpleNamespace(name="inn")) is not None)
+check("世界か名前が無ければ組まない",
+      I2I.source_path("W", "portrait", "", "Zeno") is None
+      and I2I.source_path("W", "portrait", "w", None) is None)
+
+both_on = I2I.derive(dict(defaults, IMG2IMG=True, CHAIN=True, CHAIN_PORTRAIT_AUTO=True))
+chain_only = I2I.derive(dict(defaults, CHAIN=True))
+blank = {"init_image": None, "strength": 0.75}
+check("ボタンで選ばなければ、今の絵があっても描き直さない（通常の生成でも使うが入なら続けて描く）",
+      I2I.plan("portrait", "lcm", blank, both_on, True) == "chain")
+check("通常の生成でも使うが入なら、新しい絵も続けて描く",
+      I2I.plan("portrait", "stage1", blank, both_on, False) == "chain")
+check("通常の生成でも使うが切なら、通常の生成は触らない",
+      I2I.plan("portrait", "stage1", blank, chain_only, False) is None
+      and I2I.plan("enemy", "lcm", blank, both_on, True) is None)
+check("ゲームの2段目は触らない", I2I.plan("portrait", "stage2", blank, both_on, True) is None)
+check("もう下絵が渡っている回は触らない",
+      I2I.plan("portrait", "lcm", {"init_image": object(), "strength": 0.75}, both_on, True) is None)
+check("下絵の口が無い出口は触らない",
+      I2I.plan("portrait", "lcm", {"width": 512}, both_on, True) is None)
+check("ボタンで txt2img を選んだ回は、通常の生成でも使うが入でもふだんどおり",
+      I2I.plan("portrait", "lcm", blank, both_on, True, "txt2img") is None)
+check("ボタンで img2img を選んだ回は、どの種類も描き直す",
+      I2I.plan("enemy", "lcm", blank, both_on, True, "img2img") == "redraw")
+check("ボタンで img2img を選んでも、今の絵が無ければふだんどおり",
+      I2I.plan("enemy", "lcm", blank, both_on, False, "img2img") is None)
+check("ボタンで txt2img→img2img を選んだ回は、どの種類も続けて描く",
+      I2I.plan("background", "lcm", blank, both_on, True, "chain") == "chain")
+check("ボタンで選んでもゲームの2段目は触らない",
+      I2I.plan("enemy", "stage2", blank, both_on, True, "img2img") is None)
+picked = I2I.derive(dict(defaults, IMG2IMG_ENEMY_PRESET="E", IMG2IMG_ENEMY_STRENGTH=0.3))
+check("描き方の設定は種類ごとに引く",
+      I2I.conf_for(picked, "redraw", "enemy") == {"preset": "E", "strength": 0.3}
+      and I2I.conf_for(picked, "chain", "enemy")["strength"] == 0.6)
+total, bottoms = I2I.stack(5)
+check("ボタン5つを詰めて並べると 600（画面の高さの 0.68 を中心にしても上にはみ出さない）",
+      total == 600 and bottoms == [130, 235, 340, 445, 550], (total, bottoms))
+check("ボタンの文字はゲームの「画像の再生成」に描き方を添えたもの",
+      I2I.BUTTON_LABELS == {"txt2img": "画像の再生成(txt2img)", "img2img": "画像の再生成(img2img)",
+                            "chain": "画像の再生成(txt2img→img2img)"})
+
+try:
+    from PIL import Image as _Image  # noqa: E402  ゲームには在る。CI のランナーと素の venv には無い
+except ImportError:
+    _Image = None
+
+
+class _FakeImage(object):
+    """PIL が無いときの絵の代わり（寸法と形式と info だけ持つ）。"""
+
+    def __init__(self, mode, size):
+        self.mode, self.size, self.info = mode, tuple(size), {}
+
+    def convert(self, mode):
+        return _FakeImage(mode, self.size)
+
+
+def new_image(mode, size, color=0):
+    return _Image.new(mode, size, color) if _Image is not None else _FakeImage(mode, size)
+
+
+if _Image is not None:
+    clear = _Image.new("RGBA", (10, 20), (255, 0, 0, 0))
+    clear.putpixel((0, 0), (0, 255, 0, 255))
+    shaped = I2I.as_init(clear, 20, 40)
+    check("下絵は透過を黒地に置いて RGB にし、出口の寸法に合わせる",
+          shaped.mode == "RGB" and shaped.size == (20, 40) and shaped.getpixel((19, 39)) == (0, 0, 0),
+          (shaped.mode, shaped.size, shaped.getpixel((19, 39))))
+else:
+    # 下絵の形だけは PIL が要る。流れの検査は偽の絵で回す（読む口と形を作る口を差し替える）。
+    print("  skip 下絵の形（PIL が無い。流れは偽の絵で回す）")
+    I2I.as_init = lambda image, width, height: _FakeImage("RGB", (width, height))
+    I2I.load_image = lambda path: _FakeImage("RGBA", (256, 512))
+shaped = new_image("RGB", (20, 40))
+check("絵の一覧からは1枚目", I2I.first_image([shaped, new_image("RGB", (1, 1))]) is shaped)
+check("絵でなければ None", I2I.first_image({"width": 1}) is None and I2I.first_image([]) is None)
+
+print("描き直しと続けて描く（出口と入口）")
+
+
+class ImgSD(object):
+    """下絵の口を持つ sdcpp の部品の代わり。描いた引数を絵の info に入れて返す。"""
+    built = 0
+
+    def __init__(self, model_path="", taesd_path="", vae_path="", lora_model_dir="",
+                 diffusion_flash_attn=False):
+        ImgSD.built += 1
+        self.model_path, self.taesd_path = model_path, taesd_path
+        self.vae_path, self.lora_model_dir = vae_path, lora_model_dir
+
+    @property
+    def model(self):
+        return self.model_path
+
+    def generate_image(self, prompt, negative_prompt="", init_image=None, width=512, height=512,
+                       cfg_scale=7.0, scheduler="default", sample_method="euler_a",
+                       sample_steps=20, strength=0.75, seed=-1):
+        if "fail" in self.taesd_path and init_image is not None:
+            raise OSError("exception: access violation writing 0x0000000000000000")
+        image = new_image("RGB", (width, height))
+        image.info.update({"model": self.model_path, "init": init_image, "strength": strength,
+                           "prompt": prompt})
+        return [image]
+
+
+ImgSD.__module__ = "fake_img.stable_diffusion"
+img_mod, img_entry = fake_backend("image_generation.fake9.stable_diffusion_manager",
+                                  "image_generation.fake9.image_generation_creature", pipe=None)
+img_mod.StableDiffusion = ImgSD
+img_mod.txt2img_pipe = ImgSD(**GAME_INIT)
+setattr(img_mod, MOD.GAME_ATTR, {"model_path_anime": GAME_SOTE, "taesd_path": GAME_INIT["taesd_path"],
+                                  "vae_path": GAME_INIT["vae_path"],
+                                  "lora_dir": GAME_INIT["lora_model_dir"]})
+img_back = types.ModuleType("image_generation.fake9.image_generation_background")
+for _fn in MOD.BACKGROUND_FUNCS:
+    setattr(img_back, _fn, lambda *a, **kw: None)
+sys.modules[img_back.__name__] = img_back
+img_dir = tempfile.mkdtemp(prefix="stable_diffusion_img2img_")
+worlds = os.path.join(img_dir, "worlds")
+os.makedirs(os.path.join(worlds, "w", "characters", "Zeno"))
+zeno_png = os.path.join(worlds, "w", "characters", "Zeno", "no_bg_image.png")
+if _Image is not None:
+    _Image.new("RGBA", (256, 512), (200, 100, 50, 255)).save(zeno_png)
+else:
+    io.open(zeno_png, "wb").write(b"png")   # 在ることだけ見る（読むのは差し替えた口）
+MOD.presets.save_custom(img_dir, "XL", {"CHECKPOINT_PATH": sdxl_path, "PORTRAIT_SHORT": 704,
+                                         "PORTRAIT_MAX_LONG": 1408, "STRIP_LORA": True})
+MOD.presets.save_custom(img_dir, "FAIL", {"CHECKPOINT_PATH": sd15_path, "TAESD_PATH": "fail.safetensors"})
+real_worlds_dir = MOD.worlds_dir
+MOD.worlds_dir = lambda: worlds
+img_exit = "fake_img.stable_diffusion:ImgSD.generate_image"
+img_init = "fake_img.stable_diffusion:ImgSD.__init__"
+img_char = "image_generation.fake9.image_generation_creature:generate_character_image"
+try:
+    ctx_img = fresh(_state_dir=img_dir, IMG2IMG=True, IMG2IMG_PORTRAIT_PRESET="XL",
+                    IMG2IMG_PORTRAIT_STRENGTH=0.45)
+    ctx_img.game_dir = os.path.dirname(sd15_path)
+    check("背景の入口も包む（今の絵を控えるため）",
+          all("image_generation.fake9.image_generation_background:" + fn in ctx_img.hooks
+              for fn in MOD.BACKGROUND_FUNCS), sorted(t for t in ctx_img.hooks if "fake9" in t))
+    game_img = img_mod.txt2img_pipe
+    ctx_img.hooks[img_init](lambda self, **kw: None, game_img, **GAME_INIT)
+    seen = {}
+
+    def game_draw(world_name, name, category, prompt):
+        """ゲームの入口の代わり。LCM の段の出口を1回呼ぶ。"""
+        seen["source"] = MOD.MARKS.source
+        MOD.MARKS.func = "generate_image_real_lcm"
+        try:
+            return ctx_img.hooks[img_exit](ImgSD.generate_image, game_img, prompt=prompt,
+                                           width=512, height=1024)
+        finally:
+            MOD.MARKS.func = None
+
+    MOD.imagegen._DRAWING.method = "img2img"   # 設定の画面の「画像の再生成(img2img)」を押した回（窓口の描き方）
+    got = ctx_img.hooks[img_char](game_draw, "w", "Zeno", "young man", "young man, cloak")[0]
+    init = got.info["init"]
+    zeno = seen.get("source")              # 次の入口で seen は上書きされるので控える
+    check("入口で今の絵を読んで控える", zeno is not None and zeno.size == (256, 512), seen)
+    check("今の絵がある回は、それを下絵にしてプリセットの部品で描き直す",
+          got.info["model"] == sdxl_path and init is not None and got.info["strength"] == 0.45,
+          got.info)
+    check("下絵は出口が描く寸法（プリセットの寸法）に合わせる",
+          init.size == got.size == (704, 1408) and init.mode == "RGB", (init.size, got.size))
+    check("入口を出ると控えを外す", getattr(MOD.MARKS, "source", None) is None)
+    got = ctx_img.hooks[img_char](game_draw, "w", "Nobody", "young man", "young man")[0]
+    MOD.imagegen._DRAWING.method = None
+    plain = ctx_img.hooks[img_char](game_draw, "w", "Zeno", "young man", "young man")[0]
+    check("ボタンで選ばなければ、img2img を使うが入でも今の絵は読まず、ふだんどおり描く",
+          seen.get("source") is None and plain.info["init"] is None, (seen, plain.info))
+    check("今の絵が無い新しい絵は、ふだんどおり描く（下絵なし・ゲームの部品）",
+          got.info["init"] is None and got.info["model"] == GAME_SOTE, got.info)
+    MOD.MARKS.func = "image_to_image_anime"
+    MOD.MARKS.kind, MOD.MARKS.source = "portrait", zeno
+    got = ctx_img.hooks[img_exit](ImgSD.generate_image, game_img, prompt="p",
+                                  init_image=new_image("RGB", (512, 1024)), width=512, height=1024)[0]
+    check("ゲームの2段目（もう下絵がある）は触らない",
+          got.info["model"] == GAME_SOTE and got.info["strength"] == 0.75, got.info)
+    MOD.MARKS.kind, MOD.MARKS.source, MOD.MARKS.func = None, None, None
+
+    ctx_fail = fresh(_state_dir=img_dir, IMG2IMG=True, IMG2IMG_PORTRAIT_PRESET="FAIL")
+    ctx_fail.game_dir = os.path.dirname(sd15_path)
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_real_lcm"
+    MOD.MARKS.source, MOD.imagegen._DRAWING.method = zeno, "img2img"
+    got = ctx_fail.hooks[img_exit](ImgSD.generate_image, game_img, prompt="p",
+                                   width=512, height=1024)[0]
+    check("描き直しで落ちたら、ふだんどおり描いて知らせる",
+          got.info["init"] is None and got.info["model"] == GAME_SOTE
+          and any(key == "img2img-redraw-failed" for key, _m in ctx_fail.warnings),
+          (got.info, ctx_fail.warnings))
+    MOD.MARKS.source, MOD.imagegen._DRAWING.method = None, None
+
+    ctx_chain = fresh(_state_dir=img_dir, CHAIN=True, CHAIN_PORTRAIT_AUTO=True, CHAIN_PORTRAIT_FIRST="",
+                      CHAIN_PORTRAIT_SECOND="XL", CHAIN_PORTRAIT_STRENGTH=0.55)
+    ctx_chain.game_dir = os.path.dirname(sd15_path)
+    calls = []
+
+    def counted(self, *args, **kwargs):
+        bound = inspect.signature(ImgSD.generate_image).bind(self, *args, **kwargs)
+        calls.append(bound.arguments.get("init_image"))
+        return ImgSD.generate_image(self, *args, **kwargs)
+
+    got = ctx_chain.hooks[img_exit](counted, game_img, prompt="young man", width=512, height=1024)[0]
+    check("続けて描くは2回描く（1回目は下絵なし、2回目は1回目の絵が下絵）",
+          len(calls) == 2 and calls[0] is None and calls[1] is not None, calls)
+    check("1回目は1つ目のプリセット（空ならゲームの部品）、2回目は2つ目のプリセット",
+          got.info["model"] == sdxl_path and got.info["strength"] == 0.55, got.info)
+    check("2回目の下絵は2つ目の寸法に合わせる",
+          calls[1].size == (704, 1408) == got.size, (calls[1].size, got.size))
+    ctx_chain2 = fresh(_state_dir=img_dir, CHAIN=True, CHAIN_PORTRAIT_AUTO=True, CHAIN_PORTRAIT_SECOND="FAIL")
+    ctx_chain2.game_dir = os.path.dirname(sd15_path)
+    got = ctx_chain2.hooks[img_exit](ImgSD.generate_image, game_img, prompt="p",
+                                     width=512, height=1024)[0]
+    check("2回目で落ちたら1回目の絵を返して知らせる",
+          got.info["init"] is None and got.size == (512, 1024)
+          and any(key == "img2img-chain-second-failed" for key, _m in ctx_chain2.warnings),
+          (got.info, ctx_chain2.warnings))
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "image_to_image_anime"
+    calls[:] = []
+    ctx_chain.hooks[img_exit](counted, game_img, prompt="p", init_image=new_image("RGB", (512, 1024)),
+                              width=512, height=1024)
+    check("続けて描くもゲームの2段目には当てない（1回だけ描く）", len(calls) == 1, calls)
+    MOD.MARKS.kind, MOD.MARKS.func = None, None
+
+    ctx_same = fresh(_state_dir=img_dir, IMG2IMG=True)     # プリセットは空（ゲーム既定のモデル）
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_real_lcm"
+    MOD.MARKS.source, MOD.imagegen._DRAWING.method = zeno, "img2img"
+    built_before = ImgSD.built
+    got = ctx_same.hooks[img_exit](ImgSD.generate_image, game_img, prompt="p",
+                                   width=512, height=1024)[0]
+    check("プリセットが空なら、ゲーム既定のモデルで今の絵から描き直す（ゲームの部品のまま）",
+          got.info["init"] is not None and got.info["model"] == GAME_SOTE
+          and got.info["strength"] == 0.5 and ImgSD.built == built_before, got.info)
+    ctx_gone = fresh(_state_dir=img_dir, IMG2IMG=True, IMG2IMG_PORTRAIT_PRESET="GONE")
+    MOD.MARKS.kind, MOD.MARKS.func = "portrait", "generate_image_real_lcm"
+    MOD.MARKS.source, MOD.imagegen._DRAWING.method = zeno, "img2img"
+    got = ctx_gone.hooks[img_exit](ImgSD.generate_image, game_img, prompt="p", width=512, height=1024)[0]
+    check("見つからないプリセットは知らせて、ゲーム既定のモデルで描き直す",
+          got.info["init"] is not None and got.info["model"] == GAME_SOTE
+          and any(key == "kind-preset-missing-GONE" for key, _m in ctx_gone.warnings),
+          (got.info, ctx_gone.warnings))
+    MOD.MARKS.source = zeno
+    # モデルを差し替えてゲームの部品が別のモデルで建っていても、空ならゲーム既定のモデルで描く。
+    # 相対の材料は apply() のときの game_dir から引くので、そこへ置く。
+    sote_file = os.path.join(ctx_same.game_dir, GAME_SOTE)
+    os.makedirs(os.path.dirname(sote_file), exist_ok=True)
+    _shutil.copyfile(sd15_path, sote_file)
+    replaced_init = dict(GAME_INIT, model_path=sdxl_path)
+    game_xl = ImgSD(**replaced_init)
+    kept_init = getattr(ImgSD, MOD.INIT_ATTR)
+    setattr(ImgSD, MOD.INIT_ATTR, replaced_init)
+    try:
+        got = ctx_same.hooks[img_exit](ImgSD.generate_image, game_xl, prompt="p",
+                                       width=512, height=1024)[0]
+        check("モデルの差し替えが入っていても、空のプリセットはゲーム既定のモデルの部品で描く",
+              got.info["model"] == GAME_SOTE and got.info["init"] is not None, got.info)
+    finally:
+        setattr(ImgSD, MOD.INIT_ATTR, kept_init)
+        ImgSD.__dict__.get(MOD.PIPES_ATTR, {}).clear()
+    MOD.MARKS.kind, MOD.MARKS.func, MOD.MARKS.source = None, None, None
+    MOD.imagegen._DRAWING.method = None
+
+    fresh(_state_dir=img_dir, IMG2IMG_PORTRAIT_PRESET="XL")
+    check("343 は描き方をローダの窓口に出す（どちらの「使う」も切なら txt2img だけ）",
+          MOD.imagegen.methods("portrait") == ["txt2img"])
+    ctx_methods = fresh(_state_dir=img_dir, IMG2IMG=True, CHAIN=True)
+    check("「使う」が入の描き方は、どの種類にも出す",
+          all(MOD.imagegen.methods(kind) == ["txt2img", "img2img", "chain"] for kind in MOD.img2img.KINDS),
+          [MOD.imagegen.methods(kind) for kind in MOD.img2img.KINDS])
+    ctx_methods.superseded = lambda: True
+    check("用済みになった登録は数えない", MOD.imagegen.methods("portrait") == ["txt2img"])
+    fresh(_state_dir=img_dir, CHAIN=True)
+    check("txt2img→img2img だけ入なら img2img は出さない",
+          MOD.imagegen.methods("enemy") == ["txt2img", "chain"])
+
+    ctx_btn = fresh(_state_dir=img_dir, IMG2IMG=True, IMG2IMG_PORTRAIT_PRESET="XL")
+    ctx_btn.game_dir = os.path.dirname(sd15_path)
+
+    def btn_draw(world_name, name, category, prompt):
+        MOD.MARKS.func = "generate_image_real_lcm"
+        try:
+            return ctx_btn.hooks[img_exit](ImgSD.generate_image, game_img, prompt=prompt,
+                                           width=512, height=1024)
+        finally:
+            MOD.MARKS.func = None
+
+    def regen_body(_app):
+        """ゲームの再生成のスレッドの代わり（会話の相手を描き直す）。"""
+        return ctx_btn.hooks[img_char](btn_draw, "w", "Zeno", "young man", "p")
+
+    check("再生成のスレッドを包む", MOD.REGEN_THREAD_TARGET in ctx_btn.hooks)
+    check("img2img を使うが入なら、立ち絵の描き方に img2img が出る",
+          MOD.imagegen.methods("portrait") == ["txt2img", "img2img"])
+    MOD.REGEN["mode"] = "img2img"
+    got = ctx_btn.hooks[MOD.REGEN_THREAD_TARGET](regen_body, object())[0]
+    check("ボタンで img2img を選ぶと、今の絵からプリセットで描き直す",
+          got.info["init"] is not None and got.info["model"] == sdxl_path, got.info)
+    check("選んだ描き方は1回で消える",
+          MOD.REGEN["mode"] is None and MOD.imagegen.method_now() is None)
+    got = ctx_btn.hooks[MOD.REGEN_THREAD_TARGET](regen_body, object())[0]
+    check("ゲームの再生成ボタン（何も選ばない）は txt2img（下絵なし・ゲームの部品）",
+          got.info["init"] is None and got.info["model"] == GAME_SOTE, got.info)
+finally:
+    MOD.worlds_dir = real_worlds_dir
+    MOD.MARKS.kind, MOD.MARKS.func, MOD.MARKS.source = None, None, None
+    MOD.imagegen._DRAWING.method = None
+    MOD.FAMILY.update({"name": None, "path": None})
+cleanup("image_generation.fake9.stable_diffusion_manager",
+        "image_generation.fake9.image_generation_creature",
+        "image_generation.fake9.image_generation_background")
+
+print("次に描く絵の見通し（道具画面の帯）")
+import outlook as OL  # noqa: E402  道具と同じく隣を素の名前で import する
+
+check("プリセットの重ね方は、知らない項目を捨てる",
+      PR.overlay({"A": 1, "B": 2}, {"B": 3, "Z": 9}) == {"A": 1, "B": 3})
+check("方式の名前から一族",
+      (OL.method_family("sdcpp_cuda"), OL.method_family("diffusers_openvino"), OL.method_family(""))
+      == ("sdcpp", "diffusers", None))
+ol_dir = tempfile.mkdtemp(prefix="stable_diffusion_outlook_")
+ol_log = os.path.join(ol_dir, "stable_diffusion.log")
+io.open(ol_log, "w", encoding="utf-8").write("\n".join([
+    "[2026-10-28T21:00:00.000] safety: 系統は sd15（game_model.safetensors）",
+    "[2026-10-28T22:30:04.349] sdcpp_cuda.stable_diffusion:StableDiffusion.generate_image [portrait/lcm] "
+    "描き直し <XL> cfg_scale: 1->4.5 height: 1024->1408 width: 512->704  画素 x1.89",
+    "[2026-10-28T22:30:04.350]   prompt [enemy/lcm] 前: full-body",
+    "[2026-10-28T22:31:00.000] sdcpp_cuda.stable_diffusion:StableDiffusion.generate_image [background/stage2] "
+    "sample_steps: 5->15",
+]) + "\n")
+ol_read = OL.read_log(ol_log)
+check("ログから種類ごとの前回の1枚（描き方・プリセット・寸法）と、ゲームの部品の系統を読む",
+      ol_read["last"]["portrait"] == {"when": "10-28 22:30", "stage": "lcm", "mode": "描き直し",
+                                      "route": "XL", "size": (704, 1408)}
+      and ol_read["last"]["background"]["size"] is None
+      and ol_read["built"] == ("sd15", "game_model.safetensors"), ol_read)
+check("プロンプトの行（字下げ）は1枚と数えない", "enemy" not in ol_read["last"], ol_read["last"])
+check("ログが無ければ空", OL.read_log(os.path.join(ol_dir, "none.log")) == {"last": {}, "built": None})
+
+ol_values = dict(defaults)
+ol_faster = {"name": "sdcpp_cuda", "character_generation_quality": "highres_faster",
+             "monster_generation_quality": "highres_faster", "background_generation_quality": "highres_faster"}
+got = OL.build(ol_values, [], ol_faster, "game_model", ol_read)
+check("素のままなら、どの種類もゲームのモデルで、寸法とサンプラーはゲームの値",
+      [row[:4] for row in got["rows"]] == [
+          ("立ち絵", "ゲーム既定", "512x1024", "lcm 5 / cfg 1"),
+          ("敵", "ゲーム既定", "512x512", "lcm 5 / cfg 1"),
+          ("背景", "ゲーム既定", "1024x512", "lcm 5 / cfg 1")]
+      and got["notes"] == [] and [row[4:] for row in got["rows"]] == [("切", "切")] * 3
+      and got["game"] == "game_model", got)
+check("前に描いた絵はログから",
+      got["last"][0] == ("立ち絵", "10-28 22:30・描き直し・XL・704x1408") and got["last"][1] == ("敵", "記録なし"),
+      got["last"])
+got = OL.build(dict(ol_values, PORTRAIT_SHORT=704, PORTRAIT_MAX_LONG=1408, STAGE1_STEPS=30),
+               [], dict(ol_faster, character_generation_quality="highres_upscale"), "game_model", ol_read)
+check("立ち絵が2段なら、2段目の寸法と両方のサンプラー",
+      got["rows"][0][2] == "704x1408" and "1段目 euler_a 30 / cfg 8" in got["rows"][0][3]
+      and "2段目 dpmpp2m 15 / cfg 7 karras" in got["rows"][0][3], got["rows"][0])
+got = OL.build(dict(ol_values, STAGE1_STEPS=30), [], ol_faster, "game_model", ol_read)
+check("どの絵も通らない段のサンプラーを変えていたら、効いていない設定に出す",
+      got["notes"] == ["1段目のサンプラー（ゲームの画質では、この段を通る絵が無い）"], got["notes"])
+ol_custom = [{"name": "XL", "values": {"CHECKPOINT_PATH": sdxl_path, "PORTRAIT_SHORT": 704,
+                                       "PORTRAIT_MAX_LONG": 1408}}]
+got = OL.build(dict(ol_values, KIND_PRESETS=True, PORTRAIT_PRESET="XL"), ol_custom, ol_faster,
+               "game_model", ol_read)
+check("種類のプリセットなら、プリセットの寸法で、SDXL の素の LCM は安全弁の値",
+      got["rows"][0][1:4] == ("XL（プリセット）", "704x1408", "euler_a 24 / cfg 5")
+      and got["rows"][1][1] == "ゲーム既定", got["rows"])
+got = OL.build(dict(ol_values, PORTRAIT_PRESET="XL"), ol_custom, ol_faster, "game_model", ol_read)
+check("割り当てても種類ごとのプリセットが切なら使わず、効いていない設定に出す",
+      got["rows"][0][1] == "ゲーム既定"
+      and got["notes"] == ["立ち絵に割り当てたプリセット（種類ごとのプリセットが切）"], got)
+got = OL.build(dict(ol_values, KIND_PRESETS=True, PORTRAIT_PRESET="GONE"), ol_custom, ol_faster,
+               "game_model", ol_read)
+check("見つからないプリセットは知らせて、プリセットを使わずに描く",
+      got["rows"][0][1] == "ゲーム既定"
+      and "立ち絵のプリセット「GONE」（見つからない。プリセットを使わずに描く）" in got["notes"], got["notes"])
+all_xl = dict(ol_values, KIND_PRESETS=True, PORTRAIT_PRESET="XL", ENEMY_PRESET="XL", BACKGROUND_PRESET="XL")
+check("どの種類もプリセットで描くなら、タブの値は効かない",
+      OL.build(all_xl, ol_custom, ol_faster, "game_model", ol_read)["notes"]
+      == ["解像度・サンプラーのタブの値（どの種類もプリセットの値で描く）"])
+got = OL.build(ol_values, [], dict(ol_faster, character_generation_quality="lowres"), "game_model", ol_read)
+check("測れていない画質は、ログの前回の段で補う",
+      got["rows"][0][3] == "lcm 5 / cfg 1（前回の段から）", got["rows"][0])
+got = OL.build(ol_values, [], dict(ol_faster, background_generation_quality="lowres"), "game_model",
+               {"last": {}, "built": None})
+check("前回も無ければ段は分からないと出す", got["rows"][2][3].startswith("段が分からない"), got["rows"][2])
+got = OL.build(dict(ol_values, CHECKPOINT_PATH=sdxl_path), [], ol_faster, "game_model", ol_read)
+check("モデルの差し替えは、建っている部品と違えば起動し直すと効くと出す",
+      got["rows"][0][1].endswith("（差し替え）")
+      and any(note.startswith("モデルの差し替え（ゲームを起動し直すと効く") for note in got["notes"]), got)
+got = OL.build(dict(ol_values, IMG2IMG=True, CHAIN=True, CHAIN_PORTRAIT_AUTO=True, PORTRAIT_SHORT=704,
+                    PORTRAIT_MAX_LONG=1408, LCM_METHOD="euler_a"),
+               [], {"name": "diffusers_openvino"}, "game_model", ol_read)
+check("diffusers 系では高度設定・寸法・サンプラーの方法が効かないと出し、寸法はゲームのまま",
+      got["rows"][0][4:] == ("使えない", "使えない")
+      and got["rows"][0][2] == "512x1024" and got["rows"][0][3] == "steps 5 / cfg 1"
+      and got["notes"] == ["高度設定（diffusers 系では使わない）",
+                           "解像度（diffusers 系では寸法を変えない。「実験用」で入にできる）",
+                           "サンプラーの方法とスケジューラ（diffusers 系は steps と cfg だけ）"], got)
+got = OL.build(dict(ol_values, IMG2IMG=True, CHAIN=True, CHAIN_BACKGROUND_AUTO=True), [], ol_faster,
+               "game_model", ol_read)
+check("img2img と txt2img→img2img は、空ならゲーム既定のモデル名、通常の生成でも使う種類はそう添える",
+      got["rows"][0][4:] == ("ゲーム既定", "ゲーム既定 → ゲーム既定")
+      and got["rows"][2][5].endswith("（通常の生成も）"), got["rows"])
+got = OL.build(dict(ol_values, IMG2IMG=True, IMG2IMG_PORTRAIT_PRESET="XL", IMG2IMG_ENEMY_PRESET="GONE",
+                    CHAIN=True, CHAIN_PORTRAIT_SECOND="XL"), ol_custom, ol_faster, "game_model", ol_read)
+check("プリセットを選んだ描き方はその名前、見つからないプリセットはゲーム既定で描くと知らせる",
+      got["rows"][0][4:] == ("XL", "ゲーム既定 → XL")
+      and got["rows"][1][4] == "ゲーム既定"
+      and "敵のimg2imgのプリセット「GONE」（見つからない。ゲーム既定のモデルで描く）" in got["notes"],
+      (got["rows"], got["notes"]))
+check("ゲームの設定が読めなければそう出す",
+      OL.build(ol_values, [], {}, "", ol_read)["notes"][0].startswith("ゲームの設定（config.json）が読めない"))
+
+print("\n失敗 {} 件".format(len(failures)))
+if failures:
+    for name in failures:
+        print("  - " + name)
+    raise SystemExit(1)
+print("すべて通った")

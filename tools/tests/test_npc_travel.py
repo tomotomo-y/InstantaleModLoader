@@ -33,6 +33,7 @@ import os
 import random
 import shutil
 import sys
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir, "runtime"))
@@ -44,6 +45,7 @@ if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
 import instantale_modloader as ml                      # noqa: E402
+from instantale_modloader import gates, modnpc         # noqa: E402
 
 
 def find_mod(suffix):
@@ -303,6 +305,13 @@ def fresh_mod(seed=1, keep_state=False, **settings):
     if os.path.exists(log_path):
         os.remove(log_path)
     ctx = FakeCtx(OUT_DIR, STATE_DIR)
+    # 日数・到着・ロードの前後と会話への注入は、ローダの窓口が1つの世代に1枚だけ包む。
+    # 当て直すたびに前の登録と包みの印を忘れさせ、この ctx に包みを渡す
+    gates.reset_all()
+    for attr in (modnpc.INSTALLED_ATTR, modnpc.STORE_ATTR):
+        if hasattr(sys, attr):
+            delattr(sys, attr)
+    modnpc.registry().clear()
     module.apply(ctx)
     module._store()["rng"].seed(seed)
     if hasattr(sys, module.STORE_ATTR):
@@ -485,6 +494,8 @@ def scene_guild_list():
     check("押すとゲームの会話が始まる形",
           buttons[ids.index(npc_id)]["spec"].cls_name == "ConversationStartManager")
     check("「やめる」の手前", ids.index(npc_id) < len(ids) - 1, texts)
+    check("足したのはゲームの会話のボタン（印は付けない。セーブに残っても MOD の無い起動で話せる）",
+          set(buttons[ids.index(npc_id)]) == {"text", "spec"}, sorted(buttons[ids.index(npc_id)]))
 
     # ゲームが名簿だけで組む場合（旅の人も並んでいる）。
     buttons = open_adventurer_list(ctx, app, others + [npc_id])
@@ -891,6 +902,15 @@ def scene_context():
         seen["npc"] = character_instance
         return "ok"
 
+    # 足すのはローダの `modnpc` の関所（この MOD は notes の層を積むだけ）。
+    # 関所は差し込まれている素の関数の署名で引数を名前に直すので、会話関数の置き場に代役を置く
+    llm_manager = types.ModuleType("scripts.llm.llm_manager")
+    llm_manager.conversation_facilitator = orig
+    llm_manager.conversation_starter = orig
+    sys.modules["scripts.llm.llm_manager"] = llm_manager
+    check("modnpc に notes の層を積む",
+          any(layer.get("owner") == "326_npc_travel" and callable(layer.get("notes"))
+              for layer in modnpc.layers_for(npc_id)), modnpc.layers_for(npc_id))
     hook = ctx.hooks["scripts.llm.llm_manager:conversation_facilitator"]
     result = hook(orig, "m", "h", "x", npc)
     check("本体は呼ばれる", result == "ok")
@@ -924,6 +944,7 @@ def scene_context():
     hook(orig, "m", "h", "x", app.world.characters[npc_id])
     check("同じ街の文は LOCAL_CONTEXT", "いつものギルドを離れ" in seen["npc"].profile,
           seen["npc"].profile)
+    sys.modules.pop("scripts.llm.llm_manager", None)
 
 
 def refresh(ctx, app):

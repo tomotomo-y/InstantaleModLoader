@@ -76,8 +76,8 @@ k は審判の power で決まる（weak 1.0 〜 extreme 約 2.45）。
     押すと自由入力と同じ経路（`function_correspond_to_input` の `PhaseSpec`）に
     防御の文を流すので、**1手をちゃんと消費して**敵の手番が来る。
     経路が読めない画面では、構えだけ付けてその旨をログに残す
-    （ボタンの作法は GAME.md §2.2。無害な `JustSetButtonToNormalPhase` を spec に
-    持たせ、押下は `on_button_press` で印を見て横取りする。
+    （ボタンはローダの窓口 `choices` の宣言型の口が組む。TECH.md §3.3.14。
+    押下は窓口がボタンに持たせた処理を呼び、セーブには残らない。
     改名した text はセーブに焼かれうるが、MOD 無しで読んでも押せば普通に
     スキル一覧が開き、次の画面の組み直しで素の名前に戻る）
 
@@ -97,6 +97,11 @@ k は審判の power で決まる（weak 1.0 〜 extreme 約 2.45）。
 
 即時回復・逃走・`physical_integrity`・経験値・戦利品はゲームのまま。
 セーブに MOD 独自の鍵は増やさない（敵の HP は戦闘中のセーブに入るが、戦闘の終わりに敵ごと消える）。
+
+## 版21
+
+1手・計算・ダメージ・審判の出力の変換・継続効果のフックは、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
 """
 
 import math
@@ -110,8 +115,11 @@ _RNG = random.Random()
 
 LOG_BASENAME = "battle_tactics.log"
 LOG_TAG = "battle tactics"
+#: 窓口（`combat`）に名乗る持ち主の名前。
+OWNER = "319_battle_tactics"
 
-# ボタン辞書に付ける印のキー。mod ごとに別の文字列にする（TECH.md §3.3）。
+# 版19までの防御のボタンの印のキー。いまは窓口が組むので付けない。
+# セーブから戻った前の版の印のボタンを落とすためだけに残す（`refresh_choice_buttons`）。
 MARK = "mod_battle_tactics"
 
 ENEMY_SIDE = "enemy"
@@ -324,7 +332,7 @@ def level_multiplier(gap):
 def hit_damage(entries, raw, defense, defender_max_hp,
                out_mult=1.0, in_mult=1.0,
                attacker_level=None, defender_level=None,
-               enemy=False, bonus=0.0):
+               enemy=False, bonus=0.0, enemy_percent=None):
     """1発の最終ダメージ。
 
     `entries` はその対象への `[(power, multiplier), ...]`（1手で同じ相手に複数乗ることがある）。
@@ -332,7 +340,7 @@ def hit_damage(entries, raw, defense, defender_max_hp,
     （ゲームは同じ相手の2本目で素点を上書きする）。そこから k で割り戻した基礎に、
     裁き1本ずつの k を掛けて r を作り、`multiplier × r × r ÷ (r + 防御)` を足し合わせる。
     `bonus` は基礎への上乗せ（仲間の武器。`ally_gear_bonus`）。
-    `enemy` なら敵の一撃の強さ（`ENEMY_DAMAGE`）を掛ける。
+    `enemy` なら敵の一撃の強さ（`ENEMY_DAMAGE`。その敵を受け持つ MOD の率があれば `enemy_percent`）を掛ける。
     """
     entries = list(entries) or [("normal", 1)]
     raw = max(0.0, _number(raw, 0.0))
@@ -346,7 +354,7 @@ def hit_damage(entries, raw, defense, defender_max_hp,
     damage *= level_multiplier(level_gap(attacker_level, defender_level))
     damage *= _number(out_mult, 1.0) * _number(in_mult, 1.0)
     if enemy:
-        damage *= ENEMY_DAMAGE / 100.0
+        damage *= (ENEMY_DAMAGE if enemy_percent is None else enemy_percent) / 100.0
     defender_max_hp = _number(defender_max_hp, 0.0)
     if defender_max_hp > 0:
         damage = max(damage, defender_max_hp * MIN_FRACTION)
@@ -593,6 +601,9 @@ def attribute_recipe(kind, attribute_type, power):
 
 def apply(ctx):
     write = ctx.logger(LOG_BASENAME, tag=LOG_TAG + ":")
+    # 敵の体力と一撃に率を掛けている MOD として、ローダの窓口に登録する。特定の敵を受け持つ MOD（`339_` の刺客）は、
+    # ここが居れば自分で体力を伸ばさず、窓口に率を答える（`combat.enemy_percent`）
+    combat.declare(combat.ENEMY_SCALER, lambda _app, _holder: True, owner=OWNER, write=write)
     warn = ctx.warner(LOG_TAG)
 
     state = {
@@ -874,7 +885,7 @@ def apply(ctx):
             say(action["app"], "\n".join(notes))
         if action is not None and state["evasion"] and state["evasion"]["actor"] is action["attacker"]:
             state["evasion"] = None
-        if action is not None and state["guard_turn"] is not None                 and state["guard_turn"] is action["attacker"]:
+        if action is not None and state["guard_turn"] is not None and state["guard_turn"] is action["attacker"]:
             state["guard_turn"] = None
         # 構えを立てた手が閉じた。ここから次の自分の手まで構えが生きる。
         if action is not None:
@@ -942,28 +953,27 @@ def apply(ctx):
     # ================================================================ 圧縮
     @ctx.wrap("__main__:BattlePhaseManager.handle_battle_situation",
               required=False, safe=True)
-    def handle_battle_situation(orig, self, character_key=None,
-                                character_side=None, battle_action=None,
-                                *args, **kwargs):
+    def handle_battle_situation(orig, self, *args, **kwargs):
         app = getattr(self, "app", None) or ui.find_app()
         try:
-            open_action(app, character_key, character_side)
+            # (character_key, character_side, battle_action)。受け取った形のまま渡し、ここでは読むだけ。
+            open_action(app, frames.arg(args, kwargs, "character_key", 0),
+                        frames.arg(args, kwargs, "character_side", 1))
         except Exception:
             ctx.log_exc("battle tactics: cannot open the action")
         # 本体が投げても1手は必ず閉じる。閉じないと古い `state["action"]` が残って
         # 手の外で呼ばれた `get_instant_damage` まで圧縮し、立てた構えも武装されない。
         try:
-            return orig(self, character_key, character_side, battle_action,
-                        *args, **kwargs)
+            return orig(self, *args, **kwargs)
         finally:
             close_action()
 
     @ctx.wrap("__main__:BattlePhaseManager.calculate_battle_effect",
               required=False, safe=True)
-    def calculate_battle_effect(orig, self, battle_action=None, *args, **kwargs):
-        result = orig(self, battle_action, *args, **kwargs)
+    def calculate_battle_effect(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
         try:
-            register_plan(battle_action, result)
+            register_plan(frames.arg(args, kwargs, "battle_action", 0), result)
         except Exception:
             ctx.log_exc("battle tactics: cannot register the plan")
         return result
@@ -977,11 +987,15 @@ def apply(ctx):
         return result
 
     @ctx.wrap("scripts.functions:get_instant_damage", required=False, safe=True)
-    def get_instant_damage(orig, attack=None, defense=None, *args, **kwargs):
-        result = orig(attack, defense, *args, **kwargs)
+    def get_instant_damage(orig, *args, **kwargs):
+        result = orig(*args, **kwargs)
         try:
             action = state["action"]
-            if action is None or not isinstance(attack, (int, float)):
+            if action is None:
+                return result
+            attack = frames.arg(args, kwargs, "attack", 0)
+            defense = frames.arg(args, kwargs, "defense", 1)
+            if not isinstance(attack, (int, float)):
                 return result
             app = action["app"]
             target, holder = find_defender(app, attack, defense)
@@ -1022,11 +1036,12 @@ def apply(ctx):
                     defense = gear_defense(defense, gear)
                     gear_note += " armor={:g}".format(gear)
             enemy = action["side"] == ENEMY_SIDE
+            enemy_pct = combat.enemy_percent(combat.ENEMY_DAMAGE, app, attacker, ENEMY_DAMAGE) if enemy else None
             final = hit_damage(entries, attack, defense, defender_max,
                                out_mult=out_mult, in_mult=in_mult,
                                attacker_level=attacker_level,
                                defender_level=defender_level,
-                               enemy=enemy, bonus=bonus)
+                               enemy=enemy, bonus=bonus, enemy_percent=enemy_pct)
             guard_turn = state["guard_turn"] is not None and attacker is state["guard_turn"]
             if guard_turn:
                 final = 0
@@ -1052,7 +1067,7 @@ def apply(ctx):
                       attacker_level if attacker_level is not None else "?",
                       defender_level if defender_level is not None else "?",
                       final, final / defender_max, int(defender_max),
-                      " enemy x{}%".format(ENEMY_DAMAGE) if enemy else "",
+                      " enemy x{:g}%".format(enemy_pct) if enemy else "",
                       (" guard" if guard else "") + gear_note,
                       "" if out_mult == 1.0 and in_mult == 1.0 else
                       " mults=({:.2f},{:.2f})".format(out_mult, in_mult)))
@@ -1064,13 +1079,14 @@ def apply(ctx):
     # ================================================================ 復元
     @ctx.wrap("__main__:BattlePhaseManager.convert_llm_output_to_instruction_dict",
               required=False, safe=True)
-    def convert_llm_output_to_instruction_dict(orig, self, actor=None, skill=None,
-                                               referee_response=None,
-                                               *args, **kwargs):
-        result = orig(self, actor, skill, referee_response, *args, **kwargs)
+    def convert_llm_output_to_instruction_dict(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
         if not RESTORE_EFFECTS:
             return result
         try:
+            # (actor, skill, referee_response)。受け取った形のまま渡し、ここでは読むだけ。
+            actor = frames.arg(args, kwargs, "actor", 0)
+            referee_response = frames.arg(args, kwargs, "referee_response", 2)
             app = getattr(self, "app", None) or ui.find_app()
             extras = extract_extras(referee_response) + skill_extras(
                 frames.attr(actor, "skills", None), referee_response)
@@ -1157,9 +1173,10 @@ def apply(ctx):
 
     @ctx.wrap("__main__:BattlePhaseManager.reduce_status_turns_and_log",
               required=False, safe=True)
-    def reduce_status_turns_and_log(orig, self, character=None, *args, **kwargs):
+    def reduce_status_turns_and_log(orig, self, *args, **kwargs):
         # 元の減算より先に適用する。
         # 内側（先に適用済み）の `308_` がこの回の報告で数字を出してくれる。
+        character = frames.arg(args, kwargs, "character", 0)
         if RESTORE_EFFECTS and character is not None:
             try:
                 max_hp = max_hp_of(character)
@@ -1196,7 +1213,7 @@ def apply(ctx):
                                 tick_kind, status_name, name, hp, new_hp))
             except Exception:
                 ctx.log_exc("battle tactics: per-turn effects failed")
-        return orig(self, character, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # ================================================================ 防御
     def begin_guard(app, holder, source):
@@ -1278,11 +1295,20 @@ def apply(ctx):
         return orig(self, *args, **kwargs)
 
     def refresh_choice_buttons(self, _buttons):
+        """組み直しの前（窓口 `choices` の `refresh`）。戦闘の画面のスキルのボタンを「スキル・防御」に改名する。
+
+        防御のボタンは `offer` が出す。ここはゲームのボタンの文言と場面の旗だけ。
+        """
         if GUARD_BUTTON:
             try:
                 buttons = getattr(self, "buttons", None)
                 if isinstance(buttons, list):
-                    screen.prune_stale(buttons, (GUARD_BUTTON_LABEL,))
+                    # 版19までの印の付いた防御のボタン（窓口が印を付け直したもの）。いまは窓口が組むので落とす
+                    old = [entry for entry in buttons if isinstance(entry, dict) and entry.get(MARK)
+                           and ui.spec_cls_name(entry) == ui.SAFE_CLS]
+                    if old:
+                        buttons[:] = [entry for entry in buttons if not any(entry is d for d in old)]
+                        write("dropped {} guard button(s) with the older mark".format(len(old)))
                     if not in_battle_screen(self):
                         state["skill_screen"] = False
                         state["input_spec_logged"] = False
@@ -1295,41 +1321,28 @@ def apply(ctx):
                         if skill_entry is not None \
                                 and skill_entry.get("text") != SKILL_MENU_LABEL:
                             skill_entry["text"] = SKILL_MENU_LABEL
-                        # スキル一覧: 「やめる」の手前に防御を入れる
-                        # （スキル1・（スキル2）・防御・やめる の並び）。
-                        # 「やめる」が見つからなければ末尾。
-                        if state["skill_screen"] \
-                                and not any(screen.mark_of(entry)
-                                            for entry in buttons):
-                            entry = screen.button(GUARD_BUTTON_LABEL,
-                                                  mark="guard")
-                            if entry is not None:
-                                at = len(buttons)
-                                for index, existing in enumerate(buttons):
-                                    if ui.spec_cls_name(existing) \
-                                            == CANCEL_MANAGER_CLS:
-                                        at = index
-                                        break
-                                buttons.insert(at, entry)
-                                write("guard into the skill list at {}: {}"
-                                      .format(at,
-                                              [(e.get("text"),
-                                                ui.spec_cls_name(e))
-                                               for e in buttons
-                                               if isinstance(e, dict)]))
-                            if not state["input_spec_logged"]:
-                                # 自由入力の流し先を1戦闘1回だけ写す。
-                                # ボタンが1手を消費できない画面が来たとき、
-                                # この行が原因の切り分けになる。
-                                state["input_spec_logged"] = True
-                                spec = getattr(self,
-                                               "function_correspond_to_input",
-                                               None)
-                                write("battle input spec: {} {}".format(
-                                    ui.spec_cls_name({"spec": spec}),
-                                    ui.spec_args({"spec": spec})))
             except Exception:
-                ctx.log_exc("battle tactics: cannot place the guard button")
+                ctx.log_exc("battle tactics: cannot relabel the skill button")
+
+    def offer(app, view):
+        """スキル一覧の「やめる」の手前に防御を出す（窓口 `choices` の `offer`）。
+
+        スキル1・（スキル2）・防御・やめる の並び。「やめる」が見つからなければ末尾。
+        """
+        if not GUARD_BUTTON or not state["skill_screen"] or not in_battle_screen(app):
+            return None
+        if not state["input_spec_logged"]:
+            # 自由入力の流し先を1戦闘1回だけ写す。
+            # ボタンが1手を消費できない画面が来たとき、
+            # この行が原因の切り分けになる。
+            state["input_spec_logged"] = True
+            spec = getattr(app, "function_correspond_to_input", None)
+            write("battle input spec: {} {}".format(
+                ui.spec_cls_name({"spec": spec}), ui.spec_args({"spec": spec})))
+            write("guard into the skill list: {}".format(
+                [(e.get("text"), ui.spec_cls_name(e)) for e in view.buttons if isinstance(e, dict)]))
+        return [choices.Choice(GUARD_BUTTON_LABEL, place=choices.before(CANCEL_MANAGER_CLS),
+                               on_press=on_button_press)]
 
     def look_at_press(self, entry, _button_index):
         """どのボタンが押されても先に通る（窓口 `choices` の `intercept`）。押下は握らない。"""
@@ -1338,8 +1351,8 @@ def apply(ctx):
         state["skill_screen"] = False
         return False
 
-    def on_button_press(self, action):
-        """自前のボタンが押された（窓口 `choices` の `presses`）。"""
+    def on_button_press(self):
+        """防御のボタンが押された（窓口がボタンに持たせた処理として呼ぶ）。"""
         if state["guard_pending"]:
             # 前の押下の手番がまだ動いている。ゲームのボタンは本体が連打を止めるが、
             # 防御は本体を通さないので自前で捨てる（0.18 秒差の2発で1巡が丸ごと2回走り、
@@ -1372,8 +1385,10 @@ def apply(ctx):
             ctx.log_exc("battle tactics: the guard button failed")
         return None
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, refresh=refresh_choice_buttons, presses={"guard": on_button_press}, intercept=look_at_press)
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    # 防御のボタンは `offer`。どのボタンでもスキル一覧の場面を降ろすのは `intercept`（押下の処理より先に呼ばれる）
+    choices.provide(ctx, screen, refresh=refresh_choice_buttons, offer=offer, intercept=look_at_press,
+                    labels=(GUARD_BUTTON_LABEL,))
 
     # ---------------------------------------------------------------- 節目
     @ctx.wrap("__main__:BattleStartManager.start_battle", required=False, safe=True)
@@ -1412,7 +1427,8 @@ def apply(ctx):
             level = frames.attr(holder, "experience_level", None)
             original = frames.attr(holder, "original_max_hp", None)
             reference = original if isinstance(original, (int, float)) else frames.attr(holder, "max_hp", None)
-            target = scaled_hp(reference, constitution, level)
+            percent = combat.enemy_percent(combat.ENEMY_HP, app, holder, ENEMY_HP)
+            target = scaled_hp(reference, constitution, level, percent)
             if target is None:
                 continue
             ratio = target / float(reference)
@@ -1420,8 +1436,8 @@ def apply(ctx):
                 value = frames.attr(holder, field, None)
                 if isinstance(value, (int, float)):
                     setattr(holder, field, max(1, int(round(value * ratio))))
-            write("enemy hp: {} {} -> {} (x{}%)".format(
-                name_of(holder, key), int(reference), frames.attr(holder, "max_hp", "?"), ENEMY_HP))
+            write("enemy hp: {} {} -> {} (x{:g}%)".format(
+                name_of(holder, key), int(reference), frames.attr(holder, "max_hp", "?"), percent))
 
     # ================================================================ 通常攻撃の頼み
     def rewrite_outgoing(texts, site):

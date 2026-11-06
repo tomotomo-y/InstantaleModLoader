@@ -7,10 +7,10 @@
     "ja": "ローカルLLMの応答を速くする"
   },
   "description": {
-    "en": "Starts llama-server with one dedicated slot instead of four shared ones. Same window, less KV memory, faster responses. Can also widen the window",
-    "ja": "llama-server を共有4スロットではなく専用1スロットで起こす。1リクエストが使える窓（トークン数）は同じまま KV が減って応答が速くなる。窓を広げることもできる"
+    "en": "Starts llama-server with one dedicated slot instead of four shared ones. Same window, less KV memory, faster responses. Also uses MTP automatically when the model has MTP layers or a matching drafter sits in the model folder's mtp\\. Can also widen the window. With shared slots it also shortens the schema description embedded in the prompt (taken over from 105)",
+    "ja": "llama-server を共有4スロットではなく専用1スロットで起こす。1リクエストが使える窓（トークン数）は同じまま KV が減って応答が速くなる。MTP 内蔵のモデルか、モデルのフォルダの mtp\\ に合う MTP 用の .gguf があれば、MTP を自動で使う。窓を広げることもできる。スロットを共有する起動では、文に埋め込まれたスキーマ説明を縮める（105 から取り込んだ）"
   },
-  "version": "3",
+  "version": "6",
   "author": "R01/Flossian",
   "settings": {
     "CTX_SIZE": {
@@ -39,6 +39,44 @@
       "note": {
         "ja": "1 が既定。専用1本になりKVが最小で最も速い。0 にすると素のゲームと同じ共有4本に戻す。2 以上は窓 × スロット数ぶんのKVを確保するのでVRAMの余裕が要る",
         "en": "1 (default) gives one dedicated slot: least KV, fastest. 0 restores the game's shared four. 2+ reserves window x slots of KV and needs VRAM to spare"
+      }
+    },
+    "MTP": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "MTP を自動で使う",
+        "en": "Use MTP automatically"
+      },
+      "note": {
+        "ja": "MTP 内蔵のモデルならそれを使う（Qwen3.8-27B など。生成が約1.7倍、VRAM を約1.1GB余分に使う）。内蔵でなければ、モデルのフォルダの mtp\\ に置いた MTP 用の .gguf のうち合うものを使う（Gemma 4 26B A4B 系。生成が約1.5倍、VRAM を約300MB余分に使う）。数字はどちらも実測。起きなかったときは MTP を外して起こし直す",
+        "en": "Uses the model's own MTP layers when it has them (e.g. Qwen3.8-27B: about 1.7x generation speed, about 1.1GB more VRAM). Otherwise hands llama-server a matching drafter (mtp-*.gguf) from the model folder's mtp\\ (Gemma 4 26B A4B models: about 1.5x, about 300MB more VRAM). Both measured. Falls back without MTP if the server fails to start"
+      }
+    },
+    "MTP_DRAFT_MAX": {
+      "type": "int",
+      "default": 4,
+      "min": 1,
+      "max": 8,
+      "label": {
+        "ja": "MTP で一度に予測するトークン",
+        "en": "MTP draft tokens per step"
+      },
+      "note": {
+        "ja": "4 が既定（MTP 用の .gguf の配布元の推奨）",
+        "en": "4 by default (the drafter's recommended value)"
+      }
+    },
+    "MTP_NGRAM": {
+      "type": "bool",
+      "default": true,
+      "label": {
+        "ja": "MTP に ngram-mod を重ねる",
+        "en": "Stack ngram-mod on MTP"
+      },
+      "note": {
+        "ja": "MTP を使うときに、ngram-mod も一緒に使う（プロンプトやそれまでに書いた文に出てきた言い回しを手掛かりに、続きを予測する仕組み）。戦闘の文の生成が MTP だけよりさらに約5%速い（実測）。VRAM は増えない。MTP を使わないときは何もしない",
+        "en": "When MTP is in use, also draft by copying repeats from the prompt and the text so far (ngram-mod). About 5% faster battle text generation than MTP alone (measured). No extra VRAM. Does nothing when MTP is not in use"
       }
     },
     "OBSERVE_ONLY": {

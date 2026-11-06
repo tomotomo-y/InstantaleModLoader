@@ -24,12 +24,15 @@ Opus 5 / Haiku 5.5 / Sonnet 5.5 は、effort が `xhigh` / `max` だと思考を
 
 構造化出力の型が大きすぎて API に断られた要求は、型の選択肢を文字列の欄に置き換えて送り直す
 （`claude_grammar.py`。依頼の生成がゲームの既定のモデルでも断られるため）。
-差し替えもキャッシュも切っていても、これだけは効かせる。
+SDK が説明文へ書き移した `const` も、送る前に `enum` へ戻す（同じファイル。町の生成の送り直しを減らす）。
+同じく書き移された数の範囲（`minimum` / `maximum` / `maxItems`）は API が縛らないので、
+応答をゲームの型で読む前に範囲へ寄せる（`claude_bounds.py`）。
+差し替えもキャッシュも切っていても、この3つは効かせる。
 """
 
 import json
 
-from . import claude_grammar
+from . import claude_bounds, claude_grammar
 from .prefix_cache import Prefixes
 
 #: SDK で、全リクエストが最後に通る1点。
@@ -113,23 +116,29 @@ def fix(body, target, effort):
                 new["display"] = thinking["display"]
             body["thinking"] = new
             changed.append("thinking enabled->adaptive")
-        elif kind == "disabled" and (found["no_disable"] or found["off_upto_high"]):
+        elif kind in ("disabled", "between_tools"):
+            # 思考を切る指定。ゲームは Sonnet 5.5 を選んでいると between_tools で送る（main_026）。
+            # 差し替え先が受けない書き方なら、受ける書き方へ直すか外す（Haiku 5.5 は between_tools を 400 で断った）
             config = body.get("output_config")
             sent = effort if effort != "keep" else (
                 config.get("effort") if isinstance(config, dict) else None)
             if found["off_upto_high"] and sent in ("xhigh", "max"):
                 # この推論量では切る指定そのものを断る。
                 del body["thinking"]
-                changed.append("-thinking disabled")
+                changed.append("-thinking " + kind)
             elif found["between_tools"]:
                 # 切り方が別の名前になっただけ。ゲームの「考えない」をそのまま通す。
-                body["thinking"] = {"type": "between_tools"}
-                changed.append("thinking disabled->between_tools")
+                if kind != "between_tools":
+                    body["thinking"] = {"type": "between_tools"}
+                    changed.append("thinking disabled->between_tools")
             elif found["no_disable"]:
                 # 切れないモデルには指定ごと外す（既定で adaptive になる）。
                 # 速さは effort で抑える。
                 del body["thinking"]
-                changed.append("-thinking disabled")
+                changed.append("-thinking " + kind)
+            elif kind == "between_tools":
+                body["thinking"] = {"type": "disabled"}
+                changed.append("thinking between_tools->disabled")
 
     choice = body.get("tool_choice")
     if (found["no_forced"] and isinstance(choice, dict)
@@ -248,14 +257,36 @@ def mark_shared_prefix(body, prefixes, ttl):
     return ["cache mark {}/{}{}".format(shared, total, " " + ttl if ttl else "")]
 
 
-def sent_effort(target, setting):
+#: ゲームが推論量（low）を付けて送るモデル（main_026 の送信モジュールの定数）。他は付けない。
+GAME_EFFORT_LOW = ("claude-fable-5", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5")
+
+#: 推論量を送らないときの API の既定が medium のモデル。表にある他のモデルは high。
+DEFAULT_MEDIUM = ("claude-opus-5-5", "claude-haiku-5-5")
+
+#: 推論量を送らず API の既定に任せるときの書き方（タイトル画面）。値の分からない名前は「既定」だけ。
+DEFAULT_TEXT = "既定"
+DEFAULT_MARK = "（既定）"
+
+
+def default_effort(model):
+    """推論量を送らないときに API が使う値（印つき）。表に無い名前は「既定」だけ。"""
+    for prefix, _found in TRAITS:
+        if model == prefix or model.startswith(prefix + "-"):
+            return ("medium" if prefix in DEFAULT_MEDIUM else "high") + DEFAULT_MARK
+    return DEFAULT_TEXT
+
+
+def sent_effort(target, setting, game_model=None):
     """実際に送る推論量（タイトル画面に出す）。推論量を受けないモデル（Haiku 4.5）なら None。
 
-    keep は「ゲームの組んだ値のまま」で、その値はここでは分からないので keep のまま返す。
+    keep は「ゲームの組んだ値のまま」で、`game_model` から決まる（ゲームが付けないなら API の既定）。
+    差し替えないときは target に game_model を、setting に keep を渡す。
     """
     if not traits(target)["effort"]:
         return None
-    return setting or "keep"
+    if setting and setting != "keep":
+        return setting
+    return "low" if game_model in GAME_EFFORT_LOW else default_effort(target)
 
 
 def usage_line(result):
@@ -296,8 +327,15 @@ def install(ctx, target, effort, cache, log):
         if caching:
             changed += mark_shared_prefix(body, prefixes, CACHE_TTL[cache])
         schema = claude_grammar.schema_of(body)
+        if schema is not None:
+            schema, restored = claude_grammar.restore_const(schema)
+            if restored:
+                body = claude_grammar.with_schema(body, schema)
+                changed.append("const->enum {}".format(restored))
         key = claude_grammar.schema_key(schema) if schema is not None else None
         known = loosened.get(key) if key is not None else None
+        if schema is not None and claude_bounds.has_bounds(schema):
+            kwargs = claude_bounds.with_clamp(kwargs, schema, report_clamp)
         call_kwargs = kwargs
         if known:
             narrow = claude_grammar.loosen(schema, known)
@@ -322,6 +360,13 @@ def install(ctx, target, effort, cache, log):
             if line:
                 log.write("usage", "[claude] usage: " + line)
         return result
+
+    def report_clamp(changes):
+        # ゲームの型で読む直前に呼ばれる。ここで投げると safe=True が素の送信をやり直すので握る。
+        try:
+            log.write("clamp", "[claude] clamped to the type's range: " + ", ".join(changes[:8]))
+        except Exception:
+            pass
 
     def resend_loosened(orig, self, path, args, kwargs, body, schema, key, first):
         """選択肢を深いものから1つずつ文字列の欄にして送り直す。通ったら覚える。"""

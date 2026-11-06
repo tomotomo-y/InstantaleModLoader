@@ -19,12 +19,17 @@
 - 戦闘の数（`319_`）と審判への文（`401_`）へは、ローダの窓口 `combat` を通して答える（TECH.md §3.3.5）
 
 遊び方は DOC.md、検証の記録と決めた仕様は VERIFICATION.md §3.70、ゲーム側の事実は GAME.md §2.13.3。
+
+版28: フック10本（火力・防御・ステータス欄・格子の判定と配置・持ち物の移動・セーブの書き出し・タッチ・二つ並びの窓）は、
+引数を受け取った形のまま元の関数へ渡す（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
+差し替える値（武器攻撃力・防御・ステータス欄の文）は来た側に合わせて書く。
+`hasattr` を既定値付きの `getattr` に替えた（TECH.md §6）。
 """
 import os
 import re
 import sys
 
-from instantale_modloader import combat, equipment, frames, state, ui
+from instantale_modloader import choices, combat, equipment, frames, loads, state, ui
 
 from . import slots as rules
 
@@ -778,8 +783,9 @@ def apply(ctx):
         py = wy + (float(window.height) - panel.height) / 2.0
         if screen_h:
             py = min(py, screen_h - panel.height)              # 画面の上端を割らない（窓より高いとき）
-        if hasattr(host, "to_widget"):
-            px, py = host.to_widget(px, py)
+        to_widget = getattr(host, "to_widget", None)
+        if callable(to_widget):
+            px, py = to_widget(px, py)
         panel.pos = (max(0.0, px), max(0.0, py))
         # 窓（品の親）より先に描く＝children の末尾へ。品の親は窓のままにするので、
         # ドラッグ中も装備中も品は装備欄の上に描かれる
@@ -866,7 +872,7 @@ def apply(ctx):
             return None
         taken = occupied_except(app, sc, item_key)
         for name, (rx, ry, _rw, _rh) in rules.REGIONS.items():
-            if rules.KIND_OF[name] == kind and not taken.get(name):
+            if rules.takes(name, kind) and not taken.get(name):
                 return name, rx, ry
         return None
 
@@ -941,7 +947,7 @@ def apply(ctx):
         for item_key in list(positions):
             item = item_of(item_key)
             name = rules.fits(item, int(positions[item_key][0]), int(positions[item_key][1]))
-            if rules.KIND_OF[name] != rules.kind_of(item) or name in seen:
+            if not rules.takes(name, rules.kind_of(item)) or name in seen:
                 positions.pop(item_key)
                 write("dropped {!r}: {} does not take it (or already holds {!r})".format(
                     item_key, name, seen.get(name)))
@@ -1046,14 +1052,18 @@ def apply(ctx):
             write("combine {}: {:g} -> {:g}".format(kind, before, after))
 
     @ctx.wrap("scripts.functions:get_base_damage_value", required=False, safe=True)
-    def get_base_damage_value(orig, character_attack=None, weapon_attack=None, *args, **kwargs):
-        """プレイヤーの手の火力。武器攻撃力を両手の合算に差し替える（通るのはプレイヤーの手だけ）。"""
+    def get_base_damage_value(orig, *args, **kwargs):
+        """プレイヤーの手の火力。武器攻撃力を両手の合算に差し替える（通るのはプレイヤーの手だけ）。
+
+        引数は (character_attack, weapon_attack)。受け取った形のまま渡し、`weapon_attack` だけを来た側に合わせて差し替える。
+        """
         app = ui.find_app()
         found = combined_of(app, player_scope(app), "weapon") if app is not None else None
+        weapon_attack = frames.arg(args, kwargs, "weapon_attack", 1)
         if found is not None and matches(weapon_attack, found[0]):
             note_combined("weapon", found[0], found[1])
-            weapon_attack = found[1]
-        return orig(character_attack, weapon_attack, *args, **kwargs)
+            args, kwargs, _ = frames.replace_arg(args, kwargs, "weapon_attack", 1, found[1])
+        return orig(*args, **kwargs)
 
     @ctx.wrap("scripts.characters:Character.get_npc_defense", required=False, safe=True)
     def get_npc_defense(orig, self, *args, **kwargs):
@@ -1076,19 +1086,21 @@ def apply(ctx):
             battle["active"] = False
 
     @ctx.wrap("scripts.functions:get_instant_damage", required=False, safe=True)
-    def get_instant_damage(orig, attack=None, defense=None, *args, **kwargs):
+    def get_instant_damage(orig, *args, **kwargs):
         """味方被弾の防御（防具の防御力がそのまま来る）を全部位の合算に差し替える。
 
         敵被弾は直前の `get_npc_defense` の値で来るので、それと同じ値なら触らない。
         319_ より外側で包む（`after`）。319_ は渡された防御で軽減を組む。
+        引数は (attack, defense)。受け取った形のまま渡し、`defense` だけを来た側に合わせて差し替える。
         """
+        defense = frames.arg(args, kwargs, "defense", 1)
         if battle["active"] and not matches(defense, battle["npc_defense"]):
             app = ui.find_app()
             found = combined_of(app, player_scope(app), "wearable") if app is not None else None
             if found is not None and matches(defense, found[0]):
                 note_combined("wearable", found[0], found[1])
-                defense = found[1]
-        return orig(attack, defense, *args, **kwargs)
+                args, kwargs, _ = frames.replace_arg(args, kwargs, "defense", 1, found[1])
+        return orig(*args, **kwargs)
 
     def stored_scope(app, holder):
         """ロードの後で窓をまだ開いていない仲間の、読むだけの scope。控えに位置が無ければ None。
@@ -1162,11 +1174,15 @@ def apply(ctx):
         return STATUS_LINE.sub(sub, text)
 
     @ctx.wrap("scripts.hud.new_hud:InstanTaleHUD.update_status_texts", safe=True)
-    def update_status_texts(orig, self, instance=None, value=None, *args, **kwargs):
+    def update_status_texts(orig, self, *args, **kwargs):
+        # (instance, value)。受け取った形のまま渡し、`value` だけを来た側に合わせて差し替える。
         app = ui.find_app()
         if app is not None:
-            value = restate_status(app, value)
-        return orig(self, instance, value, *args, **kwargs)
+            value = frames.arg(args, kwargs, "value", 1)
+            restated = restate_status(app, value)
+            if restated is not value:
+                args, kwargs, _ = frames.replace_arg(args, kwargs, "value", 1, restated)
+        return orig(self, *args, **kwargs)
 
     def merge_into_save(data):
         """書き出す直前のセーブ辞書へ、装備欄の品を `to_dict()` で足す。足した数を返す。
@@ -1237,7 +1253,7 @@ def apply(ctx):
         if getattr(item, "obtainer", None) is not sc["owner"]:
             return False
         name = rules.fits(item, gx, y_top)
-        if name is None or rules.KIND_OF[name] != rules.kind_of(item):
+        if name is None or not rules.takes(name, rules.kind_of(item)):
             return False
         held = current_slots(app, sc).get(name)
         item_key = key_of(widget)
@@ -1259,12 +1275,13 @@ def apply(ctx):
             return False
 
     @ctx.wrap("scripts.hud.new_hud:InventoryGrid.try_place_item", safe=True)
-    def try_place_item(orig, self, item, pos, *args, **kwargs):
+    def try_place_item(orig, self, *args, **kwargs):
         """装備欄へのドロップ。可否は `is_valid_placement` の包みが決める。ここでは置換の先出しと品の控えだけ。"""
         sc = scope_of_grid(self)
+        item = frames.arg(args, kwargs, "item", 0)      # (item, pos)
         placing["item"] = item if sc is not None else None
         try:
-            result = orig(self, item, pos, *args, **kwargs)
+            result = orig(self, *args, **kwargs)
         finally:
             placing["item"] = None
         if sc is not None:
@@ -1291,11 +1308,16 @@ def apply(ctx):
         return result
 
     @ctx.wrap("scripts.hud.new_hud:InventoryGrid.is_valid_placement", safe=True)
-    def is_valid_placement(orig, self, grid_x, grid_y, width, height, *args, **kwargs):
-        result = orig(self, grid_x, grid_y, width, height, *args, **kwargs)
+    def is_valid_placement(orig, self, *args, **kwargs):
+        result = orig(self, *args, **kwargs)
         sc = scope_of_grid(self)
         if sc is None:
             return result
+        # (grid_x, grid_y, width, height)。受け取った形のまま渡し、ここでは読むだけ。
+        grid_x = frames.arg(args, kwargs, "grid_x", 0)
+        grid_y = frames.arg(args, kwargs, "grid_y", 1)
+        width = frames.arg(args, kwargs, "width", 2)
+        height = frames.arg(args, kwargs, "height", 3)
         item = placing["item"]
         if item is None:
             # 本体の下見（ドロップの前）。落とす先の部位に同じ種類の品が居れば置換の先出しをして下見をやり直す
@@ -1304,7 +1326,7 @@ def apply(ctx):
                 app = ui.find_app()
                 try:
                     if app is not None and evict_for(app, sc, dragging, int(grid_x), to_top_y(int(grid_y), int(height))):
-                        result = orig(self, grid_x, grid_y, width, height, *args, **kwargs)
+                        result = orig(self, *args, **kwargs)
                 except (TypeError, ValueError):
                     pass
             return result
@@ -1325,9 +1347,10 @@ def apply(ctx):
         return reason is None
 
     @ctx.wrap("scripts.hud.new_hud:InventoryItem.change_inventory", safe=True)
-    def change_inventory(orig, self, new_inventory, *args, **kwargs):
+    def change_inventory(orig, self, *args, **kwargs):
         old = frames.attr(self, "inventory", None)
-        result = orig(self, new_inventory, *args, **kwargs)
+        new_inventory = frames.arg(args, kwargs, "new_inventory", 0)
+        result = orig(self, *args, **kwargs)
         app = ui.find_app()
         sc = scope_of_grid(new_inventory) or scope_of_grid(old)
         if app is None or sc is None:
@@ -1432,7 +1455,7 @@ def apply(ctx):
         if found is None:
             kind = rules.kind_of(item_instance)
             for name, (rx, ry, _rw, _rh) in rules.REGIONS.items():
-                if rules.KIND_OF[name] == kind:
+                if rules.takes(name, kind):
                     held = current_slots(app, sc).get(name)
                     old = next((w for w in item_widgets(app, sc["owner"]) if key_of(w) == held), None)
                     if old is not None:
@@ -1515,9 +1538,8 @@ def apply(ctx):
     for _target in ("ItemEquipManager.equip_item", "ItemUnequipManager.unequip_item"):
         ctx.wrap("__main__:" + _target, required=False, safe=True)(resync_after_native)
 
-    @ctx.wrap("__main__:World.__init__", required=False, safe=True)
-    def world_loaded(orig, self, save_data_dict=None, *args, **kwargs):
-        """ロード・新規開始。前の周回の装備欄の品を必ず捨てる。
+    def world_loaded(call):
+        """ロード・新規開始。前の周回の装備欄の品を必ず捨てる（世界を組み立てた後。ローダの窓口 `loads`）。
 
         装備中の品は装備欄の辞書にしか居ないが、セーブには書き出しの時点で合流済み。
         同じ世界・同じ主人公のロードでも捨てる。残すと、セーブの後で手に入れて装備した品を
@@ -1526,7 +1548,7 @@ def apply(ctx):
         ここでは `app` から周回の鍵を引かない（`app` の辞書と `player` はまだ前の周回を指していることがある）。
         鍵は次に窓を組むときに `refresh_container` が引く。
         """
-        result = orig(self, save_data_dict, *args, **kwargs)
+        save_data_dict = call.save_data
         count = forget_containers()
         # 印は次に窓を組むときに今の周回で立て直す（空の辞書を合流させても何も足さない）
         setattr(sys, CONTAINER_ATTR + "_playthrough", None)
@@ -1534,15 +1556,19 @@ def apply(ctx):
         if count:
             write("load ({!r}): dropped {} item(s) of the previous play".format(
                 state.playthrough_key_of_dict(save_data_dict, None), count))
-        return result
+
+    loads.on(owner, ctx, (loads.WORLD,), after=world_loaded, write=write)
 
     @ctx.wrap("scripts.save_codec:write_obfuscated_json_file", safe=True)
-    def write_save(orig, file_path, data, *args, **kwargs):
-        """セーブの書き出し。装備欄の品を JSON 側へ足す（`equipments` の id は本体が書いている）。"""
-        added = merge_into_save(data)
+    def write_save(orig, *args, **kwargs):
+        """セーブの書き出し。装備欄の品を JSON 側へ足す（`equipments` の id は本体が書いている）。
+
+        引数は (file_path, data)。`data` は書き出す直前の辞書で、足すのはその辞書の中。受け取った形のまま渡す。
+        """
+        added = merge_into_save(frames.arg(args, kwargs, "data", 1))
         if added:
             write("save: added {} equipped item(s) to the save data".format(added))
-        return orig(file_path, data, *args, **kwargs)
+        return orig(*args, **kwargs)
 
     @ctx.wrap("scripts.hud.new_hud:ItemPopupMenu.on_discard_item", safe=True)
     def on_discard_item(orig, self, *args, **kwargs):
@@ -1566,18 +1592,19 @@ def apply(ctx):
     # ドラッグ中の品を控える。本体はドロップの前に `is_valid_placement` で下見をし、
     # 通らなければ `try_place_item` を呼ばずに品を元へ戻す。置換の先出しはその下見で行う。
     @ctx.wrap("scripts.hud.new_hud:InventoryItem.on_touch_down", safe=True)
-    def on_touch_down(orig, self, touch, *args, **kwargs):
+    def on_touch_down(orig, self, *args, **kwargs):
         try:
+            touch = frames.arg(args, kwargs, "touch", 0)
             if self.collide_point(*touch.pos) and scope_for(ui.find_app(), getattr(instance_of(self), "obtainer", None), create=False) is not None:
                 placing["dragging"] = self
         except Exception:
             pass
-        return orig(self, touch, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("scripts.hud.new_hud:InventoryItem.on_touch_up", safe=True)
-    def on_touch_up(orig, self, touch, *args, **kwargs):
+    def on_touch_up(orig, self, *args, **kwargs):
         try:
-            return orig(self, touch, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         finally:
             if placing.get("dragging") is self:
                 schedule(lambda: placing.__setitem__("dragging", None))
@@ -1616,14 +1643,16 @@ def apply(ctx):
         ctx.wrap("scripts.hud.new_hud:InstanTaleHUD." + _target, required=False, safe=True)(pull_before_window)
 
     @ctx.wrap("__main__:InstantaleApp.toggle_twin_inventory_window", required=False, safe=True)
-    def toggle_twin_window(orig, self, left_inventory_obtainer=None, right_inventory_obtainer=None,
-                           left_label_text=None, situation=None, *args, **kwargs):
+    def toggle_twin_window(orig, self, *args, **kwargs):
         """402_ の受け渡しの窓。右側が同行の仲間なら、組む前にその仲間の装備欄の品を辞書から抜き、
         組んだ後に装備欄を窓の右に出す。店（場面が違う）には出さない。
 
         引数の名前は本体と同じにする。店を開く本体の lambda はキーワードで渡してくるので、
-        名前が違うと値が `kwargs` に残り、位置でも渡して二重になって落ちる（版21）。"""
-        right = right_inventory_obtainer
+        名前が違うと値が `kwargs` に残り、位置でも渡して二重になって落ちる（版21）。
+        版28 からは名前で受けず、受け取った形のまま渡す（読むのは `frames.arg`）。"""
+        # (left_inventory_obtainer, right_inventory_obtainer, left_label_text, situation)
+        right = frames.arg(args, kwargs, "right_inventory_obtainer", 1)
+        situation = frames.arg(args, kwargs, "situation", 3)
         app = ui.find_app()
         sc = None
         if (app is not None and situation == SITUATION_TWIN and right is not None
@@ -1634,8 +1663,7 @@ def apply(ctx):
                     refresh_container(app, sc)
                 except Exception:
                     ctx.log_exc("equipment slots: refreshing the npc container failed")
-        result = orig(self, left_inventory_obtainer, right_inventory_obtainer, left_label_text,
-                      situation, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         if sc is not None:
             def settle():
                 try:
@@ -1750,16 +1778,26 @@ def apply(ctx):
     equipment.declare(equipment.EQUIPPED, npc_equipped, owner=owner, write=write)
     equipment.declare(equipment.GEAR, worn_of, owner=owner, write=write)
 
-    def restore_buttons_after(orig, self, *args, **kwargs):
-        """選択肢の組み直し・ロード・タイトルへ戻るの後で、隠した選択肢を戻す。"""
-        result = orig(self, *args, **kwargs)
+    def buttons_back(_call=None):
         app = ui.find_app()
         if app is not None:
             schedule(lambda: ensure_buttons(app))
+
+    def restore_buttons_after(orig, self, *args, **kwargs):
+        """タイトルへ戻るの後で、隠したアイコンのボタンを戻す。"""
+        result = orig(self, *args, **kwargs)
+        buttons_back()
         return result
 
-    for _target in ("refresh_choice_buttons", "load_game_new", "return_to_title"):
-        ctx.wrap("__main__:InstantaleApp." + _target, required=False, safe=True)(restore_buttons_after)
+    ctx.wrap("__main__:InstantaleApp.return_to_title", required=False, safe=True)(restore_buttons_after)
+    # ロードの後はローダの窓口 `loads` から（TECH.md §3.3.21）
+    loads.on(owner + ":buttons", ctx, (loads.LOAD,), after=buttons_back, write=write)
+
+    def after_refresh(app):
+        """選択肢の組み直しの後（ローダの窓口 `choices` の `after`。組み直しは自分で包まない。TECH.md §3.3.14）。"""
+        schedule(lambda: ensure_buttons(app))
+
+    choices.provide(ctx, None, after=after_refresh)
 
     @ctx.wrap("scripts.hud.new_hud:InstanTaleHUD.toggle_center_inventory_visibility", safe=True)
     def toggle_inventory(orig, self, *args, **kwargs):

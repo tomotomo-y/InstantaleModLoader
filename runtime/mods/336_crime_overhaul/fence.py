@@ -7,6 +7,9 @@
 - 事務所の選択肢に「盗品を売る」（盗品を持っているときだけ）。押すと、事務所の主を相手に
   ゲーム自身の売買の窓（`toggle_twin_inventory_window`）を開く。ドラッグ・確認の窓・支払いはゲームのまま
   （店でない施設でも開け、売れる。2026-10-05 の実機）。開くのはゲームの店と同じく `process_choice` を通した自前のフェーズから
+- 店と同じく入力欄で値切れる。窓を開いたら、ゲームの店の「売買する」と同じく入力欄の行き先（`function_correspond_to_input`）を
+  `ShoppingNegotiateManager` へ差し替え、閉じたら開く前の行き先へ戻す（GAME.md §2.13.1.4。窓を直に開くだけでは自由行動へ流れた。
+  2026-11-03 の実機）。値切った額はローダの値段の関所が固定する
 - 盗品でない品は主が押し返す（`theft.sell_item`）。主の棚から買うことはできない
 - 売った品はゲームが主の持ち物へ積む。窓を閉じたら（ゲームの後始末 `on_close_window` の後）、開く前に無かった品を主の持ち物から外す（セーブに積もらない）。
   閉じる前にゲームが落ちたときのために、開く前の主の持ち物の鍵を控えの `fence` に持ち、窓の開いていないときに選択肢を組んだら片付ける
@@ -18,12 +21,11 @@
   2つに絞ったまま残った（実機）
 - 司法取引で裏の事務所を売った締め出しの間は出さない（`office`）
 """
-from instantale_modloader import ui
+from instantale_modloader import choices, ui
 
 from . import common, office
 
 LABEL = "盗品を売る"
-MARK = "fence:open"
 #: 売買の窓の左の見出し。ゲームは短い語しか出さない（主の名前を渡すと末尾だけが出た。実機）。
 WINDOW_LABEL = "買取"
 WINDOW_SITUATION = "shop"
@@ -32,6 +34,10 @@ NO_BUY_TEXT = "{broker}は品を引き寄せた。\n「買い取った品は売�
 TWIN_WINDOW_DATA = "visible_twin_inventory_data"
 #: 窓を開いている間に残す選択肢（施設の「出る」「会話する」）。閉じたら `set_buttons_to_normal` で戻す。
 KEEP_WHILE_OPEN = (common.FACILITY_MARK, "DisplayTalkChoice")
+#: 入力欄の行き先（`PhaseSpec`）と、店の窓の間にゲームが入れる値切りのマネージャ（GAME.md §2.13.1.4）。
+INPUT_SPEC_ATTR = "function_correspond_to_input"
+INPUT_BACKUP_ATTR = "input_backup_for_shopping"
+NEGOTIATE_CLS = "ShoppingNegotiateManager"
 
 
 def rate_label(pct):
@@ -81,6 +87,7 @@ def install(env):
         主が引けないとき（ロードの途中は人物がまだ空）は、控えを残して次の組み直しに回す。
         先に控えを捨てると、売った品が主の持ち物に残り続ける。
         """
+        end_haggle(app)
         env.fence.update(broker=None, opening=False)
         playthrough = worlds.playthrough(app)
         with worlds.lock:
@@ -105,25 +112,22 @@ def install(env):
             len(gone), getattr(broker, "name", None), names))
 
     def on_refresh(app, buttons):
+        """窓が閉じていれば、売った品を主の持ち物から片付ける（閉じる前にゲームが落ちた回の控えも）。"""
         if not window_open(app) and not env.fence.get("opening"):
             with worlds.lock:
                 pending = worlds.load(worlds.playthrough(app)).get("fence")
             if env.fence.get("broker") or pending is not None:
                 clear_bought(app)
-        buttons[:] = [entry for entry in buttons if screen.mark_of(entry) != MARK]
-        screen.prune_stale(buttons, (LABEL,))
-        if not common.is_facility_screen(buttons) or getattr(app, "in_conversation", False):
-            return              # 施設の最初の画面だけ（入ったときの話しかけの選択肢には足さない。実機）
+
+    def offer(app, view):
+        """事務所の最初の画面に「盗品を売る」を出す（「出る」の手前）。"""
+        if not common.is_facility_screen(view.buttons) or getattr(app, "in_conversation", False):
+            return None         # 施設の最初の画面だけ（入ったときの話しかけの選択肢には足さない。実機）
         if not cfg.FENCE_ENABLED or not in_office(app) or env.underworld_banned(app):
-            return
+            return None
         if not holds_stolen(app):
-            return
-        entry = screen.button(LABEL, mark=MARK)
-        if entry is None:
-            return
-        at = next((index for index, item in enumerate(buttons)
-                   if ui.spec_cls_name(item) == common.FACILITY_MARK), len(buttons))
-        buttons.insert(at, entry)
+            return None
+        return [choices.Choice(LABEL, place=choices.before(common.FACILITY_MARK), on_press=press)]
 
     class FencePhase(object):
         """自前のフェーズ。ゲームの店（`ShoppingStartManagerRemake`）と同じく `process_choice` を通して開く。
@@ -167,6 +171,35 @@ def install(env):
             return
         env.fence["opening"] = False
         write("fence: opened with {!r} ({})".format(getattr(broker, "name", None), broker_id))
+        allow_haggle(app)
+
+    def spec_name(spec):
+        data = ui.spec_data(spec)
+        return data.get("cls_name") if isinstance(data, dict) else None
+
+    def allow_haggle(app):
+        """入力欄を値切りへ向ける。開く前の行き先は控えに持ち、閉じたら `end_haggle` で戻す。"""
+        current = getattr(app, INPUT_SPEC_ATTR, None)
+        if spec_name(current) == NEGOTIATE_CLS:
+            return
+        spec_cls = ui.cls_of("PhaseSpec")
+        try:
+            spec = spec_cls(NEGOTIATE_CLS, []) if spec_cls is not None else None
+        except Exception:
+            ctx.log_exc("crime incentive: cannot make the haggling spec for the fence")
+            spec = None
+        if spec is None:
+            write("WARN fence: no haggling at the fence (PhaseSpec unavailable)")
+            return
+        env.fence["input"] = current
+        setattr(app, INPUT_BACKUP_ATTR, current)
+        setattr(app, INPUT_SPEC_ATTR, spec)
+
+    def end_haggle(app):
+        """入力欄を開く前の行き先へ戻す（値切りのままなら）。"""
+        before = env.fence.pop("input", None)
+        if before is not None and spec_name(getattr(app, INPUT_SPEC_ATTR, None)) == NEGOTIATE_CLS:
+            setattr(app, INPUT_SPEC_ATTR, before)
 
     def restore_choices(app):
         """事務所の選択肢に戻す（ゲーム自身の `set_buttons_to_normal`。選択肢を組み直す合図で 336 のボタンも付き直る）。"""
@@ -174,15 +207,15 @@ def install(env):
         if callable(normal):
             normal()
         else:
-            screen.apply_buttons(app, None, "fence")
+            choices.repaint(app)
 
-    def press(app, action):
+    def press(app):
         found = broker_here(app)
         if found is None or getattr(app, "player", None) is None or getattr(app, "in_conversation", False):
             write("WARN fence: no broker here or in a conversation ({})".format(
                 getattr(app, "in_conversation", None)))
-            screen.apply_buttons(app, None, "fence")
-            return
+            choices.repaint(app)
+            return None
         broker_id, broker = found
         playthrough = worlds.playthrough(app)
         with worlds.lock:
@@ -193,13 +226,14 @@ def install(env):
         # 窓を開いている間は「出る」「会話する」（と、組み直しで付く「盗品を売る」）だけにする。
         # 事務所の選択肢は左の4つに収まらず、塗り直すと右の欄が窓の上に開く（GAME.md §2.2）。
         # 閉じたら `restore_choices` で事務所の選択肢に戻す（ゲームの後始末は、この開き方では選択肢を戻さなかった。実機）。
-        app.buttons = [entry for entry in (getattr(app, "buttons", None) or [])
+        app.buttons = [entry for entry in choices.game_buttons(app)
                        if ui.spec_cls_name(entry) in KEEP_WHILE_OPEN]
         app.buttons_backup_for_shopping = list(app.buttons)
         if not screen.start_phase(app, FencePhase(app, broker_id), LABEL):
             env.fence["opening"] = False
             clear_bought(app)
             restore_choices(app)
+        return None
 
     @ctx.wrap("__main__:InstantaleApp.on_close_window", required=False, safe=True)
     def on_close_window(orig, self, *args, **kwargs):
@@ -208,13 +242,32 @@ def install(env):
         選択肢の組み直しの合図だけに頼ると、閉じても片付かない回があった（会話の画面の上で閉じた回。実機）。
         """
         result = orig(self, *args, **kwargs)
-        if env.fence.get("broker") and not env.fence.get("opening"):
-            try:
-                clear_bought(self)
-            except Exception:
-                ctx.log_exc("crime incentive: cannot clear the fence")
-            restore_choices(self)
+        after_close(self)
         return result
+
+    @ctx.wrap("scripts.hud.new_hud:InstanTaleHUD.turnoff_window_visibility", required=False, safe=True)
+    def turnoff_window_visibility(orig, self, *args, **kwargs):
+        """窓を消した（外側を押した）。ゲームの後始末の後のフレームで、上と同じ片付けをする。
+
+        HUD は作られたときの `on_close_window` を `on_backdrop_callback` に握るので、注入より前に作られた HUD では
+        上の包みを通らなかった（閉じても選択肢が絞ったまま・入力欄が値切りのまま。2026-11-03 の実機）。
+        """
+        result = orig(self, *args, **kwargs)
+        if env.fence.get("broker") and not env.fence.get("opening"):
+            app = ui.find_app()
+            if app is not None:
+                screen.schedule(lambda: after_close(app))
+        return result
+
+    def after_close(app):
+        """盗品買取商の窓が閉じていれば、主の持ち物を片付けて事務所の選択肢へ戻す（入力欄も `clear_bought` が戻す）。"""
+        if not env.fence.get("broker") or env.fence.get("opening") or window_open(app):
+            return
+        try:
+            clear_bought(app)
+        except Exception:
+            ctx.log_exc("crime incentive: cannot clear the fence")
+        restore_choices(app)
 
     @ctx.wrap("scripts.hud.new_hud:InventoryItem.buy_item", required=False, safe=True)
     def buy_item(orig, self, *args, **kwargs):
@@ -235,4 +288,5 @@ def install(env):
         return None
 
     env.on_refresh(on_refresh)
-    env.on_press(MARK, press)
+    env.on_offer(offer)
+    env.on_labels(lambda app: (LABEL,))

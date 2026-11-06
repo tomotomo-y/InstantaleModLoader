@@ -182,6 +182,80 @@ def check_flag_reads(path):
     return problems
 
 
+#: 選択肢の組み直しと押下。MOD は自分で包まず、ローダの窓口 `choices` に預ける（TECH.md §3.3.14）。
+CHOICE_TARGETS = ("__main__:InstantaleApp.refresh_choice_buttons", "__main__:InstantaleApp.on_button_press")
+#: 窓口の古い口。働きは v2.0.0 まで残るが、宣言型の口（offer / screens / claim）へ移す（TECH.md §3.9）。
+OLDER_CHOICE_WAYS = ("presses", "trim")
+
+
+def check_choice_ways(path):
+    """選択肢の組み直し・押下を自分で包んでいないか、窓口の古い口を使っていないか。
+
+    自分で包む MOD は、窓口が組んだボタンを外せず（`claim` でも残る）、塗り直しも2度走る。
+    古い口（印で振り分ける `presses`、ほかの MOD のボタンまで絞る `trim`）は、印がロードで落ちた。
+    捕まえるのは包みの対象の文字列（`ctx.wrap(...)` と、包む関数へ渡す文字列）、素の関数を
+    `unwrap` で引く呼び出し、`choices.provide` の `presses=` / `trim=`。
+    計測 MOD（`"debug": true`）は観察が仕事なので、呼び出し側で外す。
+    """
+    tree, _problem = _parse(path)
+    if tree is None:
+        return []
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value in CHOICE_TARGETS:
+            problems.append((path, "line {}".format(node.lineno),
+                             "{!r} を自分で包んでいる。ローダの窓口 choices.provide（offer / screens / claim。"
+                             "ボタンを足さない合図なら after）に預ける（TECH.md §3.3.14）".format(node.value)))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name == "unwrap" and any(
+                    isinstance(sub, ast.Attribute) and sub.attr in ("refresh_choice_buttons", "on_button_press")
+                    for arg in node.args for sub in ast.walk(arg)):
+                problems.append((path, "line {}".format(node.lineno),
+                                 "素の組み直し・押下を unwrap で引いている。窓口 choices の宣言型の口"
+                                 "（claim / offer）で組む（TECH.md §3.3.14）"))
+            elif name == "provide" and isinstance(func, ast.Attribute) \
+                    and isinstance(func.value, ast.Name) and func.value.id == "choices":
+                for keyword in node.keywords:
+                    if keyword.arg in OLDER_CHOICE_WAYS:
+                        problems.append((path, "line {}".format(node.lineno),
+                                         "choices.provide の {}= は古い口（v2.0.0 で外す）。"
+                                         "ボタンは offer / screens / claim と choices.Choice の on_press で組む"
+                                         "（TECH.md §3.3.14）".format(keyword.arg)))
+    return problems
+
+
+#: ローダの関所が1枚だけ包む対象と、代わりに使う窓口（TECH.md §3.3.21）。
+#: MOD が自分で包むと、ゲームの更新で名前や引数が変わったときに直す所が MOD の数だけ増える。
+GATE_TARGETS = {
+    "__main__:InstantaleApp.load_game_new": "loads.on(owner, ctx, (loads.LOAD,), ...)",
+    "__main__:InstantaleApp.start_game": "loads.on(owner, ctx, (loads.NEW_GAME,), ...)",
+    "__main__:World.__init__": "loads.on(owner, ctx, (loads.WORLD,), ...)",
+    "__main__:InstantaleApp.elapse_days": "durations.on_days(owner, ctx, ...)（日数を変えるなら claim_days）",
+    "__main__:MovePhaseManager.move_phase": "arrivals.on(owner, ctx, (arrivals.FACILITY,), ...)",
+    "__main__:AreaMoveManager.execute": "arrivals.on(owner, ctx, (arrivals.AREA,), ...)",
+}
+
+
+def check_gate_targets(path):
+    """ローダの関所が包む対象を、MOD が自分で包んでいないか。
+
+    捕まえるのは対象の文字列そのもの（`ctx.wrap(...)` に渡す文字列・対象の定数）。
+    計測 MOD（`"debug": true`）は観察が仕事なので、呼び出し側で外す。
+    """
+    tree, _problem = _parse(path)
+    if tree is None:
+        return []
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value in GATE_TARGETS:
+            problems.append((path, "line {}".format(node.lineno),
+                             "{!r} を自分で包んでいる。ローダの窓口 {} に前後の処理を預ける"
+                             "（TECH.md §3.3.21）".format(node.value, GATE_TARGETS[node.value])))
+    return problems
+
+
 def _mod_files(name):
     """mod フォルダの中の .py を全て返す（入口 + 分割した中身）。
 
@@ -197,6 +271,18 @@ def _mod_files(name):
         found.extend(os.path.join(dirpath, f)
                      for f in sorted(filenames) if f.endswith(".py"))
     return found
+
+
+def _mod_source(name):
+    """mod フォルダの .py を全部つないだ文字列。読めないファイルは飛ばす。"""
+    chunks = []
+    for path in _mod_files(name):
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                chunks.append(fh.read())
+        except Exception:
+            pass
+    return "\n".join(chunks)
 
 
 def _module_constants(path):
@@ -261,6 +347,23 @@ def check_manifest(name, manifest):
             problems.append((path, MANIFEST_NAME,
                              '"tool.entry" が指す {!r} が無い'.format(tool["entry"])))
 
+    # 記録の置き場所（GUI の行の右クリック「state/ を開く」が開く先）。ローダは外へ出る宣言を黙って捨てるので、
+    # 書いた意図と違って開けないことにここで気付く。名前の打ち間違いは、
+    # 区切った各段が MOD のソースに文字列として在るかで見る（`("musics", "battle")` の形でも通る）。
+    raw_state = data.get("state")
+    if raw_state is not None:
+        listed = [raw_state] if isinstance(raw_state, str) else raw_state
+        if not isinstance(listed, list) or len(manifest.get("state") or []) != len(listed):
+            problems.append((path, MANIFEST_NAME,
+                             '"state" は state/ の中の相対パスの並びで書く: {!r}'.format(raw_state)))
+        source = _mod_source(name)
+        for rel in manifest.get("state") or []:
+            missing = [seg for seg in rel.split("/")
+                       if '"{}"'.format(seg) not in source and "'{}'".format(seg) not in source]
+            if missing:
+                problems.append((path, MANIFEST_NAME,
+                                 '"state" の {!r} がソースに無い（{}）'.format(rel, ", ".join(missing))))
+
     # ローダ API。
     # ここで撥ねられる mod は注入しても読み込まれない。
     verdict, reason = ml.api_status(manifest)
@@ -297,8 +400,32 @@ def check_manifest(name, manifest):
                 problems.append((path, MANIFEST_NAME,
                                  '"{}" が自分自身を指している'.format(key)))
 
+    # 文字列の中の制御文字。`"out\random.log"` のように `\` を1つで書くと、JSON は `\r` を復帰として
+    # 黙って読み、設定画面の注記が崩れる（143 の注記で起きた）。改行（`\n`）は意図して使うので除く。
+    for where, text in _strings_of(data):
+        bad = sorted({repr(ch) for ch in text if ch in CONTROL_CHARS})
+        if bad:
+            problems.append((path, MANIFEST_NAME,
+                             "{} に制御文字 {}（パスの \\ は \\\\ と書く）".format(where, ", ".join(bad))))
+
     problems += check_settings(name, data, manifest, entry_path)
     return problems, notes
+
+
+#: mod.json の文字列に紛れると表示が崩れる制御文字（改行は除く）。
+CONTROL_CHARS = set(chr(code) for code in range(32)) - {"\n"}
+
+
+def _strings_of(value, where=""):
+    """入れ子の JSON の中の文字列を `(場所, 文字列)` で並べる。"""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _strings_of(item, "{}.{}".format(where, key) if where else str(key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _strings_of(item, "{}[{}]".format(where, index))
+    elif isinstance(value, str):
+        yield where, value
 
 
 def check_settings(name, raw, manifest, entry_path):
@@ -573,6 +700,10 @@ def main():
             mod_problems += check_file(path)
             if not probe:
                 mod_problems += check_flag_reads(path)
+                # 選択肢を自分で包む・古い口を使うのは note（`--strict` の CI では問題に数える）
+                mod_notes += check_choice_ways(path)
+                # ローダの関所が包む対象を自分で包むのも同じ扱い
+                mod_notes += check_gate_targets(path)
         # 開発中の mod（9xx。TECH.md §2.6）は**見るが、赤にはしない**。
         # 配布物にも `load_order.json` にも入らないものなので、
         # 書きかけの一本で CI が止まると、リリースする側の検査が使えなくなる。

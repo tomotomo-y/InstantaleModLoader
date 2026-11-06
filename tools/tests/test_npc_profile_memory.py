@@ -37,6 +37,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, os.path.join(_ROOT, "runtime"))
 
 import instantale_modloader as ml                      # noqa: E402
+from instantale_modloader import modnpc                # noqa: E402
 
 MODS_DIR = os.path.join(_ROOT, "runtime", "mods")
 
@@ -384,7 +385,8 @@ class Ctx(object):
     def read_json(self, path, default=None):
         return ml.read_json(path, default, report=self.log_exc)
 
-    def wrap(self, target, required=True):
+    def wrap(self, target, required=True, **kw):
+        # ローダの `modnpc` の関所は `safe=True` を渡して包む
         def decorate(fn):
             self.hooks[target] = fn
             return fn
@@ -442,6 +444,9 @@ def bind_function(ctx, target, module, name):
     def patched(*args, **kwargs):
         return hook(original, *args, **kwargs)
 
+    # ローダの包みと同じく元の関数を指す。`modnpc` の頼み文の関所は、
+    # いま差し込まれている物から `__original__` をたどった素の関数の署名で引数を名前に直す
+    patched.__original__ = original
     setattr(module, name, patched)
 
 
@@ -462,6 +467,12 @@ def reset_mod_store():
     """`sys` に置かれた mod の共有一式を落とす（筋書きごとの独立を保つ）。"""
     if hasattr(sys, MOD.STATE_STORE_ATTR):
         delattr(sys, MOD.STATE_STORE_ATTR)
+    # 会話5関数への注入はローダの `modnpc` の関所が1つの世代に1枚だけ包み、層の登録簿は `sys` に残る。
+    # 筋書きごとに新しい ctx へ関所を渡し直し、前の筋書きの層を持ち越さない
+    for attr in (modnpc.INSTALLED_ATTR, modnpc.STORE_ATTR):
+        if hasattr(sys, attr):
+            delattr(sys, attr)
+    modnpc.registry().clear()
 
 
 class Run(object):
@@ -814,6 +825,56 @@ def test_recorded_facts_are_shown_to_the_extractor():
     return run
 
 
+class FakeQuest(object):
+    def __init__(self, qid, title, status):
+        self.id = qid
+        self.quest_title = title
+        self.config = {"status": status}
+
+
+def _with_quests(run, rows):
+    run.app.world.quests = {qid: FakeQuest(qid, title, status) for qid, title, status in rows}
+    return run
+
+
+def test_extractor_is_told_the_finished_quests():
+    """記録係に片付いた依頼を渡す。未完了は渡さず、新しいものから数える"""
+    run = _with_quests(Run(answers=FOUND), [
+        (str(n), "依頼{}".format(n), "completed") for n in range(2, 12)] + [("90", "途中の依頼", "incomplete")])
+    run.turn()
+    prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
+    check(MOD.FINISHED_QUESTS_HEADING in prompt, "片付いた依頼の欄が無い: {}".format(prompt[:300]))
+    check("依頼11" in prompt and "依頼7" in prompt, "新しい依頼が載っていない")
+    check("依頼6" not in prompt, "件数の上限を超えている")
+    check("途中の依頼" not in prompt, "未完了の依頼が載っている")
+    check("書き足さない" in prompt, "一覧を書き足させない指示が無い")
+    check(prompt.index(MOD.FINISHED_QUESTS_HEADING) < prompt.index("【新しい会話】"), "新しい会話より後にある")
+    return run
+
+
+def test_no_finished_quests_means_no_block():
+    """片付いた依頼が無ければ欄を出さない。素の世界で文を増やさない"""
+    run = _with_quests(Run(answers=FOUND), [("1", "途中の依頼", "incomplete")])
+    run.turn()
+    prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
+    check(MOD.FINISHED_QUESTS_HEADING not in prompt, "片付いた依頼が無いのに欄が出た")
+    return run
+
+
+def test_extractor_does_not_record_report_procedures():
+    """依頼の報告や手続きのその場の話を事実にしない指示がある。ほかの決まりを書かせない指示にはしない"""
+    run = Run(answers=FOUND)
+    run.turn()
+    prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
+    check("依頼の報告の仕方、報酬の受け取り方、依頼の後の手続き" in prompt, "報告の手続きの指示が無い")
+    check("継続的な性格、価値観、嗜好、経歴、関係" in prompt, "ふだんの記録の指示が消えた")
+    # 【決まり】に置くだけでは事実に残った（実機）。効いたのは項目の説明と最後の指示。
+    check("依頼の後の手続きの話は入れない" in prompt, "事実の項目の説明に指示が無い")
+    last = prompt.rsplit("<行動:", 1)[-1]
+    check("人物像にも事実にも入れない" in last, "最後の指示に無い: {}".format(last))
+    return run
+
+
 def test_no_facts_means_no_block():
     """事実がまだ無いなら見出しごと出さない（空欄を見せない）"""
     run = Run(answers=FOUND, seed_record={"name": "傭兵ガロ",
@@ -902,10 +963,25 @@ def test_elapsed_days_reads_the_world_day():
     check(MOD.elapsed_days({MOD.DAY_KEY: True}, 130) is None, "真偽値を日数にした")
 
 
+def test_elapsed_span_rounds_the_days():
+    """経過日数は段の上限ちょうどまでその段、超えたら次の段"""
+    check(MOD.elapsed_span(1) == "前日", "1日が前日にならない")
+    check(MOD.elapsed_span(2) == "数日前", "2日が数日前にならない")
+    for limit, span in MOD.ELAPSED_SPANS:
+        check(MOD.elapsed_span(limit) == span,
+              "{}日が {} にならない".format(limit, span))
+    last = MOD.ELAPSED_SPANS[-1][0]
+    check(MOD.elapsed_span(last + 1) == MOD.ELAPSED_SPAN_LONGEST,
+          "上限を超えても最後の段にならない")
+    limits = [limit for limit, _ in MOD.ELAPSED_SPANS]
+    check(limits == sorted(limits), "段の上限が昇順でない: {}".format(limits))
+
+
 def test_elapsed_note_avoids_a_reunion():
     """但し書きは「地続きにしない」と「久しぶりにもしない」の両方を言う"""
     note = MOD.elapsed_note(90, "エリス")
-    check("90日" in note, "日数が入っていない: {}".format(note))
+    check("数か月前" in note, "経過の言い方が入っていない: {}".format(note))
+    check("90" not in note, "生の日数が漏れた: {}".format(note))
     check("エリス" in note, "相手の名が入っていない: {}".format(note))
     check("そのまま再開" in note, "地続き禁止が無い: {}".format(note))
     check("再会のようにも" in note, "久しぶり抑制が無い: {}".format(note))
@@ -929,7 +1005,8 @@ def test_the_day_is_recorded_and_injected_next_time():
     run.app.world.days_elapsed = 190
     run.facilitate()
     injected = Facilitator.calls[-1]["npc"].profile
-    check("90日" in injected, "経過日数が注入されない: {!r}".format(injected))
+    check("数か月前" in injected, "経過日数が注入されない: {!r}".format(injected))
+    check("90" not in injected, "生の日数が注入された: {!r}".format(injected))
     check("再会のようにも" in injected, "久しぶり抑制が注入されない")
     return run
 
@@ -946,7 +1023,8 @@ def test_elapsed_days_can_be_turned_off():
               "切っているのに日を控えた: {}".format(run.profiles()[stem]["77"]))
         run.app.world.days_elapsed = 190
         run.facilitate()
-        check("90日" not in Facilitator.calls[-1]["npc"].profile,
+        check(MOD.ELAPSED_HEADING.format(player="冒険者")
+              not in Facilitator.calls[-1]["npc"].profile,
               "切っているのに日数を注入した")
         return run
     finally:
@@ -961,7 +1039,8 @@ def test_the_extractor_is_told_the_gap():
     prompt = Llm.last_prompt(MOD.MANAGER_EXTRACT)
     check("【前回の会話からの経過】" in prompt,
           "経過の欄が無い: {}".format(prompt[:400]))
-    check("60日が経っている" in prompt, "日数が違う: {}".format(prompt[:400]))
+    check("前回の会話は数か月前" in prompt, "経過が違う: {}".format(prompt[:400]))
+    check("60日" not in prompt, "生の日数を渡した: {}".format(prompt[:400]))
     return run
 
 
@@ -1154,11 +1233,31 @@ def test_all_five_conversation_hooks_inject_profile():
         seen.append(kwargs.get("character_instance") or args[3])
         return "ok"
 
-    for target in targets:
-        hook = run.ctx.hooks.get(target)
-        check(hook is not None, "フックが未登録: {}".format(target))
-        if hook is not None:
-            hook(capture, [], {}, run.app.player, run.npc)
+    # 足すのはローダの `modnpc` の関所（この MOD は notes の層を積むだけ）。
+    # 関所は差し込まれている素の関数の署名で引数を名前に直すので、
+    # 5つとも先頭4引数が本物と同じ並びの代役を置き、検査の後で戻す
+    def stand_in(messages, character_life_log, player, character_instance, *rest, **kw):
+        return "ok"
+
+    names = [target.rsplit(":", 1)[-1] for target in targets]
+    kept = {name: getattr(llm_manager, name, None) for name in names}
+    check(any(layer.get("owner") == "311_npc_profile_memory"
+              for layer in modnpc.layers_for("77")),
+          "modnpc に notes の層が無い: {}".format(modnpc.layers_for("77")))
+    try:
+        for target, name in zip(targets, names):
+            setattr(llm_manager, name, stand_in)
+            hook = run.ctx.hooks.get(target)
+            check(hook is not None, "関所の包みが未登録: {}".format(target))
+            if hook is not None:
+                hook(capture, [], {}, run.app.player, run.npc)
+    finally:
+        for name, original in kept.items():
+            if original is None:
+                if hasattr(llm_manager, name):
+                    delattr(llm_manager, name)
+            else:
+                setattr(llm_manager, name, original)
     check(len(seen) == len(targets), "全経路を通らない: {}".format(len(seen)))
     check(all(MOD.PROFILE_HEADING in npc.profile for npc in seen),
           "追加プロフィールが無い経路がある")
@@ -1578,7 +1677,10 @@ def test_group_extract_updates_all_participants():
 
 
 def main():
-    for test in (test_turn_updates_profile,
+    for test in (test_extractor_is_told_the_finished_quests,
+                 test_no_finished_quests_means_no_block,
+                 test_extractor_does_not_record_report_procedures,
+                 test_turn_updates_profile,
                  test_extraction_runs_after_the_reply,
                  test_extraction_does_not_block_the_game_thread,
                  test_queued_extractions_are_serialized,

@@ -137,7 +137,8 @@ id は採番台帳から採る（`ids.claim`）。
 
 **この MOD 自身の入れ替えは止めない。** 空にした回（`pending` が立っている回）は
 素通しする。止めると入れ替えそのものが働かなくなる。
-初めて開いた店（控えがまだ無くて持ち物も空）も素通しする。
+初めて開いた店（控えがまだ無くて持ち物も空）と、雛形がまだ無い店（ゲームがこの来店で
+初めて品揃えを作る。主が売買の前から品を持っていても）も素通しする。
 止めると品揃えが1つも作られない。
 一度でも開いた店を買い占めた場合は空のままになり、
 戻るのは入れ替えの日が来てからになる。
@@ -169,12 +170,15 @@ id は採番台帳から採る（`ids.claim`）。
 控えをその日に付け直して入れ替えない（次の来店から数え直す）。
 控えより先に進んだ日数だけで判断するので、
 複数の世界・複数のセーブを行き来しても混ざらない（周回ごとにファイルを分けてある）。
+
+版9: `toggle_twin_inventory_window` と `set_item_from_world_data` のフックは、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
 """
 
 import sys
 import typing
 
-from instantale_modloader import frames, ids, llm, ui
+from instantale_modloader import frames, ids, items, llm, shop_lineup, ui, value_limits
 from instantale_modloader.state import WorldStore
 
 # ---- 設定（既定値は mod.json の "settings" と一致させること。
@@ -212,6 +216,15 @@ ITEM_TYPES = {
                  "other_material"),
 }
 RARITIES = ("common", "rare", "magical", "epic", "legendary", "mythic")
+#: 頼みに書く価値の目盛りの上限。ゲームの難易度の上限（`QUEST_DIFFICULTY_VALUE_MAX`）と同じ 76。
+#: ゲームの頼みは「最高が70」と書くが、雛形の価値は終盤の街で 76 まで出る。
+#: 返ってきた価値を切る上限は窓口 `value_limits` から引く（素は 76。76 を超えた価値はゲームが値段と強さを
+#: 76 の値で止める。VERIFICATION.md §3.112。`923_beyond_76` が入っていれば 100。TECH.md §3.3.26）。
+VALUE_MAX = 76
+
+# 店の種類ごとの品揃えの傾向（`340_shop_lineup` がローダの窓口 `shop_lineup` に出す一文）。
+# 誰も口を出さなければ、ゲームのプロンプトと同じく武器と防具を含めさせる。
+DEFAULT_LINEUP = "武器と防具をそれぞれ1つ以上含める。"
 
 # 周回ごとの控えの置き場。
 # `state/` の下（消すと入れ替えの間隔が巻き戻る）。
@@ -439,10 +452,18 @@ def apply(ctx):
         `always` は新しい品揃えを作った直後用。`KEEP_SOLD_OUT` が切れていても
         雛形からの作り直し（同じ品名）は外さないと、新旧が混ざる。
 
-        素通しするのは1つだけ:
-        **初めて開く店で、持ち物がまだ空のとき**（品揃えを作らせる回）。
-        既に品を持っている店は、控えがあってもなくても止める側に入れる
+        素通しするのは2つ（どちらも品揃えを作らせる回）:
+
+        - **雛形がまだ無い店**（ゲームがこの来店で初めて品揃えを作る）。作り直しの元が無いので、
+          増えたぶんは全部新しい品。主が売買の前から品を持っていても入れる（`340_` が売買を足した
+          鍛冶屋・宿屋の主は持ち物を持っていることがある。版7までの取り違えは DOC.md）
+        - **初めて開く店（控えが無い）で、持ち物がまだ空のとき**
+
+        初めて開いたときに品揃えの生成が落ちた店（控えはあるが雛形がまだ無い）も前者に入る。
+        売り切れと読むと、次に作られた品揃えを全部外して店が空のままになる（DOC.md）。
+        雛形のある店で品を持っている店は、控えがあってもなくても止める側に入れる
         （古いセーブから始めた場合も、増えたぶんだけを外せる）。
+        `always` の回（こちらが新しい品揃えを作った直後）は、雛形が無くても止める側に入れる。
         """
         if not KEEP_SOLD_OUT and not always:
             return None
@@ -453,9 +474,11 @@ def apply(ctx):
         inventory = inventory_of(owner)
         if inventory is None:
             return None
-        if not inventory and store["fresh"]:
-            return None
         facility = facility_of(app)
+        if not always and never_stocked(facility):
+            return None
+        if not inventory and (store["fresh"] or never_stocked(facility)):
+            return None
         return {"app": app, "owner_id": owner_id, "owner": owner,
                 "facility": facility, "keys": set(inventory),
                 "goods": goods_names(facility)}
@@ -474,6 +497,16 @@ def apply(ctx):
         if entries is None:
             return None
         return {entry.get("name") for entry in entries}
+
+    def never_stocked(facility):
+        """ゲームがまだ品揃えを作っていない店か。
+
+        ゲームは初めて品揃えを作るときに雛形（`config["goods"]`）を書く。
+        作る前の施設の `config` には鍵そのものが無い。
+        `config` が読めないときは False（売り切れを守る側）。
+        """
+        config = frames.attr(facility, "config", None)
+        return isinstance(config, dict) and not config.get("goods")
 
     def goods_entries(facility):
         """雛形の1件ずつ。読めなければ None。名前の無い行は数えない。"""
@@ -574,6 +607,10 @@ def apply(ctx):
         entries = goods_entries(pending["facility"])
         if not entries:
             return
+        # 窓口が「並べない」とした種類（340 の設定で、宿屋と診療所の武器・防具）は雛形からも作り直さない。
+        excluded = shop_lineup.excluded_of(pending["facility"])
+        entries = [entry for entry in entries
+                   if str(entry.get("item_type") or "").lower() not in excluded]
         app = pending["app"]
         owner = pending["owner"]
         present = {item_name(item) for item in inventory.values()}
@@ -620,6 +657,14 @@ def apply(ctx):
         return llm.create_structure(ctx, "ShopStock", {
             "items": (typing.List[item], ...)}, label="shop restock")
 
+    def lineup_of(facility):
+        """その店の品揃えの傾向の一文。窓口に誰も居なければ既定の文。"""
+        text, by = shop_lineup.lineup_of(facility)
+        if text:
+            write("new stock: lineup of {} from {}".format(
+                frames.attr(facility, "facility_type", ""), by))
+        return text or DEFAULT_LINEUP
+
     def stock_messages(pending, values):
         """入れ替え1回ぶんの頼み文。場所は施設と土地、価値は雛形の値をそのまま。"""
         app = pending["app"]
@@ -627,12 +672,14 @@ def apply(ctx):
         area = ui.current_area(app)
         old_names = sorted({item_name(i) for i in pending["snapshot"].values()}
                            - {"?"})
+        excluded = shop_lineup.excluded_of(facility)
         types = "、".join("{}: {}".format(t, "/".join(subs))
-                          for t, subs in ITEM_TYPES.items())
+                          for t, subs in ITEM_TYPES.items() if t not in excluded)
+        lineup = lineup_of(facility)
         text = (
             "あなたはRPGの売買イベントの管理者だ。\n【指示】\n"
             "店主が仕入れを入れ替えた。この店に新しく並ぶ商品を{n}個作れ。"
-            "前の品揃えと同じ名前の商品は作らない。武器と防具をそれぞれ1つ以上含める。\n\n"
+            "前の品揃えと同じ名前の商品は作らない。{lineup}\n\n"
             "【場所】\n世界: {world}\n土地: {area}\n{area_desc}\n"
             "店: {shop}（{kind}）\n{shop_desc}\n\n"
             "【アイテムの生成要素】\n"
@@ -640,12 +687,13 @@ def apply(ctx):
             "- description: 日本語で1〜2文。\n"
             "- item_type と item_sub_type: 次の組から選ぶ。{types}\n"
             "- value: アイテムの価値。次の値を順に1つずつ使う: {values}。"
-            "この世界における最低が1で最高が70。高いほど強力であったり、特別であったりする。\n"
-            "- item_appearance: 見た目を日本語で短く（画像の選択に使う）。\n"
+            "この世界における最低が1で最高が{max}。高いほど強力であったり、特別であったりする。\n"
+            "- item_appearance: 英語で短い一文、画像の選択に使う。"
+            "(例:['A rusted longsword with a chipped blade and worn leather grip.'])\n"
             "- rarity: {rarities} のいずれか。value が低いほど common。\n"
             "- 前の品揃え（同じ名前を作らない）: {old}\n"
         ).format(
-            n=len(values),
+            n=len(values), lineup=lineup,
             world=frames.short(frames.attr(getattr(app, "world", None), "name", ""), 60),
             area=frames.short(frames.attr(area, "name", ""), 60),
             area_desc=frames.short(frames.attr(area, "description", "") or "", 600),
@@ -653,6 +701,7 @@ def apply(ctx):
             kind=frames.attr(facility, "facility_type", ""),
             shop_desc=frames.short(frames.attr(facility, "description", "") or "", 400),
             types=types, values=values, rarities="/".join(RARITIES),
+            max=VALUE_MAX,
             old="、".join(old_names) or "無し")
         return [{"role": "system", "content": text},
                 {"role": "user", "content": "＜入れ替え＞"}]
@@ -683,7 +732,7 @@ def apply(ctx):
             sub = ITEM_TYPES[item_type][0]
         got = row.get("value")
         if isinstance(got, int) and not isinstance(got, bool):
-            value = max(1, min(70, got))
+            value = max(1, min(value_limits.value_max(), got))
         rarity = str(row.get("rarity") or "")
         if rarity not in RARITIES:
             rarity = "common"
@@ -718,13 +767,19 @@ def apply(ctx):
                 type(raw).__name__))
             return 0
         made = []
+        excluded = shop_lineup.excluded_of(pending["facility"])
         for index, row in enumerate(rows[:len(values)]):
             fields = tidy(row, values[index])
             if fields is None:
                 continue
+            if fields[2] in excluded:
+                write("new stock: skipped {!r} ({}) excluded by the shop lineup".format(fields[0], fields[2]))
+                continue
             before = set(inventory_of(owner) or {})
             try:
-                item = maker(*(fields + (owner,)))
+                call = fields + (owner,)
+                # 戻りは `(Item, 鍵)`。品だけを取り出す（tuple のまま棚へ入れない）。
+                item = items.made_item("generate_item_from_item_data", maker(*call), call, {})
             except Exception:
                 ctx.log_exc("shop restock: generate_item_from_item_data failed")
                 continue
@@ -876,7 +931,7 @@ def apply(ctx):
 
     @ctx.wrap("__main__:InstantaleApp.toggle_twin_inventory_window",
               required=False, safe=True)
-    def before_window(orig, self, left_inventory_obtainer=None, *args, **kwargs):
+    def before_window(orig, self, *args, **kwargs):
         """売買画面が組み上がる手前で、その来店で増えたぶんを外す。
 
         ここはメインスレッドで、ゲームが持ち物の辞書を回すより前。
@@ -884,6 +939,7 @@ def apply(ctx):
         """
         held = store.get("held")
         if held is not None:
+            left_inventory_obtainer = frames.arg(args, kwargs, "left_inventory_obtainer", 0)
             owner = held["owner"]
             same = (left_inventory_obtainer is owner
                     or (owner is not None and str(getattr(
@@ -894,12 +950,14 @@ def apply(ctx):
                     drop_refilled(held)
                 except Exception:
                     ctx.log_exc("shop restock: cannot drop the refilled stock")
-        return orig(self, left_inventory_obtainer, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     @ctx.wrap("__main__:ShoppingStartManagerRemake.set_item_from_world_data",
               required=False, safe=True)
-    def observe_tier(orig, self, shop_owner_instance, next_tier, *args, **kwargs):
+    def observe_tier(orig, self, *args, **kwargs):
         try:
+            shop_owner_instance = frames.arg(args, kwargs, "shop_owner_instance", 0)
+            next_tier = frames.arg(args, kwargs, "next_tier", 1)
             owner_id = getattr(shop_owner_instance, "id", None)
             if owner_id is not None and isinstance(next_tier, (int, float, str)):
                 known = store["tiers"].get(str(owner_id))
@@ -908,7 +966,7 @@ def apply(ctx):
                     write("tier: owner={} tier={!r}".format(owner_id, next_tier))
         except Exception:
             ctx.log_exc("shop restock: cannot record the stock tier")
-        return orig(self, shop_owner_instance, next_tier, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     ctx.log("shop restock: every {} in-game day(s), keep_sold_out={}, "
             "new_stock={}; log goes to out/{}".format(

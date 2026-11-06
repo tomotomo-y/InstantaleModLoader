@@ -92,9 +92,9 @@ mod を入れる前に保存したもの）、読み込み直後に立ってい�
 注入した時点でも、窓が開いていなければ下ろす。
 """
 
-import sys
+import os
 
-from instantale_modloader import frames, ui
+from instantale_modloader import frames, loads, ui
 
 LOG_BASENAME = "battle_bgm.log"   # 106_ / 207_ と同じ時系列で読めるようにする
 
@@ -114,9 +114,6 @@ SHOP_FLAG = "in_shopping"  # 下ろすために名前を持つ。untrusted-flag-
 
 # 売買の窓を閉じる処理。窓の外側を押すとゲームが呼ぶ（閉じるボタンは無い）。
 SHOP_CLOSE_TARGET = "__main__:InstantaleApp.close_shopping_window_process"
-
-# `app.party` の主人公の鍵（仲間は id）。
-PLAYER_KEY = "player"
 
 # ロード直後にも残骸を下ろすか。
 CLEAR_ON_LOAD = True
@@ -194,42 +191,15 @@ def apply(ctx):
         勝ちの終わり方（`BattleEndInColosseum`）は預かりを戻さない。
         主人公が一覧に居ないまま画面から消え、そのままセーブに焼かれた
         （実機。一覧 `['88']`・預かり `['player']`。GAME.md §2.10）。
-        実行中の預かりは `{id: Character}`、セーブでは id の並びなので、どちらも受ける。
-        主人公は一覧の先頭へ戻す（セーブの並びを崩さない）。
+        戻し方はローダの語彙（`ui.return_escaped`。版9 で `147_` / `334_` / 窓口 `defeat` と1つにした）。
         """
         if app is None:
             return
-        escaped = getattr(app, "escaped_member_in_battle", None)
-        party = getattr(app, "party", None)
-        if not escaped or not isinstance(party, dict):
-            return
-        if isinstance(escaped, dict):
-            held = list(escaped.items())
-        elif isinstance(escaped, (list, tuple)):
-            held = [(member_id, None) for member_id in escaped]
-        else:
-            return
-        back, missing = [], []
-        for member_id, value in held:
-            if member_id in party:
-                continue
-            if value is None or isinstance(value, (str, int)):
-                value = (getattr(app, "player", None) if member_id == PLAYER_KEY
-                         else ui.character_of(app, member_id))
-            if value is None:
-                missing.append(member_id)
-                continue
-            party[member_id] = value
-            back.append(member_id)
-        if PLAYER_KEY in back:
-            ordered = [(PLAYER_KEY, party[PLAYER_KEY])] + [
-                (key, value) for key, value in party.items() if key != PLAYER_KEY]
-            party.clear()
-            party.update(ordered)
         try:
-            escaped.clear()
+            back, missing = ui.return_escaped(app)
         except Exception:
             ctx.log_exc("battle flag: could not clear escaped_member_in_battle")
+            return
         if back:
             write("{}: brought {} back from escaped_member_in_battle (the game left them "
                   "there)".format(where, ", ".join(str(m) for m in back)))
@@ -263,44 +233,41 @@ def apply(ctx):
 
     # ------------------------------------------------------------ ロード直後
     # この mod を入れる前に保存したセーブには、立ったままのフラグが焼かれている。
-    def on_load(target, label):
-        @ctx.wrap(target, required=False)
-        def _load(orig, self, *args, **kwargs):
-            result = orig(self, *args, **kwargs)
-            try:
-                # 売買の旗は戦闘の画面かどうかに関わらず下ろす（ロードの直後に窓は開いていない）。
-                clear_shop(self if frames.attr(self, SHOP_FLAG) is not frames.MISSING
-                           else find_app(), label)
-            except Exception:
-                ctx.log_exc("shop flag: clear failed")
-            try:
-                # `hasattr` は使わない。
-                # 失敗するルックアップを1回起こすので
-                # `__getattr__` トリップワイヤ（`201_`）を自己発火させる。
-                # 既定値付きの読み取りなら「本当に読まれた1回」と区別が付かない（TECH.md
-                # §6.3）。
-                owner = self if frames.attr(self, "in_battle") is not frames.MISSING \
-                    else find_app()
-                if ui.battle_on_screen(owner):   # ロードの直後の見分けはローダの1か所
-                    write("{}: the battle screen came back -- the save was made "
-                          "mid-battle; not touching".format(label))
-                    return result
-                return_escaped(owner, label)
-                if any(getattr(owner, name, False) for name in CLEAR_FLAGS):
-                    seen = [ui.spec_cls_name(entry)
-                            for entry in (getattr(owner, "buttons", None) or [])]
-                    write("{}: not a battle screen (buttons: {})".format(
-                        label, ", ".join(str(name) for name in seen) or "none"))
-                    clear_stale(owner, label)
-                    clear_stale_enemies(owner, label)
-            except Exception:
-                ctx.log_exc("battle flag: clear failed")
-            return result
-        return _load
+    # ロードと新規開始の後はローダの窓口 `loads` から呼ばれる（自分では包まない。TECH.md §3.3.21）。
+    def after_load(call):
+        self, label = call.obj, call.label
+        try:
+            # 売買の旗は戦闘の画面かどうかに関わらず下ろす（ロードの直後に窓は開いていない）。
+            clear_shop(self if frames.attr(self, SHOP_FLAG) is not frames.MISSING
+                       else find_app(), label)
+        except Exception:
+            ctx.log_exc("shop flag: clear failed")
+        try:
+            # `hasattr` は使わない。
+            # 失敗するルックアップを1回起こすので
+            # `__getattr__` トリップワイヤ（`201_`）を自己発火させる。
+            # 既定値付きの読み取りなら「本当に読まれた1回」と区別が付かない（TECH.md
+            # §6.3）。
+            owner = self if frames.attr(self, "in_battle") is not frames.MISSING \
+                else find_app()
+            if ui.battle_on_screen(owner):   # ロードの直後の見分けはローダの1か所
+                write("{}: the battle screen came back -- the save was made "
+                      "mid-battle; not touching".format(label))
+                return
+            return_escaped(owner, label)
+            if any(getattr(owner, name, False) for name in CLEAR_FLAGS):
+                seen = [ui.spec_cls_name(entry)
+                        for entry in (getattr(owner, "buttons", None) or [])]
+                write("{}: not a battle screen (buttons: {})".format(
+                    label, ", ".join(str(name) for name in seen) or "none"))
+                clear_stale(owner, label)
+                clear_stale_enemies(owner, label)
+        except Exception:
+            ctx.log_exc("battle flag: clear failed")
 
     if CLEAR_ON_LOAD:
-        on_load("__main__:InstantaleApp.load_game_new", "load_game_new")
-        on_load("__main__:InstantaleApp.start_game", "start_game")
+        loads.on(os.path.basename(getattr(ctx, "mod_dir", "") or "") or "107_fix_battle_flag_stuck", ctx, (loads.LOAD, loads.NEW_GAME),
+                 after=after_load, write=write)
 
     # ----------------------------------------------------- 売買の窓を閉じた後
     @ctx.wrap(SHOP_CLOSE_TARGET, required=False)

@@ -245,11 +245,41 @@ check("旗が無いなら --ctx-size は足さない", "--ctx-size" not in argv,
 check("旗が無くても --parallel は足す", flag_value(argv, "--parallel") == "1", argv)
 
 print("チェックポイント（--parallel 1 の副作用打ち消し）")
+OLD_HELP = "-cpent, --checkpoint-every-n-tokens N   create a checkpoint every n tokens\n"
+NEW_HELP = ("-ctxcp, --ctx-checkpoints, --swa-checkpoints N\n"
+            "-cms,  --checkpoint-min-step N          minimum spacing between context checkpoints\n")
+CKPT = ("--checkpoint-every-n-tokens", "--checkpoint-min-step", "-cpent", "-cms")
 module, ctx = fresh_mod()
 argv = passed_argv(launch(ctx, list(GAME_ARGV)))
-check("既定で -cpent を足す",
+check("--help が読めなければどれも足さない（存在しない実行ファイル）",
+      not any(flag in argv for flag in CKPT), argv)
+check("足さなくても --parallel 1 は立てる", flag_value(argv, "--parallel") == "1", argv)
+module.server_help = lambda exe: "--parallel N\n"
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("どちらも知らないサーバには足さない", not any(flag in argv for flag in CKPT), argv)
+check("知らなくても他の書き換えは残る", flag_value(argv, "--parallel") == "1", argv)
+module.server_help = lambda exe: "--checkpoint-every-n-tokens-max N\n"
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("長い名前の一部には当たらない", not any(flag in argv for flag in CKPT), argv)
+module.server_help = lambda exe: NEW_HELP
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("b10642 の形には --checkpoint-min-step 256 を足す",
+      flag_value(argv, "--checkpoint-min-step") == "256", argv)
+check("  旧い旗は足さない", "--checkpoint-every-n-tokens" not in argv, argv)
+argv = passed_argv(launch(ctx, GAME_ARGV + ["-cms", "1024"]))
+check("欄で -cms 指定済みなら上書きも追加もしない",
+      flag_value(argv, "-cms") == "1024" and "--checkpoint-min-step" not in argv, argv)
+module.server_help = lambda exe: OLD_HELP + NEW_HELP
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("両方知っているサーバには旧い旗だけ（先頭の1つ）",
+      flag_value(argv, "--checkpoint-every-n-tokens") == "256"
+      and "--checkpoint-min-step" not in argv, argv)
+module.server_help = lambda exe: OLD_HELP
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("b7054 の形には -cpent を足す",
       flag_value(argv, "--checkpoint-every-n-tokens") == "256",
       flag_value(argv, "--checkpoint-every-n-tokens"))
+check("  新しい旗は足さない", "--checkpoint-min-step" not in argv, argv)
 argv = passed_argv(launch(ctx, GAME_ARGV + ["--checkpoint-every-n-tokens", "512"]))
 check("欄で指定済みなら上書きしない",
       flag_value(argv, "--checkpoint-every-n-tokens") == "512",
@@ -257,7 +287,7 @@ check("欄で指定済みなら上書きしない",
 check("二重に足さない", argv.count("--checkpoint-every-n-tokens") == 1)
 module, ctx = fresh_mod(SLOTS=0)
 argv = passed_argv(launch(ctx, list(GAME_ARGV)))
-check("統合に戻すときは足さない", "--checkpoint-every-n-tokens" not in argv, argv)
+check("統合に戻すときは足さない", not any(flag in argv for flag in CKPT), argv)
 
 print("窓を黙って縮めない")
 module, ctx = fresh_mod(CTX_SIZE=0, SLOTS=2)
@@ -278,6 +308,274 @@ print("観測のみ")
 module, ctx = fresh_mod(OBSERVE_ONLY=True)
 argv = passed_argv(launch(ctx, list(GAME_ARGV)))
 check("OBSERVE_ONLY では1文字も変えない", argv == GAME_ARGV, argv)
+
+print("MTP の下書き役")
+GEMMA = {"general.architecture": "gemma4", "gemma4.embedding_length": 2816,
+         "tokenizer.ggml.model": "gemma4", "tokenizer.ggml.tokens": ("array", 262144)}
+DRAFT = {"general.architecture": "gemma4-assistant", "gemma4-assistant.nextn_predict_layers": 4,
+         "gemma4-assistant.embedding_length_out": 2816,
+         "tokenizer.ggml.model": "gemma4", "tokenizer.ggml.tokens": ("array", 262144)}
+module = fresh_mod()[0]
+for name, value in zip(module.MTP_SAME_KEYS, (16, 512, 512, 256, 256, 1024, 1e6, 1e4, 512, 256)):
+    GEMMA["gemma4." + name] = value
+    DRAFT["gemma4-assistant." + name] = value
+check("同じ構造の本体と下書き役は合う", module.mtp_matches(GEMMA, DRAFT)[0], module.mtp_matches(GEMMA, DRAFT))
+qwen = dict(GEMMA, **{"general.architecture": "qwen35"})
+check("構造が違えば合わない", not module.mtp_matches(qwen, DRAFT)[0])
+wide = dict(GEMMA, **{"gemma4.embedding_length": 5376})
+check("幅が違えば合わない（同じ Gemma 4 でも 31B など）", not module.mtp_matches(wide, DRAFT)[0])
+swa = dict(GEMMA, **{"gemma4.attention.sliding_window": 512})
+check("注意の形が1つでも違えば合わない", not module.mtp_matches(swa, DRAFT)[0])
+no_layers = {k: v for k, v in DRAFT.items() if "nextn" not in k}
+check("MTP の層が無い下書き役は合わない", not module.mtp_matches(GEMMA, no_layers)[0])
+missing = {k: v for k, v in GEMMA.items() if k != "gemma4.rope.freq_base"}
+check("読めない値があれば合わない（付けない側に倒す）", not module.mtp_matches(missing, DRAFT)[0])
+
+MTP_HELP = NEW_HELP + "-md, --model-draft FNAME\n--spec-type none,draft-simple,draft-mtp,ngram-mod\n"
+DRAFT_PATH = r"C:\game\runtime\models\llama_cpp\mtp\mtp-gemma.gguf"
+module, ctx = fresh_mod()
+module.server_help = lambda exe: MTP_HELP
+module.find_drafter = lambda argv: (DRAFT_PATH, "合う")
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("合う下書き役があれば --model-draft と draft-mtp を足し、ngram-mod を重ねる",
+      flag_value(argv, "--model-draft") == DRAFT_PATH and flag_value(argv, "--spec-type") == "draft-mtp,ngram-mod"
+      and flag_value(argv, "--spec-draft-n-max") == "4", argv)
+check("  チェックポイントと --parallel 1 も残る",
+      flag_value(argv, "--checkpoint-min-step") == "256" and flag_value(argv, "--parallel") == "1", argv)
+module.server_help = lambda exe: NEW_HELP + "-md, --model-draft FNAME\n--spec-type none,draft-simple,draft-mtp\n"
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("ngram-mod を知らないサーバには draft-mtp だけを渡す",
+      flag_value(argv, "--model-draft") == DRAFT_PATH and flag_value(argv, "--spec-type") == "draft-mtp", argv)
+check("  重ねなかった理由をログに残す",
+      any("ngram-mod は重ねない" in after for _f, _b, after in module.rewrite_argv(list(GAME_ARGV))[1]))
+module.server_help = lambda exe: MTP_HELP
+argv = passed_argv(launch(ctx, GAME_ARGV + ["--spec-type", "ngram-mod"]))
+check("欄で投機の旗が指定済みなら MTP に触らない",
+      "--model-draft" not in argv and argv.count("--spec-type") == 1, argv)
+module.server_help = lambda exe: NEW_HELP
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("MTP を知らないサーバには足さない", "--model-draft" not in argv, argv)
+module.server_help = lambda exe: MTP_HELP
+module.find_drafter = lambda argv: (None, "合う下書き役が無い")
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("合う下書き役が無ければ足さない", "--model-draft" not in argv, argv)
+module, ctx = fresh_mod(MTP=False)
+module.server_help = lambda exe: MTP_HELP
+module.find_drafter = lambda argv: (DRAFT_PATH, "合う")
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("設定で切れば足さない", "--model-draft" not in argv, argv)
+module, ctx = fresh_mod(MTP_NGRAM=False)
+module.server_help = lambda exe: MTP_HELP
+module.find_drafter = lambda argv: (DRAFT_PATH, "合う")
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("重ねるのを切れば draft-mtp だけ", flag_value(argv, "--spec-type") == "draft-mtp", argv)
+
+print("本体の MTP の層")
+module, ctx = fresh_mod()
+module.server_help = lambda exe: MTP_HELP
+module.builtin_mtp = lambda argv: (True, module.BUILTIN_DRAFT)
+module.find_drafter = lambda argv: (DRAFT_PATH, "合う")
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("本体に層があれば、下書き役があっても --model-draft を渡さず draft-mtp を足す",
+      "--model-draft" not in argv and flag_value(argv, "--spec-type") == "draft-mtp,ngram-mod"
+      and flag_value(argv, "--spec-draft-n-max") == "4", argv)
+module.server_help = lambda exe: NEW_HELP + "--spec-type none,draft-mtp,ngram-mod\n"
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("  --model-draft を知らないサーバでも、本体の層なら使う", flag_value(argv, "--spec-type") == "draft-mtp,ngram-mod", argv)
+module.builtin_mtp = lambda argv: (False, "本体に MTP の層が無い")
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("  本体に層が無く --model-draft も知らなければ足さない", "--spec-type" not in argv, argv)
+module, ctx = fresh_mod(MTP=False)
+module.server_help = lambda exe: MTP_HELP
+module.builtin_mtp = lambda argv: (True, module.BUILTIN_DRAFT)
+argv = passed_argv(launch(ctx, list(GAME_ARGV)))
+check("  設定で切れば本体の層も使わない", "--spec-type" not in argv, argv)
+
+print("MTP を付けて起きなかったら外して起こし直す")
+module, ctx = fresh_mod()
+module.server_help = lambda exe: MTP_HELP
+module.find_drafter = lambda argv: (DRAFT_PATH, "合う")
+module._MTP_STATE.failed.clear()
+started = []
+
+
+def fake_set_ai_models(*_args, **_kwargs):
+    seen = launch(ctx, list(GAME_ARGV))           # ゲームはこの中で llama-server を起こす
+    started.append(passed_argv(seen))
+    if "--model-draft" in started[-1]:
+        raise RuntimeError("同梱llama-serverが起動しませんでした")
+    return "ok"
+
+
+result = ctx.hooks["__main__:AIManager.set_ai_models"](fake_set_ai_models, "manager")
+check("2回目は MTP を外して起き、ゲームには成功を返す",
+      result == "ok" and len(started) == 2 and "--model-draft" in started[0]
+      and "--model-draft" not in started[1], started)
+check("  WARN を残す", any(level == "WARN" and "MTP" in msg for level, msg in ctx.logs), ctx.logs)
+started.clear()
+result = ctx.hooks["__main__:AIManager.set_ai_models"](fake_set_ai_models, "manager")
+check("  同じ組はこのプロセスの間は付けない（1回で起きる）",
+      result == "ok" and len(started) == 1 and "--model-draft" not in started[0], started)
+
+
+def broken(*_args, **_kwargs):
+    launch(ctx, list(REMBG_ARGV))
+    raise RuntimeError("別の理由")
+
+
+raised = False
+try:
+    ctx.hooks["__main__:AIManager.set_ai_models"](broken, "manager")
+except RuntimeError:
+    raised = True
+check("MTP を付けていない失敗はそのまま上げる（握り潰さない）", raised)
+module._MTP_STATE.failed.clear()
+
+module, ctx = fresh_mod()
+module.server_help = lambda exe: MTP_HELP
+module.builtin_mtp = lambda argv: (True, module.BUILTIN_DRAFT)
+started = []
+
+
+def fake_builtin_fail(*_args, **_kwargs):
+    started.append(passed_argv(launch(ctx, list(GAME_ARGV))))
+    if "--spec-type" in started[-1]:
+        raise RuntimeError("同梱llama-serverが起動しませんでした")
+    return "ok"
+
+
+result = ctx.hooks["__main__:AIManager.set_ai_models"](fake_builtin_fail, "manager")
+check("本体の層で起きなかったときも MTP を外して起こし直す",
+      result == "ok" and len(started) == 2 and "--spec-type" in started[0] and "--spec-type" not in started[1], started)
+check("  WARN に本体の層と書く", any(level == "WARN" and module.BUILTIN_DRAFT in msg for level, msg in ctx.logs), ctx.logs)
+module._MTP_STATE.failed.clear()
+
+print("GGUF の情報を読む")
+import struct as _struct  # noqa: E402
+
+module = fresh_mod()[0]
+
+
+def gguf_bytes(pairs, tensors=()):
+    out = [b"GGUF", _struct.pack("<I", 3), _struct.pack("<QQ", len(tensors), len(pairs))]
+    for key, kind, value in pairs:
+        raw = key.encode("utf-8")
+        out.append(_struct.pack("<Q", len(raw)) + raw + _struct.pack("<I", kind))
+        if kind == 8:
+            data = value.encode("utf-8")
+            out.append(_struct.pack("<Q", len(data)) + data)
+        elif kind == 4:
+            out.append(_struct.pack("<I", value))
+        elif kind == 9:
+            out.append(_struct.pack("<IQ", 8, len(value)))
+            for item in value:
+                data = item.encode("utf-8")
+                out.append(_struct.pack("<Q", len(data)) + data)
+    for name, dims in tensors:                         # 名前・次元の数・形・型・置き場所
+        raw = name.encode("utf-8")
+        out.append(_struct.pack("<Q", len(raw)) + raw + _struct.pack("<I", len(dims))
+                   + b"".join(_struct.pack("<Q", d) for d in dims) + _struct.pack("<IQ", 0, 0))
+    return b"".join(out)
+
+
+path = os.path.join(OUT_DIR, "meta_probe.gguf")
+with open(path, "wb") as fh:
+    fh.write(gguf_bytes([("general.architecture", 8, "gemma4"),
+                         ("gemma4.embedding_length", 4, 2816),
+                         ("tokenizer.ggml.tokens", 9, ["t{}".format(i) for i in range(100)])]))
+meta = module.gguf_meta(path)
+check("構造の名前・数・長い語彙の並び（数だけ）を読む",
+      meta == {"general.architecture": "gemma4", "gemma4.embedding_length": 2816,
+               "tokenizer.ggml.tokens": ("array", 100), module.NEXTN_TENSORS_KEY: 0}, meta)
+check("  本体に MTP の層が無ければ builtin_mtp は無しと答える", module.builtin_mtp(["llama-server", "-m", path])[0] is False)
+with open(path, "wb") as fh:
+    fh.write(gguf_bytes([("general.architecture", 8, "qwen35"), ("qwen35.nextn_predict_layers", 4, 1)],
+                        [("blk.0.attn_q.weight", (5120, 6144)), ("blk.64.nextn.eh_proj.weight", (10240, 5120)),
+                         ("blk.64.nextn.enorm.weight", (5120,))]))
+module._META_CACHE.clear()
+meta = module.gguf_meta(path)
+check("テンソルの名前を読み、MTP の層の重みを数える", meta.get(module.NEXTN_TENSORS_KEY) == 2, meta)
+check("  層の数と重みがあれば builtin_mtp は有りと答える", module.builtin_mtp(["llama-server", "-m", path])[0] is True)
+with open(path, "wb") as fh:
+    fh.write(gguf_bytes([("general.architecture", 8, "qwen35"), ("qwen35.nextn_predict_layers", 4, 1)],
+                        [("blk.0.attn_q.weight", (5120, 6144))]))
+module._META_CACHE.clear()
+check("  層の数があっても重みが無ければ無し",
+      module.builtin_mtp(["llama-server", "-m", path]) == (False, "本体に MTP の層の重みが無い"))
+module._META_CACHE.clear()
+with open(path, "wb") as fh:
+    fh.write(b"NOPE")
+module._META_CACHE.clear()
+check("GGUF でなければ None", module.gguf_meta(path) is None)
+os.remove(path)
+
+print("窓を共有する起動ではスキーマ説明を縮める")
+module = fresh_mod()[0]
+needs = module.needs_schema_compact
+check("--parallel 無し（統合 KV）は縮める", needs(GAME_ARGV, GAME_ARGV)[0] is True)
+check("--parallel 1 で窓がゲームのままなら縮めない",
+      needs(GAME_ARGV, GAME_ARGV + ["--parallel", "1"])[0] is False)
+check("-np の綴りでも読む", needs(GAME_ARGV, GAME_ARGV + ["-np", "1"])[0] is False)
+wide = [item if item != "16384" else "32768" for item in GAME_ARGV] + ["--parallel", "2"]
+check("--parallel 2 で窓をスロット数倍にしたら縮めない", needs(GAME_ARGV, wide)[0] is False)
+check("--parallel 2 で窓が割られたら縮める",
+      needs(GAME_ARGV, GAME_ARGV + ["--parallel", "2"])[0] is True)
+
+sc = module.schema_compact
+LONG_SCHEMA = sc.SAMPLE_SCHEMA.replace(
+    "'title': 'Area'", "'title': 'Area', 'x': '" + "a" * sc.MIN_SCHEMA_CHARS + "'")
+LONG_PROMPT = "出力は次の構造に従うこと: " + LONG_SCHEMA
+
+
+def send(ctx):
+    """フック越しに頼みを1回送る。戻り値は元関数が受け取った本文。"""
+    got = {}
+
+    def orig(self, model, messages, format=None, *a, **kw):
+        got["messages"] = messages
+        return {"content": "{}"}
+
+    sent = [{"role": "system", "content": LONG_PROMPT}, {"role": "user", "content": "行く"}]
+    ctx.hooks[module.CHAT_TARGET](orig, object(), "m", sent, {"type": "object"})
+    return got["messages"][0]["content"], sent
+
+
+def reset_compact_state(mod):
+    mod._COMPACT_STATE.need = None
+    mod._COMPACT_STATE.why = ""
+
+
+module, ctx = fresh_mod()
+reset_compact_state(module)
+launch(ctx, list(GAME_ARGV))
+content, sent = send(ctx)
+check("既定（SLOTS=1）で起こしたら頼みは素のまま", content == LONG_PROMPT, content[:80])
+
+module, ctx = fresh_mod(SLOTS=0)
+reset_compact_state(module)
+launch(ctx, list(GAME_ARGV))
+content, sent = send(ctx)
+check("SLOTS=0 で起こしたらスキーマ説明を縮める",
+      content.startswith("出力は次の構造に従うこと: Location = {") and len(content) < len(LONG_PROMPT),
+      content[:80])
+check("呼び出し側の message は書き換えない", sent[0]["content"] == LONG_PROMPT)
+check("短いスキーマは縮めない（下限）",
+      sc.compact_embedded_schema("出力: " + sc.SAMPLE_SCHEMA) is None)
+
+module, ctx = fresh_mod()
+reset_compact_state(module)
+module.running_flags = lambda: None
+content, sent = send(ctx)
+check("起動を見ておらずサーバも読めなければ縮める", content != LONG_PROMPT, content[:80])
+reset_compact_state(module)
+module.running_flags = lambda: ("16384", "1")
+content, sent = send(ctx)
+check("起動を見ていなくても、走っているサーバが --parallel 1 なら縮めない", content == LONG_PROMPT,
+      content[:80])
+reset_compact_state(module)
+
+module, ctx = fresh_mod(OBSERVE_ONLY=True)
+check("観測のみでは頼みを包まない", module.CHAT_TARGET not in ctx.hooks)
 
 print("設定の宣言")
 with io.open(os.path.join(MOD_DIR, "mod.json"), encoding="utf-8") as fh:

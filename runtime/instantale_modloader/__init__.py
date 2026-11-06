@@ -33,6 +33,10 @@ GUI に出るだけだが、次の5つは動作に関わる:
     "settings": {...}               GUI から変えられる設定の宣言（config.py）
     "debug": true                   開発者向け。デバッグモードのときだけ動く（discover）
     "superseded": "main_024"        本体がその版で同じ修正を取り込んだので降ろした
+                                    （別の MOD が取り込んだときはその MOD の名前。"127_llm_response_speed"）
+
+`"state": ["npc_profiles"]` はその MOD の記録の置き場所（`state/` からの相対）。
+GUI の行の右クリック「state/ を開く」が開く先で、読み込みには関わらない。
 
 `kind` は mod 自身が名乗る種別（`KINDS` の1つ。GUI の「種別」列に出る。表示だけで
 読み込みの扱いは変えない）。
@@ -61,6 +65,7 @@ import datetime
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -68,7 +73,7 @@ import time
 import traceback
 import uuid
 
-__version__ = "1.15.0"
+__version__ = "1.19.0"
 
 # mod との契約。`mod.json` の "api" がこれと突き合わされる。
 #
@@ -272,9 +277,13 @@ def read_json(path: str, default=None, *, report=None):
     mod を止めるほうが損害が大きい。
     `load_order.json` が壊れていても必ず動かすのと同じ判断）。
     変わるのは**消えたことが後から分かる**ことだけ。
+
+    BOM 付きの UTF-8 も読む（`utf-8-sig`）。控えと設定は手で直せるので、
+    エディタが BOM を付けて保存すると読めず、`default` から作り直されて上書きされていた。
+    書くほうは BOM を付けない（`write_json`）。
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             return json.load(fh)
     except FileNotFoundError:
         return default
@@ -290,6 +299,13 @@ def read_json(path: str, default=None, *, report=None):
 DEFERRED_POLL = 5.0          # sys.modules を見に行く間隔（秒）
 DEFERRED_TIMEOUT = 3600.0    # ここまで来なければ諦める（1時間）
 MAX_DEFERRED_BOOTS = 8       # 当て直しの上限。暴走よけ
+
+# 画面を開いたときに初めて import されるモジュール（TECH.md §3.4）。
+# ここ宛ての保留は段階適用の待ちに数えず（台帳の `on_demand`）、`DEFERRED_TIMEOUT` で諦めずに見張り続ける。
+ON_DEMAND_MODULES = (
+    "scripts.hud.hud_world_bulk",       # 世界の一括生成の「開始／再開」
+    "scripts.world_bulk_backend",       # 同上
+)
 
 # ローダの状態。
 # 再注入のたびに作り直される。
@@ -1023,6 +1039,48 @@ def order_path(mods_dir: str) -> str:
     return local if os.path.isfile(local) else os.path.join(mods_dir, ORDER_NAME)
 
 
+#: 改名した MOD（古いフォルダ名 → 新しいフォルダ名）。
+#: 更新の zip も手で展開した zip も古いフォルダを消さないので、残ると「順序ファイルに無い MOD」として
+#: 新しい名前と一緒に読み込まれ、一覧に2つ並ぶ。前に切っていた入切も古い名前にしか残らない。
+RENAMED_MODS = {
+    "406_gemini_user_role_fix": "406_user_role_fix",        # v1.16.0（Claude でも効くようにした）
+}
+
+
+def drop_renamed(mods_dir: str) -> list[str]:
+    """改名した MOD の古いフォルダを消し、順序ファイルの入切を新しい名前へ移す。消した古い名前を返す。
+
+    新しい名前のフォルダ（`mod.json`）が無ければ何もしない（古い版の zip で戻したときなど）。
+    古い名前を切っていたら新しい名前も切り、順序ファイルから古い名前を外す。
+    GUI の起動・更新の展開・watcher の起動で呼ぶ。v1.15.0 の GUI の更新はこれを持たないので、
+    更新の後に開き直した GUI が片付ける。
+    """
+    dropped = []
+    for old, new in RENAMED_MODS.items():
+        if not os.path.isfile(os.path.join(mods_dir, new, MANIFEST_NAME)):
+            continue
+        source = os.path.join(mods_dir, old)
+        if os.path.isdir(source):
+            try:
+                shutil.rmtree(source)
+            except OSError:
+                log_exc("cannot remove the renamed mod {}".format(source))
+                continue
+            dropped.append(old)
+        path = order_path(mods_dir)
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        order = [name for name in data.get("order") or [] if name != old]
+        disabled = list(data.get("disabled") or [])
+        if old in disabled:
+            disabled = [new if name == old else name for name in disabled]
+            disabled = [name for i, name in enumerate(disabled) if name not in disabled[:i]]
+        if order != (data.get("order") or []) or disabled != (data.get("disabled") or []):
+            write_json(path, dict(data, order=order, disabled=disabled), indent=2)
+    return dropped
+
+
 
 
 def _installed(mods_dir: str) -> list[str]:
@@ -1095,7 +1153,7 @@ def discover(mods_dir: str | None = None, *, debug: bool | None = None) -> dict:
          "disabled":  ["..."],                  切られているもの
          "debug":     {"200_probe_..."},        開発者向け。今は伏せられている
          "debug_mode": False,                   デバッグモードが入っているか
-         "superseded": {"101_...": "main_024"}, 本体が取り込んだので降ろしたもの
+         "superseded": {"101_...": "main_024"}, 本体か別の MOD が取り込んだので降ろしたもの
          "wip":       {"901_..."},              開発中（9xx）。順序ファイルに載り、かつデバッグモードのときだけ読む
          "manifests": {名前: マニフェスト},      無効なものも壊れたものも含む
          "problems":  ["..."],                  宣言と実体のずれ。人が読む行
@@ -1236,11 +1294,8 @@ def _order(mods_dir: str, found: list[str],
 
     `hide` に挙げた mod は適用順から外す（デバッグモードが切のときの計測 mod。
     `discover()` が渡す）。
-    `disabled` と違って**報告もしない**。切ったのは設定ではなくローダなので、
-    「無効化されています」「記載の無い MOD」を出すと、
-    伏せたはずのものが警告として画面に出てくる。
-    切られていることを必ず見せる `disabled` とは目的が逆なので、
-    同じ扱いにはできない。
+    切ったのは設定ではなくローダなので、「記載の無い MOD」にも数えない。
+    数えると、伏せたはずのものが警告として画面に出てくる。
 
     戻り値は `(有効な mod の適用順, 一覧に出す順, 切られている mod, 報告)`。
     2つ目は無効な mod も**宣言された位置に**含む（GUI の一覧用）。
@@ -1291,22 +1346,9 @@ def _order(mods_dir: str, found: list[str],
         disabled = []
     off = {name for name in disabled if isinstance(name, str)}
     skipped = sorted(off & set(found))
-    # 報告するのは `disabled` で切ったものだけ。
-    # 伏せている mod は `skipped` に残す（「切る」選択そのものは消さない。
-    # GUI が保存で書き戻すため）が、警告としては出さない。
-    #
-    # `local/` の mod も報告しない。
-    # この行の目的は「入れたのに効かない」を配った先で気付かせることだが、
-    # `local/` は配布物に入らないので知らせる相手が居ない
-    # （手元で切ってあるだけの状態が、静的検査でずっと赤になる）。
-    # 切られていること自体は `skipped` に残るので、GUI のチェックは外れたまま。
-    told = [name for name in skipped
-            if name not in hide and name not in local]
-    if told:
-        # 「入れたのに効かない」を黙って起こさない。
-        # 切ったことは必ず残す。
-        problems.append("無効化されています（読み込まれません）: {}".format(
-            ", ".join(told)))
+    # 切ったものは報告しない（TECH.md §3.2.1）。
+    # MOD が増えて切るのが普通の使い方になり、毎回の警告は見落としを増やすだけになった。
+    # 切られていることは `skipped` に残り、GUI のチェックが外れて見える。
 
     # 一覧に出す順。
     # 無効なものも宣言された位置に残す。
@@ -1481,8 +1523,8 @@ def _manifest(mods_dir: str, name: str) -> dict:
         # （TECH.md §3.2.2。挙動を変えるなら機能追加でも 1xx に置いてよい）ので、
         # どれに属するかは mod 自身に言わせる。無指定・語彙の外は ""。
         "kind": kind,
-        # ゲーム本体が同じ修正を取り込んだので降ろした mod。
-        # 値はその版（例 "main_024"）。
+        # ゲーム本体か別の mod が同じ修正を取り込んだので降ろした mod。
+        # 値は取り込んだ版（例 "main_024"）か、取り込んだ mod の名前（例 "127_llm_response_speed"）。
         # **読み込みの扱いは "debug" と同じ**で、
         # 違うのは「なぜ伏せられているか」だけ。計測用に作ったものと、
         # 要らなくなった修正とを一覧で見分けられないと、
@@ -1494,7 +1536,35 @@ def _manifest(mods_dir: str, name: str) -> dict:
         # {"entry": "tool.py", "label": {...}, "note": {...}}。無ければ None。
         # GUI が起動するだけで、ローダ本体は読まない。
         "tool": _tool_decl(name, data.get("tool")),
+        # この MOD の記録の置き場所（`state/` からの相対。"npc_profiles"・"musics/battle"・
+        # "road_travel.json"）。GUI の行の右クリック「state/ を開く」が開くだけで、ローダ本体は読まない。
+        # 置き場所はコードの定数で決まり、フォルダ名とも一致しない（"adventurer_recruit"）ので、
+        # GUI が推し量らずに済むよう MOD に言わせる。
+        "state": _state_decl(name, data.get("state")),
     }
+
+
+def _state_decl(name: str, raw) -> list[str]:
+    """`"state"` の宣言を均す。`/` 区切りの相対パスの並び。外へ出るものは捨てる。"""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        if raw is not None:
+            log("{}: \"state\" が並びではない。無視する".format(name), level="WARN")
+        return []
+    found = []
+    for item in raw:
+        parts = [p for p in str(item).replace("\\", "/").split("/") if p] if isinstance(item, str) else []
+        # 先頭の区切りは直に見る（Windows の 3.13 から `os.path.isabs("/x")` は False）。
+        if (not parts or str(item)[:1] in ("/", "\\") or ":" in str(item)
+                or any(p in (".", "..") for p in parts)):
+            log("{}: \"state\" の {!r} は state/ の中の相対パスではない。無視する".format(name, item),
+                level="WARN")
+            continue
+        joined = "/".join(parts)
+        if joined not in found:
+            found.append(joined)
+    return found
 
 
 def _tool_decl(name: str, raw) -> dict | None:
@@ -1569,15 +1639,10 @@ def _sort_dependencies(order: list[str], manifests: dict,
 
     存在しない mod や無効な mod を指した制約は黙って捨てる（消した
     mod の記述が残っていても壊れないように。順序ファイルの扱いと同じ）。
-    ただし**報告は残す**。切った相手を指していることは、
-    順序が変わる理由として見えていてよい。
-
-    `silent` に挙げた相手を指した制約は、報告もしない。
-    伏せている mod（デバッグモードが切のときの計測 mod）が相手で、
-    これを報告すると `300_event_facility_arrival` の
-    `"after": ["205_probe_player_events"]` が「無効な
-    mod を指している」として毎回警告に出る。
-    画面から見れば存在しないはずの mod の名前が出てくることになる。
+    報告するのは存在しない mod を指したときだけ（名前の書き間違いを見つけるため）。
+    切った相手と、`silent` に挙げた伏せている mod（デバッグモードが切のときの計測 mod）が
+    相手のときは報告しない。
+    相手が動いていなければ順序の制約は意味を持たず、切るのは普通の使い方なので。
 
     循環していたら**基準の並びをそのまま返す**。
     ここで例外にすると mod が全滅する。
@@ -1593,19 +1658,15 @@ def _sort_dependencies(order: list[str], manifests: dict,
         for other in manifest.get("after") or []:
             if other in known:
                 edges[other].add(name)
-            elif other in silent:
+            elif other in silent or other in manifests:
                 pass
-            elif other in manifests:
-                notes.append("{}: \"after\" が無効な mod を指しています（{}）".format(name, other))
             else:
                 notes.append("{}: \"after\" の {} が見つかりません".format(name, other))
         for other in manifest.get("before") or []:
             if other in known:
                 edges[name].add(other)
-            elif other in silent:
+            elif other in silent or other in manifests:
                 pass
-            elif other in manifests:
-                notes.append("{}: \"before\" が無効な mod を指しています（{}）".format(name, other))
             else:
                 notes.append("{}: \"before\" の {} が見つかりません".format(name, other))
 
@@ -1810,9 +1871,30 @@ def _owner_modules(owners) -> list[str]:
 def _deferred_loop(out_dir: str, generation: str, pending: list,
                    owners: list = ()) -> None:
     from . import patch as _patch
+    from . import patch_registry as _registry
     owners = list(owners)
     deadline = time.monotonic() + DEFERRED_TIMEOUT
-    while time.monotonic() < deadline:
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            # 起動の段階適用の分は諦める。画面を開くまで来ない分（`ON_DEMAND_MODULES`）だけで見張り続ける。
+            late = [n for n in pending
+                    if sys.modules.get(n) is None and n not in ON_DEMAND_MODULES]
+            if owners:
+                # 持ち主待ちも同じ理由で降ろす。台帳を引く鍵はモジュール名（`_owner_modules`）。
+                late = late + [n for n in _owner_modules(owners) if n not in late]
+            if late:
+                log("deferred: gave up after {:.0f}s; still not resolvable: {}".format(
+                    DEFERRED_TIMEOUT, ", ".join(late)), level="WARN")
+                # 見張りが降りた以上、もう当たらない。
+                # `deferred` のまま残すと「まだ待っている」と読めてしまうので、
+                # 諦めたことを台帳に書いて status.json へ流す。
+                if _registry.settle_deferred(late, "gave up after {:.0f}s".format(DEFERRED_TIMEOUT)):
+                    write_status(out_dir)
+            pending = [n for n in pending if n in ON_DEMAND_MODULES]
+            owners = []
+            deadline = None
+            if not pending:
+                return
         time.sleep(DEFERRED_POLL)
         if _superseded(generation):
             return
@@ -1856,18 +1938,6 @@ def _deferred_loop(out_dir: str, generation: str, pending: list,
                 # 記録だけして降りる。
                 log_exc("deferred re-apply failed")
         return
-    from . import patch_registry as _registry
-    late = [n for n in pending if sys.modules.get(n) is None]
-    if owners:
-        # 持ち主待ちも同じ理由で降ろす。台帳を引く鍵はモジュール名（`_owner_modules`）。
-        late = late + [n for n in _owner_modules(owners) if n not in late]
-    log("deferred: gave up after {:.0f}s; still not resolvable: {}".format(
-        DEFERRED_TIMEOUT, ", ".join(late)), level="WARN")
-    # 見張りが降りた以上、もう当たらない。
-    # `deferred` のまま残すと「まだ待っている」と読めてしまうので、
-    # 諦めたことを台帳に書いて status.json へ流す。
-    if _registry.settle_deferred(late, "gave up after {:.0f}s".format(DEFERRED_TIMEOUT)):
-        write_status(out_dir)
 
 
 def _arm_deferred(out_dir: str, generation: str) -> None:
@@ -1952,10 +2022,12 @@ def _forget_unapplied(results: dict, manifests: dict) -> list[str]:
     from . import prices as _prices
     from . import combat as _combat
     from . import equipment as _equipment
+    from . import abilities as _abilities
     ok = {name for name, verdict in results.items() if verdict == "ok"}
     base, layers = _prices.item_price_sources()
-    owners = (set(manifests) | set(_durations.owners()) | {base} | set(layers)
-              | set(_combat.owners()) | set(_equipment.owners()))
+    _inn_answer, inn_layers = _prices.inn_price_sources()
+    owners = (set(manifests) | set(_durations.owners()) | {base} | set(layers) | set(inn_layers)
+              | set(_combat.owners()) | set(_equipment.owners()) | set(_abilities.owners()))
     gone = []
     for owner in sorted(owners - ok - {""}):
         if _durations.forget(owner, write=log):
@@ -2060,6 +2132,19 @@ def _boot(out_dir: str) -> dict:
 
     from . import config as _config
     from . import patch_registry as _registry
+
+    # ゲームが送り口を作り直したら、MOD とローダの包みを当て直す（llm.py の `REBUILD_TARGET`）。
+    # MOD の適用より前に据える。MOD が `set_ai_models` を包むと前の世代の層が剥がれるので、後に据えると
+    # そこから据わるまでの間の作り直しを見逃した（遅れて当て直す boot の最中に「開始する」を押した実機）。
+    try:
+        from . import llm as _llm
+        _registry.begin_mod("(loader)")
+        try:
+            _llm.install_rebuild_hook(ctx)
+        finally:
+            _registry.end_mod()
+    except BaseException:
+        log_exc("cannot install the sender rebuild hook")
 
     results: dict[str, str] = {}
     settings: dict[str, dict] = {}
@@ -2215,15 +2300,45 @@ def _boot(out_dir: str) -> dict:
             _registry.end_mod()
     except BaseException:
         log_exc("cannot install the stall guard")
+    # 能力値の補正を、ゲームが読む場面の間だけ足して見せる（abilities.py）。MOD の層より後に当てる
+    # （MOD が自分の包みの中で読む攻撃力・能力値にも補正が乗る）。
+    try:
+        from . import abilities as _abilities
+        _registry.begin_mod("(loader)")
+        try:
+            _abilities.install(ctx)
+        finally:
+            _registry.end_mod()
+    except BaseException:
+        log_exc("cannot install the ability bonuses")
     try:
         _patch.drop_stale_layers()
     except BaseException:
         log_exc("cannot drop the stale patch layers")
     _rebind_cloud_resources()
+    # ゲームの更新で MOD が効かなくなったのを、遊んでいる間に見つける（drift.py）。
+    # 包みの控え（`patch.placements()`）が揃った後に立てる。
+    try:
+        from . import drift as _drift
+        _drift.start(ctx, out_dir)
+    except BaseException:
+        log_exc("cannot start the drift watch")
     try:
         _forget_unapplied(results, manifests)
     except BaseException:
         log_exc("cannot forget the durations of the mods not applied")
+    try:
+        # 左下の MOD 用のボタンの一覧から、今回適用されなかった MOD の行を外す（1つも無ければボタンごと外す）
+        from . import hudicons as _hudicons
+        _hudicons.settle()
+    except BaseException:
+        log_exc("cannot settle the hud icons")
+    try:
+        # 当て直しの途中に来た選択肢の組み直しには、まだ登録し直していない MOD のボタンが無い。揃ったので組み直させる
+        from . import choices as _choices
+        _choices.settle(ctx)
+    except BaseException:
+        log_exc("cannot settle the choices")
 
     ok = sum(1 for v in results.values() if v == "ok")
     log("-" * 70)
@@ -2244,6 +2359,8 @@ def _boot(out_dir: str) -> dict:
     # 遅れて当て直す boot では大半が同じ行だった（実測。180行ほどのうち9割以上）。
     # 今の全体は `status.json` の `patches.conflicts` にある。
     # 見出しと、保留・見送り・UNRESOLVED の節は毎回書く。
+    # 画面を開くまで来ないモジュール宛ての保留は、報告と status.json の前に分けておく（`ON_DEMAND_MODULES`）。
+    _registry.mark_on_demand(ON_DEMAND_MODULES)
     section = None
     for line in _registry.format_report():
         if not line.startswith("  "):
@@ -2457,6 +2574,24 @@ def _unload(out_dir: str | None) -> dict:
                 _modfacility.purge(_ui.find_app())
         except Exception:
             log_exc("unload: cannot take the mod facilities off the towns")
+        try:
+            # 左下の MOD 用のボタンを外し、ゲームの4つのアイコンを元の位置へ戻す
+            from . import hudicons as _hudicons
+            _hudicons.remove_all()
+        except Exception:
+            log_exc("unload: cannot remove the hud icons")
+        try:
+            # 「家と施設」の窓を閉じ、330/331 が置いた側を外す
+            from . import holdings as _holdings
+            _holdings.remove_all()
+        except Exception:
+            log_exc("unload: cannot remove the holdings window")
+        try:
+            # 剥がした包みを見回りが付け直さないよう、先に止める
+            from . import drift as _drift
+            _drift.stop()
+        except Exception:
+            log_exc("unload: cannot stop the drift watch")
         reverted = _patch.revert_all()
         _rebind_cloud_resources()
         return reverted
@@ -2481,11 +2616,15 @@ def _unload(out_dir: str | None) -> dict:
         from . import prices as _prices
         from . import combat as _combat
         from . import equipment as _equipment
+        from . import abilities as _abilities
         base, layers = _prices.item_price_sources()
-        owners = (set(_durations.owners()) | {base} | set(layers)
-                  | set(_combat.owners()) | set(_equipment.owners()))
+        _inn_answer, inn_layers = _prices.inn_price_sources()
+        owners = (set(_durations.owners()) | {base} | set(layers) | set(inn_layers)
+                  | set(_combat.owners()) | set(_equipment.owners()) | set(_abilities.owners()))
         for owner in sorted(owners - {""}):
             _durations.forget(owner, write=log)
+        # 読み口はクラスに残る（剥がさない）。場面の包みが剥がれたので補正は足されないが、念のため素通しにする
+        _abilities.detach()
     except Exception:
         log_exc("unload: cannot forget the durations")
     _state["mods"] = {}
@@ -2527,6 +2666,11 @@ def status() -> dict:
         snapshot.pop(key, None)
     snapshot["ready_pending"] = len(_state.get("ready") or [])
     snapshot["patches"] = _registry.summary()
+    try:
+        from . import drift as _drift
+        snapshot["drift"] = _drift.report()
+    except Exception:
+        snapshot["drift"] = {}
     snapshot["written_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     return snapshot
 

@@ -46,7 +46,9 @@ if RUNTIME_DIR not in sys.path:
     sys.path.insert(0, RUNTIME_DIR)
 
 import instantale_modloader as ml                              # noqa: E402
-from instantale_modloader import durations, modfacility, modnpc  # noqa: E402
+from instantale_modloader import durations, gates, modfacility, modnpc  # noqa: E402
+from instantale_modloader import choices                # noqa: E402
+from instantale_modloader import holdings as holdings_window, hudicons  # noqa: E402
 from instantale_modloader import state as loader_state          # noqa: E402
 
 
@@ -250,6 +252,9 @@ class World:
         self.areas = {}
         self.days_elapsed = 100
         self.characters = {}
+        # 人物が揃った世界にする（窓口 `choices` は人物が 0 人の間を読み込みの途中と見て MOD の選択肢を組まない）
+        if getattr(app, "player", None) is not None:
+            self.characters["player"] = app.player
         for area_id, area_data in ((save_data_dict or {}).get("areas") or {}).items():
             area = Area(str(area_id), area_data.get("name") or "")
             for node_id, node_data in (area_data.get("nodes") or {}).items():
@@ -634,8 +639,10 @@ def setup(keep_state=False, extra_in_village=(), gold=500000, configure=None):
     os.makedirs(OUT_DIR, exist_ok=True)
     if os.path.exists(LOG_PATH):
         os.remove(LOG_PATH)
+    # 窓口 `choices` の置き場（開いた画面・印の控え）は `sys` に在って注入をまたぐ。前の検査の画面を持ち越さない
+    choices.reset()
     if not keep_state:
-        for folder in (STATE_DIR,
+        for folder in (STATE_DIR, os.path.join(OUT_DIR, "state", choices.STATE_DIRNAME),
                        os.path.join(OUT_DIR, "state", modfacility.STATE_DIRNAME),
                        os.path.join(OUT_DIR, "state", modnpc.STATE_DIRNAME)):
             if os.path.isdir(folder):
@@ -662,6 +669,8 @@ def setup(keep_state=False, extra_in_village=(), gold=500000, configure=None):
     # （この MOD だけなら `modfacility` が先）。建物より前に主人を置こうとする**厳しい側**で、
     # 実機で主人が会話の一覧から消えたのはこの順序のとき（DOC.md §3.2 の5回目）。
     modnpc.install(ctx, write=lambda *a: None)
+    # ローダの窓口（`loads` ほか）の包みは1つの世代に1枚。偽の ctx を作り直すたびに忘れさせる
+    gates.reset_all()
     module.apply(ctx)
     install(ctx.hooks, (
         ("__main__:InstantaleApp.refresh_choice_buttons", classes["app"],
@@ -867,6 +876,19 @@ check("村では宿屋だけが並ぶ", app.has("宿屋を建てる") and not ap
 check("まだ持っていないので一覧は出ない", not app.has(module.STATUS_LABEL), app.labels())
 app.press(module.CANCEL_LABEL)
 check("「やめる」で役場の選択肢に戻る", app.has(EXIT_TEXT) and not app.has("宿屋を建てる"),
+      app.labels())
+
+print("[等級の画面で保存して読み直す]")
+game_office = [e for e in app.buttons if e.get("text") != module.DESK_LABEL]
+app.press(module.DESK_LABEL)
+app.press("宿屋を建てる")
+tiers = app.labels()
+app.buttons = [dict(e) for e in game_office]           # ロード: セーブの一覧が戻り、メモリの控えは消えた
+choices._store()["opened"].clear()
+app.facility_screen()
+check("読み直しても同じ種類の等級の画面に戻る（選んだ種類は画面の控えに持つ）", app.labels() == tiers, app.labels())
+app.press(module.CANCEL_LABEL)
+check("やめると役場の選択肢に戻る", app.has(module.DESK_LABEL) and not app.has(cat.TIER_LABEL["basic"]),
       app.labels())
 
 print("[出資]")
@@ -1129,8 +1151,12 @@ check("渡せなかった回は受け取った日を進めない（売上が消�
       holdings()[0].get("collected") == collected_before, holdings()[0])
 app.go(building)
 saves_before = len(app.saved)
+received_before = holdings()[0].get("received")
 app.press_like("売上を受け取る")
 CLOCK.settle()
+check("受け取った額が帳簿に積まれる（建てたときは 0 から）",
+      isinstance(received_before, int) and holdings()[0].get("received") == received_before + 30 * per_day
+      and not holdings()[0].get("received_partial"), (received_before, holdings()[0].get("received")))
 check("30日ぶんが入る", app.player.gold == gold_before + 30 * per_day,
       (gold_before, app.player.gold, per_day))
 check("受け取った後にゲームの保存が走る", len(app.saved) > saves_before,
@@ -1141,11 +1167,48 @@ app.go(building)
 check("受け取った直後は無い", app.has(module.COLLECT_EMPTY_LABEL), app.labels())
 app.elapse_days(module.HOLD_DAYS + 500)
 app.go(building)
+check("売上が保管上限に届くと「家と施設」の行に知らせの印",
+      bool(hudicons._store()["attention"].get(holdings_window.ICON_KEY)),
+      hudicons._store()["attention"])
+_side = holdings_window.collect(app).get(holdings_window.FACILITIES)
+_card = (_side or {}).get("cards", [{}])[0]
+check("窓の施設の札: 保管上限に届いた目盛りと注意の行",
+      _card.get("meter", {}).get("tone") == "bad" and _card.get("meter", {}).get("right") == "保管上限 {}日".format(module.HOLD_DAYS)
+      and _card.get("cautions") and _card.get("badge") == ("上等", "fair"), _card)
+check("窓の施設の札: 建設費の後ろに受け取った額",
+      "受け取り済み {}G".format(ml.ui.money(holdings()[0]["received"])) in (_card.get("notes") or [""])[0], _card.get("notes"))
+check("窓の施設の側: 受け取れる売上の合計と軒数",
+      _side.get("income") == module.HOLD_DAYS * per_day and _side.get("count") == len(holdings()), _side)
 gold_before = app.player.gold
 app.press_like("売上を受け取る")
 check("溜まりは HOLD_DAYS で頭打ち",
       app.player.gold == gold_before + module.HOLD_DAYS * per_day,
       (app.player.gold - gold_before, module.HOLD_DAYS * per_day))
+
+print("[版45 より前の帳簿]")
+_live = getattr(sys, "__instantale_facility_investment_store__")["worlds"].load(
+    loader_state.playthrough_key(app))["holdings"][0]
+
+
+def _received_note():
+    side = holdings_window.collect(app).get(holdings_window.FACILITIES) or {}
+    return ((side.get("cards") or [{}])[0].get("notes") or [""])[0]
+
+
+_live.pop("received", None)
+_live["collected"] = _live["built"]
+check("額の無い帳簿でも、一度も受け取っていなければ「まだ受け取っていない」", "（まだ受け取っていない）" in _received_note(),
+      _received_note())
+_live["collected"] = _live["built"] + 1
+check("額の無い帳簿で受け取ったことがあれば「記録なし」", "（受け取った額の記録なし）" in _received_note(), _received_note())
+_live["collected"] = world.days_elapsed - 30
+app.go(building)
+app.press_like("売上を受け取る")
+CLOCK.settle()
+check("最初に受け取ると、その額から数えて「以上」を付ける",
+      holdings()[0].get("received") == 30 * per_day and holdings()[0].get("received_partial") is True
+      and "受け取り済み {}G 以上".format(ml.ui.money(30 * per_day)) in _received_note(),
+      (holdings()[0].get("received"), _received_note()))
 
 print("[宿泊]")
 app.go(building)
@@ -1276,6 +1339,27 @@ app.buttons = [{"text": "試合に出る", "spec": PhaseSpec("EntryColosseumMatc
 app.refresh_choice_buttons(reset_page=True)
 CLOCK.settle()
 check("ゲームの「試合に出る」はそのまま", app.has("試合に出る"), app.labels())
+# 相手の生成：既に出た闘士の名前を `location` の概要に足す。ゲームがキーワード引数で呼んでも
+# 受け取った形のまま `location` だけを差し替える（版47）。
+gen_hooks = ctx.hooks.get("scripts.llm.llm_manager:colosseum_enemy_generator") or []
+saved_config = getattr(arena, "config", None)
+arena.config = {"enemy_data": {"1": {"data": {"name": "ヴィオラ"}}}}
+try:
+    gen_seen = []
+
+    def gen_orig(*a, **kw):
+        gen_seen.append((a, dict(kw)))
+        return {}
+
+    if gen_hooks:
+        gen_hooks[-1](gen_orig, location={"name": "闘技場", "description": "砂の闘技場"},
+                      area="area", world="world", npc_difficulty_level=10)
+    check("闘技場の相手の生成：キーワード引数でも既出の闘士を概要に足し、形はそのまま",
+          gen_seen and gen_seen[0][0] == ()
+          and sorted(gen_seen[0][1]) == ["area", "location", "npc_difficulty_level", "world"]
+          and "ヴィオラ" in (gen_seen[0][1]["location"].get("description") or ""), gen_seen)
+finally:
+    arena.config = saved_config
 check("売上と出口が並び、自前の試合の選択肢は無い",
       app.has("売上を受け取る") and app.has(module.LEAVE_LABEL) and not app.has("興行"), app.labels())
 check("闘技場の絵もゲームに任せる（部屋の絵は描かない）", ("room", module.STAY_QUALITY) not in app.backgrounds)

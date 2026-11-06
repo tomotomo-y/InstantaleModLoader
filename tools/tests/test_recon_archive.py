@@ -14,6 +14,7 @@
 GAME.md §1.5）。
 """
 
+import datetime
 import io
 import json
 import os
@@ -40,12 +41,18 @@ def _sandbox():
     return tempfile.mkdtemp(prefix="recon_archive_")
 
 
-def _plant(recon_dir, marker, build=None):
-    """前回のダンプが在ることにする。`marker` が中身の見分けになる。"""
+def _plant(recon_dir, marker, build=None, function=None):
+    """前回のダンプが在ることにする。`marker` が中身の見分けになる。
+
+    `function`（`"m:f(x)"` の形）を渡すと、`targets.txt` の2行目に足す。重複の判定は関数で見るので、
+    中身の違うダンプとして扱わせたいときに要る。
+    """
     os.makedirs(recon_dir, exist_ok=True)
     for name in recon.OUTPUT_FILES:
         with io.open(os.path.join(recon_dir, name), "w", encoding="utf-8") as fh:
             fh.write(marker + "\n")
+            if function and name == "targets.txt":
+                fh.write(function + "\n")
     path = os.path.join(recon_dir, recon.BUILD_NAME)
     if build is None:
         # 控えの無い（この仕組みが入る前の）ダンプを作る。
@@ -85,6 +92,70 @@ def test_same_build():
     check(not recon._same_build(dict(base), dict(base, app_version=None)),
           "版が読めなくなった場合も別のビルド扱い（消さない側に倒す）")
 
+    # 注入が `__main__` の組み上がりより早いと game_version だけ取れない（main_025・026 の実機）。
+    check(recon._same_build(dict(base, game_version=None), dict(base)),
+          "前回 game_version が取れていなくても、他が揃えば同じビルド")
+    check(recon._same_build(dict(base), dict(base, game_version=None)),
+          "今回 game_version が取れていなくても、他が揃えば同じビルド")
+    check(not recon._same_build(dict(base, game_version=None),
+                                dict(base, app_version="main_026")),
+          "game_version が無くても、版が違えば別のビルド")
+    # 起動直後は実行ファイルの場所が読めず exe_size が取れなかった（2026-10-15 の実機で2本退避した）。
+    check(recon._same_build(dict(base), dict(base, exe_size=None, game_version=None)),
+          "起動直後に exe_size が取れなくても、他が揃えば同じビルド")
+    exe = recon._exe_path()
+    check(os.path.isfile(exe), "実行ファイルの場所は実在のファイル: {}".format(exe))
+
+    # 版の名前が取れず（Steam など）、大きさも変わらない更新（中身だけの直し）は exe のハッシュで見分ける。
+    check(not recon._same_build(dict(base, exe_sha256="a" * 64), dict(base, exe_sha256="b" * 64)),
+          "版の名前と大きさが同じでも、exe のハッシュが違えば別のビルド")
+    check(recon._same_build(dict(base), dict(base, exe_sha256="b" * 64)),
+          "ハッシュを足す前の控えとは、ほかが揃えば同じビルド")
+    check(recon.build_key(dict(base, llama_builds="b1", exe_sha256="0123456789abcdef")) == "main_025|716076544|b1|0123456789ab"
+          and recon.build_key(dict(base, llama_builds="b1")) == "main_025|716076544|b1",
+          "版の鍵はハッシュが取れたときだけ頭の12文字を足す（足す前の鍵の形は変えない）")
+
+
+def test_exe_digest():
+    print("=== exe_digest: exe のハッシュを控えで使い回す ===")
+    sandbox = _sandbox()
+    real_digest = recon._digest
+    calls = []
+
+    def counting(path):
+        calls.append(path)
+        return real_digest(path)
+
+    saved = getattr(sys, recon._DIGEST_ATTR, None)
+    try:
+        exe = os.path.join(sandbox, "instantale.exe")
+        with open(exe, "wb") as fh:
+            fh.write(b"build one")
+        snap_dir = os.path.join(sandbox, recon.SNAPSHOT_DIR_NAME)
+        recon._digest = counting
+        vars(sys).pop(recon._DIGEST_ATTR, None)
+        first = recon.exe_digest(exe, os.stat(exe), snap_dir)
+        check(first == real_digest(exe) and len(calls) == 1, "初回は数えて控える")
+        check(os.path.isfile(os.path.join(snap_dir, recon.EXE_DIGEST_NAME)), "  控えを recon_history に置く")
+        recon.exe_digest(exe, os.stat(exe), snap_dir)
+        check(len(calls) == 1, "  同じプロセスでは数え直さない")
+        vars(sys).pop(recon._DIGEST_ATTR, None)
+        check(recon.exe_digest(exe, os.stat(exe), snap_dir) == first and len(calls) == 1,
+              "  次の起動（プロセスの控えが無い）でも、場所・大きさ・更新時刻が同じなら控えを使う")
+        stat = os.stat(exe)
+        with open(exe, "wb") as fh:
+            fh.write(b"build two")                         # 同じ大きさで中身だけ違う
+        os.utime(exe, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10 ** 9))
+        second = recon.exe_digest(exe, os.stat(exe), snap_dir)
+        check(second != first and len(calls) == 2, "  更新時刻が動けば数え直し、大きさが同じでも違いが出る")
+    finally:
+        recon._digest = real_digest
+        if saved is not None:
+            setattr(sys, recon._DIGEST_ATTR, saved)
+        else:
+            vars(sys).pop(recon._DIGEST_ATTR, None)
+        shutil.rmtree(sandbox, ignore_errors=True)
+
 
 def test_snapshot_name():
     print("=== _snapshot_name: 退避の名前 ===")
@@ -120,7 +191,8 @@ def test_archive_previous():
     print("=== archive_previous: 退避が走る条件 ===")
     sandbox = _sandbox()
     try:
-        recon_dir = os.path.join(sandbox, "recon")
+        # 配布フォルダの形にする（退避先は `out/` の1つ上）。
+        recon_dir = os.path.join(sandbox, "out", "recon")
         snap_dir = os.path.join(sandbox, recon.SNAPSHOT_DIR_NAME)
         old = {"app_version": "main_024", "game_version": "014",
                "exe_size": 700000000, "written": "2026-08-05T16:44:53"}
@@ -143,7 +215,7 @@ def test_archive_previous():
 
         # ビルドが変わった。
         # ここが本命。
-        _plant(recon_dir, "main_024 の最後の1回", build=old)
+        _plant(recon_dir, "main_024 の最後の1回", build=old, function="m:first(a)")
         path = recon.archive_previous(recon_dir, dict(new))
         check(path is not None and os.path.isfile(path), "ビルドが変われば退避する")
         check(_zips(snap_dir) == ["main_024_20260805.zip"],
@@ -153,8 +225,8 @@ def test_archive_previous():
             names = sorted(archive.namelist())
             expected = sorted(list(recon.OUTPUT_FILES) + [recon.BUILD_NAME])
             check(names == expected, "  成果物5つと build.json が入っている")
-            check(archive.read("targets.txt").decode("utf-8").strip()
-                  == "main_024 の最後の1回",
+            check(archive.read("targets.txt").decode("utf-8").replace("\r\n", "\n").strip()
+                  == "main_024 の最後の1回\nm:first(a)",
                   "  中身は上書きされる前の（＝前の版の）ダンプ")
             check(json.loads(archive.read(recon.BUILD_NAME).decode("utf-8"))["app_version"]
                   == "main_024",
@@ -162,10 +234,16 @@ def test_archive_previous():
 
         # 同じ版・同じ日にもう一度。
         # 滅多に無いが、黙って上書きしてはいけない。
-        _plant(recon_dir, "main_024 のもう1回", build=old)
+        _plant(recon_dir, "main_024 のもう1回", build=old, function="m:second(b)")
         recon.archive_previous(recon_dir, dict(new))
         check(_zips(snap_dir) == ["main_024_20260805.zip", "main_024_20260805_2.zip"],
               "名前が埋まっていれば _2 を足す（先の退避を消さない）")
+
+        # 同じビルドで中身も同じダンプは、もう1本作らない。
+        _plant(recon_dir, "main_024 の3回目", build=old, function="m:second(b)")
+        check(recon.archive_previous(recon_dir, dict(new)) is None
+              and _zips(snap_dir) == ["main_024_20260805.zip", "main_024_20260805_2.zip"],
+              "同じビルドで関数も同じなら退避しない")
 
         # 控えの無い（この仕組みが入る前の）ダンプ。
         # 確かめられない＝残す。
@@ -184,8 +262,11 @@ def test_dump_end_to_end():
     print("=== dump: 書き出しと退避のつながり ===")
     sandbox = _sandbox()
     try:
-        recon_dir = recon.dump(sandbox)
+        out_dir = os.path.join(sandbox, "out")
+        recon_dir = recon.dump(out_dir)
         snap_dir = os.path.join(sandbox, recon.SNAPSHOT_DIR_NAME)
+        check(recon.snapshot_dir(out_dir) == snap_dir and not snap_dir.startswith(out_dir + os.sep),
+              "退避先は out/ の外（1つ上の {}）".format(recon.SNAPSHOT_DIR_NAME))
         missing = [n for n in list(recon.OUTPUT_FILES) + [recon.BUILD_NAME]
                    if not os.path.isfile(os.path.join(recon_dir, n))]
         check(not missing, "成果物一式と build.json が揃う（欠け: {}）".format(missing))
@@ -196,31 +277,157 @@ def test_dump_end_to_end():
               "build.json に各ファイルの sha256 が入る")
         check(record.get("written", "")[:2] == "20", "いつ書いたかが入る")
 
+        current = os.path.join(snap_dir, recon.CURRENT_DIR_NAME)
+        check(os.path.isfile(os.path.join(current, recon.BUILD_NAME))
+              and os.path.isfile(os.path.join(current, recon.SIGNATURES_NAME)),
+              "最初のダンプが基準（current）になる")
+
         # 2回目。
-        # 同じビルドなので退避は走らない。
-        recon.dump(sandbox)
+        # 同じビルドで関数も同じなので退避は走らない。
+        recon.dump(out_dir)
         check(_zips(snap_dir) == [], "同じビルドで走らせ直しても zip は増えない")
 
-        # ゲームが更新されたことにする。
-        path = os.path.join(recon_dir, recon.BUILD_NAME)
-        record = json.load(io.open(path, encoding="utf-8"))
-        record["app_version"] = "main_000"
-        record["written"] = "2026-08-05T16:44:53"
-        io.open(path, "w", encoding="utf-8").write(json.dumps(record, ensure_ascii=False))
-        recon.dump(sandbox)
+        def edit_current(**changes):
+            path = os.path.join(current, recon.BUILD_NAME)
+            record = json.load(io.open(path, encoding="utf-8"))
+            record.update(changes)
+            io.open(path, "w", encoding="utf-8").write(json.dumps(record, ensure_ascii=False))
+
+        # ゲームが更新されたことにする（基準が前の版）。
+        edit_current(app_version="main_000", written="2026-08-05T16:44:53")
+        recon.dump(out_dir)
         check(_zips(snap_dir) == ["main_000_20260805.zip"],
-              "版が変わると、上書きの前に前回ぶんが退避される")
+              "版が変わると、前の版の基準が退避される")
+        with zipfile.ZipFile(os.path.join(snap_dir, "main_000_20260805.zip")) as archive:
+            reason = archive.read(recon.REASON_NAME).decode("utf-8")
+        check(reason.startswith("build changed") and "app_version: main_000 -> " in reason,
+              "  理由が添えてある: {!r}".format(reason[:60]))
+        check(json.load(io.open(os.path.join(current, recon.BUILD_NAME), encoding="utf-8"))
+              .get("app_version") != "main_000", "  基準は今回のダンプに替わる")
+
+        # 同梱の llama-server だけが替わった（版の表記は同じ）。
+        edit_current(llama_builds="llama-b7054-bin-win-cuda-12.4-x64", written="2026-09-20T00:00:00")
+        live = json.load(io.open(os.path.join(recon_dir, recon.BUILD_NAME), encoding="utf-8"))
+        if live.get("llama_builds") is None:
+            # ゲームの外では取れないので比べない（取れない鍵は比べない決まり）
+            check(_zips(snap_dir) == ["main_000_20260805.zip"], "  （ゲームの外では llama_builds を比べない）")
+
+        # 関数が変わった（版は同じ）。
+        sig_path = os.path.join(current, recon.SIGNATURES_NAME)
+        sigs = json.load(io.open(sig_path, encoding="utf-8"))
+        some = sorted(sigs)[0]
+        sigs[some] = "(old, signature)"
+        sigs[some.split(":", 1)[0] + ":gone_function"] = "()"
+        io.open(sig_path, "w", encoding="utf-8").write(json.dumps(sigs, ensure_ascii=False))
+        edit_current(written="2026-10-01T00:00:00")
+        recon.dump(out_dir)
+        zips = _zips(snap_dir)
+        changed = [n for n in zips if n.startswith(("unknown_20261001", "None_20261001"))
+                   or n.endswith("_20261001.zip")]
+        check(len(changed) == 1, "関数が変わると、版が同じでも基準が退避される: {}".format(zips))
+        if changed:
+            with zipfile.ZipFile(os.path.join(snap_dir, changed[0])) as archive:
+                reason = archive.read(recon.REASON_NAME).decode("utf-8")
+            check(reason.startswith("functions changed (2)") and "removed " in reason
+                  and "changed {}(old, signature)".format(some) in reason,
+                  "  理由に消えた関数と変わった引数が並ぶ")
+
+        # 基準が読み込みの途中（起動直後）で、今回のほうが多く読み込み、関数が「増えた」だけ。
+        sigs = json.load(io.open(sig_path, encoding="utf-8"))
+        partial = {k: v for k, v in sigs.items() if k != sorted(sigs)[-1]}
+        io.open(sig_path, "w", encoding="utf-8").write(json.dumps(partial, ensure_ascii=False))
+        edit_current(modules=1, written="2026-10-03T00:00:00")
+        before = _zips(snap_dir)
+        recon.dump(out_dir)
+        check(_zips(snap_dir) == before, "  基準より多く読み込んで「増えた」だけなら退避しない")
+
+        # 基準より読み込みの少ないダンプ（起動直後）は比べない。
+        sigs = json.load(io.open(sig_path, encoding="utf-8"))
+        edit_current(modules=10 ** 9, written="2026-10-02T00:00:00")
+        sigs[some] = "(again, different)"
+        io.open(sig_path, "w", encoding="utf-8").write(json.dumps(sigs, ensure_ascii=False))
+        before = _zips(snap_dir)
+        recon.dump(out_dir)
+        check(_zips(snap_dir) == before, "  基準より読み込みが少ない回は比べない（zip は増えない）")
+        check(json.load(io.open(os.path.join(current, recon.BUILD_NAME), encoding="utf-8"))
+              .get("modules") == 10 ** 9, "  基準もそのまま（少ない回で置き換えない）")
 
         # 退避を切ってあれば走らない。
-        record = json.load(io.open(path, encoding="utf-8"))
-        record["app_version"] = "main_001"
-        record["written"] = "2026-08-06T00:00:00"
-        io.open(path, "w", encoding="utf-8").write(json.dumps(record, ensure_ascii=False))
-        recon.dump(sandbox, backup=False)
-        check(_zips(snap_dir) == ["main_000_20260805.zip"],
-              "backup=False なら版が変わっても退避しない")
+        edit_current(app_version="main_001", modules=0, written="2026-08-06T00:00:00")
+        before = _zips(snap_dir)
+        recon.dump(out_dir, backup=False)
+        check(_zips(snap_dir) == before, "backup=False なら版が変わっても退避しない")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_signatures_scope():
+    print("=== signatures.json: その場所で定義されたゲームの関数だけ ===")
+    import functools
+    import types as _types
+    sandbox = _sandbox()
+    name = "scripts.recon_scope_probe"
+    module = _types.ModuleType(name)
+    exec("class Item:\n"
+         "    def defined(self, a):\n"
+         "        pass\n"
+         "def top(x):\n"
+         "    pass\n", module.__dict__)
+    for value in (module.Item, module.top, module.Item.defined):
+        value.__module__ = name
+
+    def callback(item_instance):            # 後から代入される関数（ゲームの Item.set_callback と同じ形）
+        pass
+    callback.__module__ = name
+    module.Item.item_buy_callback = callback
+    module.imported = json.dumps            # よそから import した関数
+
+    @functools.wraps(module.top)
+    def wrapped(*args, **kwargs):           # ローダの包み（元の名前を写す）
+        return None
+    module.top = wrapped
+
+    def from_mod(y):
+        pass
+    from_mod.__module__ = "instantale_mod_999_test"
+    module.Item.from_mod = from_mod
+    sys.modules[name] = module
+    try:
+        recon_dir = recon.dump(os.path.join(sandbox, "out"), backup=False)
+        sigs = json.load(io.open(os.path.join(recon_dir, recon.SIGNATURES_NAME), encoding="utf-8"))
+        mine = sorted(k for k in sigs if k.startswith(name + ":"))
+        check(mine == [name + ":Item.defined", name + ":top"],
+              "定義されたメソッドと、包まれた関数だけが入る: {}".format(mine))
+        targets = io.open(os.path.join(recon_dir, "targets.txt"), encoding="utf-8").read()
+        check(name + ":Item.item_buy_callback" in targets,
+              "  targets.txt（貼るための一覧）には従来どおり全部載る")
+    finally:
+        sys.modules.pop(name, None)
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_function_changes():
+    print("=== function_changes / identity_changes ===")
+    old = {"m:a": "(x)", "m:b": "(y)", "m:C.c": "(self)"}
+    new = {"m:a": "(x, z=None)", "m:C.c": "(self)", "m:d": "()", "lazy:e": "()"}
+    lines = recon.function_changes(old, new)
+    check(lines == ["changed m:a(x) -> (x, z=None)", "removed m:b(y)", "added m:d()"],
+          "引数の変化・消えた・増えた（前に無かったモジュールの関数は数えない）: {}".format(lines))
+    check(recon.function_changes(old, dict(old)) == [], "同じなら空")
+    check(recon.function_changes(dict(old, **{"llama_cpp_runtime_completion:LlamaCppClient.chat": "(self)"}), old) == [],
+          "今回読み込まれていないモジュールの関数は消えたと数えない（ローカルからクラウドへ替えた回）")
+    check(recon.function_changes(dict(old, **{"__main__:_instantale_modloader_bootstrap": "()"}), old) == [],
+          "ローダが置いた名前（_instantale…）は消えても数えない")
+    check(recon._parse_targets("# x\n__main__:_instantale_modloader_bootstrap()\nm:a(x)\n") == {"m:a": "(x)"},
+          "重複の判定でもローダが置いた名前を外す")
+    base = {"app_version": "main_026", "game_version": "014", "exe_size": 1,
+            "python": "3.10.11", "kivy": "2.3.0", "llama_builds": "llama-b10642"}
+    check(recon.identity_changes(base, dict(base, llama_builds="llama-b11000"))
+          == ["llama_builds: llama-b10642 -> llama-b11000"],
+          "同梱の llama-server が替われば特異な変化として出る")
+    check(not recon._same_build(base, dict(base, kivy="2.3.1")), "Kivy が替われば別のビルド")
+    check(recon._same_build(dict(base, kivy=None, llama_builds=None), dict(base)),
+          "前の控えに無い鍵（2026-10-14 より前）は比べない")
 
 
 def test_dump_module_vanishes():
@@ -275,13 +482,194 @@ def test_build_identity():
           "ゲームの外では版が取れず、それでも例外にならない")
 
 
+def test_prune_keeps_each_version():
+    print("=== _prune_snapshots: 版ごとの1本は消さない ===")
+    sandbox = _sandbox()
+    try:
+        snap_dir = os.path.join(sandbox, recon.SNAPSHOT_DIR_NAME)
+        os.makedirs(snap_dir)
+        base = 1_700_000_000
+
+        def plant(name, size, age):
+            path = os.path.join(snap_dir, name)
+            with open(path, "wb") as fh:
+                fh.write(b"x" * size)
+            os.utime(path, (base + age, base + age))
+
+        # 古い版が1本ずつ、新しい版の退避が大小交互に溜まった形（main_025 の 10-14 と同じ）。
+        plant("main_023_20260805.zip", 300, 0)
+        plant("main_024_20260809.zip", 300, 1)
+        for i in range(12):
+            plant("main_025_20261014{}.zip".format("" if i == 0 else "_{}".format(i + 1)),
+                  350 if i % 2 else 65, 10 + i)
+        dropped = recon._prune_snapshots(snap_dir, keep=4)
+        left = sorted(os.listdir(snap_dir))
+        check("main_023_20260805.zip" in left and "main_024_20260809.zip" in left,
+              "同じ版の退避が溜まっても、前の版の1本は消さない")
+        check(dropped == 12 - 1 - 4 and len(left) == 2 + 1 + 4,
+              "  消すのは同じ版の2本目以降で、上限はそれだけで数える（残り {}）".format(len(left)))
+        kept25 = [n for n in left if n.startswith("main_025")]
+        check("main_025_20261014_12.zip" in kept25,
+              "  版の1本は、いちばん大きい（モジュールを多く見た）うち新しいもの")
+        check(recon._snapshot_version("main_025_20261014_12.zip") == "main_025"
+              and recon._snapshot_version("unknown_20260801.zip") == "unknown"
+              and recon._snapshot_version("odd.zip") == "odd.zip",
+              "  名前から版を取り出す（形が違えば名前そのもの）")
+        check(recon._prune_snapshots(snap_dir, keep=4) == 0, "  もう一度刈っても減らない")
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_redundant():
+    print("=== _redundant: 重複した記録だけを落とす ===")
+    sandbox = _sandbox()
+    try:
+        snap_dir = os.path.join(sandbox, recon.SNAPSHOT_DIR_NAME)
+        os.makedirs(snap_dir)
+        build = {"app_version": "main_026", "game_version": "014", "exe_size": 1}
+        full = ["m:a(x)", "m:b(y)", "__main__:Item.cb(i)"]
+
+        def zipped(name, lines, build=build, pad=0):
+            path = os.path.join(snap_dir, name)
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("targets.txt", "# header\n" + "\n".join(lines) + "\n" + "#" * pad)
+                if build is not None:
+                    archive.writestr(recon.BUILD_NAME, json.dumps(build))
+            return path
+
+        zipped("main_026_20261014.zip", full[:1], dict(build, game_version=None))   # 起動直後（読み込み途中）
+        zipped("main_026_20261014_2.zip", full, pad=10)                             # 全部読み込んだ
+        zipped("main_026_20261014_3.zip", full)                                     # 中身が同じで小さい
+        zipped("main_026_20261015.zip", ["m:a(x, z=None)", "m:b(y)"])               # 関数が変わった
+        zipped("main_027_20261101.zip", full[:1], dict(build, app_version="main_027"))  # 別のビルド
+        zipped("unknown_20260801.zip", full[:1], build=None)                        # build.json が無い
+        paths = [os.path.join(snap_dir, n) for n in sorted(os.listdir(snap_dir))]
+        drop = sorted(os.path.basename(p) for p in recon._redundant(paths))
+        check(drop == ["main_026_20261014.zip", "main_026_20261014_3.zip"],
+              "読み込み途中の記録と、中身が同じで小さい記録だけ落とす: {}".format(drop))
+        recon._prune_snapshots(snap_dir)
+        left = sorted(os.listdir(snap_dir))
+        check(left == ["main_026_20261014_2.zip", "main_026_20261015.zip",
+                       "main_027_20261101.zip", "unknown_20260801.zip"],
+              "  刈り込みでも同じものが落ちる: {}".format(left))
+        check(recon._duplicate_of(os.path.join(snap_dir, "main_026_20261015.zip"), snap_dir) is None,
+              "  関数が変わった記録は、ほかの記録の重複ではない")
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_migrate_old_snapshots():
+    print("=== migrate_old_snapshots: 前の退避先（out/recon_snapshots）から移す ===")
+    sandbox = _sandbox()
+    try:
+        out_dir = os.path.join(sandbox, "out")
+        old_dir = os.path.join(out_dir, recon.OLD_SNAPSHOT_DIR_NAME)
+        snap_dir = recon.snapshot_dir(out_dir)
+        os.makedirs(os.path.join(old_dir, "main_023"))          # zip にする前の頃のフォルダ
+        io.open(os.path.join(old_dir, "main_023", "targets.txt"), "w", encoding="utf-8").write("023")
+        for name in ("main_025_20261014.zip", "main_026_20261014.zip"):
+            io.open(os.path.join(old_dir, name), "wb").write(b"old")
+        os.makedirs(snap_dir)
+        io.open(os.path.join(snap_dir, "main_026_20261014.zip"), "wb").write(b"new")  # 名前がぶつかる
+
+        moved = recon.migrate_old_snapshots(out_dir, snap_dir)
+        left = sorted(os.listdir(snap_dir))
+        check(moved == 3, "zip もフォルダも移す（{}件）".format(moved))
+        check(left == ["main_023", "main_025_20261014.zip", "main_026_20261014.zip",
+                       "main_026_20261014_2.zip"], "  名前がぶつかれば _2 を足してどちらも残す: {}".format(left))
+        check(io.open(os.path.join(snap_dir, "main_026_20261014.zip"), "rb").read() == b"new",
+              "  先に在った退避は上書きしない")
+        check(not os.path.exists(old_dir), "  空になった前の退避先は消す")
+        check(recon.migrate_old_snapshots(out_dir, snap_dir) == 0, "  2回目は何もしない")
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_build_changes():
+    print("=== build_changes: 前の版の記録と今の基準の関数を比べる（drift が読む） ===")
+    sandbox = _sandbox()
+    try:
+        snap_dir = os.path.join(sandbox, recon.SNAPSHOT_DIR_NAME)
+        os.makedirs(snap_dir)
+        old_build = {"app_version": "main_025", "exe_size": 1, "llama_builds": "b7054"}
+        new_build = {"app_version": "main_026", "exe_size": 2, "llama_builds": "b10642"}
+
+        def zipped(name, lines, build):
+            path = os.path.join(snap_dir, name)
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("targets.txt", "# header\n" + "\n".join(lines) + "\n")
+                archive.writestr(recon.BUILD_NAME, json.dumps(build))
+            return path
+
+        zipped("main_024_20261001.zip", ["m:a(x)"], dict(old_build, app_version="main_024"))
+        older = zipped("main_025_20261014.zip", ["m:a(x)"], old_build)               # 読み込みの少ない回
+        os.utime(older, (1, 1))
+        biggest = zipped("main_025_20261014_2.zip", ["m:a(x)", "m:b(y)", "m:c(z)"], old_build)  # 前の版でいちばん多い回
+        switched = 1_760_000_000                                                       # 版が替わって退避した時刻
+        os.utime(biggest, (switched, switched))
+        zipped("main_026_20261014.zip", ["m:a(x)"], new_build)                        # 今の版の退避（比べない）
+        check(recon.build_changes(snap_dir) is None, "基準が無ければ比べない")
+
+        current = os.path.join(snap_dir, recon.CURRENT_DIR_NAME)
+        _plant(current, "# now", new_build, function="m:a(x, area_difficulty=None)")
+        with io.open(os.path.join(current, "targets.txt"), "a", encoding="utf-8") as fh:
+            fh.write("m:c(z)\nm:d(w)\n")
+        changes = recon.write_build_changes(snap_dir)
+        kinds = sorted((item["kind"], item["key"]) for item in changes["functions"])
+        check(changes["since"] == "main_025_20261014_2.zip",
+              "比べる相手は直前の版のうち関数のいちばん多い記録: {}".format(changes["since"]))
+        check(kinds == [("added", "m:d"), ("changed", "m:a"), ("removed", "m:b")],
+              "  変わった・消えた・増えたを分ける: {}".format(kinds))
+        check(changes["build"] == recon.build_key(new_build) == "main_026|2|b10642",
+              "  版の鍵は build_key: {}".format(changes["build"]))
+        check(os.path.isfile(os.path.join(current, recon.CHANGES_NAME)), "  基準に changes.json を添える")
+        first = changes["detected_at"]
+        check(first == datetime.datetime.fromtimestamp(switched).isoformat(timespec="seconds"),
+              "  初めて書くときの見つけた日時は、前の版を退避した時刻（ローダを入れ替えた日ではない）: {}".format(first))
+        again = recon.write_build_changes(snap_dir, {"since": changes["since"], "detected_at": "2000-01-01T00:00:00"})
+        check(again["detected_at"] == "2000-01-01T00:00:00" and first != again["detected_at"],
+              "  同じ相手との比べなら、見つけた日時を引き継ぐ")
+        check(recon.build_key({"app_version": None, "exe_size": None, "llama_builds": None}) is None,
+              "  素性が何も取れなければ鍵は None")
+
+        # 基準を置き換えない回（読み込みが少ない）でも、まだ比べていなければ比べる
+        os.remove(os.path.join(current, recon.CHANGES_NAME))
+        recon_dir = os.path.join(sandbox, "out", "recon")
+        _plant(recon_dir, "# small", new_build)
+        with io.open(os.path.join(recon_dir, recon.BUILD_NAME), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(new_build, modules=1)))
+        with io.open(os.path.join(current, recon.BUILD_NAME), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(new_build, modules=99)))
+        recon.update_current(recon_dir, snap_dir)
+        check(os.path.isfile(os.path.join(current, recon.CHANGES_NAME)),
+              "  置き換えない回でも、changes.json が無ければ書く")
+
+        # ハッシュを足す前の基準は、置き換えない回でもハッシュを書き足す
+        with io.open(os.path.join(recon_dir, recon.BUILD_NAME), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(new_build, modules=1, exe_sha256="c" * 64)))
+        recon.update_current(recon_dir, snap_dir)
+        with io.open(os.path.join(current, recon.BUILD_NAME), encoding="utf-8") as fh:
+            kept = json.load(fh)
+        check(kept.get("exe_sha256") == "c" * 64 and kept.get("modules") == 99,
+              "  置き換えない回でも、ハッシュの無い基準には書き足す（ほかはそのまま）")
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 def main():
     test_same_build()
     test_snapshot_name()
     test_archive_previous()
+    test_prune_keeps_each_version()
+    test_redundant()
+    test_migrate_old_snapshots()
+    test_function_changes()
+    test_build_changes()
+    test_signatures_scope()
     test_dump_end_to_end()
     test_dump_module_vanishes()
     test_build_identity()
+    test_exe_digest()
     print()
     if _FAILS:
         print("{} 件失敗: {}".format(len(_FAILS), _FAILS))

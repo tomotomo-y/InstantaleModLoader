@@ -10,9 +10,12 @@
   展開     … 頭一段を剥がして上書きする。zip に無いファイルは残る。".." と別のドライブ名は書かない
   MOD の追加 … install_from_zip も ".." とドライブ名を書かない。mods/ の外を指す mod は断る。
              入れ子の mod.json は外側の mod の中身として写す
-  同梱の既定 … 書き換えた *.default.* は手元の名前に改名して残す（111/120/132）。
+  同梱の既定 … 書き換えた *.default.* は手元の名前に改名して残す（111/120/132/338）。
              配った版のままなら残さない。SHIPPED_DEFAULTS は git の履歴と一致する
   配る tools … make_dist.bat の一覧にあるファイルが読む tools\\ のモジュールも一覧にある
+  落とす zip … アセットの zip の指紋が手元（runtime\\assets.json）と同じなら lite、違う・無い・2種類なら full。手元のファイルは見ない。
+             展開は指紋を最後に書く。
+             make_dist.bat の大きいアセットの一覧はリポジトリに在り、ci.yml と同じ。ローダだけ・MOD だけの zip は作らない
 """
 import json
 import os
@@ -195,6 +198,64 @@ with tempfile.TemporaryDirectory() as tmp:
     assert carried == {"order": ["100_a", "905_mine"], "disabled": ["905_mine"]}, carried
     assert not os.path.exists(os.path.join(dest, "out", gui.UPDATE_ORDER_NAME))
 
+# 改名した MOD の古いフォルダは消し、切っていたら新しい名前も切る（一覧に2つ並ばない）。
+with tempfile.TemporaryDirectory() as tmp:
+    old_name, new_name = next(iter(gui.ml.RENAMED_MODS.items()))
+    z = os.path.join(tmp, "full.zip")
+    with zipfile.ZipFile(z, "w") as f:
+        f.writestr("InstantaleModLoader-9.9.9/runtime/mods/load_order.json", json.dumps(
+            {"order": ["100_a", new_name], "disabled": []}))
+        f.writestr("InstantaleModLoader-9.9.9/runtime/mods/{}/mod.json".format(new_name), "{}")
+    dest = os.path.join(tmp, "dest")
+    mods = os.path.join(dest, "runtime", "mods")
+    for name in ("100_a", old_name):
+        os.makedirs(os.path.join(mods, name))
+        with open(os.path.join(mods, name, "mod.json"), "w") as f:
+            f.write("{}")
+    with open(os.path.join(mods, "load_order.json"), "w") as f:
+        json.dump({"order": ["100_a", old_name], "disabled": [old_name]}, f)
+    gui.extract_release(z, dest)
+    with open(os.path.join(mods, "load_order.json"), encoding="utf-8") as f:
+        carried = json.load(f)
+    assert carried == {"order": ["100_a", new_name], "disabled": [new_name]}, carried
+    assert not os.path.exists(os.path.join(mods, old_name))
+    assert not os.path.exists(os.path.join(dest, "out", "backup"))
+
+    # 新しい名前が届かない zip（古い版で戻した）では古いフォルダに触らない
+    z_old = os.path.join(tmp, "old.zip")
+    with zipfile.ZipFile(z_old, "w") as f:
+        f.writestr("InstantaleModLoader-9.9.9/runtime/mods/load_order.json", json.dumps(
+            {"order": ["100_a", old_name], "disabled": []}))
+        f.writestr("InstantaleModLoader-9.9.9/runtime/mods/{}/mod.json".format(old_name), "{}")
+    dest2 = os.path.join(tmp, "dest2")
+    os.makedirs(os.path.join(dest2, "runtime", "mods", "100_a"))
+    gui.extract_release(z_old, dest2)
+    assert os.path.isdir(os.path.join(dest2, "runtime", "mods", old_name))
+    assert gui.ml.drop_renamed(os.path.join(dest2, "runtime", "mods")) == []
+
+# 前の版の GUI で更新した後（古いフォルダが残り、順序の末尾に足され、古い名前で切ってある）は、
+# 開き直した GUI の `drop_renamed` が片付ける。手元用の順序ファイルがあればそちらを直す。
+for local in (False, True):
+    with tempfile.TemporaryDirectory() as tmp:
+        old_name, new_name = next(iter(gui.ml.RENAMED_MODS.items()))
+        mods = os.path.join(tmp, "runtime", "mods")
+        for name in ("100_a", new_name, old_name):
+            os.makedirs(os.path.join(mods, name, "__pycache__"))
+            with open(os.path.join(mods, name, "mod.json"), "w") as f:
+                f.write("{}")
+        before = {"order": ["100_a", new_name, old_name], "disabled": [old_name]}
+        name = "load_order.local.json" if local else "load_order.json"
+        with open(os.path.join(mods, name), "w") as f:
+            json.dump(before, f)
+        assert gui.ml.drop_renamed(mods) == [old_name]
+        assert not os.path.exists(os.path.join(mods, old_name))
+        with open(os.path.join(mods, name), encoding="utf-8") as f:
+            after = json.load(f)
+        assert after == {"order": ["100_a", new_name], "disabled": [new_name]}, after
+        # 2回目は何もしない
+        assert gui.ml.drop_renamed(mods) == []
+        assert gui.ml.discover(mods, debug=False)["order"] == ["100_a"]
+
 # 壊れた zip は1つも書かずに止める（途中で落ちて新旧が混ざらない）。
 with tempfile.TemporaryDirectory() as tmp:
     z = os.path.join(tmp, "broken.zip")
@@ -366,5 +427,67 @@ for name in sorted(shipped):
     assert not missing, "{} が読むのに配らない: {}".format(name, sorted(missing))
 with open(os.path.join(ROOT, "InstantaleModLoader.bat"), encoding="utf-8") as f:
     assert "tools\\gui.py" in f.read()
+
+# 落とす zip（pick_package）。指紋が同じなら lite、違う・手元に無い・lite が無いなら full。
+REL = [{"name": "InstantaleModLoader-9.9.9-full.zip", "browser_download_url": "u/full", "size": 30 * 2 ** 20},
+       {"name": "InstantaleModLoader-9.9.9-lite.zip", "browser_download_url": "u/lite", "size": 4 * 2 ** 20},
+       {"name": "InstantaleModLoader-9.9.9-assets-44dc455def15.zip", "browser_download_url": "u/assets", "size": 26 * 2 ** 20}]
+assert gui.pick_package(REL, "44dc455def15") == {"kind": "lite", "url": "u/lite", "size": 4 * 2 ** 20}
+assert gui.pick_package(REL, "000000000000")["kind"] == "full"
+assert gui.pick_package(REL, None)["kind"] == "full"
+assert gui.pick_package([REL[0], REL[2]], "44dc455def15")["kind"] == "full"      # lite が無い
+assert gui.pick_package(REL[1:], "44dc455def15") is None                         # full が無い
+# v1.16.2 までの Release（full・ローダだけ・MOD だけ）からも full を選ぶ
+OLD = [{"name": "InstantaleModLoader-1.16.2-full.zip", "browser_download_url": "u/old"},
+       {"name": "InstantaleModLoader-1.16.2.zip", "browser_download_url": "u/loader"},
+       {"name": "InstantaleMods-1.16.2.zip", "browser_download_url": "u/mods"}]
+assert gui.pick_package(OLD, "44dc455def15") == {"kind": "full", "url": "u/old", "size": 0}
+# アセットの zip が2種類（前の版の消し忘れ）なら、どちらが今の版か分からないので full
+TWO = REL + [{"name": "InstantaleModLoader-9.9.8-assets-000000000000.zip", "browser_download_url": "u/a2"}]
+assert gui.pick_package(TWO, "44dc455def15")["kind"] == "full"
+assert gui.pick_package(TWO, "000000000000")["kind"] == "full"
+# 指紋（runtime/assets.json）は最後に書く。zip の並びで先にあっても、途中で落ちたら書かれていない
+with tempfile.TemporaryDirectory() as tmp:
+    zpath = os.path.join(tmp, "u.zip")
+    dest = os.path.join(tmp, "dest")
+    os.makedirs(os.path.join(dest, "runtime", "blocked"))                # ファイルを書けない（同名のフォルダ）
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.writestr("InstantaleModLoader-9.9.9/runtime/assets.json", '{"digest": "44dc455def15"}')
+        z.writestr("InstantaleModLoader-9.9.9/runtime/blocked", "x")
+    try:
+        gui.extract_release(zpath, dest)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("書けないファイルで落ちなかった")
+    assert not os.path.exists(os.path.join(dest, "runtime", "assets.json"))
+with tempfile.TemporaryDirectory() as tmp:
+    os.makedirs(os.path.join(tmp, "runtime"))
+    manifest = os.path.join(tmp, "runtime", "assets.json")
+    assert gui.local_assets_digest(manifest) is None
+    # 手元のファイルは見ない（要らない分類の絵を消した人に、更新のたびに full を落とさせない）
+    with open(manifest, "w", encoding="utf-8") as f:
+        json.dump({"digest": "44dc455def15", "files": 2, "dirs": ["runtime/mods/128_x/images"]}, f)
+    assert gui.local_assets_digest(manifest) == "44dc455def15"
+    with open(manifest, "w", encoding="utf-8") as f:
+        f.write("[]")
+    assert gui.local_assets_digest(manifest) is None
+
+# make_dist.bat の大きいアセット。一覧のフォルダはリポジトリに在り、lite から外して assets に入れる。
+# ローダだけ・MOD だけの zip はもう作らない（片方だけ更新すると、両方に跨る直しで動かなくなる）。
+dirs = re.search(r'set "ASSETDIRS=([^"]+)"', script)
+assert dirs, "make_dist.bat に ASSETDIRS が無い"
+for d in dirs.group(1).split():
+    assert os.path.isdir(os.path.join(ROOT, d)), "ASSETDIRS のフォルダが無い: " + d
+# ci.yml の zip の検査（$assetDirs）も同じ一覧を持つ。ずれると CI は赤くなるが、文言から原因を辿りにくい
+with open(os.path.join(ROOT, ".github", "workflows", "ci.yml"), encoding="utf-8") as f:
+    ci_dirs = re.search(r"\$assetDirs = @\(([^)]*)\)", f.read())
+assert ci_dirs, "ci.yml に $assetDirs が無い"
+assert sorted(re.findall(r"'([^']+)'", ci_dirs.group(1))) \
+    == sorted(d.replace("\\", "/") + "/" for d in dirs.group(1).split()), \
+    "ci.yml の $assetDirs と make_dist.bat の ASSETDIRS が違う"
+for name in ("-full.zip", "-lite.zip", "-assets-%DIGEST%.zip"):
+    assert name in script, name
+assert "MODSNAME" not in script and "ZIPLOADER" not in script
 
 print("ok")

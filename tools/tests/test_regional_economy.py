@@ -357,7 +357,6 @@ def main():
     print("[矢印の色]")
     # 色は**向き**で決める。スコアで決めると、表記が反転する店主側だけ
     # 色と向きが食い違う（緑の下向き矢印が出る）。
-    import importlib.util as _il
 
     class Ctx:
         """色付けに要るぶんだけの偽 ctx。"""
@@ -423,6 +422,14 @@ def main():
     mod.apply(ctx)
     check("色付きで当てても例外が出ない", not ctx.errors, ctx.errors)
 
+    # 品を並べ終えた直後にも検品する（売買画面を開く手前で待たない。VERIFICATION.md §3.114）。
+    laid = "__main__:ShoppingStartManagerRemake.set_item_from_world_data"
+    check("品を並べ終えた直後の入口を包む", laid in ctx.hooks, sorted(ctx.hooks))
+    if laid in ctx.hooks:
+        got = ctx.hooks[laid](lambda self, *a, **k: "laid", object(), None, 1)
+        check("並べる処理の戻り値はそのまま（店が引けなくても）", got == "laid", got)
+        check("引けない場面でも例外を出さない", not ctx.errors, ctx.errors)
+
     check("得と損で別の色", mod.GAIN_MARK_COLOR != mod.LOSS_MARK_COLOR)
     check("色は6桁のHTML色",
           all(len(c) == 7 and c.startswith("#")
@@ -464,9 +471,15 @@ def main():
     import types as _types
 
     class GenCtx(Ctx):
+        #: 作るたびに次の世代にする。ローダの窓口の関所（`arrivals` など）は1つの世代に1枚で、
+        #: 同じ世代の2つ目の ctx には包みが渡らない（本番の注入し直しは世代が進む）。
+        _last_generation = [Ctx.generation]
+
         def __init__(self):
             Ctx.__init__(self)
             self.gone = False
+            GenCtx._last_generation[0] += 1
+            self.generation = GenCtx._last_generation[0]
 
         def superseded(self):
             return self.gone

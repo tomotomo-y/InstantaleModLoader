@@ -11,7 +11,7 @@
 
 | 何を変えるか | どこで変えるか |
 |---|---|
-| ボタンの表示 | `AreaMoveCofirmation.update_button_display` の後で `text` だけ書き換える |
+| ボタンの表示 | 確認画面の徒歩・馬車を、ローダの窓口 `choices` の差し替え（`replace`）で今の設定の文言にして出す |
 | 経過する日数 | `AreaMoveManager.execute` の間だけ、ローダの日数送りの関所へ「この移動は何日か」を出す |
 | 移動中の文言 | 同じ窓の間だけ `InstantaleApp.add_text` の文言をテンプレートへ置き換える |
 | 馬車の料金 | ゲームが引き落とす前に差額ぶん所持金をずらす（前払い調整） |
@@ -23,8 +23,8 @@
 
 留意点:
 
-- **ボタンは `text` だけ触る**（spec と `args` はゲーム自身のものを残す）ので、
-  この MOD を外しても押下の挙動は壊れない。
+- **ゲームのボタンは書き換えない**。窓口が同じ spec と `args` の写しを今の文言で出し、押下はゲームへ流す
+  （TECH.md §3.3.14）。セーブにはゲームの文言が残るので、この MOD を外しても押下の挙動も文言も壊れない。
   手段の見分けもラベルの文字列には下がらず `args` の
   `mode` だけで行う（`kind_of_mode` のコメント）
 - 日数は**ローダの関所**（`durations`。TECH.md §3.3.3）に望みを出すだけで、
@@ -65,13 +65,19 @@
 こちらが外側に居ると先に置き換えてしまい、307_ の伏せが効かなくなる。
 
 遊び方の説明は MODS.md の `314_` の項、検証の経過は VERIFICATION.md §3.27。
+
+版7: `AreaMoveManager.__init__` と `add_text` のフックは、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。文言の言い換えは来た側に合わせて差し替える。
+`hasattr` を既定値付きの `getattr` に替えた（TECH.md §6）。
+`add_text` は窓の外では設定を読み直さない（版6までは本文1行ごとにワールド別の設定ファイルを `os.stat` していた）。
 """
 
 import os
+import re
 import sys
 import time
 
-from instantale_modloader import choices, durations, ui
+from instantale_modloader import arrivals, choices, durations, frames, ui
 from instantale_modloader.state import UNKNOWN_WORLD, WorldStore, playthrough_key, world_key
 
 LOG_BASENAME = "area_move_custom.log"
@@ -179,6 +185,8 @@ ARRIVE_MARKS = ("辿り着いた",)
 GAME_WALK_DAYS = 90
 GAME_COACH_DAYS = 14
 GAME_COACH_PRICE = 1000
+#: ゲームが確認画面に書く徒歩の文言の書式（実測: `徒歩(3ヵ月)`）。前の版がセーブに焼いた自分の文言と見分ける。
+GAME_WALK_TEXT = re.compile(r"^徒歩\(\d+ヵ月\)$")
 
 # ラベルから料金を読むのはローダの語彙（`ui.parse_coin`。`315_` と共有）。
 # `馬車(1000G)` → 1000。桁区切りが入っても読める。
@@ -268,11 +276,8 @@ def apply(ctx):
             "window": None,
             # 確認画面のラベルから読み取った素の運賃（読めた最新の値）。
             "game_price": None,
-            # 自分が最後に書いた馬車のラベル。
-            # 画面がラベルを組み直さないビルドで
-            # update_button_display がもう一度来たとき、**自分の書いた
-            # 300G を素の運賃として読み込まない**ための目印。
-            "our_coach_label": None,
+            # 最後に書いた文言の差し替え（同じものを組み直しのたびにログへ書かない）。
+            "noted": None,
         }
         setattr(sys, STATE_STORE_ATTR, state)
 
@@ -288,7 +293,7 @@ def apply(ctx):
         settings_store = WorldStore(ctx, SETTINGS_DIRNAME, default=dict,
                                     write=write)
         setattr(sys, SETTINGS_STORE_ATTR, settings_store)
-    elif settings_store is not None and hasattr(settings_store, "rebind"):
+    elif settings_store is not None and callable(getattr(settings_store, "rebind", None)):
         settings_store.rebind(ctx, write)
     # 注入のたびにモジュールは作り直され、一括設定を注入してからここへ来る（TECH.md §3.8）。
     # だからここで控えた値がそのまま一括設定（`sys` に固定してはいけない。
@@ -479,57 +484,6 @@ def apply(ctx):
             return new if new != old else None
         return None
 
-    @ctx.wrap("__main__:AreaMoveCofirmation.update_button_display", required=False,
-              safe=True)
-    def confirmation_buttons(orig, self, *args, **kwargs):
-        """徒歩・馬車が並び終えた後、ラベルの `text` だけを書き直す。
-
-        素の運賃はここで（書き換える前のラベルから）読み取って控える。
-        描画はもう済んでいるので、変えたときだけ次のフレームで塗り直す（`307_` と同じ。
-        二度目は同じ文字列になるので塗り直しは繰り返さない）。
-        """
-        result = orig(self, *args, **kwargs)
-        try:
-            app = getattr(self, "app", None) or ui.find_app()
-            if app is None:
-                return result
-            refresh_world(app)
-            options = move_options(getattr(app, "buttons", None))
-            if not options:
-                return result
-            # 確認画面は1つの行き先の徒歩・馬車が並ぶので、挟む街の数は1回でよい。
-            origin_id = ui.area_id_of(ui.current_area(app))
-            target_id = str(options[0][1][0])
-            hops = road_hops(app, origin_id, target_id)
-            if hops:
-                write("hops: {} settlement(s) between {} and {} "
-                      "(a road opened by 325_)".format(hops, origin_id, target_id))
-            changed = False
-            for entry, argv in options:
-                kind = kind_of_mode(argv[1])
-                old = entry.get("text") or ""
-                if kind is None:
-                    write("unknown mode {!r} on {!r}; leaving it alone "
-                          "(the game may have changed its vocabulary)".format(
-                              argv[1], old))
-                    continue
-                if kind == "coach" and old != state["our_coach_label"]:
-                    price = ui.parse_coin(old)
-                    if price is not None:
-                        state["game_price"] = price
-                new = relabel(kind, old, hops)
-                if new and new != old:
-                    entry["text"] = new
-                    changed = True
-                    if kind == "coach":
-                        state["our_coach_label"] = new
-                    write("label: {!r} -> {!r} ({})".format(old, new, kind))
-            if changed:
-                screen.apply_buttons(app, None, "relabel")
-        except Exception:
-            ctx.log_exc("area move custom: cannot relabel the buttons")
-        return result
-
     # ============================================================ 手持ちの確認
     def on_button_press(self, entry, button_index):
         """設定した運賃に手持ちが満たないときは、押された時点で断る。
@@ -567,56 +521,71 @@ def apply(ctx):
             return "徒歩({}ヵ月)".format(GAME_WALK_DAYS // 30)
         return ui.rewrite_coins("馬車({}G)".format(state["game_price"] or GAME_COACH_PRICE))
 
-    def relabel_restored(app, buttons):
-        """組み直しの前。確認画面の徒歩・馬車の文言を、今の設定で付け直す。
+    def game_text(kind, text):
+        """ゲームの書式の文言か（`徒歩(3ヵ月)` / `馬車(1000G)`）。前の版がセーブに焼いた自分の文言なら偽。"""
+        if kind == "walk":
+            return GAME_WALK_TEXT.match(text) is not None
+        price = ui.parse_coin(text)
+        return price is not None and text == ui.rewrite_coins("馬車({}G)".format(price))
 
-        セーブに残るのは文言そのもので、ロードの後は `update_button_display` が走らない。
-        設定を変えてから、確認画面で保存したセーブを読むと、保存した時の運賃・日数が出ていた
-        （引かれるのは今の設定の額）。素のゲームの文言から `relabel` し直すので、
-        どの画面でも `confirmation_buttons` と同じ文言になる。
-        ふだんの確認画面ではゲームが `update_button_display` の中で組み直すので、こちらが先に付ける。
+    def offer(app, view):
+        """確認画面の徒歩・馬車を今の設定の文言で出す（窓口 `choices` の `offer`。組み直しのたびに呼ばれる）。
+
+        ゲームのボタンは書き換えず、同じ spec の写し（`replace`）を出す。押下はゲームへ流す（`on_press` 無し）。
         素の運賃は、文言がゲームの書式（`馬車(1000G)`）のときだけ読む。
-        自分の書いた文言から読むと、保存した時の運賃を素の運賃と取り違える。
+        前の版がセーブに焼いた自分の文言（`馬車(50G・7日)`）からは読まず、素のゲームの文言（`game_label`）から付け直す。
         """
-        try:
-            options = move_options(buttons)
-            if not options:
-                return
-            refresh_world(app)
-            origin_id = ui.area_id_of(ui.current_area(app))
-            hops = road_hops(app, origin_id, str(options[0][1][0]))
-            for entry, argv in options:
-                kind = kind_of_mode(argv[1])
-                if kind is None:
-                    continue
-                old = entry.get("text") or ""
-                if kind == "coach":
-                    price = ui.parse_coin(old)
-                    if price is not None                             and old == ui.rewrite_coins("馬車({}G)".format(price)):
-                        state["game_price"] = price
-                base = game_label(kind)
-                new = relabel(kind, base, hops) or base
-                if new != old:
-                    entry["text"] = new
-                    if kind == "coach":
-                        state["our_coach_label"] = new
-                    write("label: {!r} -> {!r} ({}; before the repaint)".format(old, new, kind))
-        except Exception:
-            ctx.log_exc("area move custom: cannot relabel the restored buttons")
+        options = move_options(view.buttons)
+        if not options:
+            return None
+        refresh_world(app)
+        # 確認画面は1つの行き先の徒歩・馬車が並ぶので、挟む街の数は1回でよい。
+        origin_id = ui.area_id_of(ui.current_area(app))
+        target_id = str(options[0][1][0])
+        hops = road_hops(app, origin_id, target_id)
+        out, notes = [], []
+        for entry, argv in options:
+            kind = kind_of_mode(argv[1])
+            old = entry.get("text") or ""
+            if kind is None:
+                notes.append("unknown mode {!r} on {!r}; leaving it alone "
+                             "(the game may have changed its vocabulary)".format(argv[1], old))
+                continue
+            is_game = game_text(kind, old)
+            if kind == "coach" and is_game:
+                state["game_price"] = ui.parse_coin(old)
+            base = old if is_game else game_label(kind)
+            new = relabel(kind, base, hops) or base
+            if new != old:
+                out.append(choices.Choice(new, base=entry, replace=True))
+                notes.append("label: {!r} -> {!r} ({})".format(old, new, kind))
+        noted = (origin_id, target_id, hops, tuple(notes))
+        if state.get("noted") != noted:
+            state["noted"] = noted
+            if hops:
+                write("hops: {} settlement(s) between {} and {} "
+                      "(a road opened by 325_)".format(hops, origin_id, target_id))
+            for line in notes:
+                write(line)
+        return out
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, refresh=relabel_restored, intercept=on_button_press)
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    # 徒歩・馬車の文言は `offer` の差し替え、運賃が足りないときの断りは `intercept`
+    choices.provide(ctx, screen, offer=offer, intercept=on_button_press)
 
     # ============================================================ 移動の窓
     @ctx.wrap("__main__:AreaMoveManager.__init__", required=False, safe=True)
-    def area_move_init(orig, self, app, target_area_id, mode, *args, **kwargs):
+    def area_move_init(orig, self, *args, **kwargs):
         """`execute` には引数が来ないので、行き先と手段をここで自分に控える。
 
         自分専用の属性名で持つだけで、ゲームのデータには何も書かない（マネージャはセーブに入らない。セーブに入るのは
         PhaseSpec のほう）。
         """
-        result = orig(self, app, target_area_id, mode, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         try:
+            # (app, target_area_id, mode)。受け取った形のまま渡し、ここでは読むだけ。
+            target_area_id = frames.arg(args, kwargs, "target_area_id", 1)
+            mode = frames.arg(args, kwargs, "mode", 2)
             self._mod_area_move_custom = {"target_id": str(target_area_id),
                                           "mode": str(mode)}
         except Exception:
@@ -682,9 +651,11 @@ def apply(ctx):
                   "leaving it as is (arrived={})".format(
                       after, prepaid, expected, arrived))
 
-    @ctx.wrap("__main__:AreaMoveManager.execute", required=False)
-    def area_move_execute(orig, self, choice_text=None, *args, **kwargs):
+    def area_move_begin(call):
         """移動の間だけ窓を開ける。日数と文言の差し替えはこの窓の中だけ。
+
+        前後ともローダの窓口 `arrivals` から呼ばれる（後は `always=True`。前は try/finally。TECH.md §3.3.21）。
+        開いた窓を返し、後の処理が `call.memo` で受け取る。
 
         料金を変えているときは、ゲームが引き落とす前に「素の運賃
         − 設定額」のぶんだけ所持金をずらしておく（前払い調整）。
@@ -693,7 +664,7 @@ def apply(ctx):
         引いてから返す方式だと、支払い直後の所持金表示が1000引かれた値のまま残る）。
         ずらした直後に描画は走らないので、増えた瞬間が画面に見えることもない。
         """
-        app = getattr(self, "app", None) or ui.find_app()
+        self, app = call.obj, call.app
         refresh_world(app)
         window = None
         try:
@@ -731,15 +702,18 @@ def apply(ctx):
                               int(window["fare"])))
             except Exception:
                 ctx.log_exc("area move custom: cannot pre-adjust the fare")
-        try:
-            return orig(self, choice_text, *args, **kwargs)
-        finally:
-            state["window"] = None
-            if window is not None:
-                try:
-                    settle_fare(app, window)
-                except Exception:
-                    ctx.log_exc("area move custom: cannot settle the fare")
+        return window
+
+    def area_move_end(call):
+        state["window"] = None
+        if call.memo is not None:
+            try:
+                settle_fare(call.app, call.memo)
+            except Exception:
+                ctx.log_exc("area move custom: cannot settle the fare")
+
+    arrivals.on(owner, ctx, (arrivals.AREA,), before=area_move_begin, after=area_move_end,
+                always=True, write=write)
 
     # ============================================================ 日数
     # `elapse_days` はこちらでは包まない。包むのはローダの関所1枚だけで、
@@ -789,18 +763,24 @@ def apply(ctx):
         return None
 
     @ctx.wrap("__main__:InstantaleApp.add_text", required=False)
-    def add_text(orig, self, context=None, *args, **kwargs):
+    def add_text(orig, self, *args, **kwargs):
         try:
+            window = state["window"]
+            if window is None:
+                # 言い換えはエリア移動の窓の中だけ。窓の外の本文では設定も読み直さない
+                # （窓を開く `area_move_begin` が開く前に読み直している）。
+                return orig(self, *args, **kwargs)
             refresh_world(self)
             window = state["window"]
+            context = frames.arg(args, kwargs, "context", 0)
             if window is not None and isinstance(context, str):
                 replaced = reword(window, context)
                 if replaced is not None and replaced != context:
                     write("text: {!r} -> {!r}".format(context, replaced))
-                    return orig(self, replaced, *args, **kwargs)
+                    args, kwargs, _ = frames.replace_arg(args, kwargs, "context", 0, replaced)
         except Exception:
             ctx.log_exc("area move custom: cannot reword the travel text")
-        return orig(self, context, *args, **kwargs)
+        return orig(self, *args, **kwargs)
 
     # ------------------------------------------------------------ 自己検証
     # 実経路はエリア移動を1回するまで通らない。

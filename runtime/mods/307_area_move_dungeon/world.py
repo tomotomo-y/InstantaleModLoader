@@ -13,10 +13,12 @@
 
 import sys
 
-from instantale_modloader import ui
+from instantale_modloader import state, ui
+
 # 世界と周回の見分け方はローダの語彙。
 # ここで再輸出して `world.world_key(app)` / `world.playthrough_key(app)` を保つ。
-from instantale_modloader.state import playthrough_key, world_key
+playthrough_key = state.playthrough_key
+world_key = state.world_key
 
 
 def short(value, limit=60):
@@ -86,9 +88,7 @@ def area_level(app, area, write, label, minimum=1):
 
 
 # --------------------------------------------------------------- クエスト
-# クエストは2箇所にある。
-# 書くときは必ず両方（GAME.md §2.9）。
-# クエストは2箇所にある（`206_` の計測）。
+# クエストは生きた一覧とセーブの中身の2箇所にある（GAME.md §2.9.1）。
 # 読むのはどちらでもよいが、書くときは必ず両方。
 # その作法はローダに集約してある（`301_` / `305_` と共有。TECH.md §3.2.3）。
 # ここで再輸出して `world.quest_ids(app)` の書き方を保つ。
@@ -103,7 +103,7 @@ def append_quest_value(app, quest_id, name, suffix, mark=None, on_error=None):
 
     `mark` を含んでいる格納先は飛ばすので、
     何度呼んでも二重に足さない（生成の直後は片方の格納先にしか居ないことがあり、
-    受注の時点でもう一度呼ぶため。GAME.md §2.9）。
+    受注の時点でもう一度呼ぶため。GAME.md §2.9.1）。
     文字列でない値には触らない。
     """
     written = 0

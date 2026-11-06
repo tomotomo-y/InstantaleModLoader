@@ -29,7 +29,10 @@ r"""機能追加: 街に施設を建てる（出資する）。
 どちらもセーブには残らず、控え（`state\`）から建て直す。
 この MOD が持つのは**出資の帳簿**だけ（`state\facility_investment\<世界名>.json`）。
 
-    持ち株  = {area, facility, keeper, kind, tier, size, name, built, collected}
+    持ち株  = {area, facility, keeper, kind, tier, size, name, built, collected, received}
+
+`received` はこれまでに受け取った売上の合計（版45 から）。それより前に受け取った分は額が残っていないので、
+版45 より前の持ち株は最初に受け取ったときに `received_partial` を立てる（「家と施設」の窓は「以上」と書く）。
 
 主人は施設を建てたときに一緒に生まれ、その施設の主として立つ。
 雇っているわけではない（表現の問題で、実際にどこかで雇うわけではない）。
@@ -60,13 +63,16 @@ r"""機能追加: 街に施設を建てる（出資する）。
 保存の前に外れ、書き出しの直前にも網があるので、セーブにも `world_data.json` にも残らない。
 進み（闘技場の `config` の `current_phase` / `enemy_data`）は実体と同じ辞書なので控えに載り、ロードで戻る。
 写しが無いまま押されたときのために、本体の入口は網で包んで握る（`run_guarded`）。
+
+版47: 宿泊・闘技場の相手の生成・建物の中の本体の入口のフックは、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。闘技場の相手の生成は `location` だけを来た側に合わせて差し替える。
 """
 
 import datetime
 import sys
 
-from instantale_modloader import (choices, durations, frames, llm, modfacility, modnpc,
-                                  prices, ui)
+from instantale_modloader import (choices, durations, frames, holdings, llm, loads, modfacility,
+                                  modnpc, prices, ui)
 from instantale_modloader.state import (UNKNOWN_WORLD, WorldStore, playthrough_key,
                                         playthrough_key_of_dict)
 
@@ -87,10 +93,9 @@ STATE_STORE_ATTR = "__instantale_facility_investment_store__"
 #: 押下を横取りするための印。他の MOD と別のキーにすること。
 MARK = "mod_facility_investment"
 
-#: ボタンに載せる種類・等級（`mod_` で始めるのは、他の MOD の掃除に
-#: 「印の無いボタン」と見なされないため。TECH.md §5.1.1）。
-KIND_KEY = "mod_facility_investment_kind"
-TIER_KEY = "mod_facility_investment_tier"
+#: 窓口 `choices` の MOD だけの画面の名前（出資の窓口・等級を選ぶ画面）。
+DESK_SCREEN = "desk"
+TIERS_SCREEN = "tiers"
 
 #: 帳簿の1件に立てる「主人の好感度を初期値まで上げた」印（`heal_keeper`）。
 WARMED_KEY = "keeper_warmed"
@@ -140,6 +145,9 @@ DAYS_PER_MONTH = 30
 COST_SCALE = 100
 INCOME_SCALE = 100
 HOLD_DAYS = 360
+
+#: 「家と施設」の窓の等級の札の色（ローダの `holdings` の色の段）。
+TIER_TONES = {"basic": "plain", "standard": "fair", "advanced": "good"}
 STAY_QUALITY = "private_room"
 
 #: 種類ごとの建設費と1日の売上、建てられる最低の規模。
@@ -304,17 +312,13 @@ def apply(ctx):
             "state": {
                 # 自前のフェーズが動いている間の旗。連打の2発目を捨てる。
                 "acting": False,
-                # 自前の画面を出す前の選択肢（`やめる` で戻すために控える）。
-                "saved": None,
-                # 窓口で選んだ種類（等級を選ぶ画面へ持ち回る）。
-                "choosing": None,
+                # 窓口 `choices` の持ち主の名前（`provide` が返す）。
+                "owner": None,
                 # 自分の宿屋での宿泊。`{"facility": id, "name": …, "quality": …}`。
                 # 宿代を前払いする部屋を覚える。
                 "own_stay": None,
                 # 一度書いた WARN の覚え。
                 "warned": set(),
-                # 手が空くのを待っているボタンの足し直し。
-                "retry": False,
                 # 主人の姿を書いた建物（訪ねるたびに1度）。
                 "noted": None,
             },
@@ -332,6 +336,7 @@ def apply(ctx):
     # 帳簿はその場でファイルになるが、所持金がセーブに入るのは次の保存のとき。
     # 保存しないまま落ちると、建物がタダで残り、受け取った売上は消えて `collected` だけ進む。
     save_soon = ui.saver(ctx, write, "investment")
+    later = ui.scheduler(ctx, "investment")
 
     # 建物と主人はローダが持つ。関所は何本の MOD が呼んでも1つしか立たない。
     modfacility.install(ctx, write=write)
@@ -923,6 +928,7 @@ def apply(ctx):
             "price": price,
             "built": day,
             "collected": day,
+            "received": 0,
             "at": datetime.datetime.now().isoformat(timespec="seconds"),
         }
         # 主人を先に決める（帳簿に控える）。`register_holding` はそれを使う。
@@ -979,6 +985,16 @@ def apply(ctx):
                              role=spec.get("keeper_role", "主人")))
         return True
 
+    def add_received(record, gold, before):
+        """受け取った額を足す。版45 より前の持ち株は、一度も受け取っていなければ 0 から数える。"""
+        got = record.get("received")
+        if isinstance(got, int) and not isinstance(got, bool):
+            record["received"] = got + int(gold)
+            return
+        record["received"] = int(gold)
+        if before != record.get("built"):
+            record["received_partial"] = True     # 前に受け取った額は残っていない
+
     def collect(app, facility_id):
         """溜まった売上を受け取る。受け取った額を返す。"""
         record = holding_of(app, facility_id)
@@ -996,7 +1012,9 @@ def apply(ctx):
             screen.say(app, NO_CHARGE_TEXT)
             return 0
         today = ui.game_day(app)
-        record["collected"] = today if today is not None else record.get("collected")
+        before = record.get("collected")
+        record["collected"] = today if today is not None else before
+        add_received(record, gold, before)
         save(app)
         save_soon(app, "collect")
         write("collected: {}G for {} day(s) at {!r}".format(gold, days, record.get("name")))
@@ -1081,43 +1099,28 @@ def apply(ctx):
 
     # ------------------------------------------------------------ 窓口
     def show_desk(app):
-        """役場の出資の窓口。建てられる種類を並べ、**全部の種類の条件**を本文に出す。
+        """役場の出資の窓口を開く。**全部の種類の条件**を本文に出す。
 
         建てられないときに「いま建てられるものは無い」だけだと、規模が足りないのか
         軒数が埋まっているのかが分からない（村で出た）。
+        ボタンは窓口 `choices` の MOD だけの画面（`desk_screen`）が組む。下の役場の選択肢は窓口が残す。
         """
         area = ui.current_area(app)
         area_name = frames.short(getattr(area, "name", ""), 40) or "この土地"
-        state["saved"] = [item for item in (getattr(app, "buttons", None) or [])
-                          if not screen.mark_of(item)]
-        state["choosing"] = None
-        entries = []
         lines = []
         buildable = 0
         no_hub = False
         size = area_size(app, ui.area_id_of(area)) if area is not None else None
         for kind in catalog.enabled_kinds():
-            spec = catalog.kind_of(kind)
             ok, why = room_for(app, area, kind) if area is not None else (False, "size")
             no_hub = no_hub or why == "hub"
             if ok:
-                entry = screen.button(BUILD_LABEL.format(spec["label"]), mark="kind",
-                                      extra={KIND_KEY: kind})
-                if entry is not None:
-                    entries.append(entry)
-                    buildable += 1
+                buildable += 1
             # 本文に出すのは**建たない種類の条件だけ**。
             # 建つ種類の値札は選択肢を押した先（等級の画面）で出る。
             line = catalog.requirement_text(kind, size, min_size_of(kind))
             if line:
                 lines.append(line)
-        if holdings_of(app):
-            entry = screen.button(STATUS_LABEL, mark="status")
-            if entry is not None:
-                entries.append(entry)
-        cancel = screen.button(CANCEL_LABEL, mark="cancel")
-        if cancel is not None:
-            entries.append(cancel)
         if size is None:
             screen.say(app, _fmt(DESK_NO_SIZE_TEXT, area=area_name))
         else:
@@ -1131,35 +1134,54 @@ def apply(ctx):
             screen.say(app, "\n".join([head] + lines))
         write("desk: {} kind(s) offered in area {!r} ({})".format(
             buildable, ui.area_id_of(area) if area is not None else None, size))
-        screen.apply_buttons(app, entries, "desk")
+        choices.open_screen(app, state["owner"], DESK_SCREEN)
+
+    def desk_screen(app, view, _data):
+        """出資の窓口のボタン（組み直しのたびに、いまの街の空きから組む）。役場に居なければ閉じる（None）。"""
+        if not at_office(app):
+            return None
+        area = ui.current_area(app)
+        out = []
+        for kind in catalog.enabled_kinds():
+            ok, _why = room_for(app, area, kind) if area is not None else (False, "size")
+            if ok:
+                text = BUILD_LABEL.format(catalog.kind_of(kind)["label"])
+                out.append(choices.Choice(text, on_press=_press("kind", kind, None, text)))
+        if holdings_of(app):
+            out.append(choices.Choice(STATUS_LABEL, on_press=_press("status", None, None, STATUS_LABEL)))
+        out.append(choices.Choice(CANCEL_LABEL, on_press=_press("cancel", None, None, CANCEL_LABEL)))
+        return out
 
     def show_tiers(app, kind):
-        """等級を選ぶ。値札は今の街の規模で計算する。"""
+        """等級を選ぶ画面を開く。値札は今の街の規模で計算する（`tiers_screen`）。"""
         area = ui.current_area(app)
         spec = catalog.kind_of(kind)
         if area is None or spec is None:
             back(app, "no area")
             return
         size = area_size(app, ui.area_id_of(area))
-        state["choosing"] = kind
-        entries = []
-        for tier in catalog.TIERS:
-            price = cost_of(kind, tier, size)
-            if price is None:
-                continue
-            label = TIER_LABEL.format(catalog.TIER_LABEL[tier], ui.money(price))
-            entry = screen.button(ui.rewrite_coins(label), mark="tier",
-                                  extra={KIND_KEY: kind, TIER_KEY: tier})
-            if entry is not None:
-                entries.append(entry)
-        cancel = screen.button(CANCEL_LABEL, mark="cancel")
-        if cancel is not None:
-            entries.append(cancel)
         income = [income_of(kind, t, size) for t in catalog.TIERS]
         screen.say(app, ui.rewrite_coins(
             "{}の等級を選ぶ。1日の売上は 並 {}G / 上等 {}G / 最上 {}G の見込み。".format(
                 spec["label"], *[ui.money(v) for v in income])))
-        screen.apply_buttons(app, entries, "tiers")
+        choices.open_screen(app, state["owner"], TIERS_SCREEN, {"kind": kind})
+
+    def tiers_screen(app, view, data):
+        """等級のボタン。選んだ種類は画面の控え（`data`）に持つ（ロードの後も同じ種類の画面に戻る）。"""
+        kind = (data or {}).get("kind")
+        area = ui.current_area(app)
+        if not at_office(app) or area is None or catalog.kind_of(kind) is None:
+            return None
+        size = area_size(app, ui.area_id_of(area))
+        out = []
+        for tier in catalog.TIERS:
+            price = cost_of(kind, tier, size)
+            if price is None:
+                continue
+            text = ui.rewrite_coins(TIER_LABEL.format(catalog.TIER_LABEL[tier], ui.money(price)))
+            out.append(choices.Choice(text, on_press=_press("tier", kind, tier, text)))
+        out.append(choices.Choice(CANCEL_LABEL, on_press=_press("cancel", None, None, CANCEL_LABEL)))
+        return out
 
     def show_status(app):
         lines = []
@@ -1180,11 +1202,10 @@ def apply(ctx):
         back(app, "status")
 
     def back(app, why="back"):
-        """自前の画面から役場の選択肢へ戻す（窓口のボタンは塗り直しの中で足し直される）。"""
-        saved, state["saved"] = state["saved"], None
-        state["choosing"] = None
-        write("back: {} ({} entries)".format(why, len(saved) if saved is not None else "keep"))
-        screen.apply_buttons(app, saved, "back")
+        """出資の窓口の画面を閉じて役場の選択肢へ戻す（下の選択肢は窓口 `choices` が残している）。"""
+        write("back: {}".format(why))
+        if not choices.close_screen(app, state["owner"]):
+            choices.repaint(app)
 
     # ------------------------------------------------------------ 自前のフェーズ
     class InvestPhase(object):
@@ -1246,74 +1267,46 @@ def apply(ctx):
             return False
         return ui.facility_type_of(location) == OFFICE_FACILITY_TYPE
 
-    def retry_when_idle(app):
-        if state.get("retry"):
-            return
-        state["retry"] = True
-
-        def again():
-            state["retry"] = False
-            try:
-                maintain_buttons(app)
-            except Exception:
-                ctx.log_exc("investment: cannot maintain the choices (idle)")
-
-        screen.when_idle(app, again, proceed_on_timeout=True, tag="retry")
-
-    def maintain_buttons(app):
-        """役場に「出資する」を足す。建物の中はローダが出す。何度呼んでも増えない。"""
-        buttons = getattr(app, "buttons", None)
-        if not isinstance(buttons, list):
-            return
-        if ui.busy_signals(app):
-            retry_when_idle(app)
-            return
-        if not is_facility_screen(buttons):
-            return
-        if modfacility.game_is_busy(app):
+    def offer(app, view):
+        """役場に「出資する」を出す（窓口 `choices` の `offer`）。建物の中はローダが出す。"""
+        if not is_facility_screen(view.buttons) or modfacility.game_is_busy(app):
             # 会話・戦闘・自由入力の最中は足さない（建物の選択肢と同じ判定。TECH.md §5.8）。
-            return
-        screen.prune_stale(buttons, list(OUR_LABEL_PREFIXES))
-        if any(screen.mark_of(entry) for entry in buttons):
-            return
+            return None
         if not at_office(app):
-            return
-        entry = screen.button(DESK_LABEL, mark="desk")
-        if entry is None:
-            return
-        buttons.insert(max(len(buttons) - 1, 0), entry)
-        screen.apply_buttons(app, None, "office")
+            return None
+        return [choices.Choice(DESK_LABEL, place=choices.at(max(len(view.buttons) - 1, 0)),
+                               on_press=_press("desk", None, None, DESK_LABEL))]
 
     # ================================================================ フック
-    def refresh_choice_buttons(self):
-        """選択肢が組み直されるたびに、建物を当て直して自前のボタンを足す。
+    def refresh_choices(self, _buttons):
+        """組み直しの前（窓口 `choices` の `refresh`）。建物を当て直す。
 
-        最後にローダの塗り直しをもう一度呼ぶ（どちらの関所が内側かは適用順で変わる）。
+        建物の当て直しは、建物の選択肢を組む前に済ませる（窓口は `refresh` の後に `offer` を呼ぶ。
+        ローダの建物の選択肢も同じ組み直しで組まれる。TECH.md §5.8）。
         """
         try:
             apply_holdings(self, getattr(self, "world", None), current_key(self), "screen")
-            maintain_buttons(self)
-            modfacility.maintain_buttons(self, write=write)
+            notice_full(self)
         except Exception:
-            ctx.log_exc("investment: cannot maintain the choices")
+            ctx.log_exc("investment: cannot apply the holdings")
 
-    def on_button_press(self, action):
-        """自前のボタンが押された（窓口 `choices` の `presses`。印で振り分けた後に呼ばれる）。"""
-        entry = choices.pressed()
-        if state["acting"]:
-            write("ignored {!r}: the previous press is still running".format(
-                entry.get("text") if isinstance(entry, dict) else None))
+    def _press(action, kind, tier, text):
+        """自前のボタンの押下（窓口がボタンに持たせる処理）。ゲームと同じ経路（`process_choice`）で動かす。"""
+        def on_press(app):
+            if state["acting"]:
+                write("ignored {!r}: the previous press is still running".format(text))
+                return None
+            write("pressed {!r} ({} kind={} tier={})".format(text, action, kind, tier))
+            screen.start_phase(app, InvestPhase(app, action, kind, tier), text,
+                               fallback=lambda: run_action(app, action, kind, tier))
             return None
-        text = (entry.get("text") if isinstance(entry, dict) else None) or DESK_LABEL
-        kind = entry.get(KIND_KEY) if isinstance(entry, dict) else None
-        tier = entry.get(TIER_KEY) if isinstance(entry, dict) else None
-        write("pressed {!r} ({} kind={} tier={})".format(text, action, kind, tier))
-        screen.start_phase(self, InvestPhase(self, action, kind, tier), text,
-                           fallback=lambda: run_action(self, action, kind, tier))
-        return None
+        return on_press
 
-    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14）に預ける。
-    choices.provide(ctx, screen, after=refresh_choice_buttons, presses={"": on_button_press})
+    # 選択肢と押下はローダの窓口 `choices`（TECH.md §3.3.14 の宣言型の口）に預ける。
+    # 役場の「出資する」は `offer`、出資の窓口と等級の画面は MOD だけの画面
+    state["owner"] = choices.provide(ctx, screen, refresh=refresh_choices, offer=offer,
+                                     screens={DESK_SCREEN: desk_screen, TIERS_SCREEN: tiers_screen},
+                                     labels=list(OUR_LABEL_PREFIXES))
 
     def register_before_load(app, key):
         """読む周回の持ち株の層を、`World.__init__` の orig より前に積む。積んだ鍵を返す。
@@ -1339,18 +1332,17 @@ def apply(ctx):
             state["key_override"] = None
         return key
 
-    @ctx.wrap("__main__:World.__init__", required=False, safe=True)
-    def world_loaded(orig, self, save_data_dict, app, *args, **kwargs):
-        """セーブを読んだ直後。前の世界の覚えを捨て、持ち株を当て直す。
-
-        層だけは orig の前に積む（`register_before_load`）。
-        """
-        early = None
+    def world_loading(call):
+        """世界を組み立てる前（ローダの窓口 `loads`）。主人の層だけは先に積む（`register_before_load`）。"""
         try:
-            early = register_before_load(app, playthrough_key_of_dict(save_data_dict, None))
+            return register_before_load(call.app, playthrough_key_of_dict(call.save_data, None))
         except Exception:
             ctx.log_exc("investment: cannot register the holdings before the load")
-        result = orig(self, save_data_dict, app, *args, **kwargs)
+            return None
+
+    def world_loaded(call):
+        """セーブを読んだ直後。前の世界の覚えを捨て、持ち株を当て直す。"""
+        self, save_data_dict, app, early = call.obj, call.save_data, call.app, call.memo
         try:
             key = playthrough_key_of_dict(save_data_dict, None) or playthrough_key(app)
             if app is not None and key and key != UNKNOWN_WORLD:
@@ -1360,8 +1352,6 @@ def apply(ctx):
                     worlds.forget(key)
                     keepers_registered.clear()
                 state["own_stay"] = None
-                state["saved"] = None
-                state["choosing"] = None
                 state["warned"] = set()
                 state["key_override"] = key
                 try:
@@ -1375,12 +1365,16 @@ def apply(ctx):
                     state["key_override"] = None
                 write("load: the ledger of {!r} has {} holding(s)".format(
                     key, len(bucket_of(key).get("holdings") or [])))
+                # 読み込んだ直後は選択肢が組み直されない（焼かれたボタンを戻すだけ）ので、
+                # 保管上限に届いたままのセーブでも赤い点が付くよう、読み終えてから1度確かめる
+                later(lambda: notice_full(app), delay=1.0)
         except Exception:
             ctx.log_exc("investment: cannot rebuild the holdings on load")
-        return result
+
+    loads.on(OWNER, ctx, (loads.WORLD,), before=world_loading, after=world_loaded, write=write)
 
     @ctx.wrap("__main__:VacationStartManager.execute", required=False)
-    def vacation_start(orig, self, choice_text="", *args, **kwargs):
+    def vacation_start(orig, self, *args, **kwargs):
         """自分の宿屋の「無料で泊まる」は宿代を取らない。よその宿屋には触らない。
 
         ゲームが引く額を**先に足しておき**、ゲームが引いて元へ戻す（前払い）。
@@ -1397,11 +1391,11 @@ def apply(ctx):
         app = getattr(self, "app", None) or ui.find_app()
         home = staying_here(app) if app is not None else None
         if home is None:
-            return orig(self, choice_text, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         before = ui.gold_of(app)
         prepaid = prepay_room(app, home, before)
         try:
-            result = orig(self, choice_text, *args, **kwargs)
+            result = orig(self, *args, **kwargs)
         except Exception as exc:
             write("WARN stay: the game's stay failed: {}({!r}) at {!r}".format(
                 type(exc).__name__, getattr(exc, "args", ()), home.get("name")))
@@ -1473,7 +1467,7 @@ def apply(ctx):
         return off
 
     @ctx.wrap("scripts.llm.llm_manager:colosseum_enemy_generator", required=False)
-    def colosseum_enemy_generator(orig, location=None, *args, **kwargs):
+    def colosseum_enemy_generator(orig, *args, **kwargs):
         """自分の闘技場の相手を作るとき、既に出た闘士の名前を頼み文に足す。
 
         ゲームの頼み文は世界観・エリア・施設名と概要・ランクだけで、前の相手を載せない。
@@ -1484,17 +1478,19 @@ def apply(ctx):
             app = ui.find_app()
             record = own_arena(app) if app is not None else None
             if record is not None:
+                # (location, area, world, npc_difficulty_level)。受け取った形のまま渡し、`location` だけを差し替える。
+                location = frames.arg(args, kwargs, "location", 0)
                 names = fighters_so_far(app, record)
                 varied = vary_location(location, names) if names else location
                 if varied is not location:
                     write("arena: {} earlier fighter(s) told to the generator: {}".format(
                         len(names), "、".join(names[-3:])))
-                    location = varied
+                    args, kwargs, _ = frames.replace_arg(args, kwargs, "location", 0, varied)
         except Exception:
             ctx.log_exc("investment: cannot vary the arena prompt")
-        return orig(location, *args, **kwargs)
+        return orig(*args, **kwargs)
 
-    def run_guarded(orig, self, choice_text, args, kwargs, what, kinds):
+    def run_guarded(orig, self, args, kwargs, what, kinds):
         """自分の建物で起きる本体の処理を包む。落ちたら握って操作を戻す。
 
         素データの写しはローダが置く（`modfacility` の `plain`。中に立っている間）ので普通は通る。
@@ -1504,9 +1500,9 @@ def apply(ctx):
         app = getattr(self, "app", None) or ui.find_app()
         record = own_building(app, kinds) if app is not None else None
         if record is None:
-            return orig(self, choice_text, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         try:
-            return orig(self, choice_text, *args, **kwargs)
+            return orig(self, *args, **kwargs)
         except Exception as exc:
             write("WARN {}: the game's {} failed: {}({!r}) at {!r}".format(
                 what, what, type(exc).__name__, getattr(exc, "args", ()),
@@ -1520,26 +1516,87 @@ def apply(ctx):
     def guard(target, what, kinds):
         """`GUARDED_PHASES` の1本を包む。"""
         @ctx.wrap(target, required=False)
-        def guarded(orig, self, choice_text="", *args, **kwargs):
-            return run_guarded(orig, self, choice_text, args, kwargs, what, kinds)
+        def guarded(orig, self, *args, **kwargs):
+            return run_guarded(orig, self, args, kwargs, what, kinds)
         return guarded
 
     for _target, _what, _kinds in GUARDED_PHASES:
         guard(_target, _what, _kinds)
 
     @ctx.wrap("__main__:VacationEndManager.execute", required=False)
-    def vacation_end(orig, self, choice_text="", *args, **kwargs):
+    def vacation_end(orig, self, *args, **kwargs):
         """宿泊の覚え（`own_stay`）を落とすだけ。
 
         中の選択肢と絵の戻しはローダが持つ（`modfacility` の `PHASE_END_TARGETS` と
         `BG_OTHER_TARGETS`。TECH.md §5.8）。ここで画面を触っていたら MOD ごとに同じ直しが要る。
         """
-        result = orig(self, choice_text, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         try:
             end_stay(getattr(self, "app", None) or ui.find_app(), "vacation ended")
         except Exception:
             ctx.log_exc("investment: cannot close the stay")
         return result
+
+    # ------------------------------------------------------------ 家と施設の窓
+    def received_text(record):
+        """建設費の後ろの括弧の中身。"""
+        got = record.get("received")
+        if isinstance(got, int) and not isinstance(got, bool):
+            if got <= 0 and not record.get("received_partial"):
+                return "まだ受け取っていない"
+            return "受け取り済み {}G{}".format(ui.money(got), " 以上" if record.get("received_partial") else "")
+        if record.get("collected") == record.get("built"):
+            return "まだ受け取っていない"
+        return "受け取った額の記録なし"
+
+    def notice_full(app):
+        """売上が保管上限に届いた建物があれば「家と施設」の行に赤い点を付ける（届くたびに1度）。"""
+        key = current_key(app)
+        if not key or key == UNKNOWN_WORLD or not int(HOLD_DAYS):
+            return
+        noticed = state.setdefault("full_noticed", set())
+        for record in holdings_of(app):
+            gold, days = owed(app, record)
+            mark = (key, str(record.get("facility")), record.get("collected"))
+            if days >= int(HOLD_DAYS) and mark not in noticed:
+                noticed.add(mark)
+                holdings.notify(playthrough=key)
+                write("full: {!r} holds {} day(s) of income ({}G)".format(record.get("name"), days, gold))
+
+    def holdings_side(app):
+        """ローダの「家と施設」の窓に出す施設の側（TECH.md §3.3.19）。帳簿は読むだけで書かない。"""
+        key = current_key(app)
+        if not key or key == UNKNOWN_WORLD:
+            return None
+        here = ui.area_id_of(ui.current_area(app))
+        hold = int(HOLD_DAYS)
+        rows = [(record,) + owed(app, record) for record in holdings_of(app)]
+        rows.sort(key=lambda row: -row[2])                 # 保管上限に近い順
+        cards, here_names, income = [], [], 0
+        for record, gold, days in rows:
+            spec = catalog.kind_of(record.get("kind")) or {}
+            tier = record.get("tier")
+            full = hold > 0 and days >= hold
+            card = {"name": record.get("name") or "", "caption": "等級",
+                    "where": "{}・{}".format(spec.get("label") or record.get("kind") or "",
+                                            record.get("area_name") or ""),
+                    "badge": (catalog.TIER_LABEL.get(tier, tier or ""), TIER_TONES.get(tier, "plain")),
+                    "rows": [("主人", keeper_name(app, record)),
+                             ("溜まった売上", "{}G（{}日ぶん）".format(ui.money(gold), days))],
+                    "meter_after": 2,
+                    "meter": {"ratio": days / float(hold) if hold > 0 else 0, "tone": "bad" if full else "fair",
+                              "left": "前に受け取った日",
+                              "right": "保管上限 {}日".format(hold) if full else "保管上限まであと{}日".format(hold - days)},
+                    "notes": ["1日の売上 {}G　建設費 {}G（{}）".format(
+                        ui.money(per_day(record)), ui.money(record.get("price") or 0), received_text(record))],
+                    "cautions": [("売上が保管上限に届いている。受け取りに行くまで、これ以上売上は保管できない。", "bad")] if full else []}
+            cards.append(card)
+            income += int(gold)
+            if here and str(record.get("area")) == here:
+                here_names.append(record.get("name") or "")
+        return {"cards": cards, "count": len(cards), "income": income, "here": here_names}
+
+    holdings.provide(ctx, holdings.FACILITIES, holdings_side, write=write)
 
     write("applied: kinds={} scales cost={}% income={}% hold={}d".format(
         catalog.enabled_kinds(), COST_SCALE, INCOME_SCALE, HOLD_DAYS))

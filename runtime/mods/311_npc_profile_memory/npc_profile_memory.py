@@ -115,14 +115,19 @@ mod どうしは同じ場所を読むことで繋がる。
 鍵の並びを `RECORD_KEYS` で固定しているのはこのため。
 読む側はファイルが無ければ何も足さない。
 この mod を切っていても、まだ一度も会話していなくても成立する。
+
+版8: 会話の1ターンのフック2本は、引数を受け取った形のまま元の関数へ渡す
+（名前付きで受けて位置引数に直さない。TECH.md の規則の表）。
+同じ版で、依頼の報告の手続きをその場で作った発言が、変わらない決まりとして残らないようにした（VERIFICATION.md §3.115）。
+記録係に片付いた依頼を渡し、依頼の報告と報酬の手続きの話を事実にしないよう指示する。
 """
 
-import copy
 import datetime
+import os
 import sys
 import threading
 
-from instantale_modloader import frames, jobs, llm, ui
+from instantale_modloader import board, frames, jobs, llm, modnpc, quest_claims, ui
 from instantale_modloader.state import WorldStore, world_key
 
 # ---- 設定（既定値は mod.json の "settings" と一致させること。
@@ -131,7 +136,21 @@ CONVERSATION_TURNS = 8     # 抽出に載せる直近のやり取りの数
 INJECT_CHARS = 1200        # 抽出LLMへの目標長（要約で収める。保存・注入では切らない）
 RECORD_PLAYER_MEMORY = True   # 「その人物から見たプレイヤー」を別欄で覚えるか
 FACT_LOG_LIMIT = 200       # 判明した事実の追記専用ログの上限件数（0 で記録しない）
+
+# 記録係に渡す、片付いた依頼の件数。新しいものから数える。
+# 依頼が片付いた後も NPC が報告の手続きを求めると、その発言が「決まり」として残った（実機）。
+# 判断の材料で、NPC に教えるものではない。伏せた依頼（ローダの窓口 `board`）は入れない。
+FINISHED_QUESTS_TOLD = 5
+FINISHED_QUESTS_HEADING = "【片付いている依頼（記録の判断にだけ使う）】"
+FINISHED_QUESTS_BODY = (
+    "{player}はこれらを片付け、報酬も受け取っている。"
+    "これらの報告や手続きがまだ残っているように記録しない。"
+    "この一覧を人物像や記録に書き足さない。")
 TELL_ELAPSED_DAYS = True   # 前に話してからのゲーム内日数を会話に伝えるか
+
+#: 会話の相手の `profile` に控えを足す順（ローダの `modnpc` の notes。小さいほど先）。
+#: 自分で包んでいたときの重なり（外側から 321・317・403・311・326・301）を保つ。TECH.md §3.3.21。
+NOTES_PRIORITY = -3
 
 LOG_BASENAME = "npc_profile.log"
 
@@ -181,10 +200,26 @@ DAY_KEY = "day"
 # だからこちらは「地続きに再開しない」「不在明けの再会にもしない」の2つだけを言う。
 ELAPSED_HEADING = "【前に{player}と話してからの日数】"
 ELAPSED_BODY = (
-    "{days}日。前回の会話はこの日数ぶん前の出来事なので、続きをこの場で"
+    "{span}。前回の会話はそれだけ前の出来事なので、続きをこの場で"
     "そのまま再開しているかのようには話さない。ただし同じ土地に留まっている"
     "間は日々見かけているはずなので、長く離れていた相手との再会のようにも"
-    "扱わない。")
+    "扱わない。人は日数を数えていないので、何日ぶりかを具体的な数で口にしない。")
+
+# 経過日数を大まかな言い方に丸める段（上限の日数, 言い方）。
+# 生の日数を渡すと、モデルによっては「677日ぶり」とそのまま口にする。
+# 人が覚えている粒度に落としてから渡す。
+ELAPSED_SPANS = (
+    (1, "前日"),
+    (6, "数日前"),
+    (12, "1週間ほど前"),
+    (24, "半月ほど前"),
+    (45, "ひと月ほど前"),
+    (150, "数か月前"),
+    (270, "半年ほど前"),
+    (450, "1年ほど前"),
+    (1000, "1年以上前"),
+)
+ELAPSED_SPAN_LONGEST = "何年も前"
 
 # 抽出LLMに書かせる JSON の鍵。
 KEY_CHANGED = "changed"
@@ -281,12 +316,20 @@ def elapsed_days(record, today):
     return days if days > 0 else None
 
 
+def elapsed_span(days):
+    """経過日数を `ELAPSED_SPANS` の大まかな言い方にする。"""
+    for limit, span in ELAPSED_SPANS:
+        if days <= limit:
+            return span
+    return ELAPSED_SPAN_LONGEST
+
+
 def elapsed_note(days, player_name):
     """経過日数の但し書き。日数が無ければ空文字。"""
     if not days:
         return ""
     return "{}\n{}".format(ELAPSED_HEADING.format(player=player_name),
-                           ELAPSED_BODY.format(days=days))
+                           ELAPSED_BODY.format(span=elapsed_span(days)))
 
 
 def recent_facts(record):
@@ -466,9 +509,9 @@ def apply(ctx):
         }
         setattr(sys, STATE_STORE_ATTR, store)
     state = store["state"]
-    log_lock = store["log_lock"]
 
     write = ctx.logger(LOG_BASENAME)
+    owner = os.path.basename(getattr(ctx, "mod_dir", "") or "") or "311_npc_profile_memory"
     worlds = store["worlds"].rebind(ctx, write)
     data_lock = worlds.lock
 
@@ -737,67 +780,32 @@ def apply(ctx):
             blocks.append(note)
         return "\n\n".join(blocks)
 
-    def with_profile(label, args, kwargs):
-        """NPC の浅い複製の `profile` に控えを足した引数を組み直す。
+    def profile_notes(info):
+        """会話5関数の相手の `profile` に足す控え。
 
-        5つの会話関数は先頭4引数の並びが同じなので、ここ1つで足りる。
-        複製できない・引数が短いならそのまま返す。
-        ただし黙っては降りない。
+        ローダの `modnpc` の notes から呼ばれる（複製と差し替えは関所が1回だけ行う。TECH.md §5.7）。
+        素通りするときも黙っては降りない。
         素通りした理由がログに残らないと、注入が効いていないことに気付けない。
         """
-        npc = kwargs.get("character_instance")
-        if npc is None and len(args) >= 4:
-            npc = args[3]
-        if npc is None:
-            note_inject("{}: no character_instance (args={}, kwargs={})".format(
-                label, len(args), sorted(kwargs)))
-            return args, kwargs
-        app = ui.find_app()
+        label = info.get("site")
+        app = info.get("app") or ui.find_app()
         if app is None:
             note_inject("{}: no running app".format(label))
-            return args, kwargs
-        npc_id = npc_id_of(app, npc)
+            return None
+        npc_id = str(info.get("npc_id") or "") or npc_id_of(app, info.get("character"))
         if not npc_id:
             note_inject("{}: cannot name the character ({})".format(
-                label, type(npc).__name__))
-            return args, kwargs
+                label, type(info.get("character")).__name__))
+            return None
         addition = memory_block(record_of(app, npc_id), player_name_of(app),
                                 game_day(app))
         if not addition:
             note_inject("{}: nothing recorded for {!r} ({})".format(
                 label, name_of(app, npc_id), npc_id))
-            return args, kwargs
-        try:
-            clone = copy.copy(npc)
-        except Exception as exc:
-            note_inject("{}: cannot copy {} ({})".format(
-                label, type(npc).__name__, type(exc).__name__))
-            return args, kwargs
-        base = getattr(npc, "profile", "")
-        if base is None:
-            base = ""
-        if not isinstance(base, str):
-            note_inject("{}: profile is {}".format(label, type(base).__name__))
-            return args, kwargs
-        clone.profile = (base.rstrip() + "\n\n" + addition
-                         if base.strip() else addition)
+            return None
         note_inject("{}: {!r} ({}) +{} chars into profile".format(
             label, name_of(app, npc_id), npc_id, len(addition)))
-        if "character_instance" in kwargs:
-            merged = dict(kwargs)
-            merged["character_instance"] = clone
-            return args, merged
-        merged = list(args)
-        merged[3] = clone
-        return tuple(merged), kwargs
-
-    def inject(orig, label, args, kwargs):
-        """引数を組み直してから元の関数へ。元の関数は必ず1回だけ呼ぶ。"""
-        try:
-            args, kwargs = with_profile(label, args, kwargs)
-        except Exception:
-            ctx.log_exc("npc profile: injection failed")
-        return orig(*args, **kwargs)
+        return addition
 
     # ------------------------------------------------------------ LLM 呼び出し
     def ask(manager_name, messages):
@@ -881,6 +889,26 @@ def apply(ctx):
         party = getattr(sys, PARTY_TALK_STORE, None)
         return isinstance(party, dict) and bool(party.get("active"))
 
+    def finished_quests(app):
+        """主人公が片付けた依頼の題。新しいものから `FINISHED_QUESTS_TOLD` 件。読めなければ空。"""
+        if FINISHED_QUESTS_TOLD <= 0:
+            return []
+        try:
+            hidden = board.kept_off(app)
+            others = {row["quest"] for row in quest_claims.claims(app, quest_claims.DONE)}
+            done = []
+            for quest_id in ui.quest_ids(app):
+                quest = ui.quest_of(app, quest_id)
+                config = ui.quest_value(quest, "config", None) if quest is not None else None
+                if isinstance(config, dict) and config.get("status") == "completed" \
+                        and str(quest_id) not in hidden and str(quest_id) not in others:
+                    done.append((quest_id, frames.short(ui.quest_value(quest, "quest_title", "依頼"), 60)))
+            done.sort(key=lambda pair: ui.id_sort_key(pair[0]))
+            return [title for _qid, title in done[-FINISHED_QUESTS_TOLD:]]
+        except Exception:
+            ctx.log_exc("npc profile: cannot read the finished quests")
+            return []
+
     def snapshot_body(app, npc_id, transcript, *, limit=None):
         """抽出写しの共通部。`transcript` は呼び出し側が組む。"""
         npc = character_of(app, npc_id)
@@ -895,6 +923,7 @@ def apply(ctx):
         cap = CONVERSATION_CHARS if limit is None else max(1, int(limit))
         return {
             "world": world_key(app),
+            "finished_quests": finished_quests(app),
             "npc_id": str(npc_id),
             "npc_name": name_of(app, npc_id),
             "player_name": player_name_of(app),
@@ -952,7 +981,8 @@ def apply(ctx):
                 '"{}": 更新後の、{}から見た{}についての記録の全文（{}文字以内）'
                 .format(KEY_ABOUT_PLAYER, npc_name, player_name, about_chars))
         fields.append('"{}": この会話で新しく判明した事実だけの配列。'
-                      '{}に有るものは入れない。無ければ []'.format(
+                      '{}に有るものは入れない。依頼の報告の仕方、報酬の受け取り方、依頼の後の手続きの話は入れない。'
+                      '無ければ []'.format(
                           KEY_NEW_FACTS, FACTS_HEADING))
         instruction = (
             "あなたは人物の記録係だ。現在の記録と新しい会話を統合し、"
@@ -964,6 +994,8 @@ def apply(ctx):
             "- 出来事の経過や会話のあらすじ（誰が何を言った・どうしたの時系列）を"
             "書いてはならない。会話そのものの記録はゲームが別に残している。"
             "書くのは会話から分かった、この先も変わらずに残ることだけ\n"
+            "- 依頼の報告の仕方、報酬の受け取り方、依頼の後の手続きについてこの人物がその場で"
+            "求めたことや案内したことは、変わらない決まりや事実として書かない\n"
             "- 記録に加えるものが何も無ければ {changed} を \"false\" にし、"
             "他の項目には現在の記録をそのまま写す\n"
             "- 固定の分類は使わず、継続的な性格、価値観、嗜好、経歴、関係、"
@@ -997,13 +1029,21 @@ def apply(ctx):
         # 前の会話からの経過日数。
         # これが無いと、日を跨いだ会話でも
         # `about_player` が「今しがた約束した」の口調で書かれる。
+        # 生の日数は控えに書き写されて会話へ漏れるので、会話と同じ言い方に丸める。
         gap = elapsed_days(record, snapshot.get("day"))
         if gap:
-            blocks.append("【前回の会話からの経過】\n{}日が経っている。".format(gap))
+            blocks.append("【前回の会話からの経過】\n前回の会話は{}。".format(
+                elapsed_span(gap)))
+        finished = snapshot.get("finished_quests")
+        if finished:
+            blocks.append("{}\n{}\n{}".format(
+                FINISHED_QUESTS_HEADING, "\n".join("- " + title for title in finished),
+                FINISHED_QUESTS_BODY.format(player=player_name)))
         blocks.append("【新しい会話】\n{}".format(snapshot["transcript"]))
         return [
             {"role": "user", "content": instruction + "\n\n" + "\n\n".join(blocks)},
-            {"role": "user", "content": "<行動: 記録を更新する>"},
+            {"role": "user", "content": "<行動: 記録を更新する。依頼の報告の仕方、報酬の受け取り方、"
+                                        "依頼の後の手続きの話は、人物像にも事実にも入れない>"},
         ]
 
     def extract(snapshot):
@@ -1274,9 +1314,9 @@ def apply(ctx):
     # ============================================================ フック
     @ctx.wrap("__main__:ConversationPhaseManager.conversation_continued",
               required=False)
-    def conversation_continued(orig, self, choice_text, *args, **kwargs):
+    def conversation_continued(orig, self, *args, **kwargs):
         """1ターンが終わったところ。ターンの結果には手を触れない。"""
-        result = orig(self, choice_text, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         try:
             schedule_extract(getattr(self, "app", None))
         except Exception:
@@ -1285,36 +1325,18 @@ def apply(ctx):
 
     @ctx.wrap("__main__:ConversationInQuestPhase.conversation_continued",
               required=False)
-    def conversation_in_quest_continued(orig, self, choice_text, *args, **kwargs):
+    def conversation_in_quest_continued(orig, self, *args, **kwargs):
         """クエスト中の会話も同じ扱い（相手は同じ NPC）。"""
-        result = orig(self, choice_text, *args, **kwargs)
+        result = orig(self, *args, **kwargs)
         try:
             schedule_extract(getattr(self, "app", None))
         except Exception:
             ctx.log_exc("npc profile: cannot schedule extraction")
         return result
 
-    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator", required=False)
-    def conversation_facilitator(orig, *args, **kwargs):
-        return inject(orig, "facilitator", args, kwargs)
-
-    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_after_retrieval",
-              required=False)
-    def conversation_facilitator_after_retrieval(orig, *args, **kwargs):
-        return inject(orig, "facilitator[retrieval]", args, kwargs)
-
-    @ctx.wrap("scripts.llm.llm_manager:conversation_facilitator_in_quest",
-              required=False)
-    def conversation_facilitator_in_quest(orig, *args, **kwargs):
-        return inject(orig, "facilitator[quest]", args, kwargs)
-
-    @ctx.wrap("scripts.llm.llm_manager:conversation_starter", required=False)
-    def conversation_starter(orig, *args, **kwargs):
-        return inject(orig, "starter", args, kwargs)
-
-    @ctx.wrap("scripts.llm.llm_manager:conversation_starter_in_quest",
-              required=False)
-    def conversation_starter_in_quest(orig, *args, **kwargs):
-        return inject(orig, "starter[quest]", args, kwargs)
+    # 会話5関数へ足す文は、ローダの `modnpc` の notes に預ける（自分で包まない）。
+    # 足す順は前に自分で包んでいたときの重なりと同じ（`NOTES_PRIORITY`）。
+    modnpc.install(ctx, write=write)
+    modnpc.register(owner, modnpc.ANY, notes=profile_notes, priority=NOTES_PRIORITY, write=write)
 
     ctx.log("npc profile memory: state={}/".format(state_dir))
